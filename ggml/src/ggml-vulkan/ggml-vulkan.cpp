@@ -39,6 +39,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <mutex>
 #include <future>
 #include <thread>
+#include <optional>
 
 #ifdef __linux__
 #include <unistd.h>  // For dup() and close()
@@ -670,6 +671,8 @@ struct vk_device_struct {
     bool external_memory_fd_support = false;  // Linux-specific
     std::vector<size_t> peer_device_indices;  // Devices we can P2P with
     std::map<size_t, vk::PeerMemoryFeatureFlags> peer_memory_features;
+    std::map<size_t, vk_context_ref> p2p_ctx_cache;  // Cached P2P transfer contexts per peer device
+    vk_semaphore p2p_semaphore;  // Timeline semaphore for async P2P transfer signaling
 
     bool mul_mat_l[GGML_TYPE_COUNT];
     bool mul_mat_m[GGML_TYPE_COUNT];
@@ -938,6 +941,7 @@ struct vk_buffer_struct {
     std::map<size_t, vk::Buffer> peer_buffers;  // Imported buffer handles per peer
     std::map<size_t, vk::DeviceMemory> peer_memories;  // Imported memory per peer
     std::vector<size_t> accessible_devices;  // Which devices can access this buffer
+    std::optional<vk_semaphore> p2p_pending_wait;  // Semaphore to wait on before next use
 
     ~vk_buffer_struct() {
         if (size == 0) {
@@ -2907,6 +2911,17 @@ static vk_buffer ggml_vk_create_p2p_buffer(vk_device& device, size_t size, const
     }
 
     device->memory_logger->log_allocation(buf, size);
+
+    // Eager import: Import to all peer devices immediately if P2P exportable
+    if (buf->p2p_exportable && !device->peer_device_indices.empty()) {
+        VK_LOG_DEBUG("Eagerly importing P2P buffer to all " << device->peer_device_indices.size() << " peer devices");
+        for (size_t peer_idx : device->peer_device_indices) {
+            bool imported = ggml_vk_import_buffer_to_peer(buf, peer_idx);
+            if (!imported) {
+                std::cerr << "ggml_vulkan: Warning: Eager import to peer device " << peer_idx << " failed" << std::endl;
+            }
+        }
+    }
 
     return buf;
 }
@@ -6061,6 +6076,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // Detect P2P capabilities after device is fully initialized
         ggml_vk_detect_peer_memory_features(device, idx);
 
+        // Initialize P2P semaphore for async transfers
+        device->p2p_semaphore = ggml_vk_create_timeline_semaphore();
+        VK_LOG_DEBUG("Initialized P2P semaphore for device " << idx);
+
         return device;
     }
 
@@ -7126,6 +7145,29 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
     return result;
 }
 
+// Get or create a P2P transfer context for a specific peer device pair
+static vk_context ggml_vk_get_p2p_ctx(vk_device& src_device, size_t peer_idx) {
+    auto& weak_ctx = src_device->p2p_ctx_cache[peer_idx];
+    vk_context ctx = weak_ctx.lock();
+    if (!ctx) {
+        VK_LOG_DEBUG("Creating new P2P context for device " << src_device->idx << " -> " << peer_idx);
+        ctx = ggml_vk_create_context(src_device, src_device->transfer_queue.cmd_pool);
+        weak_ctx = ctx;
+    } else {
+        VK_LOG_DEBUG("Reusing P2P context for device " << src_device->idx << " -> " << peer_idx);
+    }
+    return ctx;
+}
+
+// Add P2P wait semaphore to context if buffer has pending P2P transfer
+static void ggml_vk_add_p2p_wait_if_needed(vk_context& ctx, vk_buffer& buf) {
+    if (buf->p2p_pending_wait.has_value()) {
+        VK_LOG_DEBUG("Adding P2P wait for buffer on semaphore value: " << buf->p2p_pending_wait->value);
+        ctx->s->wait_semaphores.push_back(buf->p2p_pending_wait.value());
+        buf->p2p_pending_wait.reset();  // Clear after adding wait
+    }
+}
+
 // Submit any pending transfer queue work and signal the transfer semaphore.
 // The next compute context created via ggml_vk_get_compute_ctx will wait on this semaphore.
 // Returns true if work was submitted.
@@ -7496,9 +7538,12 @@ static void ggml_vk_buffer_copy_p2p(vk_buffer& dst, size_t dst_offset, vk_buffer
     vk_device& cmd_device = src->device;
     std::lock_guard<std::recursive_mutex> guard(cmd_device->mutex);
 
-    // Create command buffer
-    vk_context subctx = ggml_vk_create_temporary_context(cmd_device->transfer_queue.cmd_pool);
+    // Get or create cached P2P context for this device pair
+    vk_context subctx = ggml_vk_get_p2p_ctx(cmd_device, dst->device->idx);
     ggml_vk_ctx_begin(cmd_device, subctx);
+
+    // Wait for any pending P2P transfers on source buffer
+    ggml_vk_add_p2p_wait_if_needed(subctx, src);
 
     // Get destination buffer handle accessible from source device
     vk::Buffer dst_handle;
@@ -7551,13 +7596,21 @@ static void ggml_vk_buffer_copy_p2p(vk_buffer& dst, size_t dst_offset, vk_buffer
     );
 
     ggml_vk_ctx_end(subctx);
-    ggml_vk_submit(subctx, cmd_device->fence);
 
-    VK_CHECK(cmd_device->device.waitForFences({ cmd_device->fence }, true, UINT64_MAX),
-             "ggml_vk_buffer_copy_p2p");
-    cmd_device->device.resetFences({ cmd_device->fence });
+    // Async P2P: Increment semaphore and signal on completion
+    cmd_device->p2p_semaphore.value++;
+    subctx->seqs.back().back().signal_semaphores.push_back(cmd_device->p2p_semaphore);
 
-    ggml_vk_queue_command_pools_cleanup(cmd_device);
+    VK_LOG_DEBUG("P2P transfer signaling semaphore value: " << cmd_device->p2p_semaphore.value);
+
+    // Store semaphore for destination buffer to wait on before next use
+    dst->p2p_pending_wait = cmd_device->p2p_semaphore;
+
+    // Submit without fence - returns immediately (async)
+    ggml_vk_submit(subctx, {});
+
+    // NO waitForFences - async return!
+    // Next operation on dst buffer will wait on the semaphore
 }
 
 static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
@@ -7567,6 +7620,11 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         // Copy within the device
         vk_context subctx = ggml_vk_create_temporary_context(src->device->transfer_queue.cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
+
+        // Wait for any pending P2P transfers on src and dst buffers
+        ggml_vk_add_p2p_wait_if_needed(subctx, src);
+        ggml_vk_add_p2p_wait_if_needed(subctx, dst);
+
         ggml_vk_buffer_copy_async(subctx, dst, dst_offset, src, src_offset, size);
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, src->device->fence);
@@ -7589,15 +7647,16 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
             bool src_can_access_dst = std::find(src_peers.begin(), src_peers.end(), dst_idx) != src_peers.end();
 
             if (src_can_access_dst) {
-                // Check if dst buffer is already accessible from src device
+                // Check if dst buffer is already accessible from src device (should be pre-imported)
                 auto& dst_accessible_devs = dst->accessible_devices;
                 bool buffers_ready = std::find(dst_accessible_devs.begin(),
                                                dst_accessible_devs.end(),
                                                src_idx) != dst_accessible_devs.end();
 
                 if (!buffers_ready) {
-                    // Try to import dst to src device on-the-fly (only on first use)
-                    buffers_ready = ggml_vk_import_buffer_to_peer(dst, src_idx);
+                    // Buffers should have been eagerly imported - this shouldn't happen
+                    std::cerr << "ggml_vulkan: Warning: P2P buffer not pre-imported to peer device " << src_idx << std::endl;
+                    std::cerr << "ggml_vulkan: Falling back to host staging" << std::endl;
                 }
 
                 p2p_available = buffers_ready;
@@ -7615,6 +7674,11 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
             VK_LOG_DEBUG("ggml_vk_buffer_copy(P2P, " << size << ")");
             ggml_vk_buffer_copy_p2p(dst, dst_offset, src, src_offset, size);
         } else {
+            static bool host_first_use = true;
+            if (host_first_use) {
+                std::cerr << "ggml_vulkan: Using host transfer between device " << src->device->idx << " and device " << dst->device->idx << std::endl;
+                host_first_use = false;
+            }
             VK_LOG_DEBUG("ggml_vk_buffer_copy(HOST_STAGING, " << size << ")");
             // Fallback to host staging - original code
             ggml_vk_ensure_sync_staging_buffer(src->device, size);
