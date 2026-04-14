@@ -2842,7 +2842,10 @@ static vk_buffer ggml_vk_create_p2p_buffer(vk_device& device, size_t size, const
     }
 
     if (!found_compatible) {
-        VK_LOG_DEBUG("No exportable memory type found for P2P buffer");
+        uint32_t ext_mem_features = (uint32_t)ext_buf_props.externalMemoryProperties.externalMemoryFeatures;
+        std::cerr << "ggml_vulkan: Warning: No exportable memory type found for P2P buffer on device " << device->idx << std::endl;
+        std::cerr << "ggml_vulkan: External memory features: 0x" << std::hex << ext_mem_features << std::dec << std::endl;
+        std::cerr << "ggml_vulkan: P2P export will likely fail - no memory type supports VK_EXT_external_memory_host or VK_KHR_external_memory_fd" << std::endl;
         // Use first available type anyway, export will fail but buffer will still work
         for (auto& req_flags : req_flags_list) {
             auto type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags);
@@ -2870,11 +2873,15 @@ static vk_buffer ggml_vk_create_p2p_buffer(vk_device& device, size_t size, const
 
         try {
             buf->export_fd = device->device.getMemoryFdKHR(get_fd_info);
-            buf->p2p_exportable = true;
-            VK_LOG_DEBUG("P2P buffer exported with FD: " << buf->export_fd);
+            if (buf->export_fd < 0) {
+                std::cerr << "ggml_vulkan: Warning: P2P buffer FD export returned invalid FD (" << buf->export_fd << ") on device " << device->idx << std::endl;
+            } else {
+                buf->p2p_exportable = true;
+            }
         } catch (const vk::SystemError& e) {
             // Export failed - this is expected if the memory type doesn't support external memory
-            VK_LOG_DEBUG("Failed to export P2P buffer FD: " << e.what());
+            std::cerr << "ggml_vulkan: Warning: P2P buffer FD export threw exception on device " << device->idx << ": " << e.what() << std::endl;
+            std::cerr << "ggml_vulkan: Buffer created but will not be P2P exportable" << std::endl;
             // p2p_exportable remains false
         }
     }
@@ -3072,7 +3079,7 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     vk_buffer buf;
 
     // Use P2P-capable buffers when P2P is enabled and device supports it
-    bool try_p2p = vk_instance.p2p_enabled &&
+    bool try_p2p = size > 0 && vk_instance.p2p_enabled &&
                    device->external_memory_support &&
                    device->external_memory_fd_support &&
                    !device->peer_device_indices.empty();
@@ -3094,8 +3101,8 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
                     // Export failed - fall back to regular buffer
                     static bool p2p_export_failed_warned = false;
                     if (!p2p_export_failed_warned) {
-                        std::cerr << "ggml_vulkan: Warning: P2P buffer export failed, falling back to regular buffers" << std::endl;
-                        std::cerr << "ggml_vulkan: P2P will be disabled for this session" << std::endl;
+                        std::cerr << "ggml_vulkan: Warning: P2P buffer export failed on device " << device->idx << ", falling back to regular buffers" << std::endl;
+                        std::cerr << "ggml_vulkan: Check previous warnings about exportable memory type and FD export - P2P will be disabled for this session" << std::endl;
                         p2p_export_failed_warned = true;
                     }
                     // Don't use this buffer, create regular one below
@@ -5261,11 +5268,11 @@ static void ggml_vk_detect_peer_memory_features(vk_device device, size_t device_
             std::cerr << "ggml_vulkan: P2P capable: device " << device_idx << " <-> device " << peer_idx << std::endl;
             VK_LOG_DEBUG("P2P capable: device " << device_idx << " <-> device " << peer_idx);
         } else {
-            VK_LOG_DEBUG("P2P NOT capable: device " << device_idx << " <-> device " << peer_idx <<
-                        " (external_memory support: dev" << device_idx << "=" <<
-                        (device->external_memory_support && device->external_memory_fd_support) <<
-                        ", dev" << peer_idx << "=" <<
-                        (peer->external_memory_support && peer->external_memory_fd_support) << ")");
+            std::cerr << "ggml_vulkan: Warning: P2P NOT capable: device " << device_idx << " <-> device " << peer_idx << std::endl;
+            std::cerr << "ggml_vulkan:   Device " << device_idx << " external_memory_support=" << device->external_memory_support
+                     << ", external_memory_fd_support=" << device->external_memory_fd_support << std::endl;
+            std::cerr << "ggml_vulkan:   Device " << peer_idx << " external_memory_support=" << peer->external_memory_support
+                     << ", external_memory_fd_support=" << peer->external_memory_fd_support << std::endl;
         }
     }
 }
