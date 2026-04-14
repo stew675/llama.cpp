@@ -40,6 +40,10 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <future>
 #include <thread>
 
+#ifdef __linux__
+#include <unistd.h>  // For dup() and close()
+#endif
+
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
@@ -660,6 +664,13 @@ struct vk_device_struct {
 
     size_t idx;
 
+    // P2P support fields
+    bool device_group_support = false;
+    bool external_memory_support = false;
+    bool external_memory_fd_support = false;  // Linux-specific
+    std::vector<size_t> peer_device_indices;  // Devices we can P2P with
+    std::map<size_t, vk::PeerMemoryFeatureFlags> peer_memory_features;
+
     bool mul_mat_l[GGML_TYPE_COUNT];
     bool mul_mat_m[GGML_TYPE_COUNT];
     bool mul_mat_s[GGML_TYPE_COUNT];
@@ -908,6 +919,9 @@ void vk_command_pool::destroy(vk::Device& device) {
     cmd_buffers.clear();
 }
 
+// Forward declaration for use in buffer destructor
+static vk_device ggml_vk_get_device(size_t idx);
+
 struct vk_buffer_struct {
     vk::Buffer buffer = VK_NULL_HANDLE;
     vk::DeviceMemory device_memory = VK_NULL_HANDLE;
@@ -918,11 +932,34 @@ struct vk_buffer_struct {
 
     vk_device device;
 
+    // P2P support
+    bool p2p_exportable = false;
+    int export_fd = -1;  // Linux: exported file descriptor
+    std::map<size_t, vk::Buffer> peer_buffers;  // Imported buffer handles per peer
+    std::map<size_t, vk::DeviceMemory> peer_memories;  // Imported memory per peer
+    std::vector<size_t> accessible_devices;  // Which devices can access this buffer
+
     ~vk_buffer_struct() {
         if (size == 0) {
             return;
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
+
+        // Clean up peer imports
+        for (auto& [peer_idx, peer_buf] : peer_buffers) {
+            vk_device peer = ggml_vk_get_device(peer_idx);
+            peer->device.destroyBuffer(peer_buf);
+        }
+        for (auto& [peer_idx, peer_mem] : peer_memories) {
+            vk_device peer = ggml_vk_get_device(peer_idx);
+            peer->device.freeMemory(peer_mem);
+        }
+
+#ifdef __linux__
+        if (export_fd >= 0) {
+            close(export_fd);
+        }
+#endif
 
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
@@ -2058,6 +2095,8 @@ struct vk_instance_t {
     std::vector<size_t> device_indices;
     std::vector<bool>   device_supports_membudget;
     vk_device devices[GGML_VK_MAX_DEVICES];
+
+    bool p2p_enabled = false;  // Controlled by GGML_VK_ENABLE_P2P env var
 };
 
 static bool vk_instance_initialized = false;
@@ -2719,6 +2758,306 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     return buf;
 }
 
+static vk_buffer ggml_vk_create_p2p_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags>& req_flags_list) {
+    VK_LOG_DEBUG("ggml_vk_create_p2p_buffer(" << device->name << ", " << size << ")");
+
+    if (size > device->max_buffer_size) {
+        throw vk::OutOfDeviceMemoryError("Buffer size exceeds device limit");
+    }
+
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    if (size == 0) {
+        buf->size = 0;
+        return buf;
+    }
+
+    // Buffer usage flags
+    vk::BufferUsageFlags usage =
+        vk::BufferUsageFlagBits::eStorageBuffer |
+        vk::BufferUsageFlagBits::eTransferSrc |
+        vk::BufferUsageFlagBits::eTransferDst;
+
+    if (device->buffer_device_address) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+
+    // External memory info for P2P
+    vk::ExternalMemoryBufferCreateInfo external_info;
+#ifdef __linux__
+    external_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+#endif
+
+    vk::BufferCreateInfo buffer_info{
+        vk::BufferCreateFlags(),
+        size,
+        usage,
+        vk::SharingMode::eExclusive,
+        0, nullptr
+    };
+    buffer_info.setPNext(&external_info);
+
+    buf->buffer = device->device.createBuffer(buffer_info);
+
+    // Get memory requirements
+    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+    vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+
+    // Query external memory properties to find compatible memory types
+    vk::PhysicalDeviceExternalBufferInfo ext_buf_info;
+    ext_buf_info.usage = usage;
+#ifdef __linux__
+    ext_buf_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+#endif
+    vk::ExternalBufferProperties ext_buf_props = device->physical_device.getExternalBufferProperties(ext_buf_info);
+
+    // Export memory info
+    vk::ExportMemoryAllocateInfo export_info;
+#ifdef __linux__
+    export_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+#endif
+
+    // Memory allocation flags
+    vk::MemoryAllocateFlagsInfo mem_flags{};
+    if (device->buffer_device_address) {
+        mem_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+    }
+    mem_flags.setPNext(&export_info);
+
+    // Find suitable memory type that supports external memory
+    uint32_t memory_type_idx = 0;
+    bool found_compatible = false;
+    for (auto& req_flags : req_flags_list) {
+        auto type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags);
+        // Check if this memory type supports external memory export
+        for (uint32_t type_idx : type_indices) {
+            if (ext_buf_props.externalMemoryProperties.externalMemoryFeatures &
+                vk::ExternalMemoryFeatureFlagBits::eExportable) {
+                memory_type_idx = type_idx;
+                buf->memory_property_flags = req_flags;
+                found_compatible = true;
+                break;
+            }
+        }
+        if (found_compatible) break;
+    }
+
+    if (!found_compatible) {
+        VK_LOG_DEBUG("No exportable memory type found for P2P buffer");
+        // Use first available type anyway, export will fail but buffer will still work
+        for (auto& req_flags : req_flags_list) {
+            auto type_indices = ggml_vk_find_memory_properties(&mem_props, &mem_req, req_flags);
+            if (!type_indices.empty()) {
+                memory_type_idx = type_indices[0];
+                buf->memory_property_flags = req_flags;
+                break;
+            }
+        }
+    }
+
+    // Allocate with export capability
+    buf->device_memory = device->device.allocateMemory({
+        mem_req.size,
+        memory_type_idx,
+        &mem_flags
+    });
+
+    // Export file descriptor (Linux)
+#ifdef __linux__
+    if (device->external_memory_fd_support) {
+        vk::MemoryGetFdInfoKHR get_fd_info;
+        get_fd_info.memory = buf->device_memory;
+        get_fd_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+
+        try {
+            buf->export_fd = device->device.getMemoryFdKHR(get_fd_info);
+            buf->p2p_exportable = true;
+            VK_LOG_DEBUG("P2P buffer exported with FD: " << buf->export_fd);
+        } catch (const vk::SystemError& e) {
+            // Export failed - this is expected if the memory type doesn't support external memory
+            VK_LOG_DEBUG("Failed to export P2P buffer FD: " << e.what());
+            // p2p_exportable remains false
+        }
+    }
+#endif
+
+    // Map if host visible
+    buf->ptr = nullptr;
+    if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+        buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
+    }
+
+    // Bind memory
+    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+
+    buf->device = device;
+    buf->size = size;
+    buf->accessible_devices.push_back(device->idx);
+
+    // Get buffer device address
+    if (device->buffer_device_address) {
+        vk::BufferDeviceAddressInfo addr_info(buf->buffer);
+        buf->bda_addr = device->device.getBufferAddress(addr_info);
+    }
+
+    device->memory_logger->log_allocation(buf, size);
+
+    return buf;
+}
+
+static bool ggml_vk_import_buffer_to_peer(vk_buffer& buf, size_t peer_device_idx) {
+    if (!buf->p2p_exportable) {
+        std::cerr << "ggml_vulkan: Warning: Buffer is not P2P exportable" << std::endl;
+        return false;
+    }
+
+    vk_device peer = ggml_vk_get_device(peer_device_idx);
+
+    if (!peer->external_memory_fd_support) {
+        std::cerr << "ggml_vulkan: Warning: Peer device doesn't support external memory FD" << std::endl;
+        return false;
+    }
+
+    // Check if already imported
+    if (buf->peer_buffers.find(peer_device_idx) != buf->peer_buffers.end()) {
+        return true;
+    }
+
+    VK_LOG_DEBUG("Importing P2P buffer to device " << peer_device_idx);
+
+#ifdef __linux__
+    // Duplicate FD for import (each import consumes the FD)
+    int dup_fd = dup(buf->export_fd);
+    if (dup_fd < 0) {
+        std::cerr << "ggml_vulkan: Error: Failed to duplicate FD for import" << std::endl;
+        return false;
+    }
+
+    // Create buffer on peer device
+    vk::ExternalMemoryBufferCreateInfo external_info;
+    external_info.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+
+    vk::BufferUsageFlags usage =
+        vk::BufferUsageFlagBits::eStorageBuffer |
+        vk::BufferUsageFlagBits::eTransferSrc |
+        vk::BufferUsageFlagBits::eTransferDst;
+    if (peer->buffer_device_address) {
+        usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+
+    vk::BufferCreateInfo buffer_info{
+        vk::BufferCreateFlags(),
+        buf->size,
+        usage,
+        vk::SharingMode::eExclusive,
+        0, nullptr
+    };
+    buffer_info.setPNext(&external_info);
+
+    vk::Buffer peer_buffer = peer->device.createBuffer(buffer_info);
+
+    // Import memory via FD
+    vk::ImportMemoryFdInfoKHR import_info;
+    import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+    import_info.fd = dup_fd;  // Ownership transfers to Vulkan
+
+    vk::MemoryAllocateFlagsInfo mem_flags{};
+    if (peer->buffer_device_address) {
+        mem_flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+    }
+    mem_flags.setPNext(&import_info);
+
+    // Get memory requirements
+    vk::MemoryRequirements peer_mem_req = peer->device.getBufferMemoryRequirements(peer_buffer);
+
+    // Find compatible memory type
+    vk::PhysicalDeviceMemoryProperties mem_props = peer->physical_device.getMemoryProperties();
+    auto type_indices = ggml_vk_find_memory_properties(&mem_props, &peer_mem_req,
+        vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+    if (type_indices.empty()) {
+        peer->device.destroyBuffer(peer_buffer);
+        std::cerr << "ggml_vulkan: Error: No compatible memory type for P2P import" << std::endl;
+        return false;
+    }
+
+    // Allocate imported memory
+    vk::DeviceMemory peer_memory = peer->device.allocateMemory({
+        peer_mem_req.size,
+        type_indices[0],
+        &mem_flags
+    });
+
+    // Bind imported memory
+    peer->device.bindBufferMemory(peer_buffer, peer_memory, 0);
+
+    // Store in buffer struct
+    buf->peer_buffers[peer_device_idx] = peer_buffer;
+    buf->peer_memories[peer_device_idx] = peer_memory;
+    buf->accessible_devices.push_back(peer_device_idx);
+
+    VK_LOG_DEBUG("Successfully imported P2P buffer to device " << peer_device_idx);
+    return true;
+#else
+    std::cerr << "ggml_vulkan: Warning: P2P import only supported on Linux" << std::endl;
+    return false;
+#endif
+}
+
+static bool ggml_vk_test_p2p(size_t dev1_idx, size_t dev2_idx) {
+    VK_LOG_DEBUG("Testing P2P between device " << dev1_idx << " and " << dev2_idx);
+
+    if (dev1_idx >= vk_instance.device_indices.size() ||
+        dev2_idx >= vk_instance.device_indices.size()) {
+        std::cerr << "ggml_vulkan: Error: Invalid device indices" << std::endl;
+        return false;
+    }
+
+    vk_device dev1 = ggml_vk_get_device(dev1_idx);
+    vk_device dev2 = ggml_vk_get_device(dev2_idx);
+
+    // Check capabilities
+    if (!dev1->device_group_support || !dev2->device_group_support) {
+        std::cerr << "ggml_vulkan: Warning: P2P test failed: device_group not supported" << std::endl;
+        return false;
+    }
+
+    // Check peer relationship
+    auto it = std::find(dev1->peer_device_indices.begin(),
+                       dev1->peer_device_indices.end(),
+                       dev2_idx);
+    if (it == dev1->peer_device_indices.end()) {
+        std::cerr << "ggml_vulkan: Warning: P2P test failed: devices are not peers" << std::endl;
+        return false;
+    }
+
+    // Test buffer allocation and import
+    const size_t test_size = 1024 * 1024;  // 1MB
+    try {
+        vk_buffer test_buf = ggml_vk_create_p2p_buffer(
+            dev1,
+            test_size,
+            { vk::MemoryPropertyFlagBits::eDeviceLocal }
+        );
+
+        if (!test_buf->p2p_exportable) {
+            std::cerr << "ggml_vulkan: Warning: P2P test failed: buffer not exportable" << std::endl;
+            return false;
+        }
+
+        bool imported = ggml_vk_import_buffer_to_peer(test_buf, dev2_idx);
+        if (!imported) {
+            std::cerr << "ggml_vulkan: Warning: P2P test failed: import failed" << std::endl;
+            return false;
+        }
+
+        VK_LOG_DEBUG("P2P test PASSED!");
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "ggml_vulkan: Error: P2P test failed with exception: " << e.what() << std::endl;
+        return false;
+    }
+}
+
 static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk::MemoryPropertyFlags req_flags, vk::MemoryPropertyFlags fallback_flags = vk::MemoryPropertyFlags(0)) {
     try {
         return ggml_vk_create_buffer(device, size, {req_flags, fallback_flags});
@@ -2731,7 +3070,49 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
 
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     vk_buffer buf;
+
+    // Use P2P-capable buffers when P2P is enabled and device supports it
+    bool try_p2p = vk_instance.p2p_enabled &&
+                   device->external_memory_support &&
+                   device->external_memory_fd_support &&
+                   !device->peer_device_indices.empty();
+
     try {
+        if (try_p2p) {
+            // Try to create P2P-capable buffer
+            try {
+                buf = ggml_vk_create_p2p_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
+                if (buf->p2p_exportable) {
+                    // Success! Use P2P buffer
+                    static bool first_p2p_buffer = true;
+                    if (first_p2p_buffer) {
+                        std::cerr << "ggml_vulkan: Successfully created P2P-capable buffers on device " << device->idx << std::endl;
+                        first_p2p_buffer = false;
+                    }
+                    return buf;
+                } else {
+                    // Export failed - fall back to regular buffer
+                    static bool p2p_export_failed_warned = false;
+                    if (!p2p_export_failed_warned) {
+                        std::cerr << "ggml_vulkan: Warning: P2P buffer export failed, falling back to regular buffers" << std::endl;
+                        std::cerr << "ggml_vulkan: P2P will be disabled for this session" << std::endl;
+                        p2p_export_failed_warned = true;
+                    }
+                    // Don't use this buffer, create regular one below
+                    buf.reset();
+                }
+            } catch (const vk::SystemError& e) {
+                // P2P buffer creation failed entirely
+                static bool p2p_create_failed_warned = false;
+                if (!p2p_create_failed_warned) {
+                    std::cerr << "ggml_vulkan: Warning: P2P buffer creation failed: " << e.what() << std::endl;
+                    std::cerr << "ggml_vulkan: Falling back to regular buffers" << std::endl;
+                    p2p_create_failed_warned = true;
+                }
+            }
+        }
+
+        // Create regular buffer (either P2P not requested or P2P failed)
         if (device->prefer_host_memory) {
             buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
                                                        vk::MemoryPropertyFlagBits::eDeviceLocal});
@@ -4855,6 +5236,40 @@ static void ggml_vk_load_shaders(vk_device& device) {
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch);
 static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev);
 
+static vk_device ggml_vk_get_device(size_t idx);
+
+static void ggml_vk_detect_peer_memory_features(vk_device device, size_t device_idx) {
+    if (!vk_instance.p2p_enabled) {
+        return;
+    }
+
+    // For external memory P2P (file descriptor based), we don't need device groups
+    // Just check if peer devices support the required extensions
+    for (size_t peer_idx = 0; peer_idx < vk_instance.device_indices.size(); peer_idx++) {
+        if (peer_idx == device_idx) continue;
+
+        vk_device peer = ggml_vk_get_device(peer_idx);
+
+        // Check if both devices support external memory
+        bool p2p_capable = device->external_memory_support &&
+                          device->external_memory_fd_support &&
+                          peer->external_memory_support &&
+                          peer->external_memory_fd_support;
+
+        if (p2p_capable) {
+            device->peer_device_indices.push_back(peer_idx);
+            std::cerr << "ggml_vulkan: P2P capable: device " << device_idx << " <-> device " << peer_idx << std::endl;
+            VK_LOG_DEBUG("P2P capable: device " << device_idx << " <-> device " << peer_idx);
+        } else {
+            VK_LOG_DEBUG("P2P NOT capable: device " << device_idx << " <-> device " << peer_idx <<
+                        " (external_memory support: dev" << device_idx << "=" <<
+                        (device->external_memory_support && device->external_memory_fd_support) <<
+                        ", dev" << peer_idx << "=" <<
+                        (peer->external_memory_support && peer->external_memory_fd_support) << ")");
+        }
+    }
+}
+
 static vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -4944,6 +5359,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
 #endif
             } else if (strcmp("VK_KHR_pipeline_executable_properties", properties.extensionName) == 0) {
                 pipeline_executable_properties_support = true;
+            } else if (strcmp("VK_KHR_device_group", properties.extensionName) == 0) {
+                device->device_group_support = true;
+            } else if (strcmp("VK_KHR_external_memory", properties.extensionName) == 0) {
+                device->external_memory_support = true;
+            } else if (strcmp("VK_KHR_external_memory_fd", properties.extensionName) == 0) {
+                device->external_memory_fd_support = true;
             } else if (strcmp("VK_EXT_memory_priority", properties.extensionName) == 0 &&
                        getenv("GGML_VK_ENABLE_MEMORY_PRIORITY")) {
                 device->memory_priority = true;
@@ -5247,6 +5668,19 @@ static vk_device ggml_vk_get_device(size_t idx) {
         if (device->external_memory_host) {
             device_extensions.push_back("VK_EXT_external_memory_host");
         }
+
+        // P2P extensions
+        if (device->device_group_support) {
+            device_extensions.push_back("VK_KHR_device_group");
+        }
+        if (device->external_memory_support) {
+            device_extensions.push_back("VK_KHR_external_memory");
+        }
+#ifdef __linux__
+        if (device->external_memory_fd_support) {
+            device_extensions.push_back("VK_KHR_external_memory_fd");
+        }
+#endif
 
 #if defined(VK_EXT_shader_64bit_indexing)
         VkPhysicalDeviceShader64BitIndexingFeaturesEXT shader_64bit_indexing_features {};
@@ -5616,6 +6050,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
             device->mmvq_mode = 1;
         }
+
+        // Detect P2P capabilities after device is fully initialized
+        ggml_vk_detect_peer_memory_features(device, idx);
 
         return device;
     }
@@ -6038,6 +6475,27 @@ static void ggml_vk_instance_init() {
         vk_instance.device_supports_membudget.push_back(membudget_supported);
 
         ggml_vk_print_gpu_info(i);
+    }
+
+    // P2P control
+    const char* GGML_VK_ENABLE_P2P = getenv("GGML_VK_ENABLE_P2P");
+    vk_instance.p2p_enabled = (GGML_VK_ENABLE_P2P != nullptr && strcmp(GGML_VK_ENABLE_P2P, "1") == 0);
+
+    if (vk_instance.p2p_enabled) {
+        std::cerr << "ggml_vulkan: P2P mode enabled via GGML_VK_ENABLE_P2P" << std::endl;
+        VK_LOG_DEBUG("P2P mode enabled via GGML_VK_ENABLE_P2P");
+    } else {
+        VK_LOG_DEBUG("P2P mode disabled (set GGML_VK_ENABLE_P2P=1 to enable)");
+    }
+
+    // Optional P2P testing
+    const char* GGML_VK_TEST_P2P = getenv("GGML_VK_TEST_P2P");
+    if (GGML_VK_TEST_P2P != nullptr && strcmp(GGML_VK_TEST_P2P, "1") == 0) {
+        for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
+            for (size_t j = i + 1; j < vk_instance.device_indices.size(); j++) {
+                ggml_vk_test_p2p(i, j);
+            }
+        }
     }
 }
 
@@ -7023,6 +7481,78 @@ static void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t ds
     vkCmdCopyBuffer(ctx->s->buffer->buf, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, 1, &bc);
 }
 
+static void ggml_vk_buffer_copy_p2p(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
+    VK_LOG_DEBUG("ggml_vk_buffer_copy_p2p(" << size << " bytes, device " <<
+                 src->device->idx << " -> device " << dst->device->idx << ")");
+
+    // Use source device for transfer command
+    vk_device& cmd_device = src->device;
+    std::lock_guard<std::recursive_mutex> guard(cmd_device->mutex);
+
+    // Create command buffer
+    vk_context subctx = ggml_vk_create_temporary_context(cmd_device->transfer_queue.cmd_pool);
+    ggml_vk_ctx_begin(cmd_device, subctx);
+
+    // Get destination buffer handle accessible from source device
+    vk::Buffer dst_handle;
+    if (dst->device->idx == cmd_device->idx) {
+        dst_handle = dst->buffer;
+    } else {
+        auto it = dst->peer_buffers.find(cmd_device->idx);
+        if (it == dst->peer_buffers.end()) {
+            throw std::runtime_error("P2P copy failed: destination buffer not accessible");
+        }
+        dst_handle = it->second;
+    }
+
+    // Memory barrier before copy - ensure previous writes are visible
+    vk::BufferMemoryBarrier src_barrier;
+    src_barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+    src_barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    src_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    src_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    src_barrier.buffer = src->buffer;
+    src_barrier.offset = src_offset;
+    src_barrier.size = size;
+
+    subctx->s->buffer->buf.pipelineBarrier(
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eTransfer,
+        vk::DependencyFlags(),
+        0, nullptr, 1, &src_barrier, 0, nullptr
+    );
+
+    // P2P copy command
+    vk::BufferCopy region(src_offset, dst_offset, size);
+    subctx->s->buffer->buf.copyBuffer(src->buffer, dst_handle, 1, &region);
+
+    // Memory barrier after copy - ensure transfer completes before next access
+    vk::BufferMemoryBarrier dst_barrier;
+    dst_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    dst_barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+    dst_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dst_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dst_barrier.buffer = dst_handle;
+    dst_barrier.offset = dst_offset;
+    dst_barrier.size = size;
+
+    subctx->s->buffer->buf.pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::DependencyFlags(),
+        0, nullptr, 1, &dst_barrier, 0, nullptr
+    );
+
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, cmd_device->fence);
+
+    VK_CHECK(cmd_device->device.waitForFences({ cmd_device->fence }, true, UINT64_MAX),
+             "ggml_vk_buffer_copy_p2p");
+    cmd_device->device.resetFences({ cmd_device->fence });
+
+    ggml_vk_queue_command_pools_cleanup(cmd_device);
+}
+
 static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& src, size_t src_offset, size_t size) {
     if (src->device == dst->device) {
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
@@ -7037,14 +7567,56 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         src->device->device.resetFences({ src->device->fence });
         ggml_vk_queue_command_pools_cleanup(src->device);
     } else {
-        VK_LOG_DEBUG("ggml_vk_buffer_copy(MULTI_DEVICE, " << size << ")");
-        // Copy device to device
-        ggml_vk_ensure_sync_staging_buffer(src->device, size);
+        // Different devices - check P2P availability
+        // Quick check: both buffers must be P2P exportable, otherwise skip all the checks
+        bool p2p_available = vk_instance.p2p_enabled &&
+                            src->p2p_exportable &&
+                            dst->p2p_exportable;
 
-        // Copy to src staging buffer
-        ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
-        // Copy to dst buffer
-        ggml_vk_buffer_write_2d(dst, dst_offset, src->device->sync_staging->ptr, 0, size, 1);
+        if (p2p_available) {
+            size_t src_idx = src->device->idx;
+            size_t dst_idx = dst->device->idx;
+
+            // Check if devices support P2P with each other
+            auto& src_peers = src->device->peer_device_indices;
+            bool src_can_access_dst = std::find(src_peers.begin(), src_peers.end(), dst_idx) != src_peers.end();
+
+            if (src_can_access_dst) {
+                // Check if dst buffer is already accessible from src device
+                auto& dst_accessible_devs = dst->accessible_devices;
+                bool buffers_ready = std::find(dst_accessible_devs.begin(),
+                                               dst_accessible_devs.end(),
+                                               src_idx) != dst_accessible_devs.end();
+
+                if (!buffers_ready) {
+                    // Try to import dst to src device on-the-fly (only on first use)
+                    buffers_ready = ggml_vk_import_buffer_to_peer(dst, src_idx);
+                }
+
+                p2p_available = buffers_ready;
+            } else {
+                p2p_available = false;
+            }
+        }
+
+        if (p2p_available) {
+            static bool p2p_first_use = true;
+            if (p2p_first_use) {
+                std::cerr << "ggml_vulkan: Using P2P transfer between device " << src->device->idx << " and device " << dst->device->idx << std::endl;
+                p2p_first_use = false;
+            }
+            VK_LOG_DEBUG("ggml_vk_buffer_copy(P2P, " << size << ")");
+            ggml_vk_buffer_copy_p2p(dst, dst_offset, src, src_offset, size);
+        } else {
+            VK_LOG_DEBUG("ggml_vk_buffer_copy(HOST_STAGING, " << size << ")");
+            // Fallback to host staging - original code
+            ggml_vk_ensure_sync_staging_buffer(src->device, size);
+
+            // Copy to src staging buffer
+            ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
+            // Copy to dst buffer
+            ggml_vk_buffer_write_2d(dst, dst_offset, src->device->sync_staging->ptr, 0, size, 1);
+        }
     }
 }
 
