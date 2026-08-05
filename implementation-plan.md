@@ -296,24 +296,48 @@ Tasks:
 - [x] Negative test: CPU-only build loading the fp8 dir -> exact "no hardware support"
       error, clean exit. `--n-gpu-layers 10` -> exact partial-offload error.
       NOTE: `--no-alloc` / `--vocab-only` skip tensor loading entirely (verified sane).
-- [ ] mmproj companion: text loader ignores vision; document + verify
-      `convert_hf_to_gguf.py ... --mmproj` produces a working `mmproj.gguf` for qwen3.5
-      vision (check `tools/mtmd/clip.cpp` accepts it; config dims: depth 24, hidden 1024,
-      pos 2304, spatial_merge 2, temporal_patch 2 - qwen3vl-shaped).
-- [ ] `tools/mtmd/mtmd-cli` + `tools/server` multimodal run with `-m <safetensors dir>`
-      + `--mmproj <mmproj.gguf>` + an image.
+- [x] mmproj companion: `convert_hf_to_gguf.py <orig-dir> --mmproj` produces a
+      298-tensor 675MB mmproj.gguf (NOTE: must use the standard-named original dir,
+      `model.safetensors-*.safetensors`; the StewFP8 `layers-*.safetensors` layout is
+      invisible to `get_model_part_names("model", ...)`).
+- [x] `llama-cli -m <safetensors dir> --mmproj <mmproj.gguf> --image <img>` works:
+      vision tower reads the actual image content (NYT "MEN WALK ON MOON" front page
+      correctly identified). `llama-server` + mmproj + image via the chat API works too
+      (content went to reasoning_content - normal Qwen3.5 thinking mode).
+      CRITICAL FIX discovered: llama-server batches 4 sequences (ne12=4) and the fp8
+      mul_mat launcher asserted ne12==1 - added a batch loop over ne12*ne13 in
+      `ggml_cuda_mul_mat_fp8` and dropped the `b->ne[2]*b->ne[3] != 1` support check.
 
 ### M4. Validation & parity (GPU)
-- [ ] Greedy parity: FP8-direct-load vs HF reference greedy output on the
-      `parity_check.py` prompts. Target: identical or near-identical logits
-      (activation quantization in llama.cpp differs from HF's per-token fp8; expect
-      tiny divergence, not bit-exact - document).
-- [ ] PPL sanity on a text corpus (FP8 vs BF16 GGUF baseline, both on GPU).
-- [ ] Multi-GPU: tensor split across 3x gfx1201 (`--split-mode row`), compare output
-      parity vs single GPU.
-- [ ] Memory: VRAM footprint for the 5.3GB dir (~2.6GB fp8 weights + KV/act).
-- [ ] Edge cases: single-file safetensors (no index), non-128 dims (ceil scale guard),
-      missing scale_inv, E5M2 tensors (reject with clear message), corrupt header.
+- [x] Greedy parity: llama.cpp-BF16-via-loader == HF-BF16 greedy, byte-exact over 20
+      tokens; **llama.cpp-FP8 == llama.cpp-BF16 for all 20 tokens** after the encode
+      fix below (before the fix it diverged at token 10 on a True/False near-tie).
+      `parity_check.py` (torch): fp8-dequant weights == bf16 weights greedy-identical.
+- [x] PPL sanity (Pride and Prejudice, 512-token windows, n_ctx=512, n_batch=2048):
+      FP8 9.9907 vs BF16 9.8881 vs Q8_0 9.8881 - fp8 within 1% of baseline.
+      **CRITICAL BUG FOUND+FIXED**: `fp8_e4m3_from_f32` had `if (E >= 15) return 0x7E`
+      which saturated ALL values in the top exponent range (256-448, the top ~43% of
+      each 128-block's dynamic range) to 448. Activations got systematically inflated
+      -> logits shifted ~2.0, PPL 23.8 (2.4x). Fix: only saturate for E >= 16 (or the
+      E=15/man3=7 NaN pattern). The self-consistent stress tests missed it because the
+      host reference shared the same buggy encode. After the fix: logits track bf16
+      within ~0.1-0.25, PPL 9.99, generation parity exact. Also fixed the encode copy
+      in the test harnesses.
+- [x] Multi-GPU: default layer split across 3x gfx1201 == single GPU output, identical
+      (tested with 40-token greedy, temp 0).
+- [x] Memory (1x R9700, default n_ctx=262144 from the model): fp8 model buffer
+      4730 MiB + KV cache 8192 MiB + RS 50 MiB + compute 320+266 MiB = ~14.3GB peak
+      on the GPU during generation (rocm-smi confirmed). BF16 model: ~17.8GB peak.
+      The fp8 weight savings show in the model buffer (4.7GB vs 7+GB incl. the tied
+      token_embd); the KV cache at full context dominates both.
+- [x] Edge cases: single-file safetensors (no index) loads; non-128 fp8 k-dim rejected
+      with a clear message ("must be a multiple of 128"); missing scale_inv rejected;
+      E5M2 tensors rejected ("unsupported tensor dtype"); corrupt header wrapped with
+      the file name; missing tokenizer.gguf gives the regenerate one-liner. All
+      verified with synthetic model dirs.
+- [x] `--vocab-file` override plumbed: `llama_model_params.vocab_file` +
+      `common_params_model.vocab_file` + `--vocab-file FILE` (default
+      `<model-dir>/tokenizer.gguf`).
 
 ### M5. (Optional, low priority) GGUF-side FP8 preservation
 - [ ] `gguf-py/gguf/constants.py`: `F8_E4M3 = 43`, `GGML_QUANT_SIZES[F8_E4M3] = (128, 132)`.

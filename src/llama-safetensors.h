@@ -35,6 +35,9 @@ public:
     llama_safetensors_loader(const char * path);
     ~llama_safetensors_loader();
 
+    // override the tokenizer file (default: <model-dir>/tokenizer.gguf)
+    void set_vocab_path(const char * path) { vocab_path = path; }
+
     llama_safetensors_loader(const llama_safetensors_loader &) = delete;
     llama_safetensors_loader & operator=(const llama_safetensors_loader &) = delete;
 

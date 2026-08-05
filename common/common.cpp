@@ -1617,6 +1617,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         mparams.kv_overrides = params.kv_overrides.data();
     }
 
+    mparams.vocab_file = params.model.vocab_file.empty() ? NULL : params.model.vocab_file.c_str();
+
     if (params.tensor_buft_overrides.empty()) {
         mparams.tensor_buft_overrides = NULL;
     } else {

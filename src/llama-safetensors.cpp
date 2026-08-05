@@ -216,7 +216,12 @@ void llama_safetensors_loader::parse_files() {
         std::string header_str(header_len, '\0');
         file->read_raw(&header_str[0], header_len);
 
-        const json header = json::parse(header_str);
+        json header;
+        try {
+            header = json::parse(header_str);
+        } catch (const std::exception & err) {
+            throw std::runtime_error(format("corrupt safetensors header in %s: %s", path.c_str(), err.what()));
+        }
         const size_t data_off = 8 + header_len;
 
         auto f = std::make_unique<st_file>();
@@ -237,6 +242,9 @@ void llama_safetensors_loader::parse_files() {
             t.nbytes = (size_t) (tinfo.at("data_offsets")[1].get<int64_t>() - tinfo.at("data_offsets")[0].get<int64_t>());
             t.dtype  = tinfo.at("dtype");
             t.shape  = tinfo.at("shape").get<std::vector<int64_t>>();
+            if (t.dtype != "F8_E4M3" && t.dtype != "BF16" && t.dtype != "F32") {
+                throw std::runtime_error(format("unsupported tensor dtype '%s' for '%s' - supported: F8_E4M3, BF16, F32", t.dtype.c_str(), tname.c_str()));
+            }
             if (t.off + t.nbytes > ll_mmaps.back()->size()) {
                 throw std::runtime_error(format("tensor '%s' in %s is out of file bounds", tname.c_str(), name.c_str()));
             }
@@ -535,6 +543,10 @@ void llama_safetensors_loader::build_mapping() {
         }
 
         if (m.type == GGML_TYPE_F8_E4M3) {
+            // the fp8 kernel consumes 128-column blocks; ggml asserts ne[0] % 128
+            if (m.ne[0] % 128 != 0) {
+                throw std::runtime_error(format("fp8 tensor '%s' has %lld columns, must be a multiple of 128", gname.c_str(), (long long) m.ne[0]));
+            }
             // the companion scale is stored as <name>.weight_scale_inv
             m.hf_scale = hf.substr(0, hf.size() - 7) + ".weight_scale_inv";
             if (hf_tensors.find(m.hf_scale) == hf_tensors.end()) {

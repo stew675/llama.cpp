@@ -4849,8 +4849,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_BF16:
                         return true;
                     case GGML_TYPE_F8_E4M3:
-                        // native FP8 hardware only (RDNA4, or NVIDIA Ada/Hopper+); F32 activations, non-batched
-                        if (b->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[2]*a->ne[3] != 1 || b->ne[2]*b->ne[3] != 1) {
+                        // native FP8 hardware only (RDNA4, or NVIDIA Ada/Hopper+); F32 activations, unbatched weights
+                        if (b->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[2]*a->ne[3] != 1) {
                             return false;
                         }
                         {

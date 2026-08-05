@@ -82,11 +82,11 @@ Row/col helpers in fp8.cuh: `fp8_wmma_row(l,s) = (l/16)*8 + s`, `fp8_wmma_col(l,
 
 ## 5. Next steps (in order)
 
-1. ~~Fix the C-fragment mapping~~ **DONE (2026-08-05)**: root cause was the gfx12 fp8 wmma fragment layout itself (A and B fragment loads wrong; staging needed the [n][k] transpose; see section 4). `fp8_correctness` + stress suite PASS. If test-backend-ops was built before fp8.cu existed, re-run `cmake .` first (GLOB re-eval).
-2. ~~Perf check~~ **DONE (2026-08-06)**: see section 4. Generation on 1x R9700: Q8_0 GGUF 91.7 t/s, BF16 safetensors 59-72 t/s, **FP8 safetensors 72.5 t/s** (was 3.2 t/s after the fixes below). Prompt: FP8 143 t/s vs Q8_0 348 t/s. M2 kernel work is DONE except the CUDA sm_89/sm_90 mma path (compile-guarded, untested).
-3. **M3 — direct safetensors loader: DONE (2026-08-06)** for the qwen35 text path. See section 9 for the full writeup. Remaining M3 items: mmproj/vision companion verification (mtmd-cli + server with --mmproj), edge cases (single-file no-index, non-128 dims, E5M2 rejection, corrupt headers).
-4. **M4**: parity vs HF greedy (parity_llama.cpp in /tmp + parity_check.py in model dir) — mostly done: llama.cpp-BF16-via-loader == HF-BF16 byte-exact over 20 tokens; llama.cpp-FP8 matches BF16/HF for the first 9 tokens then diverges on a True/False near-tie (expected activation-quantization divergence; fp8 matches HF farther than Q8_0 does). Remaining: PPL sanity, multi-GPU row-split parity, memory footprint check (~5.3GB expected on 1 GPU: 1319+1319+2092 MiB split across 3 in the default split).
-5. **M5 (optional)**: gguf-py F8_E4M3 constants + `--preserve-fp8` in conversion/base.py.
+1. ~~Fix the C-fragment mapping~~ **DONE (2026-08-05)**: root cause was the gfx12 fp8 wmma fragment layout itself. `fp8_correctness` + stress suite PASS.
+2. ~~Perf check~~ **DONE (2026-08-06)**: 1x R9700: FP8 safetensors 72 t/s generation vs Q8_0 GGUF 91.7 t/s vs BF16 57-71 t/s. Prompt: FP8 139-148 t/s.
+3. ~~M3 - direct safetensors loader~~ **DONE (2026-08-06)** for the qwen35 text path + mmproj. See section 9. Remaining minor: mtmd-cli direct run (llama-cli + llama-server + API verified instead), non-128-rows fp8 (guard rejects non-128 k only - rows are fine), E5M2 (rejected).
+4. ~~M4 - validation & parity~~ **DONE (2026-08-06)**: greedy parity exact (20 tokens), PPL 9.99 vs 9.89 bf16 (< 1%), row-split parity exact, memory measured (14.3GB peak 1-GPU full-ctx). See section 9 for the critical encode bug found via PPL.
+5. **Remaining**: M5 (optional gguf-py fp8 preservation) - not started, low priority. CUDA sm_89/sm_90 mma path still compile-guarded/untested (scalar fallback).
 
 ## 6. Key references
 - `implementation-plan.md` (repo root) — full plan, M1 marked done, M2 spike results documented.
@@ -151,3 +151,44 @@ Row/col helpers in fp8.cuh: `fp8_wmma_row(l,s) = (l/16)*8 + s`, `fp8_wmma_col(l,
 - Edge cases untested: single-file no-index safetensors, non-128 dims, E5M2 rejection, corrupt headers.
 - CUDA sm_89/sm_90 fp8 mma path still compile-guarded/untested (scalar fallback).
 - ~1-ulp expf differences vs numpy for F32-source A_log (numerically irrelevant; the bf16-sourced StewFP8 path rounds through bf16 and matches byte-exact).
+
+## 10. M3 completion + M4 results (DONE 2026-08-06)
+
+### Critical bug found via PPL (the big one)
+The fp8 kernel's activation encoder `fp8_e4m3_from_f32` had `if (E >= 15) return 0x7E`
+- saturating EVERY value in the top exponent range (256..448, i.e. the top ~43% of
+each 128-block's dynamic range) to 448. Activations were systematically inflated to
+their block max, distorting the hidden states: logits shifted ~2.0, PPL = 23.8 (2.4x
+vs bf16's 9.89), generation diverged at token 10. The self-consistent stress tests
+missed it (host reference shared the same buggy encode). Fix in fp8.cuh: saturate only
+for E >= 16, or the E=15/man3=7 NaN pattern (man3=7 clamped to 6 = 448). After the
+fix: logits track bf16 within 0.1-0.25, **PPL 9.9907 vs 9.8881 (< 1%)**, generation
+parity EXACT over 20 tokens. The test harnesses' host encode copies were fixed too.
+
+### New features this session
+- **Batched fp8 mul_mat** (needed by llama-server, which batches 4 sequences):
+  `ggml_cuda_mul_mat_fp8` loops over ne12*ne13; the supports_op check dropped the
+  `b->ne[2]*b->ne[3] != 1` restriction. Verified with a 4-batch correctness test
+  (bad=1/16384, max_rel 3.9e-3 - the residual is the ULP-scale tie-flip noise).
+- **llama-server works** with the fp8 dir + mmproj: text + image chat via the API
+  (image content read correctly; output goes to reasoning_content = Qwen3.5 thinking).
+- **--vocab-file override**: `llama_model_params.vocab_file` + common_params_model +
+  arg.cpp (env LLAMA_ARG_VOCAB_FILE). Default remains <model-dir>/tokenizer.gguf.
+- **mmproj verified**: `convert_hf_to_gguf.py --mmproj` on the ORIGINAL dir
+  (`model.safetensors-*.safetensors` naming - the StewFP8 `layers-*` layout is
+  invisible to the converter's get_model_part_names) -> 298 tensors, 675MB.
+  llama-cli + llama-server + image work end-to-end.
+
+### M4 results
+- Greedy parity: llama.cpp fp8 == llama.cpp bf16 for all 20 tokens (after the fix).
+- PPL (Pride and Prejudice, 512-token windows): FP8 9.9907, BF16 9.8881, Q8_0 9.8881.
+- Row-split parity: default 3-GPU layer split == single GPU, identical output.
+- Memory (1x R9700, n_ctx=262144 default): model 4730 MiB + KV 8192 MiB + RS 50 MiB +
+  compute 320+266 MiB = ~14.3GB peak. BF16 same setup: ~17.8GB.
+- Edge cases verified with synthetic dirs: single-file no-index, E5M2 rejection,
+  non-128 k rejection, missing scale_inv, corrupt header, missing tokenizer one-liner.
+
+### Known gaps / next
+- mtmd-cli direct binary not run (llama-cli/server + API verified instead).
+- CUDA sm_89/sm_90 fp8 mma path compile-guarded, untested (scalar fallback).
+- M5 (gguf-py F8_E4M3 constants, --preserve-fp8) not started.

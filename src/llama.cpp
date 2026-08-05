@@ -460,6 +460,9 @@ struct llama_model * llama_model_load_from_file(
         gguf_context * metadata = nullptr;
         try {
             loader  = std::make_unique<llama_safetensors_loader>(path_model);
+            if (params.vocab_file) {
+                loader->set_vocab_path(params.vocab_file);
+            }
             metadata = loader->build_metadata();
         } catch (const std::exception & err) {
             LLAMA_LOG_ERROR("%s: failed to load safetensors model: %s\n", __func__, err.what());

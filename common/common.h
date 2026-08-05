@@ -303,6 +303,7 @@ struct common_params_model {
     std::string url         = ""; // model url to download
     std::string hf_repo     = ""; // HF repo
     std::string hf_file     = ""; // HF file
+    std::string vocab_file  = ""; // external tokenizer GGUF (safetensors loading only)
     std::string docker_repo = ""; // Docker repo
 
     std::string get_name() const {

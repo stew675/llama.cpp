@@ -58,8 +58,8 @@ __device__ __forceinline__ uint8_t fp8_e4m3_from_f32(float x) {
     }
 
     int E = (int) exp - 120;
-    if (E >= 15) {
-        return sign ? 0xFE : 0x7E; // saturate to 448
+    if (E >= 16) {
+        return sign ? 0xFE : 0x7E; // well beyond e4m3 range
     }
     if (E <= 0) {
         // subnormal range: M = rne(value * 512), 0..7, 8 carries to E=1
@@ -80,7 +80,7 @@ __device__ __forceinline__ uint8_t fp8_e4m3_from_f32(float x) {
         return (uint8_t)((sign << 7) | M);
     }
 
-    // normal: E in 1..14, round mantissa to 3 bits (RNE)
+    // normal: E in 1..15, round mantissa to 3 bits (RNE)
     uint32_t man_3 = man >> 20;
     const uint32_t frac = man & 0xFFFFF;
     if (frac > 0x80000 || (frac == 0x80000 && (man_3 & 1))) {
@@ -91,9 +91,9 @@ __device__ __forceinline__ uint8_t fp8_e4m3_from_f32(float x) {
         E++;
     }
     if (E == 15 && man_3 == 7) {
-        man_3 = 6; // 480 would overflow -> clamp to 448
+        man_3 = 6; // 480 is NaN in e4m3 -> clamp to 448
     }
-    if (E >= 15) {
+    if (E >= 16) {
         return sign ? 0xFE : 0x7E; // saturate to 448
     }
     return (uint8_t)((sign << 7) | (E << 3) | man_3);

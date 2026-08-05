@@ -2969,6 +2969,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_HF_FILE"));
     add_opt(common_arg(
+        {"--vocab-file"}, "FILE",
+        "external tokenizer GGUF file to use when loading a safetensors model (default: <model-dir>/tokenizer.gguf)",
+        [](common_params & params, const std::string & value) {
+            params.model.vocab_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_VOCAB_FILE"));
+    add_opt(common_arg(
         {"-hft", "--hf-token"}, "TOKEN",
         "Hugging Face access token (default: value from HF_TOKEN environment variable)",
         [](common_params & params, const std::string & value) {

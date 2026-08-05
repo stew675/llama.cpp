@@ -331,6 +331,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // path to an external tokenizer GGUF file (direct safetensors loading only; NULL = <model-dir>/tokenizer.gguf)
+        const char * vocab_file;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
