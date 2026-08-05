@@ -151,13 +151,21 @@ __device__ __forceinline__ int fp8_wmma_col(int l, int s) {
     return l % 16;
 }
 
-// Weights: block_f8_e4m3 rows [m][k/128]. Activations: fp8 staging [n][k] + scales [n][k/128].
 // Wave32 wmma fragments (gfx12 fp8, verified on gfx1201):
 //   A: lane l byte e = A[l%16][(l/16)*8+e]  -> weight row (m0 + l%16), 8 contiguous qs bytes
 //   B: lane l byte e = B[(l/16)*8+e][l%16]  -> staging[(n0 + l%16)][...], 8 contiguous bytes
 //   C: slot s = C[(l/16)*8+s][l%16]
-// 4 warps per CTA, each on a different 16-token column tile.
-// Grid: (ceil(n/64), ceil(m/16))
+//
+// Each warp computes a 2x2 grid of 16x16 wmma tiles (32 weight rows x 32 tokens):
+// per k-step the same A/B fragments feed 4 wmma instructions, reducing the shared
+// memory read traffic per wmma. 8 warps per CTA -> 64 rows x 128 tokens, which also
+// halves the redundant re-staging of the activation block across the m dimension
+// (the staging bandwidth was the bottleneck after the smem port fix).
+// Grid: (ceil(n/128), ceil(m/64)).
+//
+// The 32 weight rows (scales and fp8 bytes in separate arrays so the per-lane
+// fragment loads are 8-byte aligned) and the 128-token x 128-byte activation block
+// are staged to shared memory with coalesced loads once per k-block.
 __launch_bounds__(GGML_FP8_NTHREADS, 1)
 __global__ void mul_mat_fp8_wmma(
         const char * __restrict__ src0, const uint8_t * __restrict__ src1_q, const float * __restrict__ src1_s, float * __restrict__ dst,
@@ -166,32 +174,90 @@ __global__ void mul_mat_fp8_wmma(
     using fp8x8_t   = __attribute__((ext_vector_type(2))) int;
     using floatx8_t = __attribute__((ext_vector_type(8))) float;
 
+    constexpr int TILE_M = 16;   // wmma tile rows
+    constexpr int TILE_N = 16;   // wmma tile cols
+    constexpr int MT = 2;        // m-tiles per warp
+    constexpr int NT = 2;        // n-tiles per warp
+    constexpr int MH = 1;        // m-halves per CTA (warp groups)
+    constexpr int CTA_M = TILE_M * MT * MH;                   // 32 rows per CTA
+    constexpr int CTA_N = GGML_FP8_NWARPS * TILE_N * NT / MH; // 128 tokens per CTA
+
+    // sA: CTA_M weight rows x 132 B (f32 scale + 128 fp8); sB: CTA_N tokens x 136 B
+    // (128 + pad so the per-lane 8-byte fragment reads hit distinct banks)
+    __shared__ uint8_t sA[CTA_M][132];
+    __shared__ uint8_t sB[CTA_N][GGML_FP8_TILE_K + 8];
+
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
+    const int tid  = threadIdx.x;
+    const int wm = warp / (GGML_FP8_NWARPS / MH); // which 32-row half of the CTA
+    const int wn = warp % (GGML_FP8_NWARPS / MH); // which 32-token quad of the CTA
+    const int t0 = wn * (TILE_N * NT); // this warp's first token within the CTA
+    const int rm = wm * (TILE_M * MT); // this warp's first row within the CTA
 
-    const int m0 = blockIdx.y * GGML_FP8_TILE_M;
-    const int n0 = blockIdx.x * (GGML_FP8_NWARPS * GGML_FP8_TILE_N) + warp * GGML_FP8_TILE_N;
+    const int m0 = blockIdx.y * CTA_M;
+    const int n0 = blockIdx.x * CTA_N;
 
-    const int row_lane = lane % 16; // token column of this lane within the warp tile
+    const int row_lane = lane % 16; // weight row of this lane within a tile (also token column)
     const int k_half   = (lane / 16) * 8; // k offset of this lane's half of the 16-k step
 
     const int64_t row_stride = n_col_blocks * (int64_t) sizeof(block_f8_e4m3);
 
-    // weight tile is in-bounds for the whole warp (m is a multiple of 16 in practice);
-    // guard anyway: OOB rows read zero and are never stored
-    const bool row_valid = m0 + GGML_FP8_TILE_M <= m;
-
-    floatx8_t acc = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+    floatx8_t acc00 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+    floatx8_t acc01 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+    floatx8_t acc10 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+    floatx8_t acc11 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 
     for (int64_t cb = 0; cb < n_col_blocks; ++cb) {
-        // accumulate the 8 wmma k-steps of this 128-col block unscaled
-        floatx8_t acc_cb = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+        const char * Abase = src0 + (int64_t) m0 * row_stride + cb * sizeof(block_f8_e4m3);
+        const uint8_t * Bbase = src1_q + (int64_t) n0 * k + cb * GGML_FP8_TILE_K;
+
+        // stage the weight tile: d (4 B) + 128 fp8 per row, coalesced 4-B loads
+        if (tid < CTA_M) {
+            *(float *) &sA[tid][0] = (m0 + tid < m) ? *(const float *) (Abase + (int64_t) tid * row_stride) : 0.f;
+        }
+        // CTA_M x 32 uint = 1024 / 128 threads = 8 each
+#pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            const int idx = tid + it * GGML_FP8_NTHREADS; // 0..1023
+            const int r = idx >> 5;
+            const int c = idx & 31;
+            *(uint *) &sA[r][4 + c * 4] = (m0 + r < m) ? *(const uint *) (Abase + (int64_t) r * row_stride + 4 + c * 4) : 0u;
+        }
+        // stage the activation block: CTA_N tokens x 128 fp8, coalesced 16-B loads
+        // CTA_N x 8 uint4 = 1024 / 128 threads = 8 each
+#pragma unroll
+        for (int it = 0; it < 8; ++it) {
+            const int idx = tid + it * GGML_FP8_NTHREADS; // 0..1023
+            const int t = idx >> 3;
+            const int c = idx & 7;
+            *(uint4 *) &sB[t][c * 16] = *(const uint4 *) (Bbase + (int64_t) t * k + c * 16);
+        }
+        __syncthreads();
+
+        // 8 wmma k-steps per tile per 128-col block; fragments are shared by the
+        // 2x2 tile grid so each smem byte feeds up to 4 wmma instructions
+        floatx8_t t00 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+        floatx8_t t01 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+        floatx8_t t10 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+        floatx8_t t11 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+        // software-pipeline the fragment loads ahead of the wmma chain
+        fp8x8_t a0 = *reinterpret_cast<const fp8x8_t *>(&sA[rm + row_lane][4 + k_half]);
+        fp8x8_t a1 = *reinterpret_cast<const fp8x8_t *>(&sA[rm + TILE_M + row_lane][4 + k_half]);
+        fp8x8_t b0 = *reinterpret_cast<const fp8x8_t *>(&sB[t0 + row_lane][k_half]);
+        fp8x8_t b1 = *reinterpret_cast<const fp8x8_t *>(&sB[t0 + TILE_N + row_lane][k_half]);
 #pragma unroll
         for (int kk = 0; kk < GGML_FP8_TILE_K / 16; ++kk) {
-            const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (src0 + ((int64_t) (m0 + row_lane)) * row_stride + cb * sizeof(block_f8_e4m3));
-            const fp8x8_t a_frag = row_valid ? *reinterpret_cast<const fp8x8_t *>(wblk->qs + kk * 16 + k_half) : fp8x8_t{0, 0};
-            const fp8x8_t b_frag = *reinterpret_cast<const fp8x8_t *>(src1_q + ((int64_t) (n0 + row_lane)) * k + cb * GGML_FP8_TILE_K + kk * 16 + k_half);
-            acc_cb = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a_frag, b_frag, acc_cb);
+            const int kk_next = (kk + 1) * 16;
+            const fp8x8_t a0_n = kk < 7 ? *reinterpret_cast<const fp8x8_t *>(&sA[rm + row_lane][4 + kk_next + k_half]) : a0;
+            const fp8x8_t a1_n = kk < 7 ? *reinterpret_cast<const fp8x8_t *>(&sA[rm + TILE_M + row_lane][4 + kk_next + k_half]) : a1;
+            const fp8x8_t b0_n = kk < 7 ? *reinterpret_cast<const fp8x8_t *>(&sB[t0 + row_lane][kk_next + k_half]) : b0;
+            const fp8x8_t b1_n = kk < 7 ? *reinterpret_cast<const fp8x8_t *>(&sB[t0 + TILE_N + row_lane][kk_next + k_half]) : b1;
+            t00 = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a0, b0, t00);
+            t01 = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a0, b1, t01);
+            t10 = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a1, b0, t10);
+            t11 = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a1, b1, t11);
+            a0 = a0_n; a1 = a1_n; b0 = b0_n; b1 = b1_n;
         }
 
         // apply the per-128x128 weight scale and per-128-block activation scale
@@ -199,19 +265,36 @@ __global__ void mul_mat_fp8_wmma(
         for (int s = 0; s < 8; ++s) {
             const int r = fp8_wmma_row(lane, s);
             const int c = fp8_wmma_col(lane, s);
-            const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (src0 + ((int64_t) (m0 + r)) * row_stride + cb * sizeof(block_f8_e4m3));
-            const float wd = row_valid ? wblk->d : 0.0f;
-            const float ad = src1_s[(int64_t) (n0 + c) * n_col_blocks + cb];
-            acc[s] += wd * ad * acc_cb[s];
+            const float wd0 = *(float *) &sA[rm + r][0];
+            const float wd1 = *(float *) &sA[rm + TILE_M + r][0];
+            const float ad0 = src1_s[(int64_t) (n0 + t0 + c) * n_col_blocks + cb];
+            const float ad1 = src1_s[(int64_t) (n0 + t0 + TILE_N + c) * n_col_blocks + cb];
+            acc00[s] += wd0 * ad0 * t00[s];
+            acc01[s] += wd0 * ad1 * t01[s];
+            acc10[s] += wd1 * ad0 * t10[s];
+            acc11[s] += wd1 * ad1 * t11[s];
         }
+
+        __syncthreads(); // protect sA/sB before the next block's stage-in
     }
 
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
         const int r = fp8_wmma_row(lane, s);
         const int c = fp8_wmma_col(lane, s);
-        if (m0 + r < m && n0 + c < n) {
-            dst[(int64_t) (n0 + c) * m + m0 + r] = acc[s];
+        const int mr = m0 + rm + r;
+        const int nc = n0 + t0 + c;
+        if (mr < m && nc < n) {
+            dst[(int64_t) nc * m + mr] = acc00[s];
+        }
+        if (mr < m && nc + TILE_N < n) {
+            dst[(int64_t) (nc + TILE_N) * m + mr] = acc01[s];
+        }
+        if (mr + TILE_M < m && nc < n) {
+            dst[(int64_t) nc * m + mr + TILE_M] = acc10[s];
+        }
+        if (mr + TILE_M < m && nc + TILE_N < n) {
+            dst[(int64_t) (nc + TILE_N) * m + mr + TILE_M] = acc11[s];
         }
     }
 #else

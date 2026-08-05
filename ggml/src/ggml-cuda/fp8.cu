@@ -68,7 +68,8 @@ void ggml_cuda_mul_mat_fp8(
                 const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
                 ggml_cuda_kernel_launch(mul_mat_fp8_gemv, launch_params, src0_d, src1_q_d, src1_s_d, dst_b, k, m, n, n_col_blocks, n_pad);
             } else {
-                const dim3 grid_dims((n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N), (m + GGML_FP8_TILE_M - 1) / GGML_FP8_TILE_M, 1);
+                // CTA: 32 weight rows x 128 tokens (2x2 wmma tiles per warp)
+                const dim3 grid_dims((n + 127) / 128, (m + 31) / 32, 1);
                 const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
                 ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_b, k, m, n, n_col_blocks, n_pad);
             }

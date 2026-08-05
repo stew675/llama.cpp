@@ -242,3 +242,60 @@ box, and the wmma fragment saga proved how easy these are to get wrong), so it
 is documented rather than shipped untested. CUDA Ada/Hopper loads fp8 models
 fine and runs them on the scalar kernel; the D3 gate message already reflects
 that.
+
+
+## 13. Prefill/generation performance investigation (DONE 2026-08-06)
+
+### Where we stand vs the goals (1x R9700, Q8_0 GGUF baseline)
+
+| metric | Q8_0 GGUF | fp8 (GGUF = safetensors) | fp8/Q8_0 |
+|---|---|---|---|
+| pp128 | 3801 t/s | 3257 t/s | 86% |
+| pp512 | 5847 t/s | 4837 t/s | 83% |
+| pp1024 | 5699 t/s | 4764 t/s | 84% |
+| pp2048 | 5512 t/s | 4648 t/s | 84% |
+| tg64 | 89.5 t/s | 70.7 t/s | 79% |
+
+Goals were prefill >= +50% over Q8_0 and generation ~ +10%; both are NOT met
+(prefill is at ~83-86% of Q8_0, generation at ~79%). The prefill DID improve
+2.4x over the original naive kernel (2048 -> 4830 t/s pp512).
+
+### What was measured/found
+- Raw fp8 wmma 16x16x16 rate on gfx1201: ~370 TFLOP/s (44G wmma/s) with 4
+  independent accumulator chains; a single serial chain saturates at ~182
+  TFLOP/s (latency-limited).
+- fp8 dot4 (`v_dot4_f32_fp8_fp8`): only 8.7 TFLOP/s - 40x below the wmma, so the
+  mmq-style kernel that makes Q8_0 fast (dot4 over smem tiles) is NOT viable for
+  fp8; wmma is the only fast path.
+- The naive wmma kernel (direct global fragment loads) ran at ~6% of the raw rate
+  (pp512 2085 t/s). Progressive fixes:
+  1. smem staging of the weight tile + activation block with coalesced loads,
+     conflict-free padded layout (sB rows 136 B): 2085 -> 4554 t/s.
+  2. 2x2 wmma tiles per warp (each fragment feeds 4 wmma): ~4550 -> ~4950 t/s.
+  3. Software-pipelined fragment reads (prefetch kk+1 fragments): small gain.
+- Staging is ~23% of the time (a no-staging probe runs 6265 t/s); the wmma
+  structure itself caps at ~6265 t/s (~54 TFLOP/s effective, 15% of the raw
+  ceiling) - the per-wmma smem reads + issue overhead is the hard wall.
+- Double-buffered smem staging regresses (smem 2x -> occupancy 1 CTA/CU).
+- Register-file double buffering (prefetch next k-block into regs) also lost:
+  bpre[2][8] (64 regs) + acc tiles push past 256 VGPRs -> spills. The best
+  correct configuration is the synchronous smem-staged 2x2 kernel (~4830 t/s).
+- A transient bug during the prefetch experiments (A staging only for block 0)
+  passed the short-parity test but produced garbage PPL (2.1M) - caught by the
+  PPL check; the wmma correctness tests only covered k <= 128 (1 block) and
+  missed it. Lesson: fp8_correctness should test multi-block k too.
+
+### Generation
+- tg is memory-bound; the fp8 model loads BIGGER than the Q8_0 model (4.75 GiB
+  vs 4.28 GiB) because the non-fp8 tensors (token_embd, norms, conv1d,
+  in_proj_a/b, A_log) stay BF16 in both the safetensors dir and the
+  `--outtype fp8_e4m3` GGUF. The Q8_0 GGUF quantizes everything. So fp8 moves
+  more bytes per token at generation; the fp8 GEMV achieves ~337 GB/s vs the
+  Q8_0 mmvq's ~381 GB/s.
+
+### Remaining levers (not done)
+- Quantize the non-fp8 tensors (e.g. Q8_0) when building the fp8 GGUF -> smaller
+  model -> faster memory-bound generation (and prefill staging traffic).
+- Deeper wmma work (register-buffered staging that stays under 256 VGPRs, or a
+  fused quantize+matmul) - attempted, did not beat the synchronous version.
+- Larger pp128 variance (short runs) makes small-prompt comparisons noisy.
