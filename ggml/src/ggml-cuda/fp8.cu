@@ -33,8 +33,8 @@ void ggml_cuda_mul_mat_fp8(
 
     const int64_t n_col_blocks = k / GGML_FP8_TILE_K;
 
-    // token padding: the wmma tiles span 16 tokens; out-of-range reads must be zeros
-    const int64_t n_pad = (n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N) * (GGML_FP8_NWARPS * GGML_FP8_TILE_N);
+    // token padding: the wmma CTA spans GGML_FP8_CTA_N tokens; out-of-range reads must be zeros
+    const int64_t n_pad = (n + GGML_FP8_CTA_N - 1) / GGML_FP8_CTA_N * GGML_FP8_CTA_N;
 
     ggml_cuda_pool_alloc<uint8_t> src1_q(ctx.pool(), k * n_pad);
     ggml_cuda_pool_alloc<float>   src1_s(ctx.pool(), n_pad * n_col_blocks);
@@ -53,7 +53,7 @@ void ggml_cuda_mul_mat_fp8(
 
         {
             const dim3 num_blocks(n_col_blocks, n, 1);
-            const dim3 block_size(GGML_FP8_NTHREADS, 1, 1);
+            const dim3 block_size(GGML_FP8_QUANT_NTHREADS, 1, 1);
             quantize_fp8<<<num_blocks, block_size, 0, stream>>>(src1_b, src1_q_d, src1_s_d, k, n, n_col_blocks, n_pad);
             CUDA_CHECK(cudaGetLastError());
         }
@@ -65,11 +65,13 @@ void ggml_cuda_mul_mat_fp8(
             if (n <= GGML_FP8_GEMV_MAX_N) {
                 // dot4 GEMV: one warp per output row, one CTA per 4 rows and token
                 const dim3 grid_dims((m + 3) / 4, n, 1);
-                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+                const dim3 gemv_block_dims(GGML_FP8_GEMV_NTHREADS, 1, 1);
+                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, gemv_block_dims, 0, stream);
                 ggml_cuda_kernel_launch(mul_mat_fp8_gemv, launch_params, src0_d, src1_q_d, src1_s_d, dst_b, k, m, n, n_col_blocks, n_pad);
             } else {
-                // CTA: 32 weight rows x 128 tokens (2x2 wmma tiles per warp)
-                const dim3 grid_dims((n + 127) / 128, (m + 31) / 32, 1);
+                // CTA: 128 weight rows x 64 tokens (2x2 wmma tiles per warp, 8 warps),
+                // register-staged k-block pipelining; grouped-M pid swizzle (aiter recipe)
+                const dim3 grid_dims(((m + GGML_FP8_CTA_M - 1) / GGML_FP8_CTA_M) * ((n + GGML_FP8_CTA_N - 1) / GGML_FP8_CTA_N), 1, 1);
                 const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
                 ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_b, k, m, n, n_col_blocks, n_pad);
             }
