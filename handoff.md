@@ -192,3 +192,53 @@ parity EXACT over 20 tokens. The test harnesses' host encode copies were fixed t
 - mtmd-cli direct binary not run (llama-cli/server + API verified instead).
 - CUDA sm_89/sm_90 fp8 mma path compile-guarded, untested (scalar fallback).
 - M5 (gguf-py F8_E4M3 constants, --preserve-fp8) not started.
+
+
+## 11. M5 - GGUF-side FP8 preservation (DONE 2026-08-06)
+
+`--outtype fp8_e4m3` now produces a standard GGUF with native F8_E4M3 tensors
+(block_f8_e4m3), so fp8 models work through the regular GGUF path (no safetensors
+loader). Summary of the changes:
+
+- gguf-py: `GGMLQuantizationType.F8_E4M3 = 43`, `GGML_QUANT_SIZES` entry
+  `(128, 132)`, `LlamaFileType.MOSTLY_F8_E4M3 = 42`; `quantize()` passes the
+  already-packed blocks through.
+- llama.cpp: `LLAMA_FTYPE_MOSTLY_F8_E4M3 = 42` in llama.h (the GGUF metadata
+  value; matching integer in gguf-py so the file type round-trips), ftype name +
+  type->ftype guess mapping in llama-model-loader.cpp.
+- converter: `_generate_fp8_tensors()` reblocks weight + weight_scale_inv into
+  `[out, in/128 * 132]` uint8 rows (d = stored scale_inv as f32, 128 fp8 bytes
+  verbatim) and writes them NVFP4-style before dequant_model. The qwen35 mixin's
+  `transform_fp8_weight` applies the V-head reorder to weight + scale grid in
+  128-row/col units. Non-fp8 tensors default to BF16. E5M2 rejected, 2D-only,
+  warns when a non-fp8 model is given the fp8_e4m3 outtype. The GUESSED
+  heuristic also detects float8_e4m3fn.
+- D3 gate extended to the plain GGUF path (llama_model_load): fp8 tensors +
+  no fp8-capable device -> the same clear error as the safetensors path.
+- The converter's index discovery now falls back to any `*.safetensors.index.json`
+  weight map, so nonstandard part naming (StewFP8 `layers-*.safetensors`) converts.
+- The safetensors loader writes `general.file_type = 42` so `ftype: F8_E4M3`
+  displays there too.
+
+Verification (Qwen3.5-4B, 1x R9700):
+- GGUF has 207 F8_E4M3 + 234 F32/BF16 tensors; block bytes byte-identical to the
+  source safetensors (d == scale_inv, qs == weight bytes).
+- 20-token greedy parity: fp8 GGUF == fp8 safetensors == bf16 (exact).
+- PPL: 8.7152 (fp8 GGUF) vs 8.7164 (fp8 safetensors) vs 8.6024 (bf16) vs 8.6126
+  (Q8_0) - the two fp8 paths agree to 4 digits, bf16 gap ~1.3%.
+- Perf: gen 73-75 t/s, prompt 140 t/s; MTP drafting 101 t/s; llama-server
+  (4-seq batched) serves the fp8 GGUF fine (output in reasoning_content, as
+  always with Qwen3.5 thinking mode).
+- CPU-only build: "FP8_E4M3 weights require a device with native FP8 support
+  (RDNA4, or NVIDIA Ada/Hopper+); this system has none. Use an integer GGUF
+  (e.g. Q8_0) instead."
+
+## 12. CUDA sm_89/sm_90 fp8 path (DONE 2026-08-06 - documented)
+
+Not implemented. On CUDA the unguarded `mul_mat_fp8_scalar` fallback runs
+(correct, slow); the RDNA4 WMMA kernels are AMD-builtin only. An sm_89
+mma.m16n8k8 PTX implementation would be unverifiable here (no NVIDIA HW on this
+box, and the wmma fragment saga proved how easy these are to get wrong), so it
+is documented rather than shipped untested. CUDA Ada/Hopper loads fp8 models
+fine and runs them on the scalar kernel; the D3 gate message already reflects
+that.

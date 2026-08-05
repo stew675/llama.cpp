@@ -210,10 +210,13 @@ Environment facts (verified):
   FP8 work (see M2 spike) but available.
 
 Tasks:
-- [ ] Baseline: run the build script as-is; confirm `ggml-hip` builds and the 3 GPUs
-      are usable (run a small GGUF with `--split-mode layer`/`row`).
-- [ ] Record baseline perplexity/generation for later FP8 comparison.
-- [ ] Confirm `rocm_agent_enumerator` (3x gfx1201 + 1x gfx1036) matches the build targets.
+- [x] Baseline: the HIP build (`-DGPU_TARGETS="gfx1200;gfx1201"`) builds and all 3
+      gfx1201 GPUs are usable with `--split-mode layer` and `row` (verified during
+      M4 multi-GPU parity).
+- [x] Baselines recorded: Q8_0 GGUF gen 91.7 t/s / prompt 348 t/s; BF16 dir
+      gen 57-71 t/s; PPL (Pride & Prejudice, 512-ctx): bf16 8.60, Q8_0 8.61,
+      fp8 8.72 (both paths).
+- [x] `rocm_agent_enumerator` = 3x gfx1201 + 1x gfx1036, matches the build targets.
 
 ### M1. `GGML_TYPE_FP8_E4M3` core type (serialization/validation only, NO CPU kernels)
 
@@ -262,8 +265,13 @@ Spike result (already done, verified by compiling a test kernel):
 
 Tasks:
 - [x] fp8 tile-load + mmq-style mul_mat kernel (WMMA path): `v_wmma_f32_16x16x16_fp8_fp8` with the verified gfx12 fragment layout. **Fragment layout (empirically verified on gfx1201 + TileLang/CK docs): A lane l byte e = A[l%16][(l//16)*8+e]; B lane l byte e = B[(l//16)*8+e][l%16]; C slot s = C[(l//16)*8+s][l%16].** Staging is [n][k] (token-major, k-minor) so B fragments are contiguous 8-byte loads. Correctness: standalone test + 12-config stress suite PASS (max rel err <= 3.4e-3).
-- [ ] Non-WMMA dot path: `v_dot4_f32_fp8_fp8` (not yet implemented; WMMA is the primary path).
-- [ ] CUDA side: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` for sm_89/sm_90 behind `#if !defined(__HIPCC__)` (compile-verified only; scalar fallback kernel exists).
+- [x] dot4 path (GEMV only): `mul_mat_fp8_gemv` uses `__builtin_amdgcn_dot4_f32_fp8_fp8`
+      for n <= 16 tokens (avoids the wmma 16-token tile waste at batch 1). A full
+      dot4 matmul for large n is not needed - WMMA covers it.
+- [x] CUDA side: NOT implemented - documented instead (see section "CUDA sm_89/sm_90
+      fp8 path"). The unguarded scalar fallback runs on CUDA (correct, slow); the
+      sm_89 mma PTX fragment layout cannot be verified without NVIDIA hardware, so
+      it is deliberately not shipped untested.
 - [x] Backend registration: HIP backend `supports_op` for f8_e4m3 mul_mat (RDNA4 gate); host-side launcher `ggml_cuda_mul_mat_fp8` pre-quantizes activations (fp8 staging + scales).
 - [x] `tests/test-backend-ops` builds; f8_e4m3 MUL_MAT shows "not supported [CPU]" (correct skip) and runs on the ROCm devices; no FAILs. (NOTE: re-run `cmake .` in the build dir so the GLOB picks up fp8.cu.)
 - [x] Perf: 1x R9700 generation: FP8 safetensors 72.5 t/s vs Q8_0 GGUF 91.7 t/s vs BF16 safetensors 59-72 t/s. Prompt: FP8 143 t/s vs Q8_0 348 t/s. (Two fixes were needed: the host-side RDNA4 dispatch was compiled out by a device-only #if guard -> scalar fallback; and a dot4 GEMV path for n <= 16 avoids the wmma batch-1 waste.)
@@ -339,20 +347,48 @@ Tasks:
       `common_params_model.vocab_file` + `--vocab-file FILE` (default
       `<model-dir>/tokenizer.gguf`).
 
-### M5. (Optional, low priority) GGUF-side FP8 preservation
-- [ ] `gguf-py/gguf/constants.py`: `F8_E4M3 = 43`, `GGML_QUANT_SIZES[F8_E4M3] = (128, 132)`.
-- [ ] `gguf-py/gguf/quants.py`: quantize/dequantize for the type (re-block from
-      weight+weight_scale_inv pairs; host-side Python, no C++ kernels needed).
-- [ ] `conversion/base.py` fp8 branch: `--preserve-fp8` flag writes the type instead of
-      dequantizing (uses `weight_block_size` 128).
-- [ ] `convert_hf_to_gguf.py` round-trip: safetensors -> GGUF(f8_e4m3) -> direct loader
-      output parity. Note: running such a GGUF still requires FP8-capable hardware
-      (D3 gate applies to GGUF loads too).
-- [ ] `llama-quantize --type f8_e4m3` (quantizing BF16 -> fp8) is NOT planned; it needs
-      a from_float implementation and has no value without native fp8 hardware anyway.
-      Defer unless explicitly wanted.
+### M5. (DONE 2026-08-06) GGUF-side FP8 preservation
 
----
+`--outtype fp8_e4m3` writes FP8 weights as native `block_f8_e4m3` GGUF tensors
+instead of dequantizing them. The safetensors loader (M3) remains for direct HF
+dirs; M5 adds the GGUF round trip so fp8 models can also be distributed as a
+single standard GGUF file.
+
+- [x] `gguf-py/gguf/constants.py`: `GGMLQuantizationType.F8_E4M3 = 43` (matches
+      ggml.h), `GGML_QUANT_SIZES[F8_E4M3] = (128, 132)`,
+      `LlamaFileType.MOSTLY_F8_E4M3 = 42`.
+- [x] `include/llama.h`: `LLAMA_FTYPE_MOSTLY_F8_E4M3 = 42`; `llama-model-loader.cpp`
+      ftype name + type->ftype guess map.
+- [x] `conversion/base.py`: `_generate_fp8_tensors()` reblocks `weight` +
+      `weight_scale_inv` pairs into block_f8_e4m3 rows `[out, in/128 * 132]`
+      (d = stored scale_inv value, fp8 bytes verbatim) and writes them directly
+      (NVFP4-style, before dequant_model). Runs when
+      `ftype == MOSTLY_F8_E4M3`. Non-fp8 tensors default to BF16. `transform_fp8_weight`
+      hook for arch-specific reorders; E5M2 rejected; 2D-only; warns when no fp8
+      tensors found. GUESSED heuristic detects float8_e4m3fn.
+- [x] `conversion/qwen.py`: `transform_fp8_weight` V-head reorder with the scale
+      grid in 128-row/col units (`row_perm[::128] // 128`).
+- [x] `convert_hf_to_gguf.py`: `--outtype fp8_e4m3` choice (replaces the earlier
+      `--preserve-fp8` flag per review feedback).
+- [x] index fallback: dirs with nonstandard part naming (StewFP8 `layers-*.safetensors`)
+      now load via any `*.safetensors.index.json` weight map.
+- [x] D3 gate extended to the plain GGUF path in `llama_model_load` (fp8 tensors +
+      no fp8 device -> same clear error as the safetensors path).
+- [x] Loader: `general.file_type = 42` written for fp8 safetensors models.
+- [x] Verified: 207 F8_E4M3 tensors in the GGUF, block bytes byte-identical to the
+      source safetensors; tokens identical to the safetensors path and bf16;
+      PPL 8.715 (fp8 GGUF) == 8.716 (fp8 safetensors) vs 8.602 (bf16);
+      gen 73-75 t/s, MTP 101 t/s, llama-server works (batched fp8); CPU-only
+      build -> the D3 error message.
+
+## CUDA sm_89/sm_90 fp8 path (DONE 2026-08-06 - documented)
+The RDNA4 WMMA kernels are AMD-builtin only; on CUDA the unguarded
+`mul_mat_fp8_scalar` fallback runs (correct, slow). Implementing the sm_89
+`mma.sync.m16n8k8.f32.e4m3.e4m3` PTX path without NVIDIA hardware to verify the
+fragment layout is exactly the class of untestable code AGENTS.md forbids, so it
+is documented as supported-but-scalar rather than shipped untested. The D3 gate
+message ("RDNA4, or NVIDIA Ada/Hopper+") matches reality: CUDA Ada/Hopper can
+load fp8 models, they just run the scalar kernel.
 
 ## 4. Files touched (summary)
 

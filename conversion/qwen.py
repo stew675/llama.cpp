@@ -551,6 +551,65 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         weight, scale = self._transform_nvfp4_weight(name, weight, scale)
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
 
+    def transform_fp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        """FP8 variant of the V-head reorder. The scale grid rows/columns are
+        per 128 rows/columns (block_f8_e4m3), so the permutations are applied
+        in units of 128 to keep the block correspondence."""
+        if not name.endswith((
+            ".linear_attn.in_proj_qkv.weight",
+            ".linear_attn.in_proj_z.weight",
+            ".linear_attn.in_proj_a.weight",
+            ".linear_attn.in_proj_b.weight",
+            ".linear_attn.out_proj.weight",
+        )):
+            return weight, scale
+
+        num_k_heads = self.hparams["linear_num_key_heads"]
+        num_v_heads = self.hparams["linear_num_value_heads"]
+        head_k_dim = self.hparams["linear_key_head_dim"]
+        head_v_dim = self.hparams["linear_value_head_dim"]
+        num_v_per_k = num_v_heads // num_k_heads
+
+        def apply_col_perm(qs: Tensor, scales: Tensor, col_perm: Tensor) -> tuple[Tensor, Tensor]:
+            qs = qs.index_select(1, col_perm.to(device=qs.device))
+            scales = scales.index_select(1, (col_perm[::128] // 128).to(device=scales.device))
+            return qs, scales
+
+        def reorder_rows(qs: Tensor, scales: Tensor, head_dim: int) -> tuple[Tensor, Tensor]:
+            row_perm = self._reorder_v_heads(
+                torch.arange(num_v_heads * head_dim, dtype=torch.long).unsqueeze(-1),
+                0, num_k_heads, num_v_per_k, head_dim,
+            ).squeeze(-1)
+            return (
+                qs.index_select(0, row_perm.to(device=qs.device)),
+                scales.index_select(0, (row_perm[::128] // 128).to(device=scales.device)),
+            )
+
+        if name.endswith(".linear_attn.in_proj_qkv.weight"):
+            q_dim = head_k_dim * num_k_heads
+            k_dim = head_k_dim * num_k_heads
+            q = weight[:q_dim]
+            k = weight[q_dim:q_dim + k_dim]
+            v = weight[q_dim + k_dim:]
+            q_scale = scale[:q_dim // 128]
+            k_scale = scale[q_dim // 128:(q_dim + k_dim) // 128]
+            v_scale = scale[(q_dim + k_dim) // 128:]
+            v, v_scale = reorder_rows(v, v_scale, head_v_dim)
+            return torch.cat([q, k, v], dim=0), torch.cat([q_scale, k_scale, v_scale], dim=0)
+
+        if name.endswith(".linear_attn.in_proj_z.weight"):
+            return reorder_rows(weight, scale, head_v_dim)
+        elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
+            return reorder_rows(weight, scale, 1)
+        elif name.endswith(".linear_attn.out_proj.weight"):
+            col_perm = self._reorder_v_heads(
+                torch.arange(num_v_heads * head_v_dim, dtype=torch.long).unsqueeze(0),
+                1, num_k_heads, num_v_per_k, head_v_dim,
+            ).squeeze(0)
+            return apply_col_perm(weight, scale, col_perm)
+
+        return weight, scale
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
         num_v_heads = self.hparams.get("linear_num_value_heads", 0)

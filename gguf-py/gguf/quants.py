@@ -59,6 +59,8 @@ def quantize(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
         return data.astype(np.float32, copy=False)
     elif qtype == GGMLQuantizationType.F16:
         return data.astype(np.float16, copy=False)
+    elif qtype == GGMLQuantizationType.F8_E4M3:
+        return data  # already packed as block_f8_e4m3 (f32 scale + 128 fp8)
     elif (q := _type_traits.get(qtype)) is not None:
         return q.quantize(data)
     else:

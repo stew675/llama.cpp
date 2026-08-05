@@ -618,6 +618,9 @@ struct gguf_context * llama_safetensors_loader::build_metadata() {
     gguf_context_ptr ctx { gguf_init_empty() };
 
     gguf_set_val_str(ctx.get(), "general.architecture", "qwen35");
+    if (has_fp8_tensors()) {
+        gguf_set_val_u32(ctx.get(), "general.file_type", LLAMA_FTYPE_MOSTLY_F8_E4M3);
+    }
     {
         std::string dir = dir_path;
         if (!dir.empty() && dir.back() == '/') {

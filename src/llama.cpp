@@ -309,6 +309,22 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
+
+        // FP8_E4M3 requires native FP8 hardware (same gate as the direct safetensors path)
+        if (!params.vocab_only) {
+            bool has_fp8 = false;
+            for (size_t i = 0; i < gguf_get_n_tensors(ml.metadata); ++i) {
+                if (gguf_get_tensor_type(ml.metadata, i) == GGML_TYPE_F8_E4M3) {
+                    has_fp8 = true;
+                    break;
+                }
+            }
+            if (has_fp8 && !llama_safetensors_loader::has_fp8_device()) {
+                LLAMA_LOG_ERROR("%s: FP8_E4M3 weights require a device with native FP8 support (RDNA4, or NVIDIA Ada/Hopper+); this system has none. Use an integer GGUF (e.g. Q8_0) instead.\n", __func__);
+                return {-1, nullptr};
+            }
+        }
+
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 
         bool ok = llama_prepare_model_devices(params, model_ptr.get());

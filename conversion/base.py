@@ -172,6 +172,10 @@ class ModelBase:
                     self.ftype = gguf.LlamaFileType.MOSTLY_F16
                     logger.info("heuristics detected float16 tensor dtype, setting --outtype f16")
                     break
+                elif tensor.dtype == torch.float8_e4m3fn:
+                    self.ftype = gguf.LlamaFileType.MOSTLY_F8_E4M3
+                    logger.info("heuristics detected float8_e4m3fn tensor dtype, setting --outtype fp8_e4m3")
+                    break
             else:
                 self.ftype = gguf.LlamaFileType.MOSTLY_F16
                 logger.info("heuristics unable to detect tensor dtype, defaulting to --outtype f16")
@@ -237,8 +241,24 @@ class ModelBase:
                     tensor_names_from_index.update(weight_map.keys())
                     part_dict: dict[str, None] = dict.fromkeys(weight_map.values(), None) # ty: ignore[invalid-assignment]
                     part_names = sorted(part_dict.keys())
+                    is_safetensors = any(p.endswith(".safetensors") for p in part_names)
             else:
-                weight_map = {}
+                # nonstandard part naming (e.g. layers-*.safetensors): take any index
+                index_candidates = sorted(self.dir_model.glob("*.safetensors.index.json"))
+                if index_candidates:
+                    index_file = index_candidates[0]
+                    logger.info(f"gguf: loading model weight map from '{index_file.name}'")
+                    with open(index_file, "r", encoding="utf-8") as f:
+                        index = json.load(f)
+                        weight_map = index.get("weight_map")
+                        if weight_map is None or not isinstance(weight_map, dict):
+                            raise ValueError(f"Can't load 'weight_map' from {index_file.name!r}")
+                        tensor_names_from_index.update(weight_map.keys())
+                        part_dict = dict.fromkeys(weight_map.values(), None) # ty: ignore[invalid-assignment]
+                        part_names = sorted(part_dict.keys())
+                        is_safetensors = any(p.endswith(".safetensors") for p in part_names)
+                else:
+                    weight_map = {}
         else:
             weight_map = {}
 
@@ -652,6 +672,80 @@ class ModelBase:
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         return ()
 
+    def transform_fp8_weight(self, name: str, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+        """Hook for arch-specific reordering of FP8 weights (e.g. V-head reorder).
+        Must move rows/columns in units of 128 (the block size) so the scale grid
+        stays aligned. Default: no reorder."""
+        del name
+        return weight, scale
+
+    def _reblock_fp8(self, name: str, weight: Tensor, scale: Tensor) -> np.ndarray:
+        """Pack FP8 weights into ggml block_f8_e4m3 rows: [out, in/128 * 132] uint8.
+        Each block is [f32 scale][128 fp8] with the stored scale_inv value as d
+        (dequant = fp8 * d, matching the loader and the fp8 mul_mat kernel)."""
+        if weight.dtype == torch.float8_e5m2:
+            raise ValueError(f"{name}: E5M2 FP8 weights are not supported by llama.cpp block_f8_e4m3")
+        if weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"{name}: expected FP8 weight, got {weight.dtype}")
+        if weight.dim() != 2:
+            raise ValueError(f"{name}: expected 2D FP8 weight, got shape {tuple(weight.shape)}")
+        if weight.shape[1] % 128 != 0:
+            raise ValueError(
+                f"{name}: FP8 column count {weight.shape[1]} must be a multiple of 128 "
+                "(llama.cpp block_f8_e4m3 requirement)")
+
+        n_out, n_in = weight.shape
+        n_blocks = n_in // 128
+        if scale.shape != (n_out // 128, n_blocks):
+            raise ValueError(
+                f"{name}: unexpected scale shape {tuple(scale.shape)}, "
+                f"expected {(n_out // 128, n_blocks)}")
+
+        weight = LazyTorchTensor.to_eager(weight).contiguous()
+        scale = LazyTorchTensor.to_eager(scale).float().contiguous()
+
+        w_bytes = weight.view(torch.uint8).numpy()  # [out, in] raw fp8 values
+        d = scale.numpy().astype(np.float32)        # [out/128, blocks]
+
+        out = np.empty((n_out, n_blocks, 132), dtype=np.uint8)
+        out[:, :, 0:4] = np.repeat(d, 128, axis=0).view(np.uint8).reshape(n_out, n_blocks, 4)
+        out[:, :, 4:] = w_bytes.reshape(n_out, n_blocks, 128)
+        return out.reshape(n_out, n_blocks * 132)
+
+    def _generate_fp8_tensors(self):
+        """Repack FP8 weights into ggml block_f8_e4m3 and write them directly,
+        before dequant_model (mirrors the NVFP4 pack flow). Runs before
+        dequant_model so the fp8 tensors are never dequantized and the
+        scale_inv companions are consumed."""
+        consumed: list[str] = []
+
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith("_scale_inv"):
+                continue
+            weight_name = name.removesuffix("_scale_inv")
+            if weight_name not in self.model_tensors:
+                continue
+
+            weight = LazyTorchTensor.to_eager(self.model_tensors[weight_name]())
+            scale = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            if weight.dtype != torch.float8_e4m3fn:
+                continue  # not an fp8 weight (e.g. plain bf16 with a stray scale)
+
+            weight, scale = self.transform_fp8_weight(weight_name, weight, scale)
+            blocks = self._reblock_fp8(weight_name, weight, scale)
+            new_name = self.map_tensor_name(weight_name)
+            logger.info(f"Repacked {new_name} with quantization F8_E4M3")
+            self.gguf_writer.add_tensor(new_name, blocks, raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+            consumed.append(weight_name)
+            consumed.append(name)
+
+        for name in consumed:
+            self.model_tensors.pop(name, None)
+
+        if not consumed:
+            logger.warning(
+                "--outtype fp8_e4m3: no FP8 weights found, the file will contain no F8_E4M3 tensors")
+
     @staticmethod
     def _nvfp4_pack(weight: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
         """Repack NVFP4 ModelOpt tensors into ggml super-block layout.
@@ -826,9 +920,12 @@ class ModelBase:
         self._is_nvfp4 = quant_algo == "NVFP4"
         self._is_mxfp4 = quant_method == "mxfp4"
 
-        # NVFP4 weights are repacked and written directly to gguf_writer.
-        # This must run before dequant_model so NVFP4 tensors are removed
-        # from model_tensors, leaving only non-NVFP4 (e.g. FP8) for dequant.
+        # FP8 weights are repacked and written directly to gguf_writer.
+        # This must run before dequant_model so FP8 tensors are removed
+        # from model_tensors, leaving only non-FP8 for dequant.
+        if self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3:
+            self._generate_fp8_tensors()
+
         if self._is_nvfp4:
             if nvfp4_compressed_tensors:
                 # Convert compressed-tensors 'global' scales into the reciprocal
@@ -953,6 +1050,9 @@ class ModelBase:
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_F16:
                         data_qtype = gguf.GGMLQuantizationType.F16
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_BF16:
+                        data_qtype = gguf.GGMLQuantizationType.BF16
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3:
+                        # FP8 weights are written directly; the rest default to BF16
                         data_qtype = gguf.GGMLQuantizationType.BF16
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
                         data_qtype = gguf.GGMLQuantizationType.Q8_0
