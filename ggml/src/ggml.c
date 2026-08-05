@@ -764,6 +764,13 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = QK_F8_E4M3,
+        .type_size                = sizeof(block_f8_e4m3),
+        .is_quantized             = true,
+        // no to_float/from_float/vec_dot: requires native FP8 hardware (GPU only)
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -7980,6 +7987,8 @@ size_t ggml_quantize_chunk(
                 result = n * elemsize;
                 memcpy((uint8_t *)dst + start * elemsize, src + start, result);
             } break;
+        case GGML_TYPE_F8_E4M3:
+            GGML_ABORT("f8_e4m3 quantization is not implemented (requires native FP8 hardware)");
         default:
             assert(false);
     }

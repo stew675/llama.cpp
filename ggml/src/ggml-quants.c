@@ -5479,6 +5479,23 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                     }
                 }
             } break;
+        case GGML_TYPE_F8_E4M3:
+            {
+                // fp8 e4m3fn: NaN is 0x7F/0xFF, all other bytes are finite
+                const block_f8_e4m3 * f = (const block_f8_e4m3 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!isfinite(f[i].d)) {
+                        fprintf(stderr, "%s: found non-finite scale at block %zu\n", __func__, i);
+                        return false;
+                    }
+                    for (int j = 0; j < QK_F8_E4M3; ++j) {
+                        if ((f[i].qs[j] & 0x7F) == 0x7F) {
+                            fprintf(stderr, "%s: found NaN at block %zu\n", __func__, i);
+                            return false;
+                        }
+                    }
+                }
+            } break;
         case GGML_TYPE_F32:
             {
                 const float * f = (const float *) data;
