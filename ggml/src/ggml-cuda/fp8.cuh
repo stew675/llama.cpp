@@ -17,6 +17,7 @@
 #define GGML_FP8_TILE_K 128
 #define GGML_FP8_NWARPS 4
 #define GGML_FP8_NTHREADS (32 * GGML_FP8_NWARPS) // 128
+#define GGML_FP8_GEMV_MAX_N 16 // use the dot4 GEMV below this token count
 
 // fp8 e4m3fn (OCP) decode: value = (-1)^s * 2^(e-7) * (1.m), max 448, NaN = 0x7F/0xFF
 __device__ __forceinline__ float fp8_e4m3_to_f32(uint8_t x) {
@@ -215,6 +216,48 @@ __global__ void mul_mat_fp8_wmma(
     }
 #else
     // unreachable: the host pass only generates the launch stub
+    (void) src0; (void) src1_q; (void) src1_s; (void) dst;
+    (void) k; (void) m; (void) n; (void) n_col_blocks; (void) n_pad;
+#endif
+}
+
+// dot4-based GEMV for small token batches (n <= GGML_FP8_GEMV_MAX_N), used during
+// generation. One warp per output row; the 32 lanes read the 128 fp8 bytes of a
+// weight block coalesced (4 bytes each) and dot4 them with the shared activation
+// block. This avoids the wmma tile waste (16-token tiles) at batch 1.
+__global__ void mul_mat_fp8_gemv(
+        const char * __restrict__ src0, const uint8_t * __restrict__ src1_q, const float * __restrict__ src1_s, float * __restrict__ dst,
+        const int64_t k, const int64_t m, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    (void) n_pad;
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+
+    const int64_t mi = blockIdx.x * 4 + warp;
+    if (mi >= m) {
+        return;
+    }
+    const int64_t ni = blockIdx.y;
+
+    float acc = 0.0f;
+    const int64_t row_stride = n_col_blocks * (int64_t) sizeof(block_f8_e4m3);
+    const uint8_t * x = src1_q + ni * k;
+
+    for (int64_t cb = 0; cb < n_col_blocks; ++cb) {
+        const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (src0 + mi * row_stride + cb * sizeof(block_f8_e4m3));
+        const uint32_t w4 = *reinterpret_cast<const uint32_t *>(wblk->qs + lane * 4);
+        const uint32_t x4 = *reinterpret_cast<const uint32_t *>(x + cb * GGML_FP8_TILE_K + lane * 4);
+
+        float dot = __builtin_amdgcn_dot4_f32_fp8_fp8(w4, x4, 0.0f);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            dot += __shfl_xor_sync(0xffffffff, dot, o, 32);
+        }
+        acc += wblk->d * src1_s[ni * n_col_blocks + cb] * dot;
+    }
+
+    dst[ni * m + mi] = acc;
+#else
     (void) src0; (void) src1_q; (void) src1_s; (void) dst;
     (void) k; (void) m; (void) n; (void) n_col_blocks; (void) n_pad;
 #endif

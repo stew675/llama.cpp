@@ -31,10 +31,12 @@ const char * llama_file_version_name(llama_fver version);
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
-        uint16_t  idx; // source file index
-        size_t   offs; // tensor data offset in the original file
+        uint16_t  idx = 0; // source file index
+        size_t   offs = 0; // tensor data offset in the original file
 
-        ggml_tensor * tensor;
+        ggml_tensor * tensor = nullptr;
+
+        llama_tensor_weight() = default;
 
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
@@ -89,6 +91,7 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+    mutable llama_tensor_weight dummy_weight; // metadata-only models: marks tensors that exist in the gguf metadata
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 

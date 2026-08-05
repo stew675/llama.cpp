@@ -36,6 +36,7 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
+            llama-safetensors.cpp
             llama-sampler.cpp
             llama-vocab.cpp
             unicode-data.cpp
@@ -51,6 +52,7 @@ set_target_properties(llama PROPERTIES
 )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

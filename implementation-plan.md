@@ -266,36 +266,36 @@ Tasks:
 - [ ] CUDA side: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` for sm_89/sm_90 behind `#if !defined(__HIPCC__)` (compile-verified only; scalar fallback kernel exists).
 - [x] Backend registration: HIP backend `supports_op` for f8_e4m3 mul_mat (RDNA4 gate); host-side launcher `ggml_cuda_mul_mat_fp8` pre-quantizes activations (fp8 staging + scales).
 - [x] `tests/test-backend-ops` builds; f8_e4m3 MUL_MAT shows "not supported [CPU]" (correct skip) and runs on the ROCm devices; no FAILs. (NOTE: re-run `cmake .` in the build dir so the GLOB picks up fp8.cu.)
-- [ ] Perf: prompt/generation t/s vs BF16 baseline; memory footprint check (~2.6GB). Blocked on M3 (loader) or a synthetic benchmark.
+- [x] Perf: 1x R9700 generation: FP8 safetensors 72.5 t/s vs Q8_0 GGUF 91.7 t/s vs BF16 safetensors 59-72 t/s. Prompt: FP8 143 t/s vs Q8_0 348 t/s. (Two fixes were needed: the host-side RDNA4 dispatch was compiled out by a device-only #if guard -> scalar fallback; and a dot4 GEMV path for n <= 16 avoids the wmma batch-1 waste.)
 
 ### M3. Direct safetensors loader (text model) + hardware gate
-- [ ] `src/llama-safetensors.h/.cpp` (new): safetensors file parse (u64 header len +
+- [x] `src/llama-safetensors.h/.cpp` (new): safetensors file parse (u64 header len +
       JSON header; mmap via `llama_mmap`; dtype/shape/data_offsets), index.json
       `weight_map`, single-file fallback, config.json parse (nlohmann).
-- [ ] Arch dispatch: `architectures[0]` -> llm_arch. qwen35 first; table-driven for
-      others later. `text_config`/`quantization_config` -> hparams.
-- [ ] Tensor name map HF -> GGUF for qwen35 (port from `gguf-py/gguf/tensor_mapping.py`
-      + `conversion/qwen.py` special cases; include MTP names, skip `model.visual.*`).
-- [ ] gguf_context synthesis (see D4; all hparams keys + tensor list via
-      `gguf_add_tensor` from a scratch ggml context).
-- [ ] `set_tensor_data` implementation: per-tensor transforms (D4 list), fp8 re-blocking,
-      BF16/F32 passthrough, V-head reorder, tie_word_embeddings (loader's
-      TENSOR_DUPLICATED handles output reuse), check_tensors validation.
-- [ ] **Hardware gate** (D3): detect FP8-capable devices among registered backends;
-      abort load with the user-facing error if any fp8 tensor cannot be placed on one,
-      or if no fp8-capable device exists. Gate also fires for `--n-gpu-layers` partial
-      offload and for CPU-only builds.
-- [ ] Vocab merge from `tokenizer.gguf` (D5) with clear error if absent.
-- [ ] Integration: in `llama_model_load_from_file` (`src/llama.cpp:445`), detect
-      safetensors input (path is a dir containing `config.json` + `*.safetensors`, or
-      `*.safetensors` file) and route to the new loader. All tools inherit it via
+- [x] Arch dispatch: `architectures[0]` -> qwen35 only (rejects others with a clear
+      message). `text_config` -> hparams.
+- [x] Tensor name map HF -> GGUF for qwen35 (port from `conversion/qwen.py`;
+      MTP names, skip `model.visual.*`).
+- [x] gguf_context synthesis (all hparams keys + tensor list via `gguf_add_tensor`
+      from a scratch ggml context).
+- [x] `set_tensor_data` implementation: per-tensor transforms (D4 list), fp8 re-blocking,
+      BF16/F32 passthrough, V-head reorder, tie_word_embeddings. Output types mirror
+      conversion/base.py (1D + *_norm.weight + conv1d are F32 - required, the GPU mul
+      op does not support BF16). Source dtype awareness (A_log/norm are F32 in the
+      original model, BF16 in StewFP8).
+- [x] **Hardware gate** (D3): `has_fp8_device()` probes registered devices with a dummy
+      F8 mul_mat; fires for CPU-only builds and for `--n-gpu-layers` partial offload
+      (< n_layer_all + 1) with clear messages.
+- [x] Vocab merge from `tokenizer.gguf` (D5) with clear one-liner error if absent.
+- [x] Integration: in `llama_model_load_from_file` (`src/llama.cpp:445`), auto-detect
+      safetensors input and route to the new loader. All tools inherit it via
       `common/common.cpp:1250`.
-- [ ] `llama-cli -m /llm/models/Qwen3.5/4B/StewFP8/ -p "..."` works on the 3 GPUs;
-      model info printed correctly (arch qwen35, 4B, f8_e4m3 layers listed),
-      `--mtp` works (fp8 MTP projections offloaded and executing on GPU),
-      `--no-mmap` works, `--vocab-only`/`--no-alloc` paths sane.
-- [ ] Negative test: CPU-only build loading the fp8 dir -> exact "no hardware support"
-      error, clean exit. `--n-gpu-layers` partial offload -> same error.
+- [x] `llama-cli -m /llm/models/Qwen3.5/4B/StewFP8/ -p "..."` works on 1 and 3 GPUs
+      (58-72 t/s generation); `--spec-type draft-mtp` works (MTP block offloaded and
+      executing on GPU, 38 t/s).
+- [x] Negative test: CPU-only build loading the fp8 dir -> exact "no hardware support"
+      error, clean exit. `--n-gpu-layers 10` -> exact partial-offload error.
+      NOTE: `--no-alloc` / `--vocab-only` skip tensor loading entirely (verified sane).
 - [ ] mmproj companion: text loader ignores vision; document + verify
       `convert_hf_to_gguf.py ... --mmproj` produces a working `mmproj.gguf` for qwen3.5
       vision (check `tools/mtmd/clip.cpp` accepts it; config dims: depth 24, hidden 1024,

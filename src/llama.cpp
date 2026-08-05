@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-safetensors.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -452,6 +453,42 @@ struct llama_model * llama_model_load_from_file(
         const char * path_model,
         struct llama_model_params params) {
     std::vector<std::string> splits = {};
+
+    // direct loading of vanilla HuggingFace safetensors (no GGUF conversion)
+    if (llama_safetensors_loader::is_safetensors_path(path_model)) {
+        std::unique_ptr<llama_safetensors_loader> loader;
+        gguf_context * metadata = nullptr;
+        try {
+            loader  = std::make_unique<llama_safetensors_loader>(path_model);
+            metadata = loader->build_metadata();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to load safetensors model: %s\n", __func__, err.what());
+            return nullptr;
+        }
+
+        if (!params.vocab_only && loader->has_fp8_tensors()) {
+            if (!llama_safetensors_loader::has_fp8_device()) {
+                gguf_free(metadata);
+                LLAMA_LOG_ERROR("%s: FP8_E4M3 weights require a device with native FP8 support (RDNA4, or NVIDIA Ada/Hopper+); this system has none. Use an integer GGUF (e.g. Q8_0) instead.\n", __func__);
+                return nullptr;
+            }
+            // fp8 tensors live in every decoder block (including the MTP block),
+            // so all of them must be offloaded to GPU
+            if (params.n_gpu_layers >= 0 && (int64_t) params.n_gpu_layers < loader->n_layer_all() + 1) {
+                gguf_free(metadata);
+                LLAMA_LOG_ERROR("%s: FP8_E4M3 weights must be fully offloaded to the GPU - increase --n-gpu-layers to at least %lld\n",
+                        __func__, (long long) loader->n_layer_all() + 1);
+                return nullptr;
+            }
+        }
+
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+        params.use_extra_bufts = false;
+        auto * model = llama_model_load_from_file_impl(metadata, llama_safetensors_loader::set_tensor_data, loader.get(), "", splits, /*file*/ nullptr, params);
+        gguf_free(metadata);
+        return model;
+    }
+
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
 }
 

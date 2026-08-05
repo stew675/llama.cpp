@@ -53,15 +53,22 @@ void ggml_cuda_mul_mat_fp8(
         CUDA_CHECK(cudaGetLastError());
     }
 
-#if defined(GGML_USE_HIP) && defined(RDNA4)
+    // the fp8 kernels are compiled for the RDNA4 device pass only; on the host
+    // side the launch stubs always exist, so dispatch on the runtime cc
     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
         const dim3 block_dims(GGML_FP8_NTHREADS, 1, 1);
-        const dim3 grid_dims((n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N), (m + GGML_FP8_TILE_M - 1) / GGML_FP8_TILE_M, 1);
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
-        ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
+        if (n <= GGML_FP8_GEMV_MAX_N) {
+            // dot4 GEMV: one warp per output row, one CTA per 4 rows and token
+            const dim3 grid_dims((m + 3) / 4, n, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+            ggml_cuda_kernel_launch(mul_mat_fp8_gemv, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
+        } else {
+            const dim3 grid_dims((n + (GGML_FP8_NWARPS * GGML_FP8_TILE_N) - 1) / (GGML_FP8_NWARPS * GGML_FP8_TILE_N), (m + GGML_FP8_TILE_M - 1) / GGML_FP8_TILE_M, 1);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+            ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_d, k, m, n, n_col_blocks, n_pad);
+        }
         return;
     }
-#endif
 
     // Scalar fallback (CUDA sm_89+)
     const dim3 block_dims(32, 8, 1);

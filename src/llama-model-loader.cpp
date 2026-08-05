@@ -830,6 +830,12 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
         return &pos->second;
     }
 
+    // metadata-only models (llama_model_init_from_user): the tensors are not loaded from files,
+    // but the gguf metadata still lists them - report them as present
+    if (files.empty() && gguf_find_tensor(metadata, name) != -1) {
+        return &dummy_weight;
+    }
+
     return nullptr;
 }
 
@@ -1225,7 +1231,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     };
 
     if (files.empty()) {
-        if (flags & TENSOR_SKIP_IF_VIRTUAL) {
+        if (flags & TENSOR_SKIP_IF_VIRTUAL || flags & TENSOR_SKIP) {
             return nullptr;
         }
         ggml_type type = GGML_TYPE_F32;
@@ -1241,6 +1247,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     return nullptr;
                 }
             }
+            if (tid == -1) {
+                // same semantics as the file-backed path: a missing tensor that is not required is skipped
+                return nullptr;
+            }
         }
 
         ggml_tensor t_meta;
@@ -1255,7 +1265,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-        GGML_ASSERT(buft != nullptr);
+        if (buft == nullptr) {
+            return nullptr;
+        }
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
