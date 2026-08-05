@@ -32,6 +32,8 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+
+void ggml_cuda_mul_mat_fp8(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst); // fp8.cu
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1852,6 +1854,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (src0->type == GGML_TYPE_F8_E4M3) {
+        ggml_cuda_mul_mat_fp8(ctx, src0, src1, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
@@ -4841,6 +4847,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                         return true;
+                    case GGML_TYPE_F8_E4M3:
+                        // native FP8 hardware only (RDNA4, or NVIDIA Ada/Hopper+); F32 activations, non-batched
+                        if (b->type != GGML_TYPE_F32 || a->ne[0] % 128 != 0 || a->ne[2]*a->ne[3] != 1 || b->ne[2]*b->ne[3] != 1) {
+                            return false;
+                        }
+                        {
+                            const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                            return GGML_CUDA_CC_IS_RDNA4(cc) || (!GGML_CUDA_CC_IS_AMD(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE);
+                        }
                     default:
                         return false;
                 }

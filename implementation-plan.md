@@ -261,20 +261,12 @@ Spike result (already done, verified by compiling a test kernel):
   wave32 on gfx12, same as the existing f16 `w32_gfx12` path).
 
 Tasks:
-- [ ] fp8 tile-load + mmq-style mul_mat kernel: load fp8 tile (128-col blocks), apply
-      the f32 block scale to the accumulator, BF16/F16 activation side. Start with a
-      straightforward "fp8 load -> f32, FMA" kernel for correctness.
-- [ ] WMMA path (`mma.cuh`, gfx12 section): `v_wmma_f32_16x16x16_fp8_fp8` using the
-      confirmed builtin and fragment layout above.
-- [ ] Non-WMMA dot path: `v_dot4_f32_fp8_fp8`.
-- [ ] CUDA side: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` for sm_89/sm_90
-      behind `#if !defined(__HIPCC__)` (compile-verified only).
-- [ ] Backend registration: HIP backend `supports_op` for f8_e4m3 mul_mat; any
-      host-side data repack needed by the kernels is pure byte rearrangement (allowed),
-      or a GPU fp8-convert kernel.
-- [ ] `tests/test-backend-ops.cpp` mul_mat + quantize on the 3 GPUs; confirm CPU
-      fallback never triggers for fp8 tensors (M1 rejection is effective).
-- [ ] Perf: prompt/generation t/s vs BF16 baseline; memory footprint check (~2.6GB).
+- [x] fp8 tile-load + mmq-style mul_mat kernel (WMMA path): `v_wmma_f32_16x16x16_fp8_fp8` with the verified gfx12 fragment layout. **Fragment layout (empirically verified on gfx1201 + TileLang/CK docs): A lane l byte e = A[l%16][(l//16)*8+e]; B lane l byte e = B[(l//16)*8+e][l%16]; C slot s = C[(l//16)*8+s][l%16].** Staging is [n][k] (token-major, k-minor) so B fragments are contiguous 8-byte loads. Correctness: standalone test + 12-config stress suite PASS (max rel err <= 3.4e-3).
+- [ ] Non-WMMA dot path: `v_dot4_f32_fp8_fp8` (not yet implemented; WMMA is the primary path).
+- [ ] CUDA side: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` for sm_89/sm_90 behind `#if !defined(__HIPCC__)` (compile-verified only; scalar fallback kernel exists).
+- [x] Backend registration: HIP backend `supports_op` for f8_e4m3 mul_mat (RDNA4 gate); host-side launcher `ggml_cuda_mul_mat_fp8` pre-quantizes activations (fp8 staging + scales).
+- [x] `tests/test-backend-ops` builds; f8_e4m3 MUL_MAT shows "not supported [CPU]" (correct skip) and runs on the ROCm devices; no FAILs. (NOTE: re-run `cmake .` in the build dir so the GLOB picks up fp8.cu.)
+- [ ] Perf: prompt/generation t/s vs BF16 baseline; memory footprint check (~2.6GB). Blocked on M3 (loader) or a synthetic benchmark.
 
 ### M3. Direct safetensors loader (text model) + hardware gate
 - [ ] `src/llama-safetensors.h/.cpp` (new): safetensors file parse (u64 header len +

@@ -7981,14 +7981,13 @@ size_t ggml_quantize_chunk(
                 ggml_fp32_to_bf16_row_ref(src + start, (ggml_bf16_t *)dst + start, n);
                 result = n * elemsize;
             } break;
+        case GGML_TYPE_F8_E4M3: result = quantize_f8_e4m3 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_F32:
             {
                 size_t elemsize = sizeof(float);
                 result = n * elemsize;
                 memcpy((uint8_t *)dst + start * elemsize, src + start, result);
             } break;
-        case GGML_TYPE_F8_E4M3:
-            GGML_ABORT("f8_e4m3 quantization is not implemented (requires native FP8 hardware)");
         default:
             assert(false);
     }

@@ -298,6 +298,119 @@ void quantize_row_q8_0_ref(const float * GGML_RESTRICT x, block_q8_0 * GGML_REST
     }
 }
 
+// fp8 e4m3fn (OCP): 1 sign, 4 exp (bias 7), 3 mantissa, max finite 448.0
+// NaN is 0x7F/0xFF; subnormals encode man * 2^-9
+static inline float fp8_e4m3_to_f32(uint8_t x) {
+    const uint32_t sign = ((uint32_t)(x & 0x80)) << 24;
+    const uint32_t exp  = (x >> 3) & 0x0F;
+    const uint32_t man  = x & 0x07;
+
+    uint32_t bits;
+    if (exp == 0) {
+        // subnormal or zero: value = man * 2^-9
+        if (man == 0) {
+            bits = sign;
+        } else {
+            const uint32_t k = man >= 4 ? 2 : man >= 2 ? 1 : 0;
+            bits = sign | ((k + 118) << 23) | ((man - (1 << k)) << (23 - k));
+        }
+    } else if (exp == 15 && man == 7) {
+        bits = 0x7FC00000u; // NaN
+    } else {
+        bits = sign | ((exp + 120) << 23) | (man << 20);
+    }
+
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// f32 -> fp8 e4m3fn, round-to-nearest-even, saturating to +/-448
+static inline uint8_t fp8_e4m3_from_f32(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    const uint32_t sign = (bits >> 31) & 1;
+    const uint32_t exp  = (bits >> 23) & 0xFF;
+    const uint32_t man  = bits & 0x7FFFFF;
+
+    if (exp == 0xFF) {
+        return sign ? 0xFF : 0x7F; // NaN/inf input
+    }
+    if (exp == 0) {
+        return sign ? 0x80 : 0x00; // f32 subnormal is far below fp8 min
+    }
+
+    int E = (int) exp - 120;
+    if (E >= 15) {
+        return sign ? 0xFE : 0x7E; // saturate to 448
+    }
+    if (E <= 0) {
+        // subnormal range: M = rne(value * 512), 0..7, 8 carries to E=1
+        const int shift = 141 - (int) exp;
+        uint32_t M = 0;
+        if (shift < 31) {
+            const uint64_t val = (1ull << 23) | man;
+            M = (uint32_t)(val >> shift);
+            const uint64_t frac = val & ((1ull << shift) - 1);
+            const uint64_t half = 1ull << (shift - 1);
+            if (frac > half || (frac == half && (M & 1))) {
+                M++;
+            }
+        }
+        if (M >= 8) {
+            return (uint8_t)((sign << 7) | 0x08); // smallest normal (E=1, M=0)
+        }
+        return (uint8_t)((sign << 7) | M);
+    }
+
+    // normal: E in 1..14, round mantissa to 3 bits (RNE)
+    uint32_t man_3 = man >> 20;
+    const uint32_t frac = man & 0xFFFFF;
+    if (frac > 0x80000 || (frac == 0x80000 && (man_3 & 1))) {
+        man_3++;
+    }
+    if (man_3 == 8) {
+        man_3 = 0;
+        E++;
+    }
+    if (E == 15 && man_3 == 7) {
+        man_3 = 6; // 480 would overflow -> clamp to 448
+    }
+    if (E >= 15) {
+        return sign ? 0xFE : 0x7E; // saturate to 448
+    }
+    return (uint8_t)((sign << 7) | (E << 3) | man_3);
+}
+
+void quantize_row_f8_e4m3_ref(const float * GGML_RESTRICT x, block_f8_e4m3 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_F8_E4M3 == 0);
+    const int nb = k / QK_F8_E4M3;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+
+        for (int j = 0; j < QK_F8_E4M3; j++) {
+            amax = MAX(amax, fabsf(x[i*QK_F8_E4M3 + j]));
+        }
+
+        // block max maps to 448 (max finite e4m3)
+        const float d = amax / 448.0f;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        y[i].d = d;
+
+        for (int j = 0; j < QK_F8_E4M3; ++j) {
+            y[i].qs[j] = fp8_e4m3_from_f32(x[i*QK_F8_E4M3 + j]*id);
+        }
+    }
+}
+
+size_t quantize_f8_e4m3(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_f8_e4m3_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_F8_E4M3, n_per_row);
+}
+
 // reference implementation for deterministic creation of model files
 void quantize_row_q8_1_ref(const float * GGML_RESTRICT x, block_q8_1 * GGML_RESTRICT y, int64_t k) {
     assert(QK8_1 == 32);
@@ -562,6 +675,22 @@ void dequantize_row_q8_0(const block_q8_0 * GGML_RESTRICT x, float * GGML_RESTRI
 
         for (int j = 0; j < qk; ++j) {
             y[i*qk + j] = x[i].qs[j]*d;
+        }
+    }
+}
+
+void dequantize_row_f8_e4m3(const block_f8_e4m3 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_F8_E4M3;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = x[i].d;
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = fp8_e4m3_to_f32(x[i].qs[j])*d;
         }
     }
 }
