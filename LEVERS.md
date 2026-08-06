@@ -18,13 +18,14 @@ stewfp8-ow.gguf` (24 delta-net layers, H=32 heads, K=V=128, neqk1=16).
 
 | metric | value | notes |
 |---|---|---|
-| pp512 (chunked) | 6538-6554 (was 6303-6334) | concat_non_cont removed (+4%) |
-| tg64 | 89.4-90.0 | decode untouched, sequential GDN |
+| pp512 (chunked) | 6818-6841 (was 6538-6554) | quantize_fp8_warp rewrite (+~4%) |
+| tg64 | 89.2-89.6 | decode untouched, sequential GDN |
 | PPL | 6.2677 | matches baseline exactly; generation matches |
 | backend tests | 47/47 GATED_DELTA_NET pass | + 83/83 SSM_CONV (incl. new 2-src cases) |
-| wmma kernel | ~186 us/launch avg | unchanged |
+| wmma kernel | ~186-188 us/launch avg | unchanged |
 | GDN chunked per pp512 | ~10.9 ms (unchanged) | phase A 4.9 + phase B 5.9 |
 | concat_non_cont | GONE (0 launches) | fused into ssm_conv_2src |
+| quantize_fp8 per pp512 | ~2.5 ms (was ~5.1) | warp rewrite: 12.6 us/launch (was 25.4) on pp512 grids |
 
 NOTE on bench noise: since 2026-08-06 late the box is noisy (+/-60-170 on
 pp512, occasionally +/-1000). Prefer rocprof kernel times (deterministic to
@@ -46,9 +47,9 @@ divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
 
 | kernel | ms/pp512 | share | note |
 |---|---|---|---|
-| mul_mat_fp8_wmma | ~38 | ~48% | prefill GEMMs, ~77 TFLOP/s |
+| mul_mat_fp8_wmma | ~38 | ~50% | prefill GEMMs, ~77 TFLOP/s |
 | gdn_chunk_prepare + state | ~10.9 | ~14% | A ~4.9 + B ~5.9 |
-| quantize_fp8 | ~6.3 | ~8% | activation staging pass |
+| quantize_fp8 | ~2.5 | ~3% | warp rewrite (was ~6.3); f32->fp8 staging |
 | Cijk (CK BF16 GEMM) | ~5.3 | ~7% | delta-net in/out projections |
 | ssm_conv_long_token_2src | ~0.6 | ~1% | fused conv (was concat 4.7 + conv 0.8) |
 | flash_attn_tile | ~3.0 | ~4% | 8 attention layers |
@@ -208,14 +209,42 @@ ac+k loads ~62 us, FMA/sync floor ~206 us).
   follows the SRC ne00, and the state cache layout is position-fastest (row
   p + c*(d_conv-1)), which the reshape_3d read side matches.
 
-### L6. quantize_fp8 fusion (small)
+### L6. quantize_fp8 - DONE 2026-08-06 night via a warp rewrite (not the fusion)
 
-- Kernel: quantize_fp8, ~6.3 ms/pp512. Staging f32 activations -> fp8 for the
-  wmma GEMMs; adds ~300 MB DRAM round-trip per pp512.
-- Approach: fuse the quantization into the GEMM's activation staging (read
-  f32 and quantize in-kernel). 4x the read bytes but removes the round-trip.
-- Expected: ~1 ms + staging simplification; only after L1/L2.
-- Depends on: L1/L2 (the GEMM kernel is the consumer).
+- Kernel: quantize_fp8 was ~5.1 ms/pp512 (25.4 us/launch on pp512 grids) for the
+  f32->fp8 activation staging. It was NOT bandwidth-bound: ~6.5 MB/launch in
+  25 us is ~256 GB/s, i.e. latency/barrier-bound (1 float per thread + 2
+  __syncthreads per 128-thread CTA).
+- DONE (commits below): quantize_fp8_warp<4> - one warp per (token, 128-col
+  block), each lane covers 4 consecutive values (float4), the amax reduce is a
+  pure warp butterfly (no smem, no barriers), and the fp8 encode uses the gfx12
+  hardware v_cvt_pk_fp8_f32 (RNE) which was verified BIT-EXACT vs the software
+  encoder fp8_e4m3_from_f32 on 406K finite inputs (every boundary, tie,
+  subnormal, saturation case; only NaN/Inf differ, which activations never
+  are). 4 k-blocks per warp (KBW) overlap the DRAM latency of the independent
+  loads; KBW=4 measured better than 1/2/8.
+- Measured (rig, min of 3, per-launch): quantize 25.4 -> 12.6 us on pp512
+  grids (-50%). pp512 6630 -> 6818-6841 (+2.9-3.2%). tg64 unchanged. PPL
+  6.2677 exact; generation matches; 47/47 GDN tests. The staging is bit-exact
+  vs the old kernel (rig check bad=0 on all model shapes), so the wmma/gemv/
+  scalar consumers are untouched.
+- Dispatch: RDNA4 + n > GGML_FP8_GEMV_MAX_N + 16-B-aligned src1 -> warp
+  kernel; else the old quantize_fp8. The decode grids (n <= 16) REGRESSED with
+  the warp kernel (1.31 -> 2.04 us/launch: its grid is ceil(k/128/32) x n, too
+  few CTAs for tiny n) - keep the old kernel there.
+- THE FUSION (the original L6 approach - read f32 in the wmma kernel and
+  quantize in-kernel) was built and measured: mul_mat_fp8_wmma_fused loses on
+  the big GEMMs that dominate pp512 (+9.8% on the gate shape 9216x512x2560,
+  +5.5% on 8192x512x2560) and wins only on the small under-occupied ones
+  (-23% on 4096x512x2560). Net per pp512 ~ +0.2 ms (a wash). The in-kernel
+  quantize (~42 us/launch added at saturation) costs more than the standalone
+  kernel it replaces (25 us) because it competes with the wmma/scale-pass
+  pipes and the f32 staging is 4x the bytes. Do NOT retry the fusion; the warp
+  rewrite gets the same win with zero risk to the GEMM path.
+- Files: fp8.cuh (quantize_fp8_warp template), fp8.cu (dispatch).
+- Validation: /tmp/bench_fused.cu + /tmp/bench_pairs.cu (rigs), /tmp/fp8_cvt_test.cu
+  (hw-vs-sw encoder bit-exactness).
+- Depends on: nothing.
 
 ### L7. Cijk BF16 GEMMs (delta-net in/out projections, 5.3 ms/pp512)
 
@@ -335,13 +364,36 @@ GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
   concat's dependency on conv_states. Fix: expand the reading op (the fused
   conv) before the cpy - the graph executes nodes in insertion order. Expanding
   it AFTER the cpy (even in the same function) does not reorder.
+- The old quantize_fp8 was NOT bandwidth-bound: ~6.5 MB/launch in 25 us is
+  ~256 GB/s (latency/barrier-bound, 1 float/thread + 2 barriers per CTA). The
+  warp rewrite (quantize_fp8_warp<4>) gets ~256 GB/s -> ~500+ GB/s on pp512
+  grids. Its grid is ceil(k/128/32) x n - on tiny decode grids (n <= 16) that
+  is too few CTAs: 1.31 -> 2.04 us/launch REGRESSION. The launcher must keep
+  the old kernel for n <= GGML_FP8_GEMV_MAX_N.
+- quantize_fp8_warp uses the gfx12 v_cvt_pk_fp8_f32 (RDNA4-only builtin) and
+  must be #if-guarded like the wmma kernels; the launcher falls back to the
+  portable quantize_fp8 on other archs and when src1 is not 16-B aligned.
+- The hardware fp8 encode (v_cvt_pk_fp8_f32 + fmed3f clamp, HIP's OCP E4M3
+  recipe) is bit-exact vs the software encoder for all FINITE inputs; only
+  NaN/Inf inputs differ (hw returns +/-448, sw returns the NaN encoding).
+  Verified on 406K values incl. every rounding boundary/tie/subnormal/
+  saturation case (/tmp/fp8_cvt_test.cu). The packed result puts fp8(a) in
+  byte 0, fp8(b) in byte 1, and the idst operand is preserved in the other
+  word - chaining idst across the two op_sel words packs 4 fp8 per register
+  with no shifts/or.
+- The fused-quantize-in-wmma experiment (mul_mat_fp8_wmma_fused, reads f32 in
+  the staging): at saturation it adds ~42 us/launch to the gate GEMM (more
+  than the 25 us standalone quantize it replaces) - the in-kernel quantize
+  competes with the wmma/scale-pass pipes and the f32 staging is 4x the bytes.
+  Wins only on small under-occupied shapes. Do not retry.
 
 ## 5. Suggested order for the next session
 
-1. Re-bench to confirm the working tree matches section 0 (expect ~6538-6554 pp512
-   after the L5 concat fusion; the box is noisy - prefer rocprof kernel times for A/B).
-2. L6 (quantize_fp8 fusion, ~6.3 ms/pp512) is the next live lever: fuse the f32->fp8
-   activation staging into the wmma GEMM's staging (read f32 and quantize in-kernel;
-   4x the read bytes but removes the ~300 MB round-trip).
-3. L7 (Cijk BF16 -> fp8 projections) only after L6. The GDN levers (L3/L4), the
-   wmma levers (L1/L2) and the conv plumbing (L5) are spent.
+1. Re-bench to confirm the working tree matches section 0 (expect ~6818-6841 pp512
+   after the L6 quantize rewrite; the box is noisy - prefer rocprof kernel times for A/B).
+2. L7 (Cijk BF16 -> fp8 projections, ~5.3 ms/pp512) is the next live lever: move the
+   delta-net in/out projections to fp8 so they run on the wmma path. Medium effort
+   (conversion + PPL re-gate); the quantizable set is norms, conv1d, in_proj_a/b, A_log.
+3. L1 (mul_mat_fp8_wmma) and L3/L4 (GDN phase A/B) are spent; L5 (conv fusion) and
+   L6 (quantize rewrite) are done. L8 (small kernels) - skip unless a specific one
+   shows up hot in a fresh profile.

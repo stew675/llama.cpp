@@ -145,6 +145,67 @@ __global__ void quantize_fp8(
     y_q[(int64_t) token * k + col0 + tid] = fp8_e4m3_from_f32(v * red[1]);
 }
 
+// Barrier-free rewrite of quantize_fp8: one warp per (token, 128-col block), each
+// lane covers 4 consecutive values (float4). The amax reduce is a pure warp
+// butterfly (no smem, no __syncthreads), so the kernel is a simple streaming
+// pass that runs at near-DRAM bandwidth instead of being latency-bound on the
+// old 1-value-per-thread + 2-barrier structure. Outputs are bit-exact vs
+// quantize_fp8 (same max-abs, same scale/inv expressions, hardware fp8 encode
+// verified bit-exact vs the software encoder for all finite inputs). KBW = k-
+// blocks per warp: the loads are independent, so KBW>1 overlaps the DRAM
+// latency of the f32 reads. RDNA4-only (hardware fp8 encode); the launcher
+// falls back to quantize_fp8 elsewhere.
+#define GGML_FP8_QUANT_KBW 4 // k-blocks per warp (the host grid math must match)
+template<int KBW>
+__global__ void quantize_fp8_warp(
+        const float * __restrict__ x, uint8_t * __restrict__ y_q, float * __restrict__ y_s,
+        const int64_t k, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
+#if defined(GGML_USE_HIP) && defined(RDNA4)
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int token = blockIdx.y;
+    constexpr int NWARPS = GGML_FP8_NTHREADS / 32;
+    const int cb0 = (blockIdx.x * NWARPS + warp) * KBW; // first k-block of this warp
+
+    float4 f[KBW];
+    float m[KBW];
+    bool valid[KBW];
+#pragma unroll
+    for (int j = 0; j < KBW; ++j) {
+        valid[j] = cb0 + j < n_col_blocks;
+        const float * xb = x + (int64_t) token * k + (int64_t) (cb0 + j) * GGML_FP8_TILE_K + lane * 4;
+        if (valid[j]) {
+            f[j] = *(const float4 *) xb;
+            m[j] = fmaxf(fmaxf(fabsf(f[j].x), fabsf(f[j].y)), fmaxf(fabsf(f[j].z), fabsf(f[j].w)));
+        } else {
+            f[j] = make_float4(0.f, 0.f, 0.f, 0.f);
+            m[j] = 0.f;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < KBW; ++j) {
+        float mm = m[j];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            mm = fmaxf(mm, __shfl_xor_sync(0xffffffff, mm, o, 32));
+        }
+        const float scale = mm / 448.0f;
+        const float inv = mm != 0.0f ? 448.0f / mm : 0.0f;
+        if (lane == 0 && valid[j]) {
+            y_s[(int64_t) token * n_col_blocks + cb0 + j] = scale;
+        }
+        unsigned int r0 = __builtin_amdgcn_cvt_pk_fp8_f32(f[j].x * inv, f[j].y * inv, 0, false);
+        r0 = __builtin_amdgcn_cvt_pk_fp8_f32(f[j].z * inv, f[j].w * inv, r0, true);
+        if (valid[j]) {
+            *(unsigned int *) (y_q + (int64_t) token * k + (int64_t) (cb0 + j) * GGML_FP8_TILE_K + lane * 4) = r0;
+        }
+    }
+#else
+    (void) x; (void) y_q; (void) y_s;
+    (void) k; (void) n; (void) n_col_blocks; (void) n_pad;
+#endif
+}
+
 // ---- weight repack: block_f8_e4m3 [m][n_col_blocks] -> fp8 [m_pad][k] + scales [m_pad][n_col_blocks] ----
 // The block rows are 132 B (f32 scale + 128 fp8), so the wmma staging loads are 4-B only
 // (misaligned for 16-B). The repack makes the fp8 bytes 16-B aligned per row and separates

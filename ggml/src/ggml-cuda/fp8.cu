@@ -107,7 +107,17 @@ void ggml_cuda_mul_mat_fp8(
         const float * src1_b = src1_d + ib * k * n;
         float       * dst_b  = dst_d  + ib * m * n;
 
-        {
+        // barrier-free warp quantize on RDNA4 when the f32 source is 16-B aligned
+        // (bit-exact vs quantize_fp8; the hardware fp8 encode is verified exact for
+        // all finite inputs); fall back to the block-reduce kernel otherwise. The
+        // warp kernel needs n large enough to fill its grid - on the tiny decode
+        // grids (n <= GGML_FP8_GEMV_MAX_N) the old kernel wins.
+        if (GGML_CUDA_CC_IS_RDNA4(cc) && n > GGML_FP8_GEMV_MAX_N && ((uintptr_t) src1_b & 15) == 0) {
+            const dim3 num_blocks((n_col_blocks + GGML_FP8_NTHREADS / 32 * GGML_FP8_QUANT_KBW - 1) / (GGML_FP8_NTHREADS / 32 * GGML_FP8_QUANT_KBW), n, 1);
+            const dim3 block_size(GGML_FP8_NTHREADS, 1, 1);
+            quantize_fp8_warp<GGML_FP8_QUANT_KBW><<<num_blocks, block_size, 0, stream>>>(src1_b, src1_q_d, src1_s_d, k, n, n_col_blocks, n_pad);
+            CUDA_CHECK(cudaGetLastError());
+        } else {
             const dim3 num_blocks(n_col_blocks, n, 1);
             const dim3 block_size(GGML_FP8_QUANT_NTHREADS, 1, 1);
             quantize_fp8<<<num_blocks, block_size, 0, stream>>>(src1_b, src1_q_d, src1_s_d, k, n, n_col_blocks, n_pad);

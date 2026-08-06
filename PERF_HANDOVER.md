@@ -29,16 +29,17 @@ aiter inspection details. This file tracks ONLY the performance picture.
 | fp8 now (phase A+B session, 2026-08-06) | **~6100-6200** (noisy box) | **89.8-90.1** | ~-1% | ~-1% |
 | fp8 now (L2 weight repack, 2026-08-06) | **6319-6334** | **89.4-90.0** | ~+1.5% | ~-1% |
 | fp8 now (L5 conv fusion, 2026-08-06) | **6538-6554** | **89.4-90.0** | ~+5% | ~-1% |
+| fp8 now (L6 quantize rewrite, 2026-08-06) | **6818-6841** | **89.2-89.6** | ~+7% | ~-1% |
 | target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
 | target generation (+10%) | - | ~100 | - | +10% |
 
 pp256: 5014, pp1024: 5446, pp2048: 5292, pp128: 3661 (high variance, use -r 5).
 
-Current authoritative numbers (2026-08-06, chunked GDN default, phase A/B
+Current authoritative numbers (2026-08-06 night, chunked GDN default, L6
 session): see LEVERS.md section 0. The box became noisy late on 2026-08-06
 (pp512 +/-60-170, occasionally much worse): trust rocprof kernel times
 (deterministic +/-3%) for A/B. GDN per pp512: phase A ~4.9 ms + phase B
-~5.9 ms (was 7.1 + 6.4).
+~5.9 ms (was 7.1 + 6.4). quantize_fp8 per pp512: ~2.5 ms (was ~5.1).
 
 PPL 6.2572 (fp8-ow) vs 6.2508 (fp8, no ow) vs 6.2464 (Q8_0) on the small
 /tmp/corpus_pride.txt corpus (all within error bars); generation matches the
@@ -73,8 +74,10 @@ old L1-L5 below:
   sequential kernel anyway (section 12).
 - the GDN levers are now internal: phase A (gdn_chunk_prepare) and phase B
   (gdn_chunk_state), both documented in LEVERS.md (L3/L4).
-- the GEMM levers (occupancy via 24 KB smem tiles, weight repack, quantize
-  fusion) survive as LEVERS.md L1/L2/L6.
+- the GEMM levers (occupancy via 24 KB smem tiles, weight repack) survive as
+  LEVERS.md L1/L2 (both spent); the quantize lever is L6 (DONE - the fusion
+  approach in the original L6 was measured and abandoned in favor of a warp
+  rewrite, see section 17).
 - the non-fp8-tensor quantization lever (old L5) is folded into LEVERS.md L7
   (Cijk BF16 projections); the quantizable-set note below is still valid.
 
@@ -159,7 +162,7 @@ rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /llm/
 ## 9. Next-session suggested order - SEE LEVERS.md
 
 The suggested order, and the current state to confirm first, moved to
-LEVERS.md section 5 (re-bench ~6100-6200 -> L1 -> L2 -> L5 -> re-evaluate).
+LEVERS.md section 5 (re-bench ~6818-6841 -> L7 -> re-evaluate).
 
 ## 10. Decode session log (2026-08-05 evening)
 
@@ -482,3 +485,45 @@ pointer-keyed cache is populated once during the first direct execution and
 reused afterwards - verified stable at ~201 entries over a 2200-call PPL run
 (no unbounded growth, no per-chunk repack cost). The one-time repack cost is
 ~13 ms total (~200 tensors, p50 71 us, max 1.09 ms for output.weight).
+
+## 17. L6: quantize_fp8 warp rewrite (2026-08-06 night, session)
+
+Goal: LEVERS.md L6 (quantize_fp8, 5.1 ms/pp512). The L6 plan was to fuse the
+quantization into the wmma kernel's staging; the session found the fusion is a
+wash and the real win is a barrier-free warp rewrite of the quantize kernel.
+Result: quantize 25.4 -> 12.6 us/launch on pp512 grids (-50%), pp512 6630 ->
+6818-6841 (+2.9-3.2%), tg64 unchanged, PPL 6.2677 exact, generation matches,
+47/47 GDN. Commits: (see git log).
+
+Why the old kernel was slow: it moves ~6.5 MB/launch in 25 us (~256 GB/s),
+far below the DRAM budget - it is latency/barrier-bound (1 float per thread,
+2 __syncthreads per 128-thread CTA, block reduce via smem).
+
+New kernel quantize_fp8_warp<4> (fp8.cuh): one warp per (token, 128-col
+block); each lane covers 4 consecutive values (float4); the amax reduce is a
+pure warp butterfly (5 shfl, no smem, no barriers); the fp8 encode uses the
+gfx12 hardware v_cvt_pk_fp8_f32 (RNE). Bit-exactness of the hardware encode
+vs the software encoder was verified on 406K finite values covering every
+rounding boundary, tie, subnormal and saturation case (/tmp/fp8_cvt_test.cu):
+only NaN/Inf inputs differ (never present in activations). 4 k-blocks per
+warp overlap the DRAM latency of the independent loads (KBW=1/2/4/8 measured;
+4 best). The staging output is bit-exact vs quantize_fp8 (rig check bad=0 on
+all model shapes), so the wmma/gemv/scalar consumers are untouched.
+
+Dispatch (fp8.cu): RDNA4 + n > GGML_FP8_GEMV_MAX_N + 16-B-aligned src1 -> warp
+kernel; else the old quantize_fp8. The warp kernel's grid (ceil(k/128/32) x n)
+is too small for the decode grids (n <= 16): it REGRESSED decode quantize 1.31
+-> 2.04 us/launch, so the old kernel stays there (decode untouched).
+
+The fusion experiment (mul_mat_fp8_wmma_fused, reads f32 in the wmma staging,
+computes scales in-kernel via an aligned-8-lane butterfly): measured on the
+real shape mix - it WINS on small shapes (m=1024: -51%, m=4096: -16%) but
+LOSES on the big GEMMs that dominate pp512 (m=9216: +10%, m=8192: +5.5%);
+net ~ +0.2 ms/pp512 (a wash). The in-kernel quantize adds ~42 us/launch at
+saturation - more than the 25 us standalone kernel it replaces - because it
+competes with the wmma/scale-pass pipes and the f32 staging is 4x the bytes.
+The warp rewrite gets the same win with zero risk to the GEMM path. Do not
+retry the fusion. (The fused kernel was removed from the tree; the rigs
+/tmp/bench_fused.cu and /tmp/bench_pairs.cu keep the A/B.)
+
+Next lever per LEVERS.md: L7 (Cijk BF16 -> fp8 projections, ~5.3 ms/pp512).
