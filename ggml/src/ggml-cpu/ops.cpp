@@ -9557,24 +9557,76 @@ void ggml_compute_forward_flash_attn_back(
 static void ggml_compute_forward_ssm_conv_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0]; // conv_x
+    const ggml_tensor * src0 = dst->src[0]; // conv_x, or qkv in the 2-src form
     const ggml_tensor * src1 = dst->src[1]; // conv1d.weight
+    const ggml_tensor * src2 = dst->src[2]; // conv states (optional, 2-src form)
 
     const int ith = params->ith;
     const int nth = params->nth;
 
+    if (src2 == nullptr) {
+        const int nc  = src1->ne[0]; // d_conv
+        const int ncs = src0->ne[0]; // d_conv - 1 + n_t
+        const int nr  = src0->ne[1]; // d_inner
+        const int n_t =  dst->ne[1]; // tokens per sequence
+        const int n_s =  dst->ne[2]; // number of sequences in the batch
+
+        GGML_ASSERT( dst->ne[0] == nr);
+        GGML_ASSERT(src0->nb[0] == sizeof(float));
+        GGML_ASSERT(src1->nb[0] == sizeof(float));
+        GGML_ASSERT(src0->nb[1] == src0->ne[0]*sizeof(float));
+
+        // rows per thread
+        const int dr = (nr + nth - 1)/nth;
+
+        // row range for this thread
+        const int ir0 = dr*ith;
+        const int ir1 = MIN(ir0 + dr, nr);
+        const int ir  = ir1 - ir0;
+
+        for (int i3 = 0; i3 < n_s; ++i3) {
+            for (int i2 = 0; i2 < n_t; ++i2) {
+                // {d_conv - 1 + n_t, d_inner, n_seqs}
+                // sliding window
+                const float * s = (const float *) ((const char *) src0->data + ir0*(src0->nb[1]) + i2*(src0->nb[0]) + i3*(src0->nb[2])); // {d_conv, d_inner, n_s}
+                const float * c = (const float *) ((const char *) src1->data + ir0*(src1->nb[1])); // {d_conv, d_inner}
+                float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2])); // {d_inner, n_t, n_s}
+
+                // TODO: transpose the output for smaller strides for big batches?
+                // d_inner
+                for (int i1 = 0; i1 < ir; ++i1) {
+                    // rowwise dot product
+                    // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
+                    float sumf = 0.0f;
+
+                    // d_conv
+                    for (int i0 = 0; i0 < nc; ++i0) {
+                        sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+                    }
+                    x[i1] = sumf;
+                }
+            }
+        }
+        return;
+    }
+
+    // 2-src form: src0 = qkv [d_inner, n_t, n_seqs] (channel-major, contiguous),
+    // src2 = conv states [d_conv - 1, d_inner, n_seqs] (position-major, contiguous).
     const int nc  = src1->ne[0]; // d_conv
-    const int ncs = src0->ne[0]; // d_conv - 1 + n_t
-    const int nr  = src0->ne[1]; // d_inner
+    const int ncs = src2->ne[0]; // d_conv - 1
+    const int nr  = src0->ne[0]; // d_inner
     const int n_t =  dst->ne[1]; // tokens per sequence
     const int n_s =  dst->ne[2]; // number of sequences in the batch
 
     GGML_ASSERT( dst->ne[0] == nr);
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(src2->nb[0] == sizeof(float));
     GGML_ASSERT(src0->nb[1] == src0->ne[0]*sizeof(float));
+    GGML_ASSERT(src2->nb[1] == src2->ne[0]*sizeof(float));
 
-    // rows per thread
+    const int64_t stride_q  = src0->nb[1] / sizeof(float);  // d_inner
+    const int64_t stride_cs = src2->nb[1] / sizeof(float);  // d_conv - 1
     const int dr = (nr + nth - 1)/nth;
 
     // row range for this thread
@@ -9583,23 +9635,22 @@ static void ggml_compute_forward_ssm_conv_f32(
     const int ir  = ir1 - ir0;
 
     for (int i3 = 0; i3 < n_s; ++i3) {
+        const float * q  = (const float *) ((const char *) src0->data + i3*(src0->nb[2])) + ir0; // {d_inner, n_t}
+        const float * cs = (const float *) ((const char *) src2->data + i3*(src2->nb[2]) + ir0*(src2->nb[1])); // {d_conv - 1, d_inner}
+
         for (int i2 = 0; i2 < n_t; ++i2) {
-            // {d_conv - 1 + n_t, d_inner, n_seqs}
-            // sliding window
-            const float * s = (const float *) ((const char *) src0->data + ir0*(src0->nb[1]) + i2*(src0->nb[0]) + i3*(src0->nb[2])); // {d_conv, d_inner, n_s}
             const float * c = (const float *) ((const char *) src1->data + ir0*(src1->nb[1])); // {d_conv, d_inner}
             float * x = (float *) ((char *) dst->data + ir0*(dst->nb[0]) + i2*(dst->nb[1]) + i3*(dst->nb[2])); // {d_inner, n_t, n_s}
 
-            // TODO: transpose the output for smaller strides for big batches?
             // d_inner
             for (int i1 = 0; i1 < ir; ++i1) {
-                // rowwise dot product
-                // NOTE: not using ggml_vec_dot_f32, because its sum is in double precision
                 float sumf = 0.0f;
 
-                // d_conv
+                // d_conv; stream position p = i2 + i0: p < ncs -> conv states, else qkv token p - ncs
                 for (int i0 = 0; i0 < nc; ++i0) {
-                    sumf += s[i0 + i1*ncs] * c[i0 + i1*nc];
+                    const int p = i2 + i0;
+                    const float xv = p < ncs ? cs[i1*stride_cs + p] : q[i1 + (p - ncs)*stride_q];
+                    sumf += xv * c[i0 + i1*nc];
                 }
                 x[i1] = sumf;
             }

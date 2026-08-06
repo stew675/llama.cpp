@@ -3986,6 +3986,31 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV 2-src form: conv over (conv states ++ qkv) without materializing the concat.
+// states: {d_conv - 1, d_inner, n_s} (position-major), qkv: {d_inner, n_t, n_s} (channel-major)
+struct test_ssm_conv_2src : public test_case {
+    const ggml_type type;
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const int64_t n_t;
+    const int64_t n_s;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, d_conv, d_inner, n_t, n_s);
+    }
+
+    test_ssm_conv_2src(ggml_type type, int64_t d_conv, int64_t d_inner, int64_t n_t, int64_t n_s)
+        : type(type), d_conv(d_conv), d_inner(d_inner), n_t(n_t), n_s(n_s) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * states = ggml_new_tensor_3d(ctx, type, d_conv - 1, d_inner, n_s);
+        ggml_tensor * qkv    = ggml_new_tensor_3d(ctx, type, d_inner, n_t, n_s);
+        ggml_tensor * w      = ggml_new_tensor_2d(ctx, type, d_conv, d_inner);
+        ggml_tensor * out    = ggml_ssm_conv_2src(ctx, states, qkv, w);
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -8768,6 +8793,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // long token (n_t > 32, exercises the long_token kernel path)
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+            // 2-src form (states ++ qkv, no concat); short (n_t <= 32) and long (n_t > 32) paths
+            test_cases.emplace_back(new test_ssm_conv_2src(GGML_TYPE_F32, d_conv, d_inner, 1, 1));
+            test_cases.emplace_back(new test_ssm_conv_2src(GGML_TYPE_F32, d_conv, d_inner, 32, 1));
+            test_cases.emplace_back(new test_ssm_conv_2src(GGML_TYPE_F32, d_conv, d_inner, 64, 4));
+            test_cases.emplace_back(new test_ssm_conv_2src(GGML_TYPE_F32, d_conv, d_inner, 64, 1));
         }
     }
 

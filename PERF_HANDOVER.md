@@ -28,6 +28,7 @@ aiter inspection details. This file tracks ONLY the performance picture.
 | fp8 now (chunked GDN, 2026-08-06) | **6068-6072** | **89.8-90.0** | **-1.7%** | **-1.2%** |
 | fp8 now (phase A+B session, 2026-08-06) | **~6100-6200** (noisy box) | **89.8-90.1** | ~-1% | ~-1% |
 | fp8 now (L2 weight repack, 2026-08-06) | **6319-6334** | **89.4-90.0** | ~+1.5% | ~-1% |
+| fp8 now (L5 conv fusion, 2026-08-06) | **6538-6554** | **89.4-90.0** | ~+5% | ~-1% |
 | target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
 | target generation (+10%) | - | ~100 | - | +10% |
 
@@ -379,8 +380,67 @@ Conclusion for LEVERS.md: L1 is spent unless a new structural idea appears
 The remaining GEMM lever with real headroom is L2 (weight repack at load
 time): 16-B staging loads + it unblocks the kpacked layout.
 
-
 ## 15. L2 wmma weight repack (2026-08-06 evening, session)
+
+Goal: LEVERS.md L2 (wmma weight repack at load time). Result: wmma kernel
+~204 -> ~186 us/launch average (-9%), pp512 6220 -> 6319-6334 (+1.6-1.8%),
+tg64 unchanged. PPL 6.2677 exact; generation matches; 47/47 GDN tests.
+Commits: (see git log).
+
+## 16. L5: ssm conv concat fusion (2026-08-06 evening, session)
+
+Goal: LEVERS.md L5 (concat_non_cont, 4.7 ms/pp512 - the delta-net conv input
+assembly). Result: concat eliminated, pp512 6303 -> 6538-6554 (+4%), tg64
+unchanged, PPL 6.2677 exact, 47/47 GDN + 83/83 SSM_CONV.
+
+Design: new op form ggml_ssm_conv_2src(ctx, conv_states, qkv, c) - the same
+GGML_OP_SSM_CONV op code with optional src[2] = conv states (nullptr keeps the
+old single-input behavior for mamba/kimi/etc.). The fused CUDA kernels
+(ssm_conv_2src_f32 for n_t <= 32, ssm_conv_long_token_2src_f32 for n_t > 32)
+read conv_states (position-major) and qkv_mixed (channel-fastest, untransposed)
+in their natural layouts into a position-major smem tile, coalesced along
+channels. The model graph (build_conv_state in delta-net-base.cpp) drops the
+transpose + concat + conv_input buffer; the state-save view is now the
+transpose of a qkv-tail view, and the concat is only built when a state window
+overlaps the conv_states piece (n_t < d_conv-1 or rollback slots with small
+batches) - decode keeps it at trivial cost.
+
+Bugs found and fixed (do not rediscover, consolidated in LEVERS.md section 4):
+1. The qkv layout is channel-fastest: qkv[c][t] at c*4 + t*nb1. A fixed
+   channel's token window is strided by d_inner*4, so staging must be coalesced
+   along CHANNELS (position-major tile, smem[p*128 + c]); the first version
+   staged along tokens (channel-major tile) and read garbage (GPU faults in
+   test-backend-ops, caught by the new test_ssm_conv_2src cases).
+2. ggml_view_3d CANNOT express a strided dim0: ggml_new_tensor_impl resets nb
+   (nb[0] = element size, nb[1] = nb[0]*ne[0], ...), so a view's dim0 stride is
+   always 4 B for f32. A "token-major window over qkv" view is impossible; the
+   state save must use transpose-of-view (tail = view_3d(qkv, channels, n_state,
+   seqs, token_stride, seq_stride, offset); T = transpose(tail)), which keeps
+   the parent nb via ggml_view_tensor. The first attempt (view_3d over a
+   transposed qkv) silently read qkv[c'][509] with a (p+c) channel mix -> PPL
+   6.42, exactly reproducible, and decode crashed with a GPU fault.
+3. The state cache layout is position-fastest: row index p + c*(d_conv-1)
+   (the save cpy_scalar scatters by the src flat index with ne00 = n_state, and
+   the next batch's reshape_3d read matches). The qkv-tail transpose view
+   reproduces the old concat-based save bit-exactly (standalone check
+   /tmp/dbg_state2.cpp: old-vs-new state save maxerr=0).
+4. Graph write-before-read hazard: the old state-save cpy depended on the concat
+   (which depends on conv_states), so it ran after the conv read the state; the
+   fused conv + qkv-view cpy have no dependency, so the cpy can overwrite
+   conv_states_all before the conv reads it. Fix: expand the fused conv before
+   the state-save cpy in build_conv_state (graph executes nodes in insertion
+   order). A naive "expand conv at the end" fix did NOT reorder (the cpy was
+   already inserted).
+
+Method notes: the CPU reference (ggml_compute_forward_ssm_conv_f32) needed the
+same channel-fastest fix (q[i1 + t*stride_q], not q[i1*stride_q + t]) plus the
+ir0 channel offset on q/cs in the multi-thread row partition (the first version
+read channel 0's data for every thread - caught by gpu-vs-cpu comparison in
+/tmp/dbg_2src2.cpp). test-backend-ops compares against the CPU backend with
+use_ref=true, which only disables fusion (the compute is still ops.cpp).
+
+The remaining concat-ish plumbing: none. ssm_conv 0.6 ms/pp512 (24 launches).
+Next lever per LEVERS.md: L6 (quantize_fp8 fusion).
 
 Goal: LEVERS.md L2 (wmma weight repack at load time). Result: wmma kernel
 ~204 -> ~186 us/launch average (-9%), pp512 6220 -> 6319-6334 (+1.6-1.8%),

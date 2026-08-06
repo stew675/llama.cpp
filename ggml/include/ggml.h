@@ -2452,6 +2452,15 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // conv over (conv_states ++ qkv) along dim 0 without materializing the concat.
+    // sx is the conv states [d_conv - 1, d_inner, n_seqs] (position-major), sy the qkv
+    // projection [d_inner, n_t, n_seqs] (channel-fastest); both must be contiguous.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_2src(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * sy,
+            struct ggml_tensor  * c);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

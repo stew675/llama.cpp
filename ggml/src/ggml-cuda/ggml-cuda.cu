@@ -5096,7 +5096,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_SSM_CONV: {
             // assumes d_inner % threads == 0
-            return op->src[0]->ne[1] % 128 == 0;
+            // 2-src form: src[0] is qkv (channel-fastest), d_inner is ne[0]
+            return op->src[2] ? op->src[0]->ne[0] % 128 == 0 : op->src[0]->ne[1] % 128 == 0;
         }
         case GGML_OP_CONT:
             return true;

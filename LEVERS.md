@@ -14,16 +14,17 @@ stewfp8-ow.gguf` (24 delta-net layers, H=32 heads, K=V=128, neqk1=16).
 
 ---
 
-## 0. Current state (verified 2026-08-06 evening, after the L2 weight-repack session)
+## 0. Current state (verified 2026-08-06 evening, after the L5 concat-fusion session)
 
 | metric | value | notes |
 |---|---|---|
-| pp512 (chunked) | 6319-6334 (was 6220 at session start) | wmma kernel -9%/launch via the L2 repack; box noisy, prefer rocprof |
+| pp512 (chunked) | 6538-6554 (was 6303-6334) | concat_non_cont removed (+4%) |
 | tg64 | 89.4-90.0 | decode untouched, sequential GDN |
 | PPL | 6.2677 | matches baseline exactly; generation matches |
-| backend tests | 47/47 GATED_DELTA_NET pass | incl. multi-seq cases |
-| wmma kernel | ~186 us/launch avg (was ~204) | 16-B staging loads from the repacked layout |
+| backend tests | 47/47 GATED_DELTA_NET pass | + 83/83 SSM_CONV (incl. new 2-src cases) |
+| wmma kernel | ~186 us/launch avg | unchanged |
 | GDN chunked per pp512 | ~10.9 ms (unchanged) | phase A 4.9 + phase B 5.9 |
+| concat_non_cont | GONE (0 launches) | fused into ssm_conv_2src |
 
 NOTE on bench noise: since 2026-08-06 late the box is noisy (+/-60-170 on
 pp512, occasionally +/-1000). Prefer rocprof kernel times (deterministic to
@@ -41,22 +42,22 @@ Profile command: `rocprofv3 -r -d /tmp/rocp_x -f csv -- llama-bench -m <model>
 (Duration = End_Timestamp - Start_Timestamp; Grid_Size_X = work-items,
 divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
 
-## 1. Where pp512 time goes (per-pp512, warmup removed)
+## 1. Where pp512 time goes (per-pp512, warmup removed, after the L5 concat fusion)
 
 | kernel | ms/pp512 | share | note |
 |---|---|---|---|
-| mul_mat_fp8_wmma | ~41 | ~48% | prefill GEMMs, ~77 TFLOP/s |
-| gdn_chunk_prepare + state | ~10.9 | ~13% | A ~4.9 + B ~5.9 (was 7.1 + 6.4) |
-| quantize_fp8 | ~6.3 | ~7.5% | activation staging pass |
-| Cijk (CK BF16 GEMM) | ~5.3 | ~6% | delta-net in/out projections |
-| concat_non_cont | ~4.7 | ~5.5% | ssm conv input assembly, 24 launches |
-| flash_attn_tile | ~3.0 | ~3.5% | 8 attention layers |
-| silu | ~2.9 | ~3.5% | |
-| rms_norm (both sizes) | ~4.4 | ~5% | |
+| mul_mat_fp8_wmma | ~38 | ~48% | prefill GEMMs, ~77 TFLOP/s |
+| gdn_chunk_prepare + state | ~10.9 | ~14% | A ~4.9 + B ~5.9 |
+| quantize_fp8 | ~6.3 | ~8% | activation staging pass |
+| Cijk (CK BF16 GEMM) | ~5.3 | ~7% | delta-net in/out projections |
+| ssm_conv_long_token_2src | ~0.6 | ~1% | fused conv (was concat 4.7 + conv 0.8) |
+| flash_attn_tile | ~3.0 | ~4% | 8 attention layers |
+| silu | ~2.9 | ~4% | |
+| rms_norm (both sizes) | ~4.4 | ~6% | |
 | k_bin_bcast / cpy / get_rows / l2_norm / rope / ssm_conv | ~3.3 | ~4% | small |
 | (decode kernels: gemv, sequential GDN, etc.) | - | - | not part of pp512 |
 
-pp512 wall = 512 / ~6150 = ~83 ms (noisy). The shares above sum to ~90% of that.
+pp512 wall = 512 / ~6550 = ~78 ms (noisy). The shares above sum to ~90% of that.
 
 The GDN share is now split nearly evenly: phase A (gdn_chunk_prepare, ~4.9
 ms/pp512, 23 syncs, 1 CTA/CU at 58 KB LDS) and phase B (gdn_chunk_state,
@@ -175,21 +176,37 @@ ac+k loads ~62 us, FMA/sync floor ~206 us).
   Realistic remaining ideas: none cheap - revisit only with a fresh profile.
 - Validation: same as L3.
 
-### L5. concat_non_cont: delta-net ssm conv plumbing (4.7 ms/pp512)
+### L5. concat_non_cont: delta-net ssm conv plumbing - DONE 2026-08-06 evening, pp512 +4%
 
-- Kernel: concat_non_cont, 24 launches/pp512, 4.7 ms. It assembles the ssm
-  conv input: `conv_input = ggml_concat(conv_states, qkv_mixed, 0)` in
-  src/models/delta-net-base.cpp (line ~472), feeding ssm_conv_long_token_f32.
-- Why slow: it moves qkv_mixed (activation) + conv_states into a fresh
-  contiguous buffer every layer; the data is L2/DRAM round-tripped.
-- Approach: check if ssm_conv can read the pieces in place (the conv kernel
-  is strided anyway - conv_states and qkv_mixed are already contiguous
-  individually; conv over a non-contiguous input needs a per-row offset
-  table, which the kernel signature does not have). If not feasible, this is
-  the lowest-effort: nothing.
-- Expected: 4.7 -> ~0 if fusable, pp512 +5%.
-- Validation: generation parity + PPL.
-- Depends on: reading ssm_conv_long_token_f32 first.
+- DONE (commits below): the ssm_conv input assembly is fused into the conv.
+  New op form `ggml_ssm_conv_2src(ctx, conv_states, qkv, c)` (same GGML_OP_SSM_CONV
+  code, optional src[2] = conv states) reads the two contiguous pieces directly:
+  conv_states (position-major) + qkv_mixed (channel-fastest, UNTRANSPOSED) with a
+  position-major smem tile. The old transpose+concat+conv_input buffer is gone.
+  Measured: concat_non_cont 0 launches (was 24, 4.7 ms/pp512); the fused long-token
+  kernel is ~0.6 ms/pp512 (24 launches). pp512 6303 -> 6538-6554 (+4%), tg64
+  unchanged. PPL 6.2677 exact; generation matches; 47/47 GDN + 83/83 SSM_CONV
+  (incl. 24 new test_ssm_conv_2src cases: d_conv 3/4/9 x d_inner 1024/1536/2048 x
+  n_t 1/32/64).
+- Graph: build_conv_state returns the fused conv output; the state-save view is
+  now the transpose of a qkv-tail view (the cache stores [position][channel] with
+  the position dim fastest, and the save cpy scatters by the src flat index). The
+  concat is only built when a state window overlaps the conv_states piece
+  (n_t < d_conv-1, or rollback slots with small batches) - decode keeps it, at
+  trivial cost. The conv is expanded before the state-save cpy to keep the
+  read-before-write ordering on conv_states_all.
+- Files: ggml.c/h (ggml_ssm_conv_2src), ssm-conv.cu (fused short + long kernels,
+  dispatch branch on src[2]), ggml-cpu/ops.cpp (2-src reference), ggml-cuda.cu
+  (supports_op uses ne[0] for the 2-src form), delta-net-base.cpp + models.h
+  (build_conv_state), qwen35/moe/3next.cpp (call sites), test-backend-ops.cpp
+  (test_ssm_conv_2src).
+- Pitfalls recorded in section 4: the qkv layout is channel-fastest (c*4 + t*nb1),
+  so a fixed channel's token window is NOT contiguous - the smem tile must be
+  staged coalesced along channels. ggml_view_3d's dim0 stride is ALWAYS the
+  element size (nb reset in ggml_new_tensor_impl) - a strided-token view is
+  impossible; use transpose-of-view instead. The cpy_scalar flat-index mapping
+  follows the SRC ne00, and the state cache layout is position-fastest (row
+  p + c*(d_conv-1)), which the reshape_3d read side matches.
 
 ### L6. quantize_fp8 fusion (small)
 
@@ -295,13 +312,36 @@ GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
   (closure rewrite + scan) moved phase A only 293 -> 276 us. The real costs
   were the 512 scalar global loads/thread (v in k_cumsum, q in attn_causal)
   - vectorizing those to float4 was the big win (276 -> 210 us).
+- qkv_mixed is channel-fastest: qkv[c][t] at c*4 + t*nb1, so a fixed channel's
+  token window is strided by d_inner*4. Any kernel reading the qkv window (the
+  fused ssm_conv) must stage coalesced along CHANNELS (position-major smem
+  tile, smem[p*128 + c]); staging along tokens (channel-major tile) reads
+  garbage and faults.
+- ggml_view_3d's dim0 stride is ALWAYS the element size: ggml_new_tensor_impl
+  resets nb (nb[0] = type_size, nb[1] = nb[0]*ne[0], nb[2] = nb[1]*ne[1]), and
+  view_3d only overrides nb[1]/nb[2]. A token-strided window over a
+  channel-fastest tensor CANNOT be expressed as a view; use transpose-of-view
+  (ggml_view_tensor copies the parent nb, so transpose of a view keeps the
+  correct strides). The first state-view attempt read a silent (p+c) channel
+  mix (PPL 6.42, decode GPU fault) - caught only by the full PPL gate.
+- The conv-state cache is position-fastest: row index p + c*(d_conv-1). The
+  state-save cpy_scalar scatters by the src flat index (ne00 = n_state), and
+  the next batch's build_rs (get_rows + reshape_3d) reads the same layout -
+  the old concat-based save and the new qkv-tail transpose view are bit-exact
+  (/tmp/dbg_state2.cpp: old-vs-new maxerr=0).
+- Graph write-before-read hazard: a state-save cpy whose source has no data
+  dependency on the state buffer (e.g. a qkv view) can run before the op that
+  reads the state. The old concat-based save was implicitly ordered by the
+  concat's dependency on conv_states. Fix: expand the reading op (the fused
+  conv) before the cpy - the graph executes nodes in insertion order. Expanding
+  it AFTER the cpy (even in the same function) does not reorder.
 
 ## 5. Suggested order for the next session
 
-1. Re-bench to confirm the working tree matches section 0 (expect ~6320 pp512
-   with the L2 repack; the box is noisy - prefer rocprof kernel times for A/B).
-2. L5 (concat_non_cont, 4.7 ms/pp512) is the next live lever: check if ssm_conv
-   can read the two contiguous pieces in place (it needs a per-row offset table
-   the signature does not have). If not fusable, L5 is nothing.
-3. L6 (quantize_fp8 fusion) and L7 (Cijk BF16 -> fp8) only after L5. The GDN
-   levers (L3/L4) and the wmma levers (L1/L2) are spent.
+1. Re-bench to confirm the working tree matches section 0 (expect ~6538-6554 pp512
+   after the L5 concat fusion; the box is noisy - prefer rocprof kernel times for A/B).
+2. L6 (quantize_fp8 fusion, ~6.3 ms/pp512) is the next live lever: fuse the f32->fp8
+   activation staging into the wmma GEMM's staging (read f32 and quantize in-kernel;
+   4x the read bytes but removes the ~300 MB round-trip).
+3. L7 (Cijk BF16 -> fp8 projections) only after L6. The GDN levers (L3/L4), the
+   wmma levers (L1/L2) and the conv plumbing (L5) are spent.

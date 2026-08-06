@@ -450,7 +450,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         llm_graph_input_rs * inp,
         ggml_tensor *        conv_states_all,
         ggml_tensor *        qkv_mixed,
-        int64_t              conv_kernel_size,
+        ggml_tensor *        conv_kernel,
         int64_t              conv_channels,
         int                  il) {
     const auto * mctx_cur = inp->mctx;
@@ -459,32 +459,76 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     const auto mem_size = mctx_cur->get_size();
 
     const int64_t n_seqs = ubatch.n_seqs;
+    const int64_t n_t    = qkv_mixed->ne[1];
 
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
-    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+    const int64_t conv_kernel_size = conv_kernel->ne[0];
+    const int64_t n_state          = conv_kernel_size - 1;
+
+    conv_states = ggml_reshape_3d(ctx0, conv_states, n_state, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
-    cb(qkv_mixed, "qkv_mixed_transposed", il);
+    // the fused conv reads conv_states (view of conv_states_all); expand it before the
+    // state-save cpy below, which writes conv_states_all and has no data dependency on it
+    // (its source is a qkv view) - the graph executes nodes in insertion order, so this
+    // guarantees the conv sees the pre-batch state.
+    ggml_tensor * conv_output = ggml_ssm_conv_2src(ctx0, conv_states, qkv_mixed, conv_kernel);
+    cb(conv_output, "conv_output_raw", il);
+    ggml_build_forward_expand(gf, conv_output);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
-    cb(conv_input, "conv_input", il);
-
-    const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
+    const int64_t row_count = n_state * conv_channels;
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
 
+    // the saved conv state is the last n_state stream positions; for prefill-sized batches the
+    // whole window lives in qkv_mixed, so the concat (and its memory round-trip) can be skipped.
+    // small batches / rollback slots can overlap the conv_states piece and keep the concat.
+    bool window_in_qkv = true;
     if (cparams.n_rs_seq == 0) {
-        const int64_t s_idx  = conv_input->ne[0] - conv_states->ne[0];
+        window_in_qkv = n_t >= n_state;
+    } else {
+        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        for (int64_t t = 1; t <= K; ++t) {
+            if (std::max<int64_t>(0, n_t - K + t) < n_state) {
+                window_in_qkv = false;
+                break;
+            }
+        }
+    }
+
+    ggml_tensor * conv_input = nullptr;
+    if (!window_in_qkv) {
+        ggml_tensor * qkv_T = ggml_transpose(ctx0, qkv_mixed);
+        cb(qkv_T, "qkv_mixed_transposed", il);
+        conv_input = ggml_concat(ctx0, conv_states, qkv_T, 0);
+        cb(conv_input, "conv_input", il);
+    }
+
+    auto build_state_view = [&](int64_t s_idx) -> ggml_tensor * {
+        if (window_in_qkv) {
+            // the state cache stores [position][channel] with the position dim fastest, and the
+            // state-save cpy scatters by the src flat index (ne00 = n_state). qkv is
+            // channel-fastest, so take the last-n_state-token tail and transpose it to
+            // position-fastest - all view ops, no data movement.
+            ggml_tensor * tail = ggml_view_3d(ctx0, qkv_mixed,
+                    conv_channels, n_state, n_seqs,
+                    qkv_mixed->nb[1], qkv_mixed->nb[2],
+                    (s_idx - n_state) * qkv_mixed->nb[1]);
+            return ggml_transpose(ctx0, tail);
+        }
+        return ggml_view_3d(ctx0, conv_input,
+                n_state, conv_channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, s_idx));
+    };
+
+    if (cparams.n_rs_seq == 0) {
+        const int64_t s_idx  = n_t;
         const int64_t s_slot = 0;
 
-        ggml_tensor * conv_state_last =
-            ggml_view_3d(ctx0, conv_input,
-                    conv_kernel_size - 1, conv_channels, n_seqs,
-                    conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, s_idx));
+        ggml_tensor * conv_state_last = build_state_view(s_idx);
         cb(conv_state_last, "conv_state_last", il);
 
         ggml_tensor * conv_state_update =
@@ -502,14 +546,10 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
         for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+            const int64_t s_idx  = std::max<int64_t>(0, n_t - K + t);
             const int64_t s_slot = K - t;
 
-            ggml_tensor * conv_state_last =
-                ggml_view_3d(ctx0, conv_input,
-                        conv_kernel_size - 1, conv_channels, n_seqs,
-                        conv_input->nb[1], conv_input->nb[2],
-                        ggml_row_size(conv_input->type, s_idx));
+            ggml_tensor * conv_state_last = build_state_view(s_idx);
 
             ggml_tensor * conv_state_update =
                 ggml_view_2d(ctx0,
@@ -521,7 +561,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         }
     }
 
-    return conv_input;
+    return conv_output;
 }
 
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
