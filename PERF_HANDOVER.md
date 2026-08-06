@@ -160,11 +160,11 @@ rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /llm/
 
 ## 9. Next-session suggested order
 
-1. Confirm working tree matches this doc (git log, re-bench pp512 ~ 5914).
-2. L1 (delta-net): port aiter's chunked gated-delta-rule kernel
-   (`/home/stew675/aiter/csrc/kernels/chunk_gated_delta_rule_fwd_h.cu`, gfx1201
-   path) into ggml-cuda; verify the gfx1201 dispatch fires; f32 intermediate
-   precision parity (PPL check); bench pp512.
+1. Confirm working tree matches this doc (git log, re-bench pp512 ~ 5925).
+2. L1 (delta-net): the chunked kernel exists but is SLOWER than the sequential
+   (pp512 4200 vs 5925) - its phase A/B matmuls are naive (untiled, global
+   reads). Optimize: smem-stage k/v/q, tile the [64x64]@[64x128] matmuls, cut
+   the closure's 126 barriers, then re-enable by default (see section 11).
 3. L2 (weight repack): re-profile the staging share first; implement the
    in-memory repack; vectorize sA staging; PPL + bench.
 4. Re-evaluate the +50% target with both in; then decide if L3/L4/L5 are worth it.
@@ -195,3 +195,46 @@ New GGUF: /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf (5.36 GiB, 442
 Left on the table (decode): gemv 496 -> ~520 GB/s (vectorized x loads, 8-block
 ILP), fuse quantize_fp8 into the gemv (226 launches/step), delta-net 0.41
 ms/step. Roughly +4% if all taken.
+
+## 11. Delta-net chunked session log (2026-08-05 night)
+
+Goal: speed up gated_delta_net_cuda (17% of pp512) by replacing the sequential
+per-token loop with a chunked formulation.
+
+KEY FINDING: aiter's chunk_gated_delta_rule_fwd_h.cu does NOT run on gfx1201 -
+op_tests/test_gated_delta_rule.py skips it on gfx12
+("kernel does not support gfx12!"). The handover's "aiter has a gfx1201 port"
+premise was wrong. The __gfx1201__ guard there is only for a buffer-resource
+constant. So no port; we implemented our own chunked kernel.
+
+Status: CORRECT but SLOWER. ggml-cuda/gated_delta_net.cu has gdn_chunk_prepare
+(phase A: per head x seq x chunk of 64 - decay cumsum, closure (I-A)^-1 via
+forward substitution, k_cumsum = attn @ (beta v), k_cumdecay = attn @ (beta k P),
+attn_causal = L .* (q^T k)) and gdn_chunk_state (phase B: per head x seq x
+V-slice of 8 - v_new = k_cumsum - k_cumdecay @ S, o = P .* (q @ S) + attn_causal
+@ v_new, S = P_last S + (k .* delta) @ v_new). Opt-in via GGML_CUDA_GDN_CHUNKED=1;
+off by default because pp512 = 4200 vs 5925 sequential.
+
+Math: validated in python (/tmp/validate_chunked.py) against the op recurrence
+(aiter's chunk_gated_delta_rule_ref structure, decay kept inside via
+L[i][j] = exp(decay_i - decay_j)). All 45 GATED_DELTA_NET backend-ops tests pass
+on BOTH paths (add 4 S_v=128 prefill cases to the eval set). PPL 6.30 vs 6.26
+baseline; generation matches.
+
+Bugs found and fixed (do not rediscover):
+- P = exp(cumsum(gate)) underflows to 0 for strong decay (cumsum < -88) ->
+  P_i/P_j = 0/0 = NaN. Keep the cumsum and always take exp(diff).
+- Phase-A scratch was indexed per chunk only, not per (head, seq): heads raced
+  on the same scratch (outputs looked like adjacent heads' data).
+- The decay_scratch store used tid = 0..127 over a 64-float per-head region:
+  threads 64-127 wrote garbage into the next head's region (nondeterministic
+  per-head corruption; single-head tests passed, multi-head flaky).
+- cudaStreamSynchronize / cudaEventCreate between the two kernels is ILLEGAL
+  during CUDA graph capture ("operation not permitted when stream is
+  capturing"). The kernels are on the same stream; no sync needed.
+
+Why it is slow: ~2x the FLOPs of the sequential kernel (closure + materialized
+k_cumsum/k_cumdecay/attn_causal) with untiled matmuls reading global memory and
+126 barriers in the closure. Next session: tile the matmuls with smem staging
+(phase A smem budget: s_attn 16.6 KB + s_k 32 KB fits one CTA/CU), reduce the
+closure barrier count, then re-enable by default.

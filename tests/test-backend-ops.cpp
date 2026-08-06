@@ -9674,6 +9674,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 1, 128, 2, 1));    // chunked 2 tokens (tail)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 2, 1));   // chunked 2 tokens 32 heads
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));    // chunked 4 heads full chunk
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 1, 128, 3, 1));    // chunked 3 tokens (tail)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 1, 128, 64, 1));   // chunked full chunk
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));   // chunked prefill PP-64
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 127, 1));  // chunked prefill PP-127 (tail)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1));  // chunked prefill PP-256
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));   // chunked prefill PP-512 4 heads
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
     // KDA (vector gate)
