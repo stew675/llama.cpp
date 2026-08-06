@@ -125,7 +125,8 @@ class ModelBase:
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
                  fp8_as_q8: bool = False,
-                 fp8_output_weight: bool = False):
+                 fp8_output_weight: bool = False,
+                 fp8_delta_net_in_proj: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -158,6 +159,7 @@ class ModelBase:
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
         self._fp8_output_weight = fp8_output_weight
+        self._fp8_delta_net_in_proj = fp8_delta_net_in_proj
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.

@@ -14,16 +14,17 @@ stewfp8-ow.gguf` (24 delta-net layers, H=32 heads, K=V=128, neqk1=16).
 
 ---
 
-## 0. Current state (verified 2026-08-06 evening, after the L5 concat-fusion session)
+## 0. Current state (verified 2026-08-06, after the L7 in-proj fp8 session)
 
 | metric | value | notes |
 |---|---|---|
-| pp512 (chunked) | 6818-6841 (was 6538-6554) | quantize_fp8_warp rewrite (+~4%) |
-| tg64 | 89.2-89.6 | decode untouched, sequential GDN |
-| PPL | 6.2677 | matches baseline exactly; generation matches |
-| backend tests | 47/47 GATED_DELTA_NET pass | + 83/83 SSM_CONV (incl. new 2-src cases) |
-| wmma kernel | ~186-188 us/launch avg | unchanged |
+| pp512 (chunked) | 7184-7260 (was 6818-6841) | L7: in_proj_a/b to fp8 (+5-6%) |
+| tg64 | 88.3-88.5 (was 89.2-89.6) | -1%: alpha/beta decode now quantize+gemv instead of bf16 mmvf |
+| PPL | 6.2528 (was 6.2677) | within noise; generation matches |
+| backend tests | GDN + SSM_CONV all pass | unchanged |
+| wmma kernel | ~159 us/launch avg (was ~186-188) | 48 small alpha/beta launches (8 CTAs, ~24 us) drag the avg down |
 | GDN chunked per pp512 | ~10.9 ms (unchanged) | phase A 4.9 + phase B 5.9 |
+| Cijk (CK BF16 GEMM) | GONE (0 launches) | in_proj_a/b now on the fp8 wmma path |
 | concat_non_cont | GONE (0 launches) | fused into ssm_conv_2src |
 | quantize_fp8 per pp512 | ~2.5 ms (was ~5.1) | warp rewrite: 12.6 us/launch (was 25.4) on pp512 grids |
 
@@ -43,14 +44,13 @@ Profile command: `rocprofv3 -r -d /tmp/rocp_x -f csv -- llama-bench -m <model>
 (Duration = End_Timestamp - Start_Timestamp; Grid_Size_X = work-items,
 divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
 
-## 1. Where pp512 time goes (per-pp512, warmup removed, after the L5 concat fusion)
+## 1. Where pp512 time goes (per-pp512, warmup removed, after the L7 in-proj fp8)
 
 | kernel | ms/pp512 | share | note |
 |---|---|---|---|
-| mul_mat_fp8_wmma | ~38 | ~50% | prefill GEMMs, ~77 TFLOP/s |
+| mul_mat_fp8_wmma | ~39.4 | ~50% | prefill GEMMs (incl. the 48 alpha/beta in-proj GEMMs, ~1.9 ms) |
 | gdn_chunk_prepare + state | ~10.9 | ~14% | A ~4.9 + B ~5.9 |
-| quantize_fp8 | ~2.5 | ~3% | warp rewrite (was ~6.3); f32->fp8 staging |
-| Cijk (CK BF16 GEMM) | ~5.3 | ~7% | delta-net in/out projections |
+| quantize_fp8 | ~2.8 | ~4% | warp rewrite (was ~6.3); f32->fp8 staging |
 | ssm_conv_long_token_2src | ~0.6 | ~1% | fused conv (was concat 4.7 + conv 0.8) |
 | flash_attn_tile | ~3.0 | ~4% | 8 attention layers |
 | silu | ~2.9 | ~4% | |
@@ -58,7 +58,13 @@ divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
 | k_bin_bcast / cpy / get_rows / l2_norm / rope / ssm_conv | ~3.3 | ~4% | small |
 | (decode kernels: gemv, sequential GDN, etc.) | - | - | not part of pp512 |
 
-pp512 wall = 512 / ~6550 = ~78 ms (noisy). The shares above sum to ~90% of that.
+pp512 wall = 512 / ~7260 = ~70.5 ms (noisy). The shares above sum to ~90% of that.
+
+The Cijk (CK BF16 GEMM) row is GONE: the delta-net in/out projections
+(in_proj_a/b = ssm_alpha/ssm_beta, 48 launches/pp512 at ~112 us each = 5.37 ms)
+are now F8_E4M3 in the GGUF and run on the wmma path (~24 us wmma + ~11 us
+quantize per launch = ~1.7 ms/pp512). The remaining in_proj cost is split
+across the wmma (~1.9 ms) and quantize (~0.3 ms) rows above.
 
 The GDN share is now split nearly evenly: phase A (gdn_chunk_prepare, ~4.9
 ms/pp512, 23 syncs, 1 CTA/CU at 58 KB LDS) and phase B (gdn_chunk_state,
@@ -246,16 +252,32 @@ ac+k loads ~62 us, FMA/sync floor ~206 us).
   (hw-vs-sw encoder bit-exactness).
 - Depends on: nothing.
 
-### L7. Cijk BF16 GEMMs (delta-net in/out projections, 5.3 ms/pp512)
+### L7. Cijk BF16 GEMMs (delta-net in/out projections) - DONE 2026-08-06, pp512 +5-6%
 
-- The qwen35 delta-net projections are BF16 in the GGUF and run on rocBLAS/
-  CK. Moving them to fp8 (they are linear projections like the rest) would
-  put them on the wmma path; the L1/L2 gains then apply. The conversion
-  script (convert_hf_to_gguf.py) already has the fp8 machinery.
-- Expected: cuts ~5.3 ms by the wmma-vs-CK ratio; medium effort (conversion +
-  PPL re-gate).
-- Depends on: decision to quantize more tensors (PPL risk; the handover's L5
-  lists the quantizable set: norms, conv1d, in_proj_a/b, A_log).
+- DONE (commits below): in_proj_a/b (ssm_alpha/ssm_beta, [32, 2560] BF16 in the
+  GGUF) are now F8_E4M3, so the 48 Cijk launches/pp512 (~5.37 ms at ~112 us
+  each for a 32x512x2560 GEMM) run on the fp8 path instead: ~24 us wmma
+  (8 CTAs, m_pad 128) + ~11 us quantize per launch = ~1.7 ms/pp512. pp512
+  6818-6841 -> 7184-7260 (+5-6%). tg64 89.2-89.6 -> 88.3-88.5 (-1%: the
+  alpha/beta decode GEMMs move from the bf16 mmvf path to quantize_fp8 +
+  mul_mat_fp8_gemv). PPL 6.2528 (was 6.2677, within noise); generation
+  matches; GDN + SSM_CONV backend tests pass.
+- Conversion: new flag `--fp8-delta-net-in-proj` in convert_hf_to_gguf.py,
+  wired through conversion/base.py; the packing lives in
+  `_LinearAttentionVReorderBase._generate_fp8_in_proj` (conversion/qwen.py):
+  same V-head reorder as modify_tensors (head_dim=1), then the standard
+  block_f8_e4m3 pack (d = BF16(amax/448) per 128-col block, q = fp8(w/d)).
+  The 32 gate rows share ONE 128-row scale block (ceil(32/128) = 1), same
+  as the model's own scale convention. The fp8 quantization error is the
+  same regime as the model's own fp8 tensors (mean rel ~2.25% vs 2.256% in
+  the conversion summary).
+- The rest of the old "quantizable set" (norms, conv1d, A_log) are NOT GEMMs
+  (elementwise/conv ops, F32, no kernel change would apply) - nothing left
+  there. The only other BF16 tensors are token_embd (get_rows, keep BF16)
+  and eh_proj (not in the 4B main path).
+- Recovery lever for the tg64 cost: fuse the quantize into the decode gemv
+  (already listed in PERF_HANDOVER section 10 as a decode item; would also
+  recover the other 226 decode quantize launches).
 
 ### L8. Small kernels (silu 2.9, rms_norm 4.4, k_bin_bcast 1.9) - skip
 
@@ -389,11 +411,12 @@ GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
 
 ## 5. Suggested order for the next session
 
-1. Re-bench to confirm the working tree matches section 0 (expect ~6818-6841 pp512
-   after the L6 quantize rewrite; the box is noisy - prefer rocprof kernel times for A/B).
-2. L7 (Cijk BF16 -> fp8 projections, ~5.3 ms/pp512) is the next live lever: move the
-   delta-net in/out projections to fp8 so they run on the wmma path. Medium effort
-   (conversion + PPL re-gate); the quantizable set is norms, conv1d, in_proj_a/b, A_log.
-3. L1 (mul_mat_fp8_wmma) and L3/L4 (GDN phase A/B) are spent; L5 (conv fusion) and
-   L6 (quantize rewrite) are done. L8 (small kernels) - skip unless a specific one
-   shows up hot in a fresh profile.
+1. Re-bench to confirm the working tree matches section 0 (expect ~7184-7260 pp512
+   after the L7 in-proj fp8 conversion; the box is noisy - prefer rocprof kernel times for A/B).
+2. L1 (mul_mat_fp8_wmma), L3/L4 (GDN phase A/B) and L7 (in-proj fp8) are spent;
+   L5 (conv fusion), L6 (quantize rewrite) and L7 are done. L8 (small kernels) - skip
+   unless a specific one shows up hot in a fresh profile.
+3. If pp512 headroom is needed again, the remaining structural ideas are L1's kpacked
+   smem layout for A (blocked on the aiter layout problem) and the decode-side fused
+   quantize-in-gemv (recovers the L7 tg64 cost plus the other 226 decode quantize
+   launches, ~+4% tg64 per the decode session notes).

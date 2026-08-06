@@ -161,6 +161,11 @@ def parse_args() -> argparse.Namespace:
         help="Also store an FP8 output.weight copy of token_embd so lm_head runs on the FP8 path "
              "(keeps token_embd BF16 for the input embedding lookup).",
     )
+    parser.add_argument(
+        "--fp8-delta-net-in-proj", action="store_true",
+        help="Also quantize the delta-net gate projections (in_proj_a/in_proj_b) to FP8 so they "
+             "run on the native FP8 GEMM path instead of the BF16 CK/rocBLAS path.",
+    )
 
     parser.add_argument(
         "--target-model-dir", type=str, default=None,
@@ -297,6 +302,7 @@ def main() -> None:
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
                                      fp8_output_weight=args.fp8_output_weight,
+                                     fp8_delta_net_in_proj=args.fp8_delta_net_in_proj,
                                      )
 
         if args.vocab_only:

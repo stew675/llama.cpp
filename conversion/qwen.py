@@ -4,12 +4,13 @@ import json
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, ModelBase, TextModel, gguf, logger
 
 
 @ModelBase.register("QWenLMHeadModel")
@@ -609,6 +610,63 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
             return apply_col_perm(weight, scale, col_perm)
 
         return weight, scale
+
+    def _generate_fp8_tensors(self):
+        super()._generate_fp8_tensors()
+        if self._fp8_delta_net_in_proj:
+            self._generate_fp8_in_proj()
+
+    def _generate_fp8_in_proj(self):
+        """Quantize the delta-net gate projections (in_proj_a/in_proj_b) to
+        block_f8_e4m3 so they run on the native FP8 GEMM path instead of the
+        BF16 CK/rocBLAS path. Same 128-col-block scale convention as the rest
+        of the FP8 tensors (scale grid [ceil(out/128), ceil(in/128)])."""
+        num_k_heads = self.hparams.get("linear_num_key_heads", 0)
+        num_v_heads = self.hparams.get("linear_num_value_heads", 0)
+        num_v_per_k = num_v_heads // num_k_heads if num_k_heads else 0
+
+        consumed: list[str] = []
+        for name in list(self.model_tensors.keys()):
+            if not name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
+                continue
+            w = LazyTorchTensor.to_eager(self.model_tensors[name]())
+            if w.dtype == torch.float8_e4m3fn or w.dim() != 2:
+                continue
+
+            M, N = w.shape
+            if N % 128 != 0:
+                logger.warning("%s: FP8 column count %d is not a multiple of 128, skipping", name, N)
+                continue
+            if M > 128:
+                # the gate rows share one 128-row block; > 128 rows would need multi-block packing
+                logger.warning("%s: %d rows do not fit one FP8 row block, skipping", name, M)
+                continue
+
+            if num_k_heads > 0 and num_v_heads > 0 and num_k_heads != num_v_heads:
+                # same V-head reorder as modify_tensors (head_dim=1 for the gate rows)
+                w = self._reorder_v_heads(w, 0, num_k_heads, num_v_per_k, 1)
+
+            nb = N // 128
+            wf = w.float().view(1, M, nb, 128)
+            amax = wf.abs().amax(dim=(1, 3))          # [1, nb] - all gate rows share the one row block
+            s_f32 = amax / 448.0
+            s_bf16 = s_f32.to(torch.bfloat16)         # stored scale (BF16-rounded)
+            q = (wf / s_f32.view(1, 1, nb, 1)).view(M, N).to(torch.float8_e4m3fn)
+
+            d = s_bf16.float().numpy().astype(np.float32)      # [1, nb]
+            q_bytes = q.view(torch.uint8).numpy()              # [M, N]
+            blocks = np.empty((M, nb, 132), dtype=np.uint8)
+            blocks[:, :, 0:4] = np.repeat(d, 128, axis=0)[:M].view(np.uint8).reshape(M, nb, 4)
+            blocks[:, :, 4:] = q_bytes.reshape(M, nb, 128)
+
+            new_name = self.map_tensor_name(name)
+            logger.info(f"Repacked {new_name} with quantization F8_E4M3")
+            self.gguf_writer.add_tensor(new_name, blocks.reshape(M, nb * 132),
+                                        raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+            consumed.append(name)
+
+        for name in consumed:
+            self.model_tensors.pop(name, None)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)

@@ -30,18 +30,20 @@ aiter inspection details. This file tracks ONLY the performance picture.
 | fp8 now (L2 weight repack, 2026-08-06) | **6319-6334** | **89.4-90.0** | ~+1.5% | ~-1% |
 | fp8 now (L5 conv fusion, 2026-08-06) | **6538-6554** | **89.4-90.0** | ~+5% | ~-1% |
 | fp8 now (L6 quantize rewrite, 2026-08-06) | **6818-6841** | **89.2-89.6** | ~+7% | ~-1% |
+| fp8 now (L7 in-proj fp8, 2026-08-06) | **7184-7260** | **88.3-88.5** | ~+13% | ~-1.5% |
 | target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
 | target generation (+10%) | - | ~100 | - | +10% |
 
 pp256: 5014, pp1024: 5446, pp2048: 5292, pp128: 3661 (high variance, use -r 5).
 
-Current authoritative numbers (2026-08-06 night, chunked GDN default, L6
-session): see LEVERS.md section 0. The box became noisy late on 2026-08-06
-(pp512 +/-60-170, occasionally much worse): trust rocprof kernel times
-(deterministic +/-3%) for A/B. GDN per pp512: phase A ~4.9 ms + phase B
-~5.9 ms (was 7.1 + 6.4). quantize_fp8 per pp512: ~2.5 ms (was ~5.1).
+Current authoritative numbers (2026-08-06, chunked GDN default, L7 session):
+see LEVERS.md section 0. The box is noisy (pp512 +/-60-170, occasionally much
+worse): trust rocprof kernel times (deterministic +/-3%) for A/B. GDN per
+pp512: phase A ~4.9 ms + phase B ~5.9 ms. quantize_fp8 per pp512: ~2.5 ms.
+The canonical GGUF is now the L7 build (in_proj_a/b F8_E4M3); the pre-change
+file is stewfp8-ow-bf16gate.gguf in the same directory.
 
-PPL 6.2572 (fp8-ow) vs 6.2508 (fp8, no ow) vs 6.2464 (Q8_0) on the small
+PPL 6.2528 (L7) vs 6.2677 (L6) vs 6.2464 (Q8_0) on the small
 /tmp/corpus_pride.txt corpus (all within error bars); generation matches the
 pre-change fp8 output on the same prompt/seed.
 
@@ -84,8 +86,9 @@ old L1-L5 below:
 Old L5 note that still matters: **do NOT quantize token_embd to fp8** without
 adding a get_rows fp8 kernel (getrows.cu has no F8_E4M3 case; CPU has no fp8
 kernels either). lm_head already runs fp8 via the `--fp8-output-weight` copy
-(token_embd stays BF16 for the input lookup). The quantizable set is norms,
-conv1d, in_proj_a/b, A_log (small).
+(token_embd stays BF16 for the input lookup). The old quantizable set (norms,
+conv1d, in_proj_a/b, A_log) is closed: in_proj_a/b are now F8_E4M3 (L7);
+norms/conv1d/A_log are not GEMMs (no fp8 kernel would apply).
 
 ## 4. Kernel facts (established this session, do not rediscover)
 
@@ -527,3 +530,53 @@ retry the fusion. (The fused kernel was removed from the tree; the rigs
 /tmp/bench_fused.cu and /tmp/bench_pairs.cu keep the A/B.)
 
 Next lever per LEVERS.md: L7 (Cijk BF16 -> fp8 projections, ~5.3 ms/pp512).
+
+## 18. L7: delta-net in/out projections to fp8 (2026-08-06, session)
+
+Goal: LEVERS.md L7 (the Cijk BF16 GEMMs, 5.3 ms/pp512). Result: the two
+remaining BF16 GEMM weights in the delta-net path (in_proj_a/b =
+ssm_alpha/ssm_beta, [32, 2560] each) are now F8_E4M3 in the GGUF, so the 48
+Cijk launches/pp512 run on the fp8 path instead. pp512 6818-6841 ->
+7184-7260 (+5-6%), tg64 89.2-89.6 -> 88.3-88.5 (-1%), PPL 6.2528 (was
+6.2677, within noise), generation matches, GDN + SSM_CONV backend tests
+pass. Commit: (see git log).
+
+Why the Cijk kernels were 5.37 ms/pp512: 48 launches (24 layers x alpha +
+beta) of a 32x512x2560 BF16 GEMM at ~112 us each - a thin m=32 shape that
+CK handles terribly (latency/grid bound, ~0.75 TFLOP/s effective). The fp8
+path per launch is ~11 us quantize_fp8_warp + ~24 us wmma (8 CTAs, m_pad
+128 so 4x the useful FLOPs on the row side) = ~35 us, ~3.2x faster. The
+alpha/beta GEMMs read the SAME cur activation, so each is quantized
+separately (2x the quantize work on that tensor).
+
+Conversion: new `--fp8-delta-net-in-proj` flag (convert_hf_to_gguf.py),
+wired via conversion/base.py; packing in
+`_LinearAttentionVReorderBase._generate_fp8_in_proj` (conversion/qwen.py).
+The BF16 weight is V-head-reordered exactly as modify_tensors does
+(head_dim=1), then packed block_f8_e4m3: d = BF16(amax/448) per 128-col
+block, q = fp8(w/d). The 32 gate rows share ONE 128-row scale block
+(ceil(32/128) = 1) - same as the model's own scale convention, and the
+measured quantization error is the same regime as the model's fp8 tensors
+(mean rel ~2.25% vs 2.256% in the conversion summary). Regenerate the
+canonical GGUF with the same invocation plus the new flag; the pre-change
+file is kept as stewfp8-ow-bf16gate.gguf.
+
+tg64 cost (-1%) and its recovery: in decode (n <= 16) the alpha/beta GEMMs
+moved from the bf16 mmvf path to quantize_fp8 (old kernel, ~1.28 us) +
+mul_mat_fp8_gemv, adding ~48-54 quantize launches per decode step (~60-70
+us/step, ~0.5-0.6% of the 11.1 ms step; the rest of the -1% is the extra
+launch/scheduling overhead). The recovery lever is the fused
+quantize-in-gemv already listed in section 10 as a decode item ("fuse
+quantize_fp8 into the gemv, 226 launches/step") - it would recover this
+plus the other 226 decode quantize launches (~+4% tg64 per that note). Not
+done here: decode is not the L7 target and the fused gemv is a separate
+kernel project.
+
+Also closed out: the rest of the old quantizable set (norms, conv1d, A_log)
+are not GEMMs - no fp8 kernel change applies. token_embd stays BF16 (get_rows
+has no fp8 kernel); eh_proj is not in the 4B main path. The only fp8-path
+quirks for the new tensors: m=32 < GGML_FP8_CTA_M (128), so the wmma kernel
+runs with m_pad 128 and its existing mi >= m bounds check handles the
+padding; the fp8_repack_weights launcher handles m < 65535 with grid.y = m
+(no row loop needed); the block_f8_e4m3 scale grid is [1, 20] (one row
+block), which np.repeat(d, 128, axis=0)[:M] replicates per row correctly.
