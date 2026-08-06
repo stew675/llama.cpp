@@ -560,13 +560,17 @@ __global__ void __launch_bounds__(256, 2) gdn_chunk_state(
         for (int r = 0; r < 16; ++r) {
             acc_S[r] = 0.0f;
         }
-        for (int t = 0; t < GDN_CHUNK; ++t) {
-            if (t < n_real) {
-                const float d = dlt[t];
-                const float vn = s_vnew[t][v];
+        for (int t4 = 0; t4 < GDN_CHUNK / 4; ++t4) {
+            const int t = 4 * t4;
+            const float4 d4 = *reinterpret_cast<const float4 *>(dlt + t);
+#pragma unroll
+            for (int tt = 0; tt < 4; ++tt) {
+                const int  tr = (t + tt < n_real) ? (t + tt) : (n_real - 1); // clamp: padded rows never contribute
+                const float d  = (t + tt < n_real) ? (tt == 0 ? d4.x : tt == 1 ? d4.y : tt == 2 ? d4.z : d4.w) : 0.0f;
+                const float vn = s_vnew[t + tt][v];
 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    const float2 kv = *reinterpret_cast<const float2 *>(kb + (int64_t) (t0 + t) * sq2 + 16 * row8 + 2 * r);
+                    const float2 kv = *reinterpret_cast<const float2 *>(kb + (int64_t) (t0 + tr) * sq2 + 16 * row8 + 2 * r);
                     acc_S[2 * r + 0] += d * kv.x * vn;
                     acc_S[2 * r + 1] += d * kv.y * vn;
                 }
