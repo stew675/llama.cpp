@@ -238,3 +238,46 @@ k_cumsum/k_cumdecay/attn_causal) with untiled matmuls reading global memory and
 126 barriers in the closure. Next session: tile the matmuls with smem staging
 (phase A smem budget: s_attn 16.6 KB + s_k 32 KB fits one CTA/CU), reduce the
 closure barrier count, then re-enable by default.
+
+## 12. Delta-net chunked: correctness fixed + phase B rewrite (2026-08-06)
+
+The chunked GDN is now BOTH correct and faster than the sequential kernel.
+Committed ef41a940a fixed the phase A closure (block forward substitution,
+see GDN_DEBUG_HANDOVER.md). This session rewrote phase B.
+
+Phase B before: gdn_chunk_state, 128 threads, V-slices of 8 (16 slices),
+scalar serial reductions, stride-8KB global k loads in the S update.
+33.82 ms per pp512 bench (48 launches x 704us, grid 32x16=512 CTAs).
+
+Phase B now: 256 threads, V-slices of 32 (4 slices), one state column per
+thread (32 cols per warp -> kd/q/k/ac loads are warp broadcasts, no L2
+amplification), 8 token rows per thread (steps 1/2) or 16 state rows
+(step 3). s_S (16 KB) + s_vnew (8 KB) smem -> 2 CTAs/CU, 1 wave (grid 128).
+12.82 ms per pp512 bench (48 x 267us). VGPR 160, scratch 0, LDS 24.6 KB.
+
+Scoreboard (pp512, stewfp8-ow, -p 512 -n 64 -r 5):
+- chunked before this session: 5436 (broken-ish phase B)
+- chunked now:               6068-6072  (sequential was 5878)
+- tg64 unchanged:            89.8
+PPL 6.2426 (sequential 6.2572), 47/47 GATED_DELTA_NET tests.
+
+Failed experiments this session (do not retry without a reason):
+- 16x16 thread grid with 4x2 register tiles + smem-staged kd/q/ac/k blocks:
+  192 VGPRs + 764-1028 B scratch spills -> 274 scratch instructions vs 308
+  FMAs in the ISA; 675-704us/launch. The register-tiled layout spreads the
+  V dimension across threads, which both amplifies shared-input L2 reads 16x
+  and blows the register budget.
+- 16x16 grid, no staging (direct L2 float4): 591-644us/launch (L2-bound).
+- __launch_bounds__(256,2) forcing 128 VGPRs: worse (more spills, 644us).
+Lesson: for this kernel shape (64x128x32 matmuls, S resident), thread-per-
+column with 32 cols/warp is the right layout - it makes every shared-input
+load a warp broadcast and keeps live registers near 40.
+
+Remaining perf (next session, in order):
+1. phase A (gdn_chunk_prepare) is now the bigger kernel: 14.2 ms vs phase B
+   12.8 ms. It runs 295us/launch at 1 CTA/CU (50 KB LDS), ~8x its FMA floor;
+   the closure's ~200 barriers and the serial M1/M2/M3 stages are the cost.
+2. phase B is still ~10x its FMA floor (267us for 4 chunks vs ~7us/chunk
+   theoretical); chunk-loop latency, not L2 bandwidth (61 MB/launch).
+   Candidates: prefetch next-chunk kd/q/ac/k during current-chunk compute
+   (needs smem or reg staging), 8 slices of 16 for more CTAs.

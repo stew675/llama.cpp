@@ -16,7 +16,7 @@
 //     k_cumdecay = attn @ (beta*k*P)
 //     attn_causal = L .* (q^T k)
 //
-//   phase B (gdn_chunk_state, one CTA per head x seq x V-slice):
+//   phase B (gdn_chunk_state, one CTA per head x seq x V-slice of 32):
 //     v_prime = k_cumdecay @ S
 //     v_new   = k_cumsum - v_prime
 //     o       = P .* (q @ S) + attn_causal @ v_new
@@ -28,7 +28,7 @@
 // the sequential kernel.
 
 #define GDN_CHUNK 64
-#define GDN_CHUNK_VSLICE 8
+#define GDN_CHUNK_VSLICE 32
 
 // phase A: per (head, seq, chunk). Block = 256 threads.
 __global__ void gdn_chunk_prepare(
@@ -326,9 +326,14 @@ __global__ void gdn_chunk_prepare(
     }
 }
 
-// phase B: per (head, seq, V-slice). Block = 128 threads. V-slices are
-// independent: each keeps its S columns resident across the chunk loop.
-__global__ void gdn_chunk_state(
+// phase B: per (head, seq, V-slice of 32). Block = 256 threads, one state
+// column per thread (32 cols per warp) so kd/q/k/ac loads are warp broadcasts:
+//   v_new = k_cumsum - k_cumdecay @ S
+//   o     = P .* (q @ S) + attn_causal @ v_new
+//   S     = P_last * S + (k .* delta)^T @ v_new
+// S stays resident in smem across the chunk chain. Thread (row8, v) owns 8
+// token rows (steps 1/2) or 16 state rows (step 3) of column v.
+__global__ void __launch_bounds__(256, 2) gdn_chunk_state(
         const float * __restrict__ q,
         const float * __restrict__ k,
         const float * __restrict__ curr_state,
@@ -352,7 +357,10 @@ __global__ void gdn_chunk_state(
     const int iq       = (int) (h % neqk1);
     const int tid      = threadIdx.x;
     const int v0       = vslice * GDN_CHUNK_VSLICE;
-    const int64_t hsc = (int64_t) hs * n_chunks; // per (head, seq) scratch base
+    const int64_t hsc  = (int64_t) hs * n_chunks;
+
+    const int row8 = tid / GDN_CHUNK_VSLICE; // 8-row block, 0..7
+    const int v    = tid % GDN_CHUNK_VSLICE; // state column within the slice
 
     __shared__ float s_S[128][GDN_CHUNK_VSLICE];
     __shared__ float s_vnew[GDN_CHUNK][GDN_CHUNK_VSLICE];
@@ -361,11 +369,15 @@ __global__ void gdn_chunk_state(
     const float * kb = k + (int64_t) seq * sq3 + (int64_t) iq * sq1;
     const float * sbase = curr_state + ((int64_t) seq * H + h) * (K * V);
 
-    // load this slice of the incoming state: S[k][v], flat k + v*K
-    for (int idx = tid; idx < 128 * GDN_CHUNK_VSLICE; idx += 128) {
-        const int kk = idx / GDN_CHUNK_VSLICE;
-        const int vv = idx % GDN_CHUNK_VSLICE;
-        s_S[kk][vv] = sbase[(v0 + vv) * K + kk];
+    // load this slice of the incoming state: S[k][v], stored flat v*K + k
+    for (int e = tid; e < 128 * GDN_CHUNK_VSLICE / 4; e += 256) {
+        const int vv  = e % GDN_CHUNK_VSLICE;
+        const int kk4 = 4 * (e / GDN_CHUNK_VSLICE);
+        const float4 sv = *reinterpret_cast<const float4 *>(sbase + (v0 + vv) * K + kk4);
+        s_S[kk4 + 0][vv] = sv.x;
+        s_S[kk4 + 1][vv] = sv.y;
+        s_S[kk4 + 2][vv] = sv.z;
+        s_S[kk4 + 3][vv] = sv.w;
     }
     __syncthreads();
 
@@ -380,60 +392,104 @@ __global__ void gdn_chunk_state(
         const float * dlt = delta_scratch + cc * GDN_CHUNK;
         const float P_last = P_last_scratch[cc];
 
-        // v_new[t][v] = k_cumsum[t][v] - sum_k k_cumdecay[t][k] * S[k][v]
-        for (int idx = tid; idx < GDN_CHUNK * GDN_CHUNK_VSLICE; idx += 128) {
-            const int t = idx / GDN_CHUNK_VSLICE;
-            const int v = idx % GDN_CHUNK_VSLICE;
-            float acc = 0.0f;
-            for (int kk = 0; kk < 128; ++kk) {
-                acc += kd[t * 128 + kk] * s_S[kk][v];
+        // v_new = k_cumsum - k_cumdecay @ S ; o_q = q @ S. Merged K loop: the
+        // s_S column is shared by the thread's 8 token rows.
+        float acc_v[8], acc_q[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            acc_v[r] = 0.0f;
+            acc_q[r] = 0.0f;
+        }
+        for (int kq = 0; kq < 128; kq += 4) {
+            float sS[4];
+#pragma unroll
+            for (int k2 = 0; k2 < 4; ++k2) {
+                sS[k2] = s_S[kq + k2][v];
             }
-            s_vnew[t][v] = kc[t * V + (v0 + v)] - acc;
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const float4 kdv = *reinterpret_cast<const float4 *>(kd + (8 * row8 + r) * K + kq);
+                float4 qv;
+                if (8 * row8 + r < n_real) {
+                    qv = *reinterpret_cast<const float4 *>(qb + (int64_t) (t0 + 8 * row8 + r) * sq2 + kq);
+                } else {
+                    qv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+                acc_v[r] += kdv.x * sS[0] + kdv.y * sS[1] + kdv.z * sS[2] + kdv.w * sS[3];
+                acc_q[r] += qv.x  * sS[0] + qv.y  * sS[1] + qv.z  * sS[2] + qv.w  * sS[3];
+            }
+        }
+
+        // v_new[t][v] = k_cumsum[t][v] - (k_cumdecay @ S)[t][v]
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            s_vnew[8 * row8 + r][v] = kc[(8 * row8 + r) * V + v0 + v] - acc_v[r];
         }
         __syncthreads();
 
-        // o[t][v] = P[t] * (q_t @ S) + sum_j attn_causal[t][j] * v_new[j][v]
-        for (int idx = tid; idx < GDN_CHUNK * GDN_CHUNK_VSLICE; idx += 128) {
-            const int t = idx / GDN_CHUNK_VSLICE;
-            const int v = idx % GDN_CHUNK_VSLICE;
+        // o = P .* (q @ S) + attn_causal @ v_new
+        float acc_o[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            acc_o[r] = expf(dc[8 * row8 + r]) * acc_q[r];
+        }
+        for (int jq = 0; jq < GDN_CHUNK; jq += 4) {
+            float vn[4];
+#pragma unroll
+            for (int k2 = 0; k2 < 4; ++k2) {
+                vn[k2] = s_vnew[jq + k2][v];
+            }
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const float4 av = *reinterpret_cast<const float4 *>(ac + (8 * row8 + r) * GDN_CHUNK + jq);
+                acc_o[r] += av.x * vn[0] + av.y * vn[1] + av.z * vn[2] + av.w * vn[3];
+            }
+        }
+
+        // write o to dst
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const int t = 8 * row8 + r;
             if (t < n_real) {
-                const float * qt = qb + (int64_t) (t0 + t) * sq2;
-                float acc = 0.0f;
-                for (int kk = 0; kk < 128; ++kk) {
-                    acc += qt[kk] * s_S[kk][v];
-                }
-                float o = expf(dc[t]) * acc;
-                const float * act = ac + t * GDN_CHUNK;
-                float acc2 = 0.0f;
-                for (int j = 0; j < GDN_CHUNK; ++j) {
-                    acc2 += act[j] * s_vnew[j][v];
-                }
-                o += acc2;
-                dst[((int64_t) (seq * n_tokens + t0 + t) * H + h) * V + (v0 + v)] = scale * o;
+                dst[((int64_t) (seq * n_tokens + t0 + t) * H + h) * V + v0 + v] = scale * acc_o[r];
             }
         }
-        __syncthreads();
 
-        // S[k][v] = P_last * S[k][v] + sum_t (k[t][k] * delta[t]) * v_new[t][v]
-        for (int idx = tid; idx < 128 * GDN_CHUNK_VSLICE; idx += 128) {
-            const int kk = idx / GDN_CHUNK_VSLICE;
-            const int v  = idx % GDN_CHUNK_VSLICE;
-            float acc = 0.0f;
-            const float * kt = kb + (int64_t) t0 * sq2 + kk;
-            for (int t = 0; t < n_real; ++t) {
-                acc += kt[(int64_t) t * sq2] * dlt[t] * s_vnew[t][v];
+        // S = P_last * S + (k .* delta)^T @ v_new. k[t][k] is contiguous in k
+        // (float2 per 2 rows), v_new[t][v] shared by the thread's 16 k rows.
+        float acc_S[16];
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            acc_S[r] = 0.0f;
+        }
+        for (int t = 0; t < GDN_CHUNK; ++t) {
+            if (t < n_real) {
+                const float d = dlt[t];
+                const float vn = s_vnew[t][v];
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const float2 kv = *reinterpret_cast<const float2 *>(kb + (int64_t) (t0 + t) * sq2 + 16 * row8 + 2 * r);
+                    acc_S[2 * r + 0] += d * kv.x * vn;
+                    acc_S[2 * r + 1] += d * kv.y * vn;
+                }
             }
-            s_S[kk][v] = s_S[kk][v] * P_last + acc;
+        }
+
+        // in-place S update; the barrier below publishes it to the next chunk
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            s_S[16 * row8 + r][v] = P_last * s_S[16 * row8 + r][v] + acc_S[r];
         }
         __syncthreads();
     }
 
     // write the final state slice
     float * sbase_out = state_out + ((int64_t) seq * H + h) * (K * V);
-    for (int idx = tid; idx < 128 * GDN_CHUNK_VSLICE; idx += 128) {
-        const int kk = idx / GDN_CHUNK_VSLICE;
-        const int vv = idx % GDN_CHUNK_VSLICE;
-        sbase_out[(v0 + vv) * K + kk] = s_S[kk][vv];
+    for (int e = tid; e < 128 * GDN_CHUNK_VSLICE / 4; e += 256) {
+        const int vv  = e % GDN_CHUNK_VSLICE;
+        const int kk4 = 4 * (e / GDN_CHUNK_VSLICE);
+        const float4 sv = make_float4(s_S[kk4 + 0][vv], s_S[kk4 + 1][vv], s_S[kk4 + 2][vv], s_S[kk4 + 3][vv]);
+        *reinterpret_cast<float4 *>(sbase_out + (v0 + vv) * K + kk4) = sv;
     }
 }
 
@@ -650,7 +706,7 @@ static void launch_gated_delta_net(
         }
         {
             const dim3 grid_b(H * n_seqs * n_slices, 1, 1);
-            const dim3 block_b(128, 1, 1);
+            const dim3 block_b(256, 1, 1);
             const ggml_cuda_kernel_launch_params lp_b(grid_b, block_b, 0, stream);
             ggml_cuda_kernel_launch(gdn_chunk_state, lp_b,
                 q_d, k_d, s_d,

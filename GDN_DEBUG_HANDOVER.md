@@ -197,12 +197,16 @@ the file after the bisect), chunked default-ON, closure fix, dump/dbg instrument
 (phase A tiling + closure fix + default-on are the intended direction; phase B rewrites need re-validation;
 dump/dbg must be removed).
 
-## 11. Performance context (if correctness gets fixed)
+## 11. Performance context (RESOLVED 2026-08-06: chunked now beats sequential)
 
-- Phase A tiling took gdn_chunk_prepare from 76ms -> 12ms per 48 launches (2 passes of 24 layers).
-- 4-slice phase B: 16.4ms -> 15.5ms (barely moved; L2-latency-bound on scratch streams).
-- Chunked pp512 = 6059 (4-slice era) vs sequential 5925. Once correct, the chunked should be re-benched.
-- Decode (tg64 ~89-90) is untouched by all this (sequential path for n_tokens=1).
+- Phase A tiling took gdn_chunk_prepare from 76ms -> 12-14ms per 48 launches.
+- Phase B was rewritten (128 threads/16 slices -> 256 threads/4 slices, thread-per-column
+  with warp-broadcast loads, see PERF_HANDOVER.md section 12): 33.8ms -> 12.8ms.
+- Chunked pp512 = 6068-6072 vs sequential 5878 (chunked WINS). PPL 6.2426, 47/47 tests.
+- The lost 4-slice phase B (15.5ms) is superseded: the new kernel (12.8ms) is simpler
+  and validated. The dump infrastructure for re-validation lives in /tmp/validate_gdn_dump.py.
+- Decode (tg64 ~89-90) is untouched (sequential path for n_tokens=1).
+- Next perf target: phase A (14.2ms, closure-barrier-bound at 1 CTA/CU).
 
 ## 12. Files
 
