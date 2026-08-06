@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
+#include <cstdlib>
 
 // ================= chunked gated delta rule (prefill path) =================
 //
@@ -29,7 +30,7 @@
 #define GDN_CHUNK 64
 #define GDN_CHUNK_VSLICE 8
 
-// phase A: per (head, seq, chunk). Block = 128 threads.
+// phase A: per (head, seq, chunk). Block = 256 threads.
 __global__ void gdn_chunk_prepare(
         const float * __restrict__ q,
         const float * __restrict__ k,
@@ -48,19 +49,22 @@ __global__ void gdn_chunk_prepare(
         const int64_t sv1, const int64_t sv2, const int64_t sv3,
         const int64_t sb1, const int64_t sb2, const int64_t sb3,
         const int64_t neqk1) {
+    const int chunk = blockIdx.y;
     const int hs    = blockIdx.x;
-    const int h     = (int) (hs % H);
-    const int seq   = (int) (hs / H);
-    const int chunk = (int) blockIdx.y;
+    const int h     = hs % H;
+    const int seq   = hs / H;
+    const int iq    = h % neqk1;
     const int tid   = threadIdx.x;
-    const int iq    = (int) (h % neqk1); // GQA: q/k head
-    const int64_t hsc = (int64_t) hs * n_chunks; // per (head, seq) scratch base
 
     const int t0     = chunk * GDN_CHUNK;
     const int n_real = min((int) GDN_CHUNK, (int) n_tokens - t0);
+    const int64_t hsc = (int64_t) hs * n_chunks;
 
-    __shared__ float s_attn[GDN_CHUNK][GDN_CHUNK + 1]; // padded: column reads stay conflict-free
+    __shared__ float s_attn[GDN_CHUNK][GDN_CHUNK + 1]; // padded: column reads conflict-free
+    __shared__ float s_k[GDN_CHUNK][128 + 1];          // padded row for conflict-free column reads
+    __shared__ float s_bp[GDN_CHUNK];                  // beta_j * exp(decay_j)
     __shared__ float s_decay[GDN_CHUNK];
+    __shared__ float s_acc[16][16];                    // closure block-product accumulator
 
     const float * qb = q    + (int64_t) seq * sq3 + (int64_t) iq * sq1;
     const float * kb = k    + (int64_t) seq * sq3 + (int64_t) iq * sq1;
@@ -86,107 +90,226 @@ __global__ void gdn_chunk_prepare(
         }
     }
 
-    // w[i][j] = -beta_i * exp(decay_i - decay_j) * <k_i, k_j> for i > j
-    // triangular entry index e = i(i+1)/2 + j; 2080 entries total
+    // stage k into smem; padded rows are zero (never read from the tensor)
     {
-        for (int e = tid; e < GDN_CHUNK * (GDN_CHUNK + 1) / 2; e += 128) {
-            const int i = (int) ((sqrtf(8.0f * e + 1.0f) - 1.0f) * 0.5f);
-            const int j = e - i * (i + 1) / 2;
-            const bool ok = (i < n_real) && (j < n_real) && (j < i); // strict coupling: zero diagonal
-            const float bi = (i < n_real) ? bb[(int64_t) (t0 + i) * sb2] : 0.0f;
-            const float Li = expf(s_decay[i] - s_decay[j]);
-            float dot = 0.0f;
-            if (ok) {
-                const float * ki = kb + (int64_t) (t0 + i) * sq2;
-                const float * kj = kb + (int64_t) (t0 + j) * sq2;
-                for (int d = 0; d < 128; ++d) {
-                    dot += ki[d] * kj[d];
+        for (int e = tid; e < GDN_CHUNK * (128 / 4); e += 256) {
+            const int t  = e / 32;
+            const int d4 = e % 32;
+            if (t < n_real) {
+                const float4 kv = *reinterpret_cast<const float4 *>(kb + (int64_t) (t0 + t) * sq2 + 4 * d4);
+                s_k[t][4 * d4 + 0] = kv.x;
+                s_k[t][4 * d4 + 1] = kv.y;
+                s_k[t][4 * d4 + 2] = kv.z;
+                s_k[t][4 * d4 + 3] = kv.w;
+            } else {
+                s_k[t][4 * d4 + 0] = 0.0f;
+                s_k[t][4 * d4 + 1] = 0.0f;
+                s_k[t][4 * d4 + 2] = 0.0f;
+                s_k[t][4 * d4 + 3] = 0.0f;
+            }
+        }
+        if (tid < GDN_CHUNK) {
+            s_bp[tid] = (tid < n_real) ? bb[(int64_t) (t0 + tid) * sb2] * expf(s_decay[tid]) : 0.0f;
+        }
+        __syncthreads();
+    }
+
+    // gram = k @ k^T into s_attn; one 4x4 output tile per thread
+    {
+        const int i0 = 4 * (tid / 16);
+        const int j0 = 4 * (tid % 16);
+        float acc[4][4];
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                acc[ii][jj] = 0.0f;
+            }
+        }
+        for (int d = 0; d < 128; ++d) {
+            float kr[4], kc[4];
+#pragma unroll
+            for (int ii = 0; ii < 4; ++ii) {
+                kr[ii] = s_k[i0 + ii][d];
+            }
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                kc[jj] = s_k[j0 + jj][d];
+            }
+#pragma unroll
+            for (int ii = 0; ii < 4; ++ii) {
+#pragma unroll
+                for (int jj = 0; jj < 4; ++jj) {
+                    acc[ii][jj] += kr[ii] * kc[jj];
                 }
             }
-            s_attn[i][j] = ok ? (-bi * Li * dot) : 0.0f;
         }
-        // upper triangle stays zero (initialized by the full-coverage write below)
-        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 128) {
-            const int i = e / GDN_CHUNK;
-            const int j = e % GDN_CHUNK;
-            if (j > i) {
-                s_attn[i][j] = 0.0f;
-            }
-        }
-    }
-
-    // closure: attn[i][:] += sum_{j<i} attn[i][j] * attn[j][:] (forward substitution)
-    for (int i = 1; i < GDN_CHUNK; ++i) {
-        __syncthreads();
-        float acc = 0.0f;
-        if (tid <= i) {
-            for (int j = 0; j < i; ++j) {
-                acc += s_attn[i][j] * s_attn[j][tid];
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                s_attn[i0 + ii][j0 + jj] = acc[ii][jj];
             }
         }
         __syncthreads();
-        if (tid <= i) {
-            s_attn[i][tid] += acc;
-        }
-    }
-    __syncthreads();
-    if (tid < GDN_CHUNK) {
-        s_attn[tid][tid] += 1.0f;
-    }
-    __syncthreads();
-
-    // k_cumsum[t][v] = sum_j attn[t][j] * (v[j][v] * beta[j])
-    // k_cumdecay[t][k] = sum_j attn[t][j] * (k[j][k] * beta[j] * P[j])
-    {
-        const int V = 128;
-        for (int idx = tid; idx < GDN_CHUNK * V; idx += 128) {
-            const int t = idx / V;
-            const int v = idx % V;
-            const float * at = s_attn[t];
-            float acc_v = 0.0f;
-            float acc_k = 0.0f;
-            for (int j = 0; j < GDN_CHUNK; ++j) {
-                const bool ok = j < n_real;
-                const float bj = ok ? bb[(int64_t) (t0 + j) * sb2] : 0.0f;
-                const float vj = ok ? vb[(int64_t) (t0 + j) * sv2 + v] : 0.0f;
-                const float kj = ok ? kb[(int64_t) (t0 + j) * sq2 + v] : 0.0f;
-                acc_v += at[j] * (bj * vj);
-                acc_k += at[j] * (bj * kj * expf(s_decay[j]));
-            }
-            k_cumsum[((hsc + chunk) * GDN_CHUNK + t) * V + v]   = acc_v;
-            k_cumdecay[((hsc + chunk) * GDN_CHUNK + t) * 128 + v] = acc_k;
-        }
     }
 
-    // attn_causal[i][j] = (P_i / P_j) * <q_i, k_j> for i >= j (reuse s_attn)
-    __syncthreads();
+    // w[i][j] = -beta_i * exp(decay_i - decay_j) * gram[i][j] for i > j
+    // (zero diagonal and upper triangle: the closure treats A as strictly lower)
     {
-        for (int e = tid; e < GDN_CHUNK * (GDN_CHUNK + 1) / 2; e += 128) {
-            const int i = (int) ((sqrtf(8.0f * e + 1.0f) - 1.0f) * 0.5f);
-            const int j = e - i * (i + 1) / 2;
+        for (int e = tid; e < GDN_CHUNK * (GDN_CHUNK - 1) / 2; e += 256) {
+            const int i = (int) ((sqrtf(8.0f * e + 1.0f) + 1.0f) * 0.5f);
+            const int j = e - i * (i - 1) / 2;
             const bool ok = (i < n_real) && (j < n_real);
-            const float Li = expf(s_decay[i] - s_decay[j]);
-            float dot = 0.0f;
-            if (ok) {
-                const float * qi = qb + (int64_t) (t0 + i) * sq2;
-                const float * kj = kb + (int64_t) (t0 + j) * sq2;
-                for (int d = 0; d < 128; ++d) {
-                    dot += qi[d] * kj[d];
-                }
-            }
-            s_attn[i][j] = ok ? (Li * dot) : 0.0f;
+            s_attn[i][j] = ok ? (-bb[(int64_t) (t0 + i) * sb2] * expf(s_decay[i] - s_decay[j]) * s_attn[i][j]) : 0.0f;
         }
-        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 128) {
+        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 256) {
             const int i = e / GDN_CHUNK;
             const int j = e % GDN_CHUNK;
-            if (j > i) {
+            if (j >= i) {
                 s_attn[i][j] = 0.0f;
             }
         }
         __syncthreads();
-        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 128) {
-            attn_causal[((hsc + chunk) * GDN_CHUNK + e / GDN_CHUNK) * GDN_CHUNK + e % GDN_CHUNK] =
-                s_attn[e / GDN_CHUNK][e % GDN_CHUNK];
+    }
+
+    // closure: attn = (I - A)^{-1} by 16x16 block forward substitution. Exact:
+    // a 64x64 strictly-lower A has nilpotency index 64, so I+A+A^2+A^3 is NOT the
+    // inverse in general (the diagonal 16x16 blocks are themselves strictly lower).
+    //   D_r      = (I - A(r,r))^{-1}, rows i: D_r(i,:) = e_i + sum_{k<i} A(r,r)(i,k) D_r(k,:)
+    //   X(r,c)   = D_r * sum_{m=c}^{r-1} A(r,m) * X(m,c)   for c < r
+    {
+        const int r = tid / 16;
+        const int c = tid % 16;
+        // diagonal blocks: D_br over block (br,br), in place
+        for (int br = 0; br < 4; ++br) {
+            for (int i = 0; i < 16; ++i) {
+                float v = 0.0f;
+                if (r == i) {
+                    v = (c == i) ? 1.0f : 0.0f;
+                    for (int k = 0; k < i; ++k) {
+                        v += s_attn[16 * br + i][16 * br + k] * s_attn[16 * br + k][16 * br + c];
+                    }
+                }
+                __syncthreads();
+                if (r == i) {
+                    s_attn[16 * br + i][16 * br + c] = v;
+                }
+                __syncthreads();
+            }
+        }
+        // off-diagonal blocks: X(br,bc) = D_br * sum_{m=bc}^{br-1} A(br,m) * X(m,bc)
+        for (int br = 1; br < 4; ++br) {
+            for (int bc = 0; bc < br; ++bc) {
+                float acc = 0.0f;
+                for (int m = bc; m < br; ++m) {
+                    for (int k = 0; k < 16; ++k) {
+                        acc += s_attn[16 * br + r][16 * m + k] * s_attn[16 * m + k][16 * bc + c];
+                    }
+                }
+                s_acc[r][c] = acc;
+                __syncthreads();
+                float x = 0.0f;
+                for (int k = 0; k < 16; ++k) {
+                    x += s_attn[16 * br + r][16 * br + k] * s_acc[k][c];
+                }
+                __syncthreads();
+                s_attn[16 * br + r][16 * bc + c] = x;
+                __syncthreads();
+            }
+        }
+    }
+
+    // k_cumsum[t][v]   = sum_j attn[t][j] * beta_j * v[j][v]
+    // k_cumdecay[t][k] = sum_j attn[t][j] * beta_j * exp(decay_j) * k[j][k]
+    // one 4x8 output tile per thread (4 token rows x 8 v/k columns)
+    {
+        const int t0t = 4 * (tid / 16);
+        const int v0  = 8 * (tid % 16);
+        float accv[4][8], acck[4][8];
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+#pragma unroll
+            for (int vv = 0; vv < 8; ++vv) {
+                accv[ii][vv] = 0.0f;
+                acck[ii][vv] = 0.0f;
+            }
+        }
+        for (int j = 0; j < GDN_CHUNK; ++j) {
+            const bool okj = j < n_real;
+            const float bj  = okj ? bb[(int64_t) (t0 + j) * sb2] : 0.0f;
+            const float bpj = okj ? s_bp[j] : 0.0f;
+            const float * vj = vb + (int64_t) (t0 + j) * sv2 + v0;
+#pragma unroll
+            for (int ii = 0; ii < 4; ++ii) {
+                const float a = s_attn[t0t + ii][j];
+#pragma unroll
+                for (int vv = 0; vv < 8; ++vv) {
+                    const float vval = okj ? vj[vv] : 0.0f;
+                    accv[ii][vv] += a * (bj * vval);
+                    acck[ii][vv] += a * (bpj * s_k[j][v0 + vv]);
+                }
+            }
+        }
+        float * kc = k_cumsum   + ((hsc + chunk) * GDN_CHUNK + t0t) * 128 + v0;
+        float * kd = k_cumdecay + ((hsc + chunk) * GDN_CHUNK + t0t) * 128 + v0;
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+#pragma unroll
+            for (int vv = 0; vv < 8; ++vv) {
+                kc[ii * 128 + vv] = accv[ii][vv];
+                kd[ii * 128 + vv] = acck[ii][vv];
+            }
+        }
+        __syncthreads();
+    }
+
+    // attn_causal = L .* (q @ k^T), reusing s_attn (strictly causal: j <= i)
+    {
+        const int i0 = 4 * (tid / 16);
+        const int j0 = 4 * (tid % 16);
+        float acc[4][4];
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                acc[ii][jj] = 0.0f;
+            }
+        }
+        const float * qr0 = qb + (int64_t) (t0 + i0) * sq2;
+        for (int d = 0; d < 128; ++d) {
+            float qv[4], kv[4];
+#pragma unroll
+            for (int ii = 0; ii < 4; ++ii) {
+                qv[ii] = (i0 + ii < n_real) ? qr0[ii * sq2 + d] : 0.0f;
+            }
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                kv[jj] = s_k[j0 + jj][d];
+            }
+#pragma unroll
+            for (int ii = 0; ii < 4; ++ii) {
+#pragma unroll
+                for (int jj = 0; jj < 4; ++jj) {
+                    acc[ii][jj] += qv[ii] * kv[jj];
+                }
+            }
+        }
+#pragma unroll
+        for (int ii = 0; ii < 4; ++ii) {
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                const int i = i0 + ii;
+                const int j = j0 + jj;
+                const float L = (j <= i && i < n_real) ? expf(s_decay[i] - s_decay[j]) : 0.0f;
+                s_attn[i][j] = L * acc[ii][jj];
+            }
+        }
+        __syncthreads();
+        for (int e = tid; e < GDN_CHUNK * GDN_CHUNK; e += 256) {
+            const int i = e / GDN_CHUNK;
+            const int j = e % GDN_CHUNK;
+            attn_causal[((hsc + chunk) * GDN_CHUNK + i) * GDN_CHUNK + j] = s_attn[i][j];
         }
     }
 
@@ -197,7 +320,7 @@ __global__ void gdn_chunk_prepare(
         if (tid == 0) {
             P_last_scratch[hsc + chunk] = expf(d_last);
         }
-        for (int t = tid; t < GDN_CHUNK; t += 128) {
+        for (int t = tid; t < GDN_CHUNK; t += 256) {
             delta_scratch[(hsc + chunk) * GDN_CHUNK + t] = expf(d_last - s_decay[t]);
         }
     }
@@ -493,12 +616,11 @@ static void launch_gated_delta_net(
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     // chunked path: prefill only, scalar gates, K=1, K=V=128. For K=1 the state
     // write layout is the same whether the gdn->cpy fusion fired (slot_stride 0)
-    // or not (slot_stride = S_v*S_v*H*n_seqs).
-    // Correct and test-validated but currently slower than the sequential kernel
-    // (naive phase-A matmuls); opt-in until the matmuls are tiled.
+    // or not (slot_stride = S_v*S_v*H*n_seqs). Default; the sequential kernel
+    // stays for decode (n_tokens=1), KDA and keep_rs_t.
     static const bool gdn_chunked_enabled = []() {
         const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
-        return env != nullptr && std::atoi(env) != 0;
+        return env == nullptr || std::atoi(env) != 0;
     }();
     if (gdn_chunked_enabled && !KDA && !keep_rs_t && S_v == 128 && n_tokens > 1 &&
         (state_slot_stride == 0 || state_slot_stride == S_v * S_v * H * n_seqs)) {
@@ -518,7 +640,7 @@ static void launch_gated_delta_net(
         float * P_last_scratch = delta_scratch + H * n_seqs * n_chunks * GDN_CHUNK;
         {
             const dim3 grid_a(H * n_seqs, n_chunks, 1);
-            const dim3 block_a(128, 1, 1);
+            const dim3 block_a(256, 1, 1);
             const ggml_cuda_kernel_launch_params lp_a(grid_a, block_a, 0, stream);
             ggml_cuda_kernel_launch(gdn_chunk_prepare, lp_a,
                 q_d, k_d, v_d, g_d, b_d,
