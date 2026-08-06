@@ -42,7 +42,9 @@ void ggml_cuda_mul_mat_fp8(
     float   * src1_s_d = src1_s.get();
     GGML_ASSERT(src1_q_d != nullptr);
     GGML_ASSERT(src1_s_d != nullptr);
-    if (n_pad > n) {
+    // only the wmma path reads the padded token region (its CTA spans
+    // GGML_FP8_CTA_N tokens); the GEMV path reads tokens 0..n-1 only
+    if (n_pad > n && n > GGML_FP8_GEMV_MAX_N) {
         CUDA_CHECK(cudaMemsetAsync(src1_q_d + k * n, 0, k * (n_pad - n), stream));
         CUDA_CHECK(cudaMemsetAsync(src1_s_d + n * n_col_blocks, 0, (n_pad - n) * n_col_blocks * sizeof(float), stream));
     }

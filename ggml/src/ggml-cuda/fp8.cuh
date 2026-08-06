@@ -397,6 +397,11 @@ __global__ void mul_mat_fp8_wmma(
 // generation. One warp per output row; the 32 lanes read the 128 fp8 bytes of a
 // weight block coalesced (4 bytes each) and dot4 them with the shared activation
 // block. This avoids the wmma tile waste (16-token tiles) at batch 1.
+//
+// The per-block scale (wblk->d, activation ad) is folded into the lane partial
+// so the dot can accumulate across all k-blocks and reduce once at the end (the
+// old per-block shuffle reduce cost 5 shfl x n_col_blocks per row). 4 k-blocks
+// are processed per iteration to keep 8 loads in flight and hide latency.
 __global__ void mul_mat_fp8_gemv(
         const char * __restrict__ src0, const uint8_t * __restrict__ src1_q, const float * __restrict__ src1_s, float * __restrict__ dst,
         const int64_t k, const int64_t m, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
@@ -413,22 +418,47 @@ __global__ void mul_mat_fp8_gemv(
 
     float acc = 0.0f;
     const int64_t row_stride = n_col_blocks * (int64_t) sizeof(block_f8_e4m3);
+    const char * row = src0 + mi * row_stride;
     const uint8_t * x = src1_q + ni * k;
+    const float * xs = src1_s + ni * n_col_blocks;
 
-    for (int64_t cb = 0; cb < n_col_blocks; ++cb) {
-        const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (src0 + mi * row_stride + cb * sizeof(block_f8_e4m3));
-        const uint32_t w4 = *reinterpret_cast<const uint32_t *>(wblk->qs + lane * 4);
-        const uint32_t x4 = *reinterpret_cast<const uint32_t *>(x + cb * GGML_FP8_TILE_K + lane * 4);
+    int64_t cb = 0;
+    for (; cb + 4 <= n_col_blocks; cb += 4) {
+        const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (row + cb * (int64_t) sizeof(block_f8_e4m3));
+        const uint32_t w0 = *(const uint32_t *) (wblk[0].qs + lane * 4);
+        const uint32_t w1 = *(const uint32_t *) (wblk[1].qs + lane * 4);
+        const uint32_t w2 = *(const uint32_t *) (wblk[2].qs + lane * 4);
+        const uint32_t w3 = *(const uint32_t *) (wblk[3].qs + lane * 4);
+        const uint8_t * xb = x + cb * GGML_FP8_TILE_K + lane * 4;
+        const uint32_t x0 = *(const uint32_t *) (xb);
+        const uint32_t x1 = *(const uint32_t *) (xb + GGML_FP8_TILE_K);
+        const uint32_t x2 = *(const uint32_t *) (xb + 2 * GGML_FP8_TILE_K);
+        const uint32_t x3 = *(const uint32_t *) (xb + 3 * GGML_FP8_TILE_K);
+        const float d0 = wblk[0].d, d1 = wblk[1].d, d2 = wblk[2].d, d3 = wblk[3].d;
+        const float a0 = xs[cb], a1 = xs[cb + 1], a2 = xs[cb + 2], a3 = xs[cb + 3];
 
-        float dot = __builtin_amdgcn_dot4_f32_fp8_fp8(w4, x4, 0.0f);
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) {
-            dot += __shfl_xor_sync(0xffffffff, dot, o, 32);
-        }
-        acc += wblk->d * src1_s[ni * n_col_blocks + cb] * dot;
+        const float dot0 = __builtin_amdgcn_dot4_f32_fp8_fp8(w0, x0, 0.0f);
+        const float dot1 = __builtin_amdgcn_dot4_f32_fp8_fp8(w1, x1, 0.0f);
+        const float dot2 = __builtin_amdgcn_dot4_f32_fp8_fp8(w2, x2, 0.0f);
+        const float dot3 = __builtin_amdgcn_dot4_f32_fp8_fp8(w3, x3, 0.0f);
+        acc += d0 * a0 * dot0 + d1 * a1 * dot1 + d2 * a2 * dot2 + d3 * a3 * dot3;
+    }
+    for (; cb < n_col_blocks; ++cb) {
+        const block_f8_e4m3 * wblk = (const block_f8_e4m3 *) (row + cb * (int64_t) sizeof(block_f8_e4m3));
+        const uint32_t w = *(const uint32_t *) (wblk->qs + lane * 4);
+        const uint32_t xq = *(const uint32_t *) (x + cb * GGML_FP8_TILE_K + lane * 4);
+        const float dot = __builtin_amdgcn_dot4_f32_fp8_fp8(w, xq, 0.0f);
+        acc += wblk->d * xs[cb] * dot;
     }
 
-    dst[ni * m + mi] = acc;
+    // single reduce at the end, not one per k-block
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, o, 32);
+    }
+    if (lane == 0) {
+        dst[ni * m + mi] = acc;
+    }
 #else
     (void) src0; (void) src1_q; (void) src1_s; (void) dst;
     (void) k; (void) m; (void) n; (void) n_col_blocks; (void) n_pad;

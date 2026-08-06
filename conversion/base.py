@@ -124,7 +124,8 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 fp8_output_weight: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -156,6 +157,7 @@ class ModelBase:
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
+        self._fp8_output_weight = fp8_output_weight
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
@@ -746,6 +748,40 @@ class ModelBase:
             logger.warning(
                 "--outtype fp8_e4m3: no FP8 weights found, the file will contain no F8_E4M3 tensors")
 
+    def _generate_fp8_output_weight(self):
+        """Quantize token_embd into an fp8 output.weight (lm_head) copy, keeping
+        token_embd BF16 for the input embedding lookup. Same 128x128-block
+        convention as the model: d = BF16(amax/448), q = fp8(w / (amax/448))."""
+        if any("output.weight" in ts for ts in self.gguf_writer.tensors):
+            return  # model already has its own output weight
+
+        embed_name = next((n for n in self.model_tensors if n.endswith("embed_tokens.weight")), None)
+        if embed_name is None:
+            return
+        w = LazyTorchTensor.to_eager(self.model_tensors[embed_name]())
+        if w.dtype == torch.float8_e4m3fn:
+            return  # token_embd already fp8, lm_head already on the fp8 path
+
+        if w.dim() != 2 or w.shape[1] % 128 != 0:
+            return
+
+        M, N = w.shape  # [n_vocab, n_embd]
+        mb, nb = M // 128, N // 128
+        wf = w.float().view(mb, 128, nb, 128)
+        amax = wf.abs().amax(dim=(1, 3))          # [mb, nb]
+        s_f32 = amax / 448.0
+        s_bf16 = s_f32.to(torch.bfloat16)         # stored scale (BF16-rounded)
+        q = (wf / s_f32.view(mb, 1, nb, 1)).view(M, N).to(torch.float8_e4m3fn)
+
+        d = s_bf16.float().numpy().astype(np.float32)
+        q_bytes = q.view(torch.uint8).numpy()
+        blocks = np.empty((M, nb, 132), dtype=np.uint8)
+        blocks[:, :, 0:4] = np.repeat(d, 128, axis=0).view(np.uint8).reshape(M, nb, 4)
+        blocks[:, :, 4:] = q_bytes.reshape(M, nb, 128)
+        logger.info("Stored FP8 output.weight copy of token_embd (lm_head on the FP8 path)")
+        self.gguf_writer.add_tensor("output.weight", blocks.reshape(M, nb * 132),
+                                    raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+
     @staticmethod
     def _nvfp4_pack(weight: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
         """Repack NVFP4 ModelOpt tensors into ggml super-block layout.
@@ -925,6 +961,8 @@ class ModelBase:
         # from model_tensors, leaving only non-FP8 for dequant.
         if self.ftype == gguf.LlamaFileType.MOSTLY_F8_E4M3:
             self._generate_fp8_tensors()
+            if self._fp8_output_weight:
+                self._generate_fp8_output_weight()
 
         if self._is_nvfp4:
             if nvfp4_compressed_tensors:

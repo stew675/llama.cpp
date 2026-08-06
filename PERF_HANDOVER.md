@@ -2,8 +2,9 @@
 
 **Purpose**: single document for the next session's performance work. Everything
 here was measured on this box (3x R9700 gfx1201, 1x used, -dev ROCm0) with the
-fp8 GGUF `/tmp/stewfp8-preserved.gguf` (Qwen3.5-4B StewFP8). Updated end of
-session 2026-08-06 after the aiter GEMM port (commit pending, see section 8).
+fp8 GGUFs in `/llm/models/Qwen3.5/4B/StewFP8/` (Qwen3.5-4B StewFP8). Updated
+2026-08-05 evening after the decode session (see section 10): generation now
+matches Q8_0; prefill is the remaining gap.
 
 Read `HANDOVER.md` for the project as a whole and `AITER_FINDINGS.md` for the
 aiter inspection details. This file tracks ONLY the performance picture.
@@ -12,30 +13,36 @@ aiter inspection details. This file tracks ONLY the performance picture.
 
 ## 1. Scoreboard (measured, all pp512 unless noted)
 
-| config | pp512 t/s | vs Q8_0 | vs fp8 baseline |
-|---|---|---|---|
-| Q8_0 GGUF (target base) | 5847 | - | - |
-| fp8 baseline (821d423ac) | 4929.8 | -16% | - |
-| fp8 now (aiter port, this session) | **5546-5596** | **-5.6%** | **+12.5-13.5%** |
-| tg64 (fp8, unchanged) | 71.0-71.4 | -21% | 0 |
-| target prefill (+50% over Q8_0) | 8770 | +50% | +78% |
-| target generation (+10%) | ~98.5 | +10% | +39% |
+| config | pp512 t/s | tg64 t/s | vs Q8_0 pp | vs Q8_0 tg |
+|---|---|---|---|---|
+| Q8_0 GGUF (target base) | 6177 | 90.9 | - | - |
+| fp8 baseline (821d423ac) | 4930 | 71.0 | -20% | -22% |
+| fp8 + aiter GEMM port (26b7be281) | 5546-5596 | 71.4 | -5.6% | -21% |
+| fp8 now (decode session, commit below) | **5914** | **89.1** | **-4.3%** | **-2.0%** |
+| target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
+| target generation (+10%) | - | ~100 | - | +10% |
 
 pp256: 5014, pp1024: 5446, pp2048: 5292, pp128: 3661 (high variance, use -r 5).
 
-PPL 8.7152 (fp8) vs 8.6024 (bf16), 8.6126 (Q8_0) — unchanged by this port.
-All 1186 MUL_MAT backend-ops tests pass; generation matches the BF16 reference.
+PPL 6.2572 (fp8-ow) vs 6.2508 (fp8, no ow) vs 6.2464 (Q8_0) on the small
+/tmp/corpus_pride.txt corpus (all within error bars); generation matches the
+pre-change fp8 output on the same prompt/seed.
 
-## 2. Where pp512 time goes (rocprofv3 kernel trace, per ~1.8 bench runs)
+## 2. Where pp512 time goes (rocprofv3 kernel trace, decode session, fp8-ow GGUF)
 
 | kernel | share of pp512 | note |
 |---|---|---|
-| mul_mat_fp8_wmma | ~50% | now ~77 TFLOP/s (was 55) |
-| gated_delta_net_cuda | ~17% | linear-attention core, custom kernel |
-| mul_mat_vec_f (bf16) | ~12.5% | incl. fused output_norm+lm_head (2.05 ms, m=248320) |
-| flash_attn_tile | ~3.5% | |
-| quantize_fp8 | ~1.2% | activation staging pass |
-| norms/silu/rope/concat/copy | ~5% | |
+| mul_mat_fp8_wmma | ~48% | ~77 TFLOP/s (aiter port) |
+| gated_delta_net_cuda | ~17% | linear-attention core, sequential per-token loop |
+| Cijk (rocBLAS/CK BF16 GEMM) | ~6% | the delta-net in/out projections (BF16 in the GGUF) |
+| quantize_fp8 | ~6% | activation staging pass |
+| concat_non_cont | ~5% | delta-net plumbing (48 launches) |
+| flash_attn_tile | ~4% | 8 attention layers |
+| silu / norms / conv / copy | ~9% | ssm_conv_long_token_f32 ~1% |
+
+Decode (tg64) breakdown, per ~11.1 ms step: mul_mat_fp8_gemv 8.95 ms (79%, 226
+GEMMs incl. lm_head at ~496 GB/s), quantize_fp8 0.32 ms, gated_delta_net 0.41
+ms, BF16 mmv 0.15 ms, norms/ops ~1.3 ms.
 
 ## 3. Ranked levers for the next session
 
@@ -82,10 +89,13 @@ All 1186 MUL_MAT backend-ops tests pass; generation matches the BF16 reference.
 
 ### L5. Non-fp8 tensors -> Q8_0 in the GGUF — SMALL-MEDIUM, decoder-focused
 - Only helps decode (memory-bound) and slightly reduces prefill staging.
-- **token_embd.weight must STAY BF16**: it is type 30 (BF16) in the GGUF today
-  and lm_head runs the fused BF16 mmv at 2.05 ms/launch; as fp8 it would be
-  ~5.4 ms (slower). The quantizable set is norms, conv1d, in_proj_a/b, A_log
-  (small) -> gen maybe +5%, prefill ~0.
+- **token_embd constraint is now VOID**: the decode session added
+  `--fp8-output-weight` (an fp8 output.weight copy of token_embd, token_embd
+  stays BF16 for the input lookup) so lm_head runs on the fast fp8 GEMV. Do NOT
+  quantize token_embd itself to fp8 without adding a get_rows fp8 kernel
+  (getrows.cu has no F8_E4M3 case; CPU has no fp8 kernels either).
+- The quantizable set is norms, conv1d, in_proj_a/b, A_log (small) -> gen maybe
+  +5%, prefill ~0.
 
 ## 4. Kernel facts (established this session, do not rediscover)
 
@@ -117,40 +127,71 @@ All 1186 MUL_MAT backend-ops tests pass; generation matches the BF16 reference.
 ```bash
 # build + bench (after any kernel change)
 cmake --build /tmp/llama-hip-full -j16 --target llama-bench llama-cli
-/tmp/llama-hip-full/bin/llama-bench -m /tmp/stewfp8-preserved.gguf -p 512 -n 64 -r 3 -dev ROCm0
+/tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 64 -r 5 -dev ROCm0
+
+# Q8_0 reference on the same box/day
+/tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/Q8_0/Qwen3.5-4B-Q8_0.gguf -p 512 -n 64 -r 5 -dev ROCm0
 
 # correctness after kernel changes (fast gate)
 /tmp/llama-hip-full/bin/test-backend-ops test -b ROCm0 -o MUL_MAT   # 1186 pass (no F8 cases! it only covers other types)
-/tmp/llama-hip-full/bin/llama-cli -m /tmp/stewfp8-preserved.gguf -f /tmp/prompt_pp.txt -n 24 --single-turn -s 42
+/tmp/llama-hip-full/bin/llama-cli -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -f /tmp/prompt_pp.txt -n 24 --single-turn -s 42
 # expected: prompt echo + "[Start thinking] Thinking Process: 1. Analyze the Request:..." (matches bf16 ref)
 # note: test-backend-ops has NO F8_E4M3 mul_mat cases (CPU backend can't do fp8) - generation diff is the gate
 
-# profile
-rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /tmp/stewfp8-preserved.gguf -p 512 -n 8 -r 1 -dev ROCm0
+# profile (decode-heavy runs crash rocprofv3 at teardown; the trace is still written)
+rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 8 -r 1 -dev ROCm0
 # per-kernel CSV in /tmp/rocp/soar/*kernel_trace.csv (Grid_Size_X = work-items = grid*256; VGPR/LDS columns)
-
-# aiter reference numbers (M=512 gate/up etc. at 89-137 TFLOP/s)
-PYTHONPATH=/home/stew675/aiter /tmp/aiter-venv/bin/python /tmp/bench_aiter_stable.py
+# decode-only view: filter kernels after the last mul_mat_fp8_wmma start
 ```
 
 ## 7. PPL / parity (do not skip after any kernel or loader change)
 
 ```bash
-/tmp/llama-hip-full/bin/llama-perplexity -m /tmp/stewfp8-preserved.gguf -f /tmp/corpus_pride.txt -c 512 -b 2048 -n 4 -dev ROCm0 2>&1 | tr -d '\0' | grep "Final estimate"  # ~8.715
+/tmp/llama-hip-full/bin/llama-perplexity -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -f /tmp/corpus_pride.txt -c 512 -b 2048 -n 4 -dev ROCm0 2>&1 | tr -d '\0' | grep "Final estimate"  # ~6.26 on this corpus
 ```
 
 ## 8. Git state
 
-- Kernel changes (ggml/src/ggml-cuda/fp8.cuh + fp8.cu) + docs (AITER_FINDINGS.md,
-  HANDOVER.md, PERF_HANDOVER.md) are being committed as one unit this session.
+- This session (decode): ggml/src/ggml-cuda/fp8.cu + fp8.cuh (gemv rewrite +
+  memset skip), convert_hf_to_gguf.py + conversion/base.py (--fp8-output-weight),
+  docs (PERF_HANDOVER.md, vllm-vs-llamacpp-performance.md) committed as one unit.
 - Branch `cllm`, origin git@github.com:stew675/llama.cpp.git.
 - Commit style: concise subject, `Assisted-by:` line, no Co-authored-by.
 
 ## 9. Next-session suggested order
 
-1. Confirm working tree matches this doc (git log, re-bench pp512 ~ 5550).
-2. L1 (delta-net): profile `gated_delta_net_cuda` per-layer; check aiter's
-   gfx1201 dispatch actually fires; port or optimize ours; PPL + bench.
+1. Confirm working tree matches this doc (git log, re-bench pp512 ~ 5914).
+2. L1 (delta-net): port aiter's chunked gated-delta-rule kernel
+   (`/home/stew675/aiter/csrc/kernels/chunk_gated_delta_rule_fwd_h.cu`, gfx1201
+   path) into ggml-cuda; verify the gfx1201 dispatch fires; f32 intermediate
+   precision parity (PPL check); bench pp512.
 3. L2 (weight repack): re-profile the staging share first; implement the
    in-memory repack; vectorize sA staging; PPL + bench.
 4. Re-evaluate the +50% target with both in; then decide if L3/L4/L5 are worth it.
+
+## 10. Decode session log (2026-08-05 evening)
+
+Goal: close the fp8 generation gap to Q8_0 (tg64 was 71.0-71.4 vs Q8_0 ~90).
+Result: tg64 72.0 -> 89.1 (98% of Q8_0's 90.9), pp512 unchanged ~5914.
+
+Three changes, all gated by generation-parity + PPL:
+
+1. fp8.cu: skip the n_pad zero-fill (cudaMemset x2 per GEMM, 450/step) when
+   n <= GGML_FP8_GEMV_MAX_N; the GEMV path never reads the padded tokens.
+   Removed ~0.5 ms/step.
+2. fp8.cuh: rewrote mul_mat_fp8_gemv - fold the per-block scales into the lane
+   partial (one deferred warp-reduce instead of 160 shuffles/row), 4 k-blocks
+   per iteration for load ILP. Bandwidth 445 -> 496 GB/s (mmvf reference: 520).
+3. convert_hf_to_gguf.py + conversion/base.py: --fp8-output-weight writes an
+   fp8 output.weight copy of token_embd (same 128x128 convention as the model:
+   d = BF16(amax/448), q = fp8(w/(amax/448))). lm_head moves from the fused
+   BF16 mmv (2.44 ms/step) to the fp8 GEMV (~1.4 ms/step); token_embd stays
+   BF16 for get_rows. +0.66 GiB storage, +0.63 B params.
+
+New GGUF: /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf (5.36 GiB, 442
+  tensors: token_embd BF16 + output.weight F8_E4M3). Regenerate with:
+  python3 convert_hf_to_gguf.py /llm/models/Qwen3.5/4B/StewFP8 --outtype fp8_e4m3 --fp8-output-weight --outfile ...
+
+Left on the table (decode): gemv 496 -> ~520 GB/s (vectorized x loads, 8-block
+ILP), fuse quantize_fp8 into the gemv (226 launches/step), delta-net 0.41
+ms/step. Roughly +4% if all taken.
