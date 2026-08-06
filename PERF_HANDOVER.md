@@ -26,13 +26,17 @@ aiter inspection details. This file tracks ONLY the performance picture.
 | fp8 + aiter GEMM port (26b7be281) | 5546-5596 | 71.4 | -5.6% | -21% |
 | fp8 now (decode session, commit below) | **5914** | **89.1** | **-4.3%** | **-2.0%** |
 | fp8 now (chunked GDN, 2026-08-06) | **6068-6072** | **89.8-90.0** | **-1.7%** | **-1.2%** |
+| fp8 now (phase A+B session, 2026-08-06) | **~6100-6200** (noisy box) | **89.8-90.1** | ~-1% | ~-1% |
 | target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
 | target generation (+10%) | - | ~100 | - | +10% |
 
 pp256: 5014, pp1024: 5446, pp2048: 5292, pp128: 3661 (high variance, use -r 5).
 
-Current authoritative numbers (2026-08-06, chunked GDN default): see LEVERS.md
-section 0. pp512 6068-6072, tg64 89.8-90.0.
+Current authoritative numbers (2026-08-06, chunked GDN default, phase A/B
+session): see LEVERS.md section 0. The box became noisy late on 2026-08-06
+(pp512 +/-60-170, occasionally much worse): trust rocprof kernel times
+(deterministic +/-3%) for A/B. GDN per pp512: phase A ~4.9 ms + phase B
+~5.9 ms (was 7.1 + 6.4).
 
 PPL 6.2572 (fp8-ow) vs 6.2508 (fp8, no ow) vs 6.2464 (Q8_0) on the small
 /tmp/corpus_pride.txt corpus (all within error bars); generation matches the
@@ -147,11 +151,13 @@ rocprofv3 -r -d /tmp/rocp -f csv -- /tmp/llama-hip-full/bin/llama-bench -m /llm/
 - Earlier (decode session, 2026-08-05): fp8.cu + fp8.cuh (gemv rewrite + memset
   skip), convert_hf_to_gguf.py + conversion/base.py (--fp8-output-weight),
   docs (PERF_HANDOVER.md, vllm-vs-llamacpp-performance.md).
+- Phase A/B session (2026-08-06): a921f8fb0 (phase A rewrite, 293 -> 210 us),
+  c8757d649 (phase B delta loads, 269 -> 246 us). See section 13.
 
 ## 9. Next-session suggested order - SEE LEVERS.md
 
 The suggested order, and the current state to confirm first, moved to
-LEVERS.md section 5 (re-bench 6068 -> L1 or L3 -> L2 -> L5 -> re-evaluate).
+LEVERS.md section 5 (re-bench ~6100-6200 -> L1 -> L2 -> L5 -> re-evaluate).
 
 ## 10. Decode session log (2026-08-05 evening)
 
@@ -267,3 +273,47 @@ Remaining GDN perf: the forward plan is LEVERS.md (L3 = phase A, L4 = phase B).
 Summary: phase A (gdn_chunk_prepare) is now the bigger kernel (~7.1 ms/pp512,
 ~8x its FMA floor, ~154 dynamic closure barriers, 1 CTA/CU); phase B is ~10x
 its FMA floor (chunk-loop latency).
+
+## 13. Delta-net phase A rewrite + phase B delta loads (2026-08-06, session)
+
+Goal: L3 (phase A closure barriers) per LEVERS.md, then re-evaluate. Result:
+phase A 293 -> ~205-210 us/launch (-24%), phase B 268.8 -> ~246 us/launch
+(-8.5%). GDN per pp512 13.5 -> ~10.9 ms. Commits a921f8fb0 + c8757d649.
+
+Phase A (gdn_chunk_prepare) changes, all validated 47/47 + PPL + generation:
+1. closure: the 16x16-block forward substitution (146 syncs) replaced by an
+   exact 4x4-blocked substitution over the whole 64x64 (16 syncs). The 4x4
+   diagonal blocks have nilpotency index 4, so D(i,i) = I + Aii + Aii^2 +
+   Aii^3 (computed in registers via a warp-shuffle row substitution, 1 sync);
+   the off-diagonal blocks D(i,j) = D(i,i) @ (A(i,j) D(j,j) + sum_{j<k<i}
+   A(i,k) D(k,j)) follow in 15 row passes. The row passes read A(i,k) from a
+   preserved packed strictly-lower smem copy s_A (8 KB; the in-place D writes
+   would clobber A otherwise - the row-pass ordering trick does NOT work
+   because blocks of the same row run concurrently in different warps). Numpy
+   check /tmp/validate_closure_4x4.py: exact to 1e-15 in both random and
+   model-like strong-decay regimes. The first implementation had a bug
+   (s_A[e - j] instead of s_A[e], NaN) - the packed index IS e.
+2. decay cumsum: Hillis-Steele (13 syncs) -> warp-shuffle scan (2 syncs);
+   the chunk's k rows are prefetched into registers during the scan (overlaps
+   the L2 latency of the staging loads, LEVERS.md approach b).
+3. k_cumsum/k_cumdecay and attn_causal: v[j][v0..v0+7] and the q rows were
+   512 scalar global loads per thread; now float4 (2 per v row / 4-wide d
+   unroll for q) with a runtime alignment fallback ((stride & 3) == 0 &&
+   pointer 16-B aligned). This was the REAL win - the sync reduction alone
+   (165 -> 23 barriers) moved phase A only 293 -> 276 us.
+
+Phase A stage breakdown (stage-elimination stubs, +/-3%): v loads ~81 us,
+q loads ~37 us, gram ~34 us, closure ~32 us of the original 293.
+
+Phase B (gdn_chunk_state): step-3 delta reads vectorized (64 scalar loads per
+thread per chunk -> 16 float4 with a clamped k-row index so padded rows stay
+in-bounds and contribute zero - a plain guard branch nullified the win).
+Stage-elimination: kd/q loads ~112 us, ac+k loads ~62 us, FMA/sync/expf floor
+~206 us of 269. The kernel is ~65% load-stall-bound but warp-broadcast loads
++ the serial S dependency kill the obvious fixes: a 2-stage kd/q register
+pipeline hit 256 VGPR + spills (495 us), #pragma unroll on the r-loop
+regressed (349 us). No cheap remaining lever; revisit with a fresh profile.
+
+Also learned: the box got noisy late 2026-08-06 (pp512 +/-60-170, one run
++/-1000). rocprof kernel times are the reliable A/B signal. fp8 gemv traffic
+in the trace stays at ~40 us avg regardless (not affected by these changes).

@@ -14,17 +14,22 @@ stewfp8-ow.gguf` (24 delta-net layers, H=32 heads, K=V=128, neqk1=16).
 
 ---
 
-## 0. Current state (verified 2026-08-06)
+## 0. Current state (verified 2026-08-06, after the phase A/B session)
 
 | metric | value | notes |
 |---|---|---|
-| pp512 (chunked) | 6068-6072 t/s | sequential path: 5878 |
-| tg64 | 89.8-90.0 | decode untouched, sequential GDN |
-| PPL | 6.2426 | sequential 6.2572, on /tmp/corpus_pride.txt |
+| pp512 (chunked) | 6069 baseline; ~6100-6200 after the phase A rewrite (noisy box, see note) | sequential path: 5878 |
+| tg64 | 89.8-90.1 | decode untouched, sequential GDN |
+| PPL | 6.2677 | 6.2426 pre-change (within the +/-0.34 error bar); generation matches |
 | backend tests | 47/47 GATED_DELTA_NET pass | incl. multi-seq cases |
-| GDN chunked per pp512 | 13.5 ms = ~16% of pp512 | phase A 7.1 + phase B 6.4 |
-| GDN phase B | 267 us/launch, 24 launches/pp512 | 1 wave, 2 CTAs/CU, no spills |
-| GDN phase A | ~280-300 us/launch, 24 launches/pp512 | 2 waves, 1 CTA/CU (50 KB LDS) |
+| GDN chunked per pp512 | ~10.9 ms = ~13% of pp512 | phase A 4.9 + phase B 5.9 |
+| GDN phase B | ~246 us/launch, 24 launches/pp512 | 1 wave, 2 CTAs/CU, no spills |
+| GDN phase A | ~205-210 us/launch, 24 launches/pp512 | 23 syncs, 1 CTA/CU (58 KB LDS) |
+
+NOTE on bench noise: since 2026-08-06 late the box is noisy (+/-60-170 on
+pp512, occasionally +/-1000). Prefer rocprof kernel times (deterministic to
++/-3%) over llama-bench for judging a change; the GDN delta of this session
+(~-2.4 ms/pp512) should be ~+2% on pp512 but is hard to pin in bench.
 
 Bench geometry (IMPORTANT, do not rediscover): `llama-bench -p 512` runs the
 512-token prompt as ONE batch (n_seqs=1, n_chunks=8) and llama-bench performs
@@ -42,7 +47,7 @@ divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
 | kernel | ms/pp512 | share | note |
 |---|---|---|---|
 | mul_mat_fp8_wmma | ~41 | ~48% | prefill GEMMs, ~77 TFLOP/s |
-| gdn_chunk_prepare + state | 13.5 | ~16% | A 7.1 + B 6.4 |
+| gdn_chunk_prepare + state | ~10.9 | ~13% | A ~4.9 + B ~5.9 (was 7.1 + 6.4) |
 | quantize_fp8 | ~6.3 | ~7.5% | activation staging pass |
 | Cijk (CK BF16 GEMM) | ~5.3 | ~6% | delta-net in/out projections |
 | concat_non_cont | ~4.7 | ~5.5% | ssm conv input assembly, 24 launches |
@@ -52,7 +57,14 @@ divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
 | k_bin_bcast / cpy / get_rows / l2_norm / rope / ssm_conv | ~3.3 | ~4% | small |
 | (decode kernels: gemv, sequential GDN, etc.) | - | - | not part of pp512 |
 
-pp512 wall = 512 / 6068 = 84.4 ms. The shares above sum to ~90% of that.
+pp512 wall = 512 / ~6150 = ~83 ms (noisy). The shares above sum to ~90% of that.
+
+The GDN share is now split nearly evenly: phase A (gdn_chunk_prepare, ~4.9
+ms/pp512, 23 syncs, 1 CTA/CU at 58 KB LDS) and phase B (gdn_chunk_state,
+~5.9 ms/pp512, 2 CTAs/CU, 1 wave). Both are ~40-65% load-stall-bound with a
+substantial FP32-FMA floor (measured by stage-elimination stubs: phase A v+q
+loads ~118 us, gram ~34 us, closure ~32 us; phase B kd/q loads ~112 us,
+ac+k loads ~62 us, FMA/sync floor ~206 us).
 
 ## 2. Ranked levers
 
@@ -91,51 +103,47 @@ pp512 wall = 512 / 6068 = 84.4 ms. The shares above sum to ~90% of that.
   (CPU can't do fp8) - generation diff and PPL are the gates.
 - Depends on: profile first (staging share at current 77 TFLOP/s).
 
-### L3. gdn_chunk_prepare (phase A): closure barriers + 1 CTA/CU (GDN priority)
+### L3. gdn_chunk_prepare (phase A) - main items DONE 2026-08-06, remaining: 2 CTAs/CU
 
-- Kernel: gdn_chunk_prepare, ~7.1 ms/pp512, ~280-300 us/launch, grid 256 CTAs
-  (32 heads x 8 chunks), 256 threads, 50 KB LDS (1 CTA/CU, 2 waves), 128 VGPR,
-  no spills. ~8x its FMA floor (~18.5 us/chunk theoretical).
-- Why slow: two things.
-  1. The (I-A)^-1 closure runs as 16x16 block forward substitution with
-     ~154 dynamic __syncthreads per CTA (4 diag blocks x 16 rows x 2 syncs +
-     6 off-diag blocks x 3 syncs + stage syncs). Each barrier with 8 warps
-     and 1 CTA/CU exposes the full L2 latency of the next stage.
-  2. The matmul stages (gram, M2 k_cumsum/k_cumdecay, M3 attn_causal) are
-     serial: each reads s_attn/s_k from smem after a barrier, no overlap.
-- Approach (in order of risk):
-  a. Reduce closure barrier count. The diag-block pass does 2 syncs per row;
-     the row substitution for row i only needs rows < i - restructure so a
-     full 16-row diag block is done with 2 syncs total (one per row of the
-     block, or batch the substitution per 4-row group). Target: 154 -> ~30.
-  b. Overlap stage c+1's global loads (k, v from L2) with stage c's compute:
-     the phases read disjoint inputs; issue the float4 loads for the next
-     phase before the current phase's FMA chain.
-  c. Cut smem so 2 CTAs/CU: s_attn 16.6 KB + s_k 33 KB + s_bp/s_decay are the
-     consumers. If the closure and M2 can share s_attn's space (they already
-     reuse it), the fixed cost is s_k 33 KB - get the total under 32 KB and
-     the kernel becomes 1 wave like phase B.
-- Expected: 7.1 ms -> 3.5-5 ms (phase A halves), pp512 +2-4%.
-- Validation: 47/47 tests, PPL 6.24, dump check if touched the closure math
-  (numpy reference in /tmp/validate_gdn_dump.py; GDN_DUMP infra was removed
-  from the code - re-add if needed, see GDN_DEBUG_HANDOVER.md for the
-  stream-ordered dump pattern).
-- Depends on: nothing. Do before L4.
+- Kernel: gdn_chunk_prepare, ~4.9 ms/pp512, ~205-210 us/launch, grid 256 CTAs
+  (32 heads x 8 chunks), 256 threads, 58 KB LDS (1 CTA/CU), 128 VGPR, no
+  spills. 23 dynamic syncs (was ~165).
+- DONE (commits a921f8fb0): closure rewritten to an exact 4x4-blocked forward
+  substitution (16 syncs vs 146; D(i,i) via warp-shuffle row substitution, the
+  off-diagonal blocks in 15 row passes reading A from a preserved packed smem
+  copy s_A); decay cumsum to a 2-sync warp-shuffle scan; k rows prefetched
+  into registers during the scan; the k_cumsum v and attn_causal q reads
+  vectorized to float4 (512 scalar global loads per thread -> 128 float4,
+  with an alignment fallback). Net 276.5 -> ~205-210 us/launch (-24%).
+- Remaining (measured by stage-elimination, all +/-3%):
+  * global loads (v+q) ~118 us of the original 293 - vectorized already, the
+    residual is the L2 latency exposure with 8 warps.
+  * gram ~34 us (1024 smem loads + 2048 FMAs/thread; symmetric-tile or
+    vectorization ideas are load-imbalance or padding-bound, see section 4).
+  * closure ~32 us (16 barriers; the pass work is inherently imbalanced -
+    pass i has i blocks; barrier count is at the floor for 4x4 granularity).
+  * 2 CTAs/CU still needs the smem under 32 KB: s_k [64][129] alone is 33 KB,
+    so it requires fp16 s_k (precision risk on the closure, which is
+    sensitivity-prone - see GDN_DEBUG_HANDOVER.md) or a chunk split. Do NOT
+    attempt casually.
+- Validation: 47/47 tests, PPL 6.2677, generation parity. Numpy check of the
+  4x4 closure math: /tmp/validate_closure_4x4.py (exact to 1e-15).
 
-### L4. gdn_chunk_state (phase B): chunk-loop latency (optional, lower value)
+### L4. gdn_chunk_state (phase B): chunk-loop latency (partial, delta loads done)
 
-- Kernel: gdn_chunk_state, ~6.4 ms/pp512, 267 us/launch, 1 wave, 2 CTAs/CU,
-  no spills, ~10x its FMA floor.
-- Why slow: the 8-chunk serial loop; kd/q/k/ac are re-read from L2 per chunk
-  (~120 MB/launch = ~40 us of L2 bandwidth at 3 TB/s - NOT bandwidth-bound,
-  it is latency-bound on the load chains with only 16 warps/CU).
-- Approach: prefetch chunk c+1's kd/q/ac/k float4 loads during chunk c's
-  compute (registers or a small smem staging buffer - smem budget is 24.6 KB,
-  room for ~8 KB), or try 8 slices of 16 (more CTAs, 2x L2 amplification -
-  probably a wash).
-- Expected: 6.4 -> 4-5 ms if prefetch works, pp512 +1.5-2.5%.
+- Kernel: gdn_chunk_state, ~5.9 ms/pp512, ~246 us/launch, 1 wave, 2 CTAs/CU,
+  VGPR 160, no spills.
+- DONE (commit c8757d649): the step-3 delta reads vectorized (64 scalar loads
+  per thread per chunk -> 16 float4, clamped k-row index keeps the padded
+  rows in-bounds and contributing zero). 268.8 -> ~246 us/launch (-8.5%).
+- Remaining (measured by stage-elimination): kd/q loads ~112 us/launch and
+  ac+k loads ~62 us of the 269; the FMA/sync/expf floor is ~206 us. The
+  kernel is ~65% load-stall-bound, but the loads are warp-broadcast and the
+  chunk loop is serially dependent on S, so a register pipeline is not
+  possible: a 2-stage kd/q pipeline hit 256 VGPR + spills (495 us), and
+  #pragma unroll on the r-loop regressed (349 us). 16 warps/CU already.
+  Realistic remaining ideas: none cheap - revisit only with a fresh profile.
 - Validation: same as L3.
-- Depends on: after L3 (phase A is bigger).
 
 ### L5. concat_non_cont: delta-net ssm conv plumbing (4.7 ms/pp512)
 
@@ -230,15 +238,29 @@ GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
   1.5 LDS/wmma, 4936 t/s), double-buffered smem 61 KB (1 CTA/CU, 5110 t/s),
   burst fragment arrays (LLVM miscompile). GROUP_SIZE_M=8 was noise.
 - The chunked GDN closure bug history is in GDN_DEBUG_HANDOVER.md; the
-  current closure (16x16 block forward substitution) is verified exact
-  (numpy diff ~1e-7). Do not "simplify" it back to I+A+A^2+A^3.
+  current closure (4x4-blocked forward substitution, 2026-08-06) is verified
+  exact (numpy diff ~1e-15, /tmp/validate_closure_4x4.py). Do NOT simplify
+  it back to I+A+A^2+A^3, and do NOT truncate the 4x4 diag power series.
+- Phase B kd/q register pipeline (2026-08-06): a 2-stage software pipeline
+  (alternating float4 register buffers for kd/q, #pragma unroll 2) hit 256
+  VGPRs + 268 B scratch -> 495 us/launch (was 269). The alternating-buffer
+  arrays force too many live registers; the thread-per-column layout that
+  made phase B fast keeps live registers ~40 and has no room for staging.
+- Phase B #pragma unroll on the step-1 r-loop (2026-08-06): 349 us/launch
+  (was 269) - the compiler's default scheduling is better; do not force.
+- Phase A syncs were NOT the main cost: cutting ~165 -> 23 dynamic barriers
+  (closure rewrite + scan) moved phase A only 293 -> 276 us. The real costs
+  were the 512 scalar global loads/thread (v in k_cumsum, q in attn_causal)
+  - vectorizing those to float4 was the big win (276 -> 210 us).
 
 ## 5. Suggested order for the next session
 
-1. Re-bench to confirm the working tree matches section 0 (6068 pp512).
-2. L1 (wmma 2 CTAs/CU) or L3 (phase A) - both independent, similar expected
-   gain. L3 is lower-risk (no fp8 numerics involved) and keeps the GDN
-   momentum; L1 has the bigger ceiling if the fragment-reuse cost is tamed.
+1. Re-bench to confirm the working tree matches section 0 (expect ~6100-6200
+   pp512, the box is noisy - prefer rocprof kernel times for A/B).
+2. L1 (wmma 2 CTAs/CU) is now the only big untapped lever: the GDN levers are
+   mostly spent (phase A -24%, phase B -8.5% this session) and the remaining
+   GDN ideas (phase A 2 CTAs/CU via fp16 s_k, phase B pipelining) are
+   documented as risky/measured-failed above. L1's fragment-reuse cost needs
+   re-measuring before committing to a shape.
 3. L2 (repack) after L1's staging share is re-measured.
-4. L5 (concat) only if L3 leaves the profile where expected.
-5. Re-evaluate L4/L6/L7 with fresh numbers.
+4. L5 (concat) if a fresh profile still shows it hot; L6/L7 only after L1/L2.
