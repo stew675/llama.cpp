@@ -1474,6 +1474,28 @@ struct ggml_backend_cuda_context {
     }
 #endif // USE_CUDA_GRAPH
 
+    // repacked F8_E4M3 weights for the wmma path (built lazily on first use, see fp8.cu):
+    // the block_f8_e4m3 rows are 132 B (f32 scale + 128 fp8), which forces 4-B staging
+    // loads in the wmma kernel; the repack makes the fp8 bytes 16-B aligned per row and
+    // separates the scales. Keyed on the tensor data pointer.
+    struct fp8_repack_buf {
+        uint8_t * q = nullptr; // m_pad x k fp8 bytes
+        float   * s = nullptr; // m_pad x n_col_blocks scales
+        int64_t m = 0;
+        int64_t k = 0;
+        int64_t n_col_blocks = 0;
+
+        ~fp8_repack_buf() {
+            if (q != nullptr) {
+                CUDA_CHECK(cudaFree(q));
+            }
+            if (s != nullptr) {
+                CUDA_CHECK(cudaFree(s));
+            }
+        }
+    };
+    std::unordered_map<const void *, std::unique_ptr<fp8_repack_buf>> fp8_repacks;
+
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {

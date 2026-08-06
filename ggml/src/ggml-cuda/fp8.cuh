@@ -145,6 +145,28 @@ __global__ void quantize_fp8(
     y_q[(int64_t) token * k + col0 + tid] = fp8_e4m3_from_f32(v * red[1]);
 }
 
+// ---- weight repack: block_f8_e4m3 [m][n_col_blocks] -> fp8 [m_pad][k] + scales [m_pad][n_col_blocks] ----
+// The block rows are 132 B (f32 scale + 128 fp8), so the wmma staging loads are 4-B only
+// (misaligned for 16-B). The repack makes the fp8 bytes 16-B aligned per row and separates
+// the scales, so the hot kernel stages 16-B uint4 loads. One warp per (row, k-block);
+// padded rows m..m_pad-1 are pre-zeroed by the launcher (the wmma staging has no bounds
+// predicates).
+__global__ void fp8_repack_weights(
+        const char * __restrict__ src0, uint8_t * __restrict__ dst_q, float * __restrict__ dst_s,
+        const int64_t k, const int64_t n_col_blocks, const int64_t m) {
+    const int lane = threadIdx.x;
+    const int64_t cb = blockIdx.x;
+
+    for (int64_t r = blockIdx.y; r < m; r += gridDim.y) {
+        const char * blk = src0 + (r * n_col_blocks + cb) * (int64_t) sizeof(block_f8_e4m3);
+        const uint32_t v = *(const uint32_t *) (blk + 4 + lane * 4);
+        *(uint32_t *) (dst_q + r * k + cb * GGML_FP8_TILE_K + lane * 4) = v;
+        if (lane == 0) {
+            dst_s[r * n_col_blocks + cb] = *(const float *) blk;
+        }
+    }
+}
+
 // C fragment layout (wmma f32 16x16x16 fp8, wave32, empirically verified on gfx1201):
 //   lane l: token column l%16, rows (l/16)*8 + slot
 //   A fragment: lane l byte e = A[l%16][(l/16)*8+e]
@@ -176,7 +198,8 @@ __device__ __forceinline__ int fp8_wmma_col(int l, int s) {
 // Grid: 1D over (ceil(m/128) * ceil(n/64)).
 __launch_bounds__(GGML_FP8_NTHREADS, 1)
 __global__ void mul_mat_fp8_wmma(
-        const char * __restrict__ src0, const uint8_t * __restrict__ src1_q, const float * __restrict__ src1_s, float * __restrict__ dst,
+        const uint8_t * __restrict__ src0_q, const float * __restrict__ src0_s,
+        const uint8_t * __restrict__ src1_q, const float * __restrict__ src1_s, float * __restrict__ dst,
         const int64_t k, const int64_t m, const int64_t n, const int64_t n_col_blocks, const int64_t n_pad) {
 #if defined(GGML_USE_HIP) && defined(RDNA4)
     using fp8x8_t   = __attribute__((ext_vector_type(2))) int;
@@ -226,32 +249,31 @@ __global__ void mul_mat_fp8_wmma(
     const int row_lane = lane % 16; // weight row of this lane within a tile (also token column)
     const int k_half   = (lane / 16) * 8; // k offset of this lane's half of the 16-k step
 
-    const int64_t row_stride = n_col_blocks * (int64_t) sizeof(block_f8_e4m3);
-
     floatx8_t acc00 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
     floatx8_t acc01 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
     floatx8_t acc10 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
     floatx8_t acc11 = { 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 
     // staging for k-block cb into registers (issued before the wmma chain):
-    //   rA: 16 x uint = 64 B of weight fp8 (4-B global loads, misaligned for 16-B)
+    //   rA: 4 x uint4 = 64 B of weight fp8 (16-B loads, repacked layout)
     //   rB: 2 x uint4 = 32 B of activation fp8
     //   rD: weight scale of this thread's row (tid < CTA_M)
     //   rS: activation scale of this thread's token (tid < CTA_N)
 
     // prologue: stage k-block 0 into the (single) buffer
     {
-        const char * Abase = src0 + (int64_t) m0 * row_stride;
+        const uint8_t * Abase = src0_q + (int64_t) m0 * k;
         const uint8_t * Bbase = src1_q + (int64_t) n0 * k;
+        const float   * Sbase = src0_s + (int64_t) m0 * n_col_blocks;
         if (tid < CTA_M) {
-            *(float *) &sA[tid][0] = (m0 + tid < m) ? *(const float *) (Abase + (int64_t) tid * row_stride) : 0.f;
+            *(float *) &sA[tid][0] = Sbase[(int64_t) tid * n_col_blocks];
         }
 #pragma unroll
-        for (int it = 0; it < 16; ++it) {
-            const int idx = tid + it * GGML_FP8_NTHREADS; // 0..4095
-            const int r = idx >> 5;
-            const int c = idx & 31;
-            *(uint *) &sA[r][8 + c * 4] = (m0 + r < m) ? *(const uint *) (Abase + (int64_t) r * row_stride + 4 + c * 4) : 0u;
+        for (int it = 0; it < 4; ++it) {
+            const int idx = tid + it * GGML_FP8_NTHREADS; // 0..1023
+            const int r = idx >> 3; // 0..127 rows
+            const int c = idx & 7;  // 0..7 uint4 slots per row
+            *(uint4 *) &sA[r][8 + c * 16] = *(const uint4 *) (Abase + (int64_t) r * k + c * 16);
         }
 #pragma unroll
         for (int it = 0; it < 2; ++it) {
@@ -270,21 +292,22 @@ __global__ void mul_mat_fp8_wmma(
         const bool has_next = (cb + 1 < n_col_blocks);
 
         // issue the global loads for k-block cb+1 into registers
-        uint rA[16];
+        uint4 rA[4];
         uint4 rB[2];
         float rD = 0.f, rS = 0.f;
         if (has_next) {
-            const char * Abase = src0 + (int64_t) m0 * row_stride + (cb + 1) * sizeof(block_f8_e4m3);
+            const uint8_t * Abase = src0_q + (int64_t) m0 * k + (cb + 1) * GGML_FP8_TILE_K;
             const uint8_t * Bbase = src1_q + (int64_t) n0 * k + (cb + 1) * GGML_FP8_TILE_K;
+            const float   * Sbase = src0_s + (int64_t) m0 * n_col_blocks;
             if (tid < CTA_M) {
-                rD = (m0 + tid < m) ? *(const float *) (Abase + (int64_t) tid * row_stride) : 0.f;
+                rD = Sbase[(int64_t) tid * n_col_blocks + cb + 1];
             }
 #pragma unroll
-            for (int it = 0; it < 16; ++it) {
+            for (int it = 0; it < 4; ++it) {
                 const int idx = tid + it * GGML_FP8_NTHREADS;
-                const int r = idx >> 5;
-                const int c = idx & 31;
-                rA[it] = (m0 + r < m) ? *(const uint *) (Abase + (int64_t) r * row_stride + 4 + c * 4) : 0u;
+                const int r = idx >> 3;
+                const int c = idx & 7;
+                rA[it] = *(const uint4 *) (Abase + (int64_t) r * k + c * 16);
             }
 #pragma unroll
             for (int it = 0; it < 2; ++it) {
@@ -347,11 +370,11 @@ __global__ void mul_mat_fp8_wmma(
                 *(float *) &sA[tid][0] = rD;
             }
 #pragma unroll
-            for (int it = 0; it < 16; ++it) {
+            for (int it = 0; it < 4; ++it) {
                 const int idx = tid + it * GGML_FP8_NTHREADS;
-                const int r = idx >> 5;
-                const int c = idx & 31;
-                *(uint *) &sA[r][8 + c * 4] = rA[it];
+                const int r = idx >> 3;
+                const int c = idx & 7;
+                *(uint4 *) &sA[r][8 + c * 16] = rA[it];
             }
 #pragma unroll
             for (int it = 0; it < 2; ++it) {
@@ -388,7 +411,7 @@ __global__ void mul_mat_fp8_wmma(
     }
 #else
     // unreachable: the host pass only generates the launch stub
-    (void) src0; (void) src1_q; (void) src1_s; (void) dst;
+    (void) src0_q; (void) src0_s; (void) src1_q; (void) src1_s; (void) dst;
     (void) k; (void) m; (void) n; (void) n_col_blocks; (void) n_pad;
 #endif
 }

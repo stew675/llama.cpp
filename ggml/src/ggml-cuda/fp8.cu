@@ -7,6 +7,60 @@
 
 // Pre-quantize F32 activations to fp8 staging, then run the native FP8 mul_mat
 // kernel. Mirrors the quantize_mmq_q8_1_cuda + mul_mat_q flow.
+
+// Lazily repack the block_f8_e4m3 weight layout into the wmma-friendly layout
+// (fp8 bytes contiguous [m_pad][k] + separate scales [m_pad][n_col_blocks]), cached
+// per tensor in the backend context. The wmma kernel reads 16-B aligned staging
+// loads this way; the GEMV and scalar paths keep reading the original block layout.
+// Safe under CUDA graphs: the first call always happens during the direct-execution
+// warmup (capture only starts after warmup completes), so cudaMalloc is legal here.
+static const ggml_backend_cuda_context::fp8_repack_buf & ggml_cuda_fp8_repack(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, cudaStream_t stream) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    const int64_t k = src0->ne[0];
+    const int64_t m = src0->ne[1];
+    const int64_t n_col_blocks = k / GGML_FP8_TILE_K;
+    const int64_t m_pad = (m + GGML_FP8_CTA_M - 1) / GGML_FP8_CTA_M * GGML_FP8_CTA_M;
+
+    auto & cache = ctx.fp8_repacks;
+    auto it = cache.find(src0->data);
+    if (it != cache.end()) {
+        const ggml_backend_cuda_context::fp8_repack_buf * buf = it->second.get();
+        if (buf->m == m && buf->k == k && buf->n_col_blocks == n_col_blocks) {
+            return *buf;
+        }
+        cache.erase(it); // shape changed - rebuild
+    }
+
+    ggml_cuda_set_device(ctx.device);
+
+    auto buf = std::make_unique<ggml_backend_cuda_context::fp8_repack_buf>();
+    buf->m = m;
+    buf->k = k;
+    buf->n_col_blocks = n_col_blocks;
+
+    CUDA_CHECK(cudaMalloc(&buf->q, m_pad * k));
+    CUDA_CHECK(cudaMalloc(&buf->s, m_pad * n_col_blocks * sizeof(float)));
+
+    // zero the padded tail rows: the wmma staging has no bounds predicates
+    if (m_pad > m) {
+        CUDA_CHECK(cudaMemsetAsync(buf->q + m * k, 0, (m_pad - m) * k, stream));
+        CUDA_CHECK(cudaMemsetAsync(buf->s + m * n_col_blocks, 0, (m_pad - m) * n_col_blocks * sizeof(float), stream));
+    }
+
+    // one warp per (row, k-block); grid.y covers the rows in chunks of 65535
+    const dim3 grid_dims(n_col_blocks, std::min<int64_t>(m, 65535), 1);
+    const dim3 block_dims(32, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(fp8_repack_weights, launch_params, (const char *) src0->data, buf->q, buf->s, k, n_col_blocks, m);
+
+    const ggml_backend_cuda_context::fp8_repack_buf * ret = buf.get();
+    cache.emplace(src0->data, std::move(buf));
+    return *ret;
+}
+
 void ggml_cuda_mul_mat_fp8(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F8_E4M3);
@@ -73,9 +127,11 @@ void ggml_cuda_mul_mat_fp8(
             } else {
                 // CTA: 128 weight rows x 64 tokens (2x2 wmma tiles per warp, 8 warps),
                 // register-staged k-block pipelining; grouped-M pid swizzle (aiter recipe)
+                // weights are read from the repacked layout (16-B staging loads)
+                const ggml_backend_cuda_context::fp8_repack_buf & rp = ggml_cuda_fp8_repack(ctx, src0, stream);
                 const dim3 grid_dims(((m + GGML_FP8_CTA_M - 1) / GGML_FP8_CTA_M) * ((n + GGML_FP8_CTA_N - 1) / GGML_FP8_CTA_N), 1, 1);
                 const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
-                ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, src0_d, src1_q_d, src1_s_d, dst_b, k, m, n, n_col_blocks, n_pad);
+                ggml_cuda_kernel_launch(mul_mat_fp8_wmma, launch_params, rp.q, rp.s, src1_q_d, src1_s_d, dst_b, k, m, n, n_col_blocks, n_pad);
             }
             continue;
         }
