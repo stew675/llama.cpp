@@ -27,6 +27,7 @@ aiter inspection details. This file tracks ONLY the performance picture.
 | fp8 now (decode session, commit below) | **5914** | **89.1** | **-4.3%** | **-2.0%** |
 | fp8 now (chunked GDN, 2026-08-06) | **6068-6072** | **89.8-90.0** | **-1.7%** | **-1.2%** |
 | fp8 now (phase A+B session, 2026-08-06) | **~6100-6200** (noisy box) | **89.8-90.1** | ~-1% | ~-1% |
+| fp8 now (L2 weight repack, 2026-08-06) | **6319-6334** | **89.4-90.0** | ~+1.5% | ~-1% |
 | target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
 | target generation (+10%) | - | ~100 | - | +10% |
 
@@ -377,3 +378,47 @@ Conclusion for LEVERS.md: L1 is spent unless a new structural idea appears
 (e.g. a swizzled kpacked smem layout for A, which the L2 repack would enable).
 The remaining GEMM lever with real headroom is L2 (weight repack at load
 time): 16-B staging loads + it unblocks the kpacked layout.
+
+
+## 15. L2 wmma weight repack (2026-08-06 evening, session)
+
+Goal: LEVERS.md L2 (wmma weight repack at load time). Result: wmma kernel
+~204 -> ~186 us/launch average (-9%), pp512 6220 -> 6319-6334 (+1.6-1.8%),
+tg64 unchanged. PPL 6.2677 exact; generation matches; 47/47 GDN tests.
+Commits: (see git log).
+
+Method:
+1. Re-measured the staging share at the current 93 TFLOP/s with the rig
+   (/tmp/stub_rig/fp8.cuh: replaced the rA/rD weight-side staging loads with
+   constants, kept the smem stores/barriers/wmma chain): 260.5 -> 175 us, so
+   the weight staging loads were ~85 us = 33% of the kernel - far above the
+   old ~15% estimate from the 55 TFLOP/s era. L2 premise confirmed.
+2. Simulated the repacked layout in a rig (/tmp/bench_repack.cu + the shared
+   /tmp/repack_kernel.cuh): contiguous fp8 [m_pad][k] rows + separate scales
+   [m_pad][n_col_blocks], uint4 staging loads, no bounds predicates (padded
+   rows pre-zeroed). 260.5 -> ~228 us on the gate shape = 93 -> 106 TFLOP/s
+   (+14%). Bit-exact vs the block-layout kernel (0 diffs of 4.7M outputs,
+   /tmp/check_repack.cu).
+3. Implemented in-tree: fp8_repack_weights kernel (one warp per row, k-block;
+   grid.y chunks rows, loop r += gridDim.y) + lazy per-context cache in
+   ggml_cuda_fp8_repack (keyed on src0->data, shape-checked; allocated via
+   cudaMalloc - safe because the first call always happens during the
+   direct-execution warmup before CUDA-graph capture). The GEMV and scalar
+   paths keep reading the original block layout (decode untouched).
+
+BUG FOUND (do not rediscover): the repack kernel looped `r < gridDim.y`
+instead of `r < m`. For m > 65535 (output.weight, vocab 152064) grid.y is
+clamped to 65535, so rows beyond 65535 were never repacked -> garbage logits
+-> PPL 9.56 (was 6.24). The bit-exact kernel-vs-kernel rig did NOT catch it
+(its repacked buffer was host-built); the isolated repack-kernel check
+(/tmp/check_repack_kernel.cu, compares device repack vs host repack on the
+real model shapes incl. m=70000) caught it. Rule: any device-side repack/
+transform kernel needs its own isolated content check, including the m >
+grid-y-limit case.
+
+Also learned: the fp8 weight tensors get fresh data pointers (and fresh names)
+on every graph build in this codebase, but CUDA-graph replay means the lazy
+pointer-keyed cache is populated once during the first direct execution and
+reused afterwards - verified stable at ~201 entries over a 2200-call PPL run
+(no unbounded growth, no per-chunk repack cost). The one-time repack cost is
+~13 ms total (~200 tensors, p50 71 us, max 1.09 ms for output.weight).

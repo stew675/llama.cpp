@@ -14,17 +14,16 @@ stewfp8-ow.gguf` (24 delta-net layers, H=32 heads, K=V=128, neqk1=16).
 
 ---
 
-## 0. Current state (verified 2026-08-06, after the phase A/B session)
+## 0. Current state (verified 2026-08-06 evening, after the L2 weight-repack session)
 
 | metric | value | notes |
 |---|---|---|
-| pp512 (chunked) | 6069 baseline; ~6100-6200 after the phase A rewrite (noisy box, see note) | sequential path: 5878 |
-| tg64 | 89.8-90.1 | decode untouched, sequential GDN |
-| PPL | 6.2677 | 6.2426 pre-change (within the +/-0.34 error bar); generation matches |
+| pp512 (chunked) | 6319-6334 (was 6220 at session start) | wmma kernel -9%/launch via the L2 repack; box noisy, prefer rocprof |
+| tg64 | 89.4-90.0 | decode untouched, sequential GDN |
+| PPL | 6.2677 | matches baseline exactly; generation matches |
 | backend tests | 47/47 GATED_DELTA_NET pass | incl. multi-seq cases |
-| GDN chunked per pp512 | ~10.9 ms = ~13% of pp512 | phase A 4.9 + phase B 5.9 |
-| GDN phase B | ~246 us/launch, 24 launches/pp512 | 1 wave, 2 CTAs/CU, no spills |
-| GDN phase A | ~205-210 us/launch, 24 launches/pp512 | 23 syncs, 1 CTA/CU (58 KB LDS) |
+| wmma kernel | ~186 us/launch avg (was ~204) | 16-B staging loads from the repacked layout |
+| GDN chunked per pp512 | ~10.9 ms (unchanged) | phase A 4.9 + phase B 5.9 |
 
 NOTE on bench noise: since 2026-08-06 late the box is noisy (+/-60-170 on
 pp512, occasionally +/-1000). Prefer rocprof kernel times (deterministic to
@@ -111,22 +110,28 @@ ac+k loads ~62 us, FMA/sync floor ~206 us).
   miscompiled kernel scores maxerr 34 / 7991-of-8192 wrong.
 - Depends on: nothing. Independent of L2.
 
-### L2. wmma weight repack at load time (second GEMM lever)
+### L2. wmma weight repack at load time - DONE 2026-08-06 evening, +1.6-1.8% pp512
 
-- Why slow: block_f8_e4m3 rows are 132 B (f32 d + 128 fp8), so staging loads
-  are 4-B only (misaligned for 16-B). The wmma kernel spends a large share of
-  its time staging (weights 16 KB + activations 8 KB per k-block per CTA).
-- Approach: repack weights once at model load into a wmma-friendly layout:
-  fp8 bytes contiguous [m][k] (16-B aligned rows), scales as a separate
-  [m/128][k/128] f32 array. Do it in the backend when the tensor is first
-  used (ggml_cuda_mul_mat_fp8) into a cached buffer so BOTH the safetensors
-  loader and GGUF path get it. Changes Abase addressing only.
-- Expected: +10-20% on the wmma kernel if staging is the limiter (was ~23% of
-  kernel time at 55 TFLOP/s; re-profile the staging share first by removing
-  the staging loop).
-- Validation: same as L1. Note test-backend-ops has NO F8_E4M3 mul_mat cases
-  (CPU can't do fp8) - generation diff and PPL are the gates.
-- Depends on: profile first (staging share at current 77 TFLOP/s).
+- DONE (commits below): weights are repacked once per tensor on first wmma use into a
+  cached layout (fp8 bytes contiguous [m_pad][k] 16-B aligned + scales [m_pad][n_col_blocks]
+  f32), so the wmma kernel stages 16-B uint4 loads instead of 4-B misaligned ones. The
+  GEMV and scalar paths keep reading the original block layout (decode untouched).
+- Measured (rig, gate shape 9216x512x2560): staging-stub delta 260.5 -> 175 us (the
+  weight-side staging loads were ~85 us = 33% of the kernel, far above the old ~15%
+  estimate at 55 TFLOP/s); repacked kernel 260.5 -> ~228 us = 93 -> 106 TFLOP/s (+14%).
+- In-tree: wmma ~204 -> ~186 us/launch average (-9%). The repack itself is one-time per
+  tensor (p50 71 us, max 1.09 ms for output.weight at 389 MB; ~13 ms total for the ~200
+  tensors, only on the first graph build - CUDA-graph replays reuse the cache, verified
+  stable at ~201 entries over a 2200-call PPL run).
+- Net: pp512 6220 -> 6319-6334 (+1.6-1.8%), tg64 unchanged. PPL 6.2677 exact; generation
+  matches; 47/47 GDN tests.
+- Files: fp8.cuh (fp8_repack_weights kernel + wmma staging addressing), fp8.cu (lazy
+  per-context cache keyed on src0->data, built in ggml_cuda_fp8_repack), common.cuh
+  (fp8_repack_buf in ggml_backend_cuda_context).
+- Validation: /tmp/check_repack_kernel.cu (isolated repack kernel check, all model
+  shapes incl. m=70000), /tmp/check_repack.cu (bit-exact kernel-vs-kernel).
+- Remaining: L2 as designed is spent. The kpacked smem layout for A (the other L2
+  benefit) is still blocked by the aiter layout problem (see L1).
 
 ### L3. gdn_chunk_prepare (phase A) - main items DONE 2026-08-06, remaining: 2 CTAs/CU
 
@@ -293,17 +298,10 @@ GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
 
 ## 5. Suggested order for the next session
 
-1. Re-bench to confirm the working tree matches section 0 (expect ~6100-6200
-   pp512, the box is noisy - prefer rocprof kernel times for A/B).
-2. L1 (wmma GEMM) is now measured as spent (2026-08-06 evening session): the
-   2-CTA/CU premise was already done, the residual 92-98 vs aiter 121-137
-   TFLOP/s gap is triton codegen that does not port (kpack layout, 2-stage
-   smem = 1 CTA/CU), and the kernel's own structure is near its floor
-   (scale pass 13%, staging/barriers 85%, fragments free). Do NOT re-attempt
-   the kpack/2-deep-pipeline shapes without a new idea.
-3. L2 (repack at load time) is the only GEMM lever left with a real,
-   unmeasured headroom: it fixes the 4-B weight staging AND would allow the
-   kpacked smem layout for A. Re-measure the staging share first (remove the
-   staging loop in /tmp/bench_wmma.cu).
-4. L5 (concat) if a fresh profile still shows it hot; L6/L7 only after L2.
-   The GDN levers (phase A/B) are spent (see L3/L4).
+1. Re-bench to confirm the working tree matches section 0 (expect ~6320 pp512
+   with the L2 repack; the box is noisy - prefer rocprof kernel times for A/B).
+2. L5 (concat_non_cont, 4.7 ms/pp512) is the next live lever: check if ssm_conv
+   can read the two contiguous pieces in place (it needs a per-row offset table
+   the signature does not have). If not fusable, L5 is nothing.
+3. L6 (quantize_fp8 fusion) and L7 (Cijk BF16 -> fp8) only after L5. The GDN
+   levers (L3/L4) and the wmma levers (L1/L2) are spent.
