@@ -769,7 +769,8 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = QK_F8_E4M3,
         .type_size                = sizeof(block_f8_e4m3),
         .is_quantized             = true,
-        // no to_float/from_float/vec_dot: requires native FP8 hardware (GPU only)
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
+        // no from_float/vec_dot: requires native FP8 hardware (GPU only)
     },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",

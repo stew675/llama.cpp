@@ -429,10 +429,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     // F8_E4M3 has no CPU kernels, requires native FP8 hardware (e.g. RDNA4, MI300)
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
-        if (op->src[i] && op->src[i]->type == GGML_TYPE_F8_E4M3) {
-            return false;
+    // exception: GET_ROWS dequantizes via type_traits.to_float, which fp8 now has
+    if (op->op != GGML_OP_GET_ROWS) {
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (op->src[i] && op->src[i]->type == GGML_TYPE_F8_E4M3) {
+                return false;
+            }
         }
+    } else if (op->src[0] && op->src[0]->type == GGML_TYPE_F8_E4M3) {
+        // the fp8 get_rows iterates on 128-value blocks
+        return op->src[0]->ne[0] % QK_F8_E4M3 == 0;
     }
     if (op->type == GGML_TYPE_F8_E4M3) {
         return false;

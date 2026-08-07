@@ -156,10 +156,17 @@ def parse_args() -> argparse.Namespace:
         "--fp8-as-q8", action="store_true",
         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
     )
-    parser.add_argument(
+    fp8_weight_group = parser.add_mutually_exclusive_group()
+    fp8_weight_group.add_argument(
         "--fp8-output-weight", action="store_true",
         help="Also store an FP8 output.weight copy of token_embd so lm_head runs on the FP8 path "
              "(keeps token_embd BF16 for the input embedding lookup).",
+    )
+    fp8_weight_group.add_argument(
+        "--fp8-token-embd", action="store_true",
+        help="Store token_embd itself as FP8 (per-row scales) so a single embedding serves both the "
+             "input lookup and the lm_head - the smallest single-copy layout. Requires the fp8 "
+             "get_rows kernel in the runtime (ggml-cuda). Mutually exclusive with --fp8-output-weight.",
     )
     parser.add_argument(
         "--fp8-delta-net-in-proj", action="store_true",
@@ -302,6 +309,7 @@ def main() -> None:
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
                                      fp8_output_weight=args.fp8_output_weight,
+                                     fp8_token_embd=args.fp8_token_embd,
                                      fp8_delta_net_in_proj=args.fp8_delta_net_in_proj,
                                      )
 

@@ -31,21 +31,27 @@ aiter inspection details. This file tracks ONLY the performance picture.
 | fp8 now (L5 conv fusion, 2026-08-06) | **6538-6554** | **89.4-90.0** | ~+5% | ~-1% |
 | fp8 now (L6 quantize rewrite, 2026-08-06) | **6818-6841** | **89.2-89.6** | ~+7% | ~-1% |
 | fp8 now (L7 in-proj fp8, 2026-08-06) | **7184-7260** | **88.3-88.5** | ~+13% | ~-1.5% |
+| fp8 now (L9 single-copy embd, 2026-08-06) | **7162-7170** | **88.3-88.6** | ~+13% | ~-1.5% |
+| fp8 now file size (L9) | 4.17 GiB / 4.33 B | vs 5.35 GiB / 4.96 B (L7) | -22% | |
 | target prefill (+50% over Q8_0) | 8770 | - | +50% | - |
 | target generation (+10%) | - | ~100 | - | +10% |
 
 pp256: 5014, pp1024: 5446, pp2048: 5292, pp128: 3661 (high variance, use -r 5).
 
-Current authoritative numbers (2026-08-06, chunked GDN default, L7 session):
+Current authoritative numbers (2026-08-06, chunked GDN default, L9 session):
 see LEVERS.md section 0. The box is noisy (pp512 +/-60-170, occasionally much
 worse): trust rocprof kernel times (deterministic +/-3%) for A/B. GDN per
 pp512: phase A ~4.9 ms + phase B ~5.9 ms. quantize_fp8 per pp512: ~2.5 ms.
-The canonical GGUF is now the L7 build (in_proj_a/b F8_E4M3); the pre-change
-file is stewfp8-ow-bf16gate.gguf in the same directory.
+BENCH ON -dev ROCm2: the box has 3x R9700 and a Qwen3.6-27B llama-server holds
+ROCm0/1 most of the time (llama-bench OOMs on an occupied GPU and llama.cpp
+silently CPU-offloads layers, which looks like a perf regression).
+The canonical GGUF is now the L9 single-copy build (fp8 token_embd, fp8 gates,
+no output.weight); the two-copy L7 reference is stewfp8-ow-2copy.gguf.
 
-PPL 6.2528 (L7) vs 6.2677 (L6) vs 6.2464 (Q8_0) on the small
+PPL 6.2250 (L9) vs 6.2528 (L7) vs 6.2464 (Q8_0) on the small
 /tmp/corpus_pride.txt corpus (all within error bars); generation matches the
-pre-change fp8 output on the same prompt/seed.
+pre-change fp8 output on the same prompt/seed (llama-cli spawns its own local
+server - point it at the same GPU as the benches).
 
 ## 2. Where pp512 time goes (historical, decode session; current: LEVERS.md section 1)
 
@@ -83,12 +89,12 @@ old L1-L5 below:
 - the non-fp8-tensor quantization lever (old L5) is folded into LEVERS.md L7
   (Cijk BF16 projections); the quantizable-set note below is still valid.
 
-Old L5 note that still matters: **do NOT quantize token_embd to fp8** without
-adding a get_rows fp8 kernel (getrows.cu has no F8_E4M3 case; CPU has no fp8
-kernels either). lm_head already runs fp8 via the `--fp8-output-weight` copy
-(token_embd stays BF16 for the input lookup). The old quantizable set (norms,
-conv1d, in_proj_a/b, A_log) is closed: in_proj_a/b are now F8_E4M3 (L7);
-norms/conv1d/A_log are not GEMMs (no fp8 kernel would apply).
+RESOLVED (L9): the old warning against quantizing token_embd is obsolete. An
+fp8 get_rows kernel now exists (getrows.cu k_get_rows_f8 + the CPU get_rows
+path via traits->to_float = dequantize_row_f8_e4m3), so token_embd can be
+stored once in fp8 and serve both the lookup and the lm_head (no output.weight
+copy). The old quantizable set (norms, conv1d, in_proj_a/b, A_log) is closed:
+in_proj_a/b are F8_E4M3 (L7); norms/conv1d/A_log are not GEMMs.
 
 ## 4. Kernel facts (established this session, do not rediscover)
 
@@ -580,3 +586,56 @@ runs with m_pad 128 and its existing mi >= m bounds check handles the
 padding; the fp8_repack_weights launcher handles m < 65535 with grid.y = m
 (no row loop needed); the block_f8_e4m3 scale grid is [1, 20] (one row
 block), which np.repeat(d, 128, axis=0)[:M] replicates per row correctly.
+
+## 19. L9: single-copy fp8 token_embd (2026-08-06, session)
+
+Goal: eliminate the duplicate embedding (token_embd BF16 + output.weight fp8
+were two copies of the same 0.64 B-param matrix) so the file shrinks without
+losing the fp8 lm_head speed. Result: token_embd is now F8_E4M3 in the GGUF
+(per-row scales) and output.weight is gone - the graph's tied-embedding
+fallback (qwen35.cpp: output == NULL -> TENSOR_DUPLICATED token_embd) makes
+the head read the same fp8 tensor. File 5.35 -> 4.17 GiB (-22%), 4.96 ->
+4.33 B params, pp512 7171 -> 7162-7170 and tg64 88.5 -> 88.3-88.6 (SAME
+speed), PPL 6.2250 (was 6.2528), generation identical, all backend tests
+pass (GET_ROWS now covers fp8, bit-exact vs CPU). Commit: (see git log).
+
+New kernels/paths:
+1. CUDA get_rows for F8: k_get_rows_f8 (one CTA per (row, 128-col block),
+   256 threads, per-row scale d, fp8_e4m3_to_f32 decode moved to common.cuh so
+   getrows.cu and fp8.cuh share it) + dispatch case in
+   ggml_cuda_get_rows_switch_src0_type + ggml_cuda_device_supports_op.
+2. CPU get_rows for F8: the type_traits table got .to_float =
+   dequantize_row_f8_e4m3 (ggml.c; also fixes llama_model_get_tok_embd), the
+   CPU supports_op blanket F8 rejection got a GET_ROWS carve-out, and
+   ggml_compute_forward_get_rows got the F8 case (it dequantizes via
+   traits->to_float).
+3. Conversion: --fp8-token-embd (mutually exclusive with --fp8-output-weight);
+   _generate_fp8_token_embd packs token_embd with PER-ROW scales
+   (d[r][cb], 20 scales per vocab row instead of one shared per 128-row
+   block - finer, and both the get_rows and the mul_mat kernels index d per
+   row, so no format change).
+
+PITFALL (do not rediscover, this cost most of the session): with F8 token_embd
+and NO CPU get_rows support, the sched placed get_rows on CUDA and copied the
+whole 625 MB embedding into the GPU compute buffer PER BATCH - decode dropped
+to 17 t/s (5x), pp512 to 4504, the compute buffer ballooned to 625 MiB, and
+the run was full of serialized host->device copies. The BF16 embedding never
+hit this because get_rows runs on CPU reading the mmap in place. Root cause:
+the input layer is always kept on the CPU buffer by design
+(llama-model.cpp: "very little benefit to offloading the input layer"), and
+with mmap the ROCm_Host candidate is converted to a plain CPU buffer. The
+CPU-buffer F8 tensor can only be consumed by a CPU get_rows (or a per-batch
+device copy). Lesson: any future F8 tensor that lives in a CPU/host buffer
+needs a CPU-side consumer; the CUDA get_rows alone is not enough.
+
+Also learned this session: the box has 3x R9700 + a small GPU3; a Qwen3.6-27B
+llama-server (started 2026-08-05) holds ROCm0/1, so benches must use
+-dev ROCm2. llama-cli in this fork is an HTTP client that spawns its own
+llama-server (or --server-base); the earlier "generation parity" runs in this
+file may have been against the spawned server on whatever GPU was free - use
+the same -dev as the benches and the same model path for a meaningful diff.
+
+Next lever per LEVERS.md: none live - L1 (wmma), L3/L4 (GDN) and L7 (in-proj
+fp8) are spent; L8 (small kernels) skip. Remaining structural ideas: L1's
+kpacked smem layout for A, and the decode-side fused quantize-in-gemv
+(~+4% tg64 per section 10).

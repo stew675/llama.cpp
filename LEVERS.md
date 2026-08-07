@@ -14,19 +14,28 @@ stewfp8-ow.gguf` (24 delta-net layers, H=32 heads, K=V=128, neqk1=16).
 
 ---
 
-## 0. Current state (verified 2026-08-06, after the L7 in-proj fp8 session)
+## 0. Current state (verified 2026-08-06, after the L9 single-copy embedding session)
 
 | metric | value | notes |
 |---|---|---|
-| pp512 (chunked) | 7184-7260 (was 6818-6841) | L7: in_proj_a/b to fp8 (+5-6%) |
-| tg64 | 88.3-88.5 (was 89.2-89.6) | -1%: alpha/beta decode now quantize+gemv instead of bf16 mmvf |
-| PPL | 6.2528 (was 6.2677) | within noise; generation matches |
-| backend tests | GDN + SSM_CONV all pass | unchanged |
-| wmma kernel | ~159 us/launch avg (was ~186-188) | 48 small alpha/beta launches (8 CTAs, ~24 us) drag the avg down |
+| pp512 (chunked) | 7162-7170 (was 7184-7260) | L9: single-copy fp8 embedding, same speed as the two-copy -ow |
+| tg64 | 88.3-88.6 (was 88.3-88.5) | unchanged |
+| PPL | 6.2250 (was 6.2528) | within noise; generation matches |
+| backend tests | all pass (GET_ROWS now covers fp8) | new F8 get_rows cases, bit-exact vs CPU |
+| wmma kernel | ~156-159 us/launch avg | unchanged |
 | GDN chunked per pp512 | ~10.9 ms (unchanged) | phase A 4.9 + phase B 5.9 |
 | Cijk (CK BF16 GEMM) | GONE (0 launches) | in_proj_a/b now on the fp8 wmma path |
 | concat_non_cont | GONE (0 launches) | fused into ssm_conv_2src |
-| quantize_fp8 per pp512 | ~2.5 ms (was ~5.1) | warp rewrite: 12.6 us/launch (was 25.4) on pp512 grids |
+| quantize_fp8 per pp512 | ~2.5 ms | warp rewrite |
+| model file | 4.17 GiB, 4.33 B params | single fp8 token_embd (was 5.35 GiB / 4.96 B two-copy) |
+
+IMPORTANT box change: the box actually has 3x R9700 (ROCm0/1/2) + a small GPU3,
+and a Qwen3.6-27B llama-server occupies ROCm0/1 most of the time. Bench on
+`-dev ROCm2` (free). llama-bench on an occupied GPU fails with cudaMalloc OOM
+and llama.cpp silently offloads layers to CPU (looks like a perf regression).
+Also: llama-cli in this fork is a SERVER CLIENT (spawns its own llama-server or
+connects via --server-base) - generation-parity runs must use the same GPU
+and model as the benches.
 
 NOTE on bench noise: since 2026-08-06 late the box is noisy (+/-60-170 on
 pp512, occasionally +/-1000). Prefer rocprof kernel times (deterministic to
@@ -40,7 +49,7 @@ launch counts (24 layers x 2) and 2x the per-pp512 kernel times. Per-pp512
 numbers in this file are the trace numbers divided by 2 unless stated.
 
 Profile command: `rocprofv3 -r -d /tmp/rocp_x -f csv -- llama-bench -m <model>
--p 512 -n 8 -r 1 -dev ROCm0`, then parse `soar/*kernel_trace.csv`
+-p 512 -n 8 -r 1 -dev ROCm2`, then parse `soar/*kernel_trace.csv`
 (Duration = End_Timestamp - Start_Timestamp; Grid_Size_X = work-items,
 divide by Workgroup_Size_X for CTA count; VGPR/LDS/Scratch columns).
 
@@ -284,6 +293,39 @@ ac+k loads ~62 us, FMA/sync floor ~206 us).
 - Not worth the risk/effort individually. Revisit only if everything else is
   done and a specific one shows up hot in a fresh profile.
 
+### L9. Single-copy fp8 token_embd - DONE 2026-08-06, same speed, -22% file
+
+- DONE (commits below): token_embd is now F8_E4M3 in the GGUF (per-row scales)
+  and the separate fp8 output.weight copy is GONE - one embedding serves both
+  the input lookup (get_rows) and the lm_head (the graph duplicates token_embd
+  as the output tensor when output.weight is absent). File 5.35 -> 4.17 GiB,
+  4.96 -> 4.33 B params, ~0.66 GB less VRAM; pp512 and tg64 UNCHANGED (7162-7170
+  / 88.3-88.6 on ROCm2); PPL 6.2250 (was 6.2528); generation identical.
+- New fp8 get_rows kernel (getrows.cu k_get_rows_f8: one CTA per (row, 128-col
+  block), per-row scale d, fp8_e4m3_to_f32 moved to common.cuh) + dispatch in
+  ggml-cuda.cu supports_op. The traits table got to_float =
+  dequantize_row_f8_e4m3 (ggml.c), which also fixes llama_model_get_tok_embd.
+- Conversion: new `--fp8-token-embd` flag (mutually exclusive with
+  --fp8-output-weight); `_generate_fp8_token_embd` in conversion/base.py packs
+  token_embd with PER-ROW scales (d[r][cb], finer than the 128-row-block
+  convention and indexable by both the get_rows and mul_mat kernels).
+- PITFALL (do not rediscover): the input layer is ALWAYS kept on the CPU buffer
+  by design ("very little benefit to offloading the input layer"), and with
+  mmap the ROCm_Host candidate is converted to a plain CPU buffer. The BF16
+  embedding works because get_rows runs on CPU reading the mmap in place. For
+  F8, the CPU backend blanket-rejected fp8 ops, so the sched placed get_rows on
+  CUDA and copied the WHOLE 625 MB embedding into the GPU compute buffer per
+  batch (decode 5x slower, 17 t/s, 625 MiB compute buffer). Fix: carve out
+  GET_ROWS in ggml_backend_cpu_device_supports_op (CPU get_rows dequantizes via
+  traits->to_float) + add the F8 case to ggml_compute_forward_get_rows. With
+  get_rows on CPU the embedding stays mmap'd, the sched compute buffer is ~8 MiB,
+  and decode is back to 88.5 t/s. Side effect: test-backend-ops now runs fp8
+  GET_ROWS cases (CPU ref vs GPU kernel) - all pass bit-exactly.
+- The duplicated output tensor (TENSOR_DUPLICATED path, qwen35.cpp) is a real
+  second ggml_tensor sharing the file data - the head mul_mat runs on the fp8
+  wmma/gemv path exactly like the old output.weight (verified with an
+  intermediate two-copy build: same speed, so the head was never the issue).
+
 ## 3. Session protocol (commands)
 
 ```bash
@@ -291,20 +333,20 @@ ac+k loads ~62 us, FMA/sync floor ~206 us).
 cmake --build /tmp/llama-hip-full -j16 --target llama-bench llama-perplexity test-backend-ops
 
 # bench (pp512 + tg64, 5 reps)
-/tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 64 -r 5 -dev ROCm0
+/tmp/llama-hip-full/bin/llama-bench -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 64 -r 5 -dev ROCm2
 
 # correctness gate (always)
-/tmp/llama-hip-full/bin/test-backend-ops test -b ROCm0 -o GATED_DELTA_NET   # 47/47
+/tmp/llama-hip-full/bin/test-backend-ops test -b ROCm2 -o GATED_DELTA_NET   # 47/47
 /tmp/llama-hip-full/bin/llama-perplexity -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf \
-    -f /tmp/corpus_pride.txt -c 512 -b 2048 -n 4 -dev ROCm0 2>&1 | tr -d '\0' | grep "Final estimate"  # 6.24
+    -f /tmp/corpus_pride.txt -c 512 -b 2048 -n 4 -dev ROCm2 2>&1 | tr -d '\0' | grep "Final estimate"  # 6.24
 
 # generation parity (PPL is not enough for fp8 changes)
 /tmp/llama-hip-full/bin/llama-cli -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -c 512 -n 24 \
-    -dev ROCm0 -p "The capital of France is" --single-turn --no-conversation   # needs both flags in this fork
+    -dev ROCm2 -p "The capital of France is" --single-turn --no-conversation   # needs both flags in this fork
 
 # profile
 rocprofv3 -r -d /tmp/rocp_x -f csv -- /tmp/llama-hip-full/bin/llama-bench \
-    -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 8 -r 1 -dev ROCm0
+    -m /llm/models/Qwen3.5/4B/StewFP8/stewfp8-ow.gguf -p 512 -n 8 -r 1 -dev ROCm2
 # parse soar/*kernel_trace.csv; REMEMBER the warmup doubles every kernel count/time
 
 # sequential-vs-chunked A/B
@@ -411,12 +453,13 @@ GGML_CUDA_GDN_CHUNKED=0 <same bench>   # sequential GDN for comparison
 
 ## 5. Suggested order for the next session
 
-1. Re-bench to confirm the working tree matches section 0 (expect ~7184-7260 pp512
-   after the L7 in-proj fp8 conversion; the box is noisy - prefer rocprof kernel times for A/B).
-2. L1 (mul_mat_fp8_wmma), L3/L4 (GDN phase A/B) and L7 (in-proj fp8) are spent;
-   L5 (conv fusion), L6 (quantize rewrite) and L7 are done. L8 (small kernels) - skip
+1. Re-bench on -dev ROCm2 (the 27B server holds ROCm0/1) to confirm the working
+   tree matches section 0 (expect ~7162-7170 pp512; the box is noisy - prefer
+   rocprof kernel times for A/B).
+2. L1 (wmma), L3/L4 (GDN phase A/B), L7 (in-proj fp8), L9 (single-copy embedding)
+   are done; L5 (conv fusion), L6 (quantize rewrite) too. L8 (small kernels) - skip
    unless a specific one shows up hot in a fresh profile.
 3. If pp512 headroom is needed again, the remaining structural ideas are L1's kpacked
    smem layout for A (blocked on the aiter layout problem) and the decode-side fused
-   quantize-in-gemv (recovers the L7 tg64 cost plus the other 226 decode quantize
-   launches, ~+4% tg64 per the decode session notes).
+   quantize-in-gemv (the remaining decode quantize launches, ~+4% tg64 per the
+   decode session notes).

@@ -126,6 +126,7 @@ class ModelBase:
                  fuse_gate_up_exps: bool = False,
                  fp8_as_q8: bool = False,
                  fp8_output_weight: bool = False,
+                 fp8_token_embd: bool = False,
                  fp8_delta_net_in_proj: bool = False):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
@@ -159,6 +160,7 @@ class ModelBase:
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
         self._fp8_output_weight = fp8_output_weight
+        self._fp8_token_embd = fp8_token_embd
         self._fp8_delta_net_in_proj = fp8_delta_net_in_proj
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
@@ -750,6 +752,46 @@ class ModelBase:
             logger.warning(
                 "--outtype fp8_e4m3: no FP8 weights found, the file will contain no F8_E4M3 tensors")
 
+    def _generate_fp8_token_embd(self):
+        """Quantize token_embd itself to block_f8_e4m3 with per-row scales so a
+        single fp8 embedding serves both the input lookup and the lm_head (the
+        graph duplicates token_embd as the output tensor when output.weight is
+        absent). Requires the fp8 get_rows kernel in the runtime. Per-row scales
+        (d[r][block]) are finer than the 128-row-block convention and work with
+        both the get_rows and the fp8 mul_mat kernels, which index d per row."""
+        if any("output.weight" in ts for ts in self.gguf_writer.tensors):
+            return  # model has its own output weight - keep token_embd BF16
+
+        embed_name = next((n for n in self.model_tensors if n.endswith("embed_tokens.weight")), None)
+        if embed_name is None:
+            return
+        w = LazyTorchTensor.to_eager(self.model_tensors[embed_name]())
+        if w.dtype == torch.float8_e4m3fn:
+            return
+        if w.dim() != 2 or w.shape[1] % 128 != 0:
+            logger.warning("%s: cannot quantize to FP8 (shape %s), keeping BF16", embed_name, tuple(w.shape))
+            return
+
+        M, N = w.shape
+        nb = N // 128
+        wf = w.float().view(M, nb, 128)
+        amax = wf.abs().amax(dim=2)               # [M, nb] per-row scales
+        s_f32 = amax / 448.0
+        s_bf16 = s_f32.to(torch.bfloat16)         # stored scale (BF16-rounded)
+        q = (wf / s_f32.unsqueeze(-1)).to(torch.float8_e4m3fn)
+
+        d = s_bf16.float().numpy().astype(np.float32)     # [M, nb]
+        q_bytes = q.view(torch.uint8).numpy()             # [M, N]
+        blocks = np.empty((M, nb, 132), dtype=np.uint8)
+        blocks[:, :, 0:4] = d.view(np.uint8).reshape(M, nb, 4)
+        blocks[:, :, 4:] = q_bytes.reshape(M, nb, 128)
+
+        new_name = self.map_tensor_name(embed_name)
+        logger.info(f"Repacked {new_name} with quantization F8_E4M3 (single-copy embedding, no output.weight)")
+        self.gguf_writer.add_tensor(new_name, blocks.reshape(M, nb * 132),
+                                    raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+        self.model_tensors.pop(embed_name, None)
+
     def _generate_fp8_output_weight(self):
         """Quantize token_embd into an fp8 output.weight (lm_head) copy, keeping
         token_embd BF16 for the input embedding lookup. Same 128x128-block
@@ -965,6 +1007,8 @@ class ModelBase:
             self._generate_fp8_tensors()
             if self._fp8_output_weight:
                 self._generate_fp8_output_weight()
+            if self._fp8_token_embd:
+                self._generate_fp8_token_embd()
 
         if self._is_nvfp4:
             if nvfp4_compressed_tensors:

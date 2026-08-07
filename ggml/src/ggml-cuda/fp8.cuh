@@ -24,31 +24,8 @@
 #define GGML_FP8_GEMV_NTHREADS 128
 #define GGML_FP8_GEMV_MAX_N 16 // use the dot4 GEMV below this token count
 
-// fp8 e4m3fn (OCP) decode: value = (-1)^s * 2^(e-7) * (1.m), max 448, NaN = 0x7F/0xFF
-__device__ __forceinline__ float fp8_e4m3_to_f32(uint8_t x) {
-    const uint32_t sign = ((uint32_t)(x & 0x80)) << 24;
-    const uint32_t exp  = (x >> 3) & 0x0F;
-    const uint32_t man  = x & 0x07;
-
-    uint32_t bits;
-    if (exp == 0) {
-        // subnormal or zero: value = man * 2^-9
-        if (man == 0) {
-            bits = sign;
-        } else {
-            const uint32_t k = man >= 4 ? 2 : man >= 2 ? 1 : 0;
-            bits = sign | ((k + 118) << 23) | ((man - (1u << k)) << (23 - k));
-        }
-    } else if (exp == 15 && man == 7) {
-        bits = 0x7FC00000u; // NaN
-    } else {
-        bits = sign | ((exp + 120) << 23) | (man << 20);
-    }
-
-    return __uint_as_float(bits);
-}
-
-// fp8 e4m3fn encode, round-to-nearest-even, saturating to +/-448
+// fp8 e4m3fn (OCP) encode, round-to-nearest-even, saturating to +/-448
+// (the decode lives in common.cuh)
 __device__ __forceinline__ uint8_t fp8_e4m3_from_f32(float x) {
     const uint32_t bits = __float_as_uint(x);
     const uint32_t sign = (bits >> 31) & 1;

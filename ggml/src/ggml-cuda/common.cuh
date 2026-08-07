@@ -132,6 +132,30 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// fp8 e4m3fn (OCP) decode: value = (-1)^s * 2^(e-7) * (1.m), max 448, NaN = 0x7F/0xFF
+static __device__ __forceinline__ float fp8_e4m3_to_f32(uint8_t x) {
+    const uint32_t sign = ((uint32_t)(x & 0x80)) << 24;
+    const uint32_t exp  = (x >> 3) & 0x0F;
+    const uint32_t man  = x & 0x07;
+
+    uint32_t bits;
+    if (exp == 0) {
+        // subnormal or zero: value = man * 2^-9
+        if (man == 0) {
+            bits = sign;
+        } else {
+            const uint32_t k = man >= 4 ? 2 : man >= 2 ? 1 : 0;
+            bits = sign | ((k + 118) << 23) | ((man - (1u << k)) << (23 - k));
+        }
+    } else if (exp == 15 && man == 7) {
+        bits = 0x7FC00000u; // NaN
+    } else {
+        bits = sign | ((exp + 120) << 23) | (man << 20);
+    }
+
+    return __uint_as_float(bits);
+}
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
