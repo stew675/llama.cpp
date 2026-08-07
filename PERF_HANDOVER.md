@@ -639,3 +639,34 @@ Next lever per LEVERS.md: none live - L1 (wmma), L3/L4 (GDN) and L7 (in-proj
 fp8) are spent; L8 (small kernels) skip. Remaining structural ideas: L1's
 kpacked smem layout for A, and the decode-side fused quantize-in-gemv
 (~+4% tg64 per section 10).
+
+## 20. 27B fp8 -ow conversion + tensor-split fixes (2026-08-06, session)
+
+Converted /llm/models/Qwen3.6/27B/FP8/ (Qwen3.5 arch, 64 layers, 27.3B params)
+to the fp8 -ow GGUF: /llm/models/Qwen3.6/27B/FP8/Qwen3.6-27B-StewFP8-ow.gguf
+(29.5 GB). PPL 4.6439 vs 4.6030 (BF16 gguf) = +0.9%, in the expected fp8 band.
+Bench on 2 GPUs (-dev ROCm0,ROCm2 -sm tensor): pp512 1292, tg16 29.5, vs the
+Q8_K_XL's 857/25.1 - the fp8 prefill win (~1.5x) holds at 27B scale.
+
+Two code fixes were required:
+1. --fp8-output-weight assumed tied embeddings (synthesized a copy of
+   token_embd). The 27B is untied (tie_word_embeddings=false, real
+   lm_head.weight) -> the flag crashed with "Duplicated tensor name
+   output.weight". Fixed: untied models now quantize lm_head.weight itself
+   (and pop it from the dequant path); the tied path is byte-identical
+   (verified against stewfp8-ow-2copy.gguf).
+2. Tensor split (-sm tensor) was broken for the whole qwen35 arch in this
+   build: ggml-backend-meta.cpp handle_ssm_conv required src0/src1 on the SAME
+   split axis, but the fused 2-src conv (L5 ssm_conv_2src) has qkv split on
+   axis 0 and the conv weight/states on axis 1 (same channel partition).
+   The assert also hit the Q8_K_XL model. Fixed: the handler now accepts the
+   channel-split-everywhere case and returns src0's state. The Q8_K_XL (33 GB)
+   now benches on 2 GPUs too, and the 27B fp8 runs with the fused GDN enabled.
+   NOTE: llama-bench uses "-dev A/B" (slash), llama-perplexity/llama-cli use
+   "-dev A,B" (comma) - the two tools disagree on the separator.
+
+Also noted: the 27B fp8 (27.5 GiB weights + ~27 GiB fp8_repack cache) does NOT
+fit one 32 GB R9700 (OOM in ggml_cuda_mul_mat_fp8 at the first repack), and
+partial offload (ngl<all) is impossible for fp8 (CPU has no fp8 mul_mat, so
+CPU-buffer fp8 weights crash GPU kernels - the L9 lesson). Two GPUs with
+tensor split is the only viable config on this box.

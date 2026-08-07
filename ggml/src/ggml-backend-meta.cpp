@@ -754,6 +754,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // fused 2-src form (ssm_conv_2src): qkv [channels, tokens] split on axis 0,
+        // conv weight [d_conv, channels] and states [n_state, channels] split on
+        // axis 1 - all along the same channel partition, so the output follows src0
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+                src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 &&
+                (tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1)) {
+            return src_ss[0];
+        }
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
                 return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};

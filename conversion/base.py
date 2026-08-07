@@ -793,20 +793,25 @@ class ModelBase:
         self.model_tensors.pop(embed_name, None)
 
     def _generate_fp8_output_weight(self):
-        """Quantize token_embd into an fp8 output.weight (lm_head) copy, keeping
-        token_embd BF16 for the input embedding lookup. Same 128x128-block
-        convention as the model: d = BF16(amax/448), q = fp8(w / (amax/448))."""
+        """Store an fp8 output.weight (lm_head) so the head runs on the FP8 path.
+        Tied models: fp8 copy of the BF16 token_embd (token_embd stays for the
+        input lookup). Untied models: quantize the model's own lm_head.weight in
+        place. Same 128x128-block convention as the model: d = BF16(amax/448),
+        q = fp8(w / (amax/448))."""
         if any("output.weight" in ts for ts in self.gguf_writer.tensors):
-            return  # model already has its own output weight
+            return  # model already has an FP8 output weight
 
-        embed_name = next((n for n in self.model_tensors if n.endswith("embed_tokens.weight")), None)
-        if embed_name is None:
+        head_name = next((n for n in self.model_tensors if n.endswith("lm_head.weight")), None)
+        if head_name is None:
+            # tied embeddings: synthesize a copy from the embedding, keep it BF16 for the lookup
+            head_name = next((n for n in self.model_tensors if n.endswith("embed_tokens.weight")), None)
+        if head_name is None:
             return
-        w = LazyTorchTensor.to_eager(self.model_tensors[embed_name]())
+        w = LazyTorchTensor.to_eager(self.model_tensors[head_name]())
         if w.dtype == torch.float8_e4m3fn:
-            return  # token_embd already fp8, lm_head already on the fp8 path
+            return  # already fp8, head already on the fp8 path
 
-        if w.dim() != 2 or w.shape[1] % 128 != 0:
+        if w.dim() != 2 or w.shape[1] % 128 != 0 or w.shape[0] % 128 != 0:
             return
 
         M, N = w.shape  # [n_vocab, n_embd]
@@ -822,9 +827,12 @@ class ModelBase:
         blocks = np.empty((M, nb, 132), dtype=np.uint8)
         blocks[:, :, 0:4] = np.repeat(d, 128, axis=0).view(np.uint8).reshape(M, nb, 4)
         blocks[:, :, 4:] = q_bytes.reshape(M, nb, 128)
-        logger.info("Stored FP8 output.weight copy of token_embd (lm_head on the FP8 path)")
+        logger.info("Stored FP8 output.weight (lm_head on the FP8 path)")
         self.gguf_writer.add_tensor("output.weight", blocks.reshape(M, nb * 132),
                                     raw_dtype=gguf.GGMLQuantizationType.F8_E4M3)
+        if head_name.endswith("lm_head.weight"):
+            # do not write the BF16 lm_head again through the dequant path
+            self.model_tensors.pop(head_name, None)
 
     @staticmethod
     def _nvfp4_pack(weight: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
