@@ -1,19 +1,22 @@
 # HIP backend notes
 
 AMD HIP backend (GGML_HIP=ON) notes for kernel-level work. Focus: BF16
-support on RDNA3.5 and newer, flash-attention kernel selection, and how KV
+support on RDNA3 and newer, flash-attention kernel selection, and how KV
 cache types flow through the attention kernels.
 
-## BF16 on RDNA3.5 and newer (gfx115x, gfx120x)
+## BF16 on RDNA3 and newer (gfx110x, gfx115x, gfx120x)
 
-AMD claims native BF16 on RDNA3.5+. That is only half true:
+AMD claims native BF16 on RDNA3+. That is only half true (the RDNA3 ISA
+reference, February 2023, lists BF16 in the dot and matrix units but has
+no BF16 FMA):
 
 - The vector ALU has no native BF16 FMA. BF16 arithmetic is emulated by the
   compiler as FP32 math: BF16 -> FP32 is a left shift by 16, and the result
   is rounded back to BF16 with an explicit round-to-nearest-even sequence
   plus overflow/denormal handling. Measured on gfx1151 (clang 23): BF16
   scalar FMA is about 12x slower than FP16.
-- The matrix and dot units do have native BF16:
+- The matrix and dot units do have native BF16, on RDNA3 as well as
+  RDNA3.5/4 (`v_dot2_bf16_bf16` is in the RDNA3 ISA):
   - `v_dot2_f32_bf16` (BF16 dot product, FP32 accumulate)
   - `v_wmma_bf16_16x16x16_bf16` (BF16 matrix multiply)
   Both assemble for gfx1100/gfx1150/gfx1151/gfx1201 (not for gfx906/gfx1030).
