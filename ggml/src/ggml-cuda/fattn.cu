@@ -549,6 +549,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            // The tile kernel reads F16 and BF16 K/V natively; other types are converted to F16.
+            need_f16_K = K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_BF16;
+            need_f16_V = V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_BF16;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
