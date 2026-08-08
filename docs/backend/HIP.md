@@ -21,6 +21,9 @@ no BF16 FMA):
   - `v_wmma_bf16_16x16x16_bf16` (BF16 matrix multiply)
   Both assemble for gfx1100/gfx1150/gfx1151/gfx1201 (not for gfx906/gfx1030).
   There is no native BF16<->FP16 conversion instruction on these targets.
+  RDNA4 (gfx120x) adds sparse matrix variants (`v_swmmac_*_16x16x32_bf16`)
+  and packed-BF16 atomic adds (image/flat/global/data-share, e.g.
+  `ds_pk_add_bf16`) but still has no BF16 FMA in the vector ALU.
 
 Microbenchmark (gfx1151, ROCm 7.14, 8 independent chains per thread):
 
