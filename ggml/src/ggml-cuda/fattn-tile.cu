@@ -4,12 +4,17 @@
 template <int DKQ, int DV>
 static void ggml_cuda_flash_attn_ext_tile_case_type(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
-    if (K->type == GGML_TYPE_BF16) {
+    const ggml_tensor * V = dst->src[2];
+#ifdef GGML_HIP_BF16_FATTN
+    if (amd_bf16_fattn_tile_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+            (K->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_BF16)) {
+        // Native BF16 K/V; mixed F16/BF16 K/V is upcast to BF16 by the launcher.
         ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_BF16>(ctx, dst);
-    } else {
-        // F32, quantized K/V are converted to F16 by the launcher.
-        ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_F16>(ctx, dst);
+        return;
     }
+#endif // GGML_HIP_BF16_FATTN
+    // F32, quantized K/V are converted to F16 by the launcher.
+    ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_F16>(ctx, dst);
 }
 
 void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

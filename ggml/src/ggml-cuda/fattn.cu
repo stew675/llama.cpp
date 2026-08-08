@@ -546,13 +546,17 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     bool need_f16_K = false;
     bool need_f16_V = false;
+    bool use_bf16   = false;
 
     switch (kernel) {
-        case BEST_FATTN_KERNEL_TILE:
-            // The tile kernel reads F16 and BF16 K/V natively; other types are converted to F16.
-            need_f16_K = K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_BF16;
-            need_f16_V = V->type != GGML_TYPE_F16 && V->type != GGML_TYPE_BF16;
-            break;
+        case BEST_FATTN_KERNEL_TILE: {
+            // The tile kernel reads F16 and BF16 K/V natively; the launcher converts
+            // the remaining types to the kernel's type. BF16 K/V requires RDNA3/3.5/4.
+            use_bf16 = (K->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_BF16) &&
+                amd_bf16_fattn_tile_available(ggml_cuda_info().devices[device].cc);
+            need_f16_K = use_bf16 ? K->type != GGML_TYPE_BF16 : K->type != GGML_TYPE_F16;
+            need_f16_V = use_bf16 ? V->type != GGML_TYPE_BF16 : V->type != GGML_TYPE_F16;
+        } break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
@@ -566,7 +570,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     }
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V, use_bf16);
 
     return f16_extra.end - (uintptr_t) dst->data;
 }

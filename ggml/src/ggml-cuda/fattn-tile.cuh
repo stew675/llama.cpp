@@ -1399,7 +1399,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, pv_dot2>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
-                need_f16_K, need_f16_V, false, warp_size);
+                need_f16_K, need_f16_V, false, warp_size, type_KV == GGML_TYPE_BF16);
             return;
         }
     }
@@ -1416,7 +1416,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, pv_dot2>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
-                need_f16_K, need_f16_V, false, warp_size);
+                need_f16_K, need_f16_V, false, warp_size, type_KV == GGML_TYPE_BF16);
             return;
         }
     }
@@ -1429,7 +1429,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, pv_dot2>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
-                need_f16_K, need_f16_V, false, warp_size);
+                need_f16_K, need_f16_V, false, warp_size, type_KV == GGML_TYPE_BF16);
             return;
         }
     }
@@ -1442,7 +1442,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, pv_dot2>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
-                need_f16_K, need_f16_V, false, warp_size);
+                need_f16_K, need_f16_V, false, warp_size, type_KV == GGML_TYPE_BF16);
             return;
         }
     }
@@ -1455,7 +1455,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, pv_dot2>;
             launch_fattn<DV, cols_per_block/ncols2, ncols2>
                 (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
-                need_f16_K, need_f16_V, false, warp_size);
+                need_f16_K, need_f16_V, false, warp_size, type_KV == GGML_TYPE_BF16);
             return;
         }
     }
@@ -1467,7 +1467,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
         fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV, pv_dot2>;
         launch_fattn<DV, cols_per_block/ncols2, ncols2>
             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
-                need_f16_K, need_f16_V, false, warp_size);
+                need_f16_K, need_f16_V, false, warp_size, type_KV == GGML_TYPE_BF16);
         return;
     }
 
@@ -1561,43 +1561,37 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     GGML_ABORT("fatal error");
 }
 
+template <int DKQ, int DV, ggml_type type_KV, bool use_logit_softcap>
+static void launch_fattn_tile_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const bool need_f16_K, const bool need_f16_V) {
+    if constexpr (type_KV == GGML_TYPE_BF16) {
+        // Packed BF16 PV (P rounded to BF16, v_dot2_f32_bf16) is opt-in; FP32 PV is the default.
+        static const bool pv_dot2 = getenv("GGML_HIP_BF16_PV_DOT2") != nullptr;
+        if (pv_dot2) {
+            launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, true>(ctx, dst, need_f16_K, need_f16_V);
+        } else {
+            launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, false>(ctx, dst, need_f16_K, need_f16_V);
+        }
+    } else {
+        launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, false>(ctx, dst, need_f16_K, need_f16_V);
+    }
+}
+
 template <int DKQ, int DV, ggml_type type_KV>
 void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
 
-    // K/V types other than F16 and BF16 are converted to F16 by the launcher.
-    const bool need_f16_K = KQV->src[1]->type != GGML_TYPE_F16 && KQV->src[1]->type != GGML_TYPE_BF16;
-    const bool need_f16_V = KQV->src[2]->type != GGML_TYPE_F16 && KQV->src[2]->type != GGML_TYPE_BF16;
+    // K/V types other than type_KV are converted to type_KV by the launcher.
+    const bool need_f16_K = KQV->src[1]->type != type_KV;
+    const bool need_f16_V = KQV->src[2]->type != type_KV;
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if constexpr (type_KV == GGML_TYPE_BF16) {
-        // Packed BF16 PV (P rounded to BF16, v_dot2_f32_bf16) is opt-in; FP32 PV is the default.
-        static const bool pv_dot2 = getenv("GGML_HIP_BF16_PV_DOT2") != nullptr;
-        if (logit_softcap == 0.0f) {
-            constexpr bool use_logit_softcap = false;
-            if (pv_dot2) {
-                launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, true>(ctx, dst, need_f16_K, need_f16_V);
-            } else {
-                launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, false>(ctx, dst, need_f16_K, need_f16_V);
-            }
-        } else {
-            constexpr bool use_logit_softcap = true;
-            if (pv_dot2) {
-                launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, true>(ctx, dst, need_f16_K, need_f16_V);
-            } else {
-                launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, false>(ctx, dst, need_f16_K, need_f16_V);
-            }
-        }
+    if (logit_softcap == 0.0f) {
+        launch_fattn_tile_case<DKQ, DV, type_KV, false>(ctx, dst, need_f16_K, need_f16_V);
     } else {
-        if (logit_softcap == 0.0f) {
-            constexpr bool use_logit_softcap = false;
-            launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, false>(ctx, dst, need_f16_K, need_f16_V);
-        } else {
-            constexpr bool use_logit_softcap = true;
-            launch_fattn_tile_switch_ncols2<DKQ, DV, use_logit_softcap, type_KV, false>(ctx, dst, need_f16_K, need_f16_V);
-        }
+        launch_fattn_tile_case<DKQ, DV, type_KV, true>(ctx, dst, need_f16_K, need_f16_V);
     }
 }
 
@@ -1606,34 +1600,49 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
 #define DECL_FATTN_TILE_CASE_F16(DKQ, DV)                            \
     template void ggml_cuda_flash_attn_ext_tile_case              \
     <DKQ, DV, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+#ifdef GGML_HIP_BF16_FATTN
 #define DECL_FATTN_TILE_CASE_BF16(DKQ, DV)                           \
     template void ggml_cuda_flash_attn_ext_tile_case              \
     <DKQ, DV, GGML_TYPE_BF16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+#else
+#define DECL_FATTN_TILE_CASE_BF16(DKQ, DV)
+#endif // GGML_HIP_BF16_FATTN
 #define DECL_FATTN_TILE_CASE(DKQ, DV)                             \
     DECL_FATTN_TILE_CASE_F16(DKQ, DV)                             \
     DECL_FATTN_TILE_CASE_BF16(DKQ, DV)
 
-extern DECL_FATTN_TILE_CASE_F16( 40, 40);
-extern DECL_FATTN_TILE_CASE_BF16( 40, 40);
-extern DECL_FATTN_TILE_CASE_F16( 64, 64);
-extern DECL_FATTN_TILE_CASE_BF16( 64, 64);
-extern DECL_FATTN_TILE_CASE_F16( 72, 72);
-extern DECL_FATTN_TILE_CASE_BF16( 72, 72);
-extern DECL_FATTN_TILE_CASE_F16( 80, 80);
-extern DECL_FATTN_TILE_CASE_BF16( 80, 80);
-extern DECL_FATTN_TILE_CASE_F16( 96, 96);
-extern DECL_FATTN_TILE_CASE_BF16( 96, 96);
-extern DECL_FATTN_TILE_CASE_F16(112, 112);
-extern DECL_FATTN_TILE_CASE_BF16(112, 112);
-extern DECL_FATTN_TILE_CASE_F16(128, 128);
-extern DECL_FATTN_TILE_CASE_BF16(128, 128);
-extern DECL_FATTN_TILE_CASE_F16(192, 128);
-extern DECL_FATTN_TILE_CASE_BF16(192, 128);
-extern DECL_FATTN_TILE_CASE_F16(256, 256);
-extern DECL_FATTN_TILE_CASE_BF16(256, 256);
-extern DECL_FATTN_TILE_CASE_F16(320, 256);
-extern DECL_FATTN_TILE_CASE_BF16(320, 256);
-extern DECL_FATTN_TILE_CASE_F16(512, 512);
-extern DECL_FATTN_TILE_CASE_BF16(512, 512);
-extern DECL_FATTN_TILE_CASE_F16(576, 512);
-extern DECL_FATTN_TILE_CASE_BF16(576, 512);
+#define EXTERN_FATTN_TILE_CASE_F16(DKQ, DV)                        \
+    extern template void ggml_cuda_flash_attn_ext_tile_case     \
+    <DKQ, DV, GGML_TYPE_F16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+#ifdef GGML_HIP_BF16_FATTN
+#define EXTERN_FATTN_TILE_CASE_BF16(DKQ, DV)                       \
+    extern template void ggml_cuda_flash_attn_ext_tile_case     \
+    <DKQ, DV, GGML_TYPE_BF16>(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+#else
+#define EXTERN_FATTN_TILE_CASE_BF16(DKQ, DV)
+#endif // GGML_HIP_BF16_FATTN
+
+EXTERN_FATTN_TILE_CASE_F16( 40, 40);
+EXTERN_FATTN_TILE_CASE_BF16( 40, 40);
+EXTERN_FATTN_TILE_CASE_F16( 64, 64);
+EXTERN_FATTN_TILE_CASE_BF16( 64, 64);
+EXTERN_FATTN_TILE_CASE_F16( 72, 72);
+EXTERN_FATTN_TILE_CASE_BF16( 72, 72);
+EXTERN_FATTN_TILE_CASE_F16( 80, 80);
+EXTERN_FATTN_TILE_CASE_BF16( 80, 80);
+EXTERN_FATTN_TILE_CASE_F16( 96, 96);
+EXTERN_FATTN_TILE_CASE_BF16( 96, 96);
+EXTERN_FATTN_TILE_CASE_F16(112, 112);
+EXTERN_FATTN_TILE_CASE_BF16(112, 112);
+EXTERN_FATTN_TILE_CASE_F16(128, 128);
+EXTERN_FATTN_TILE_CASE_BF16(128, 128);
+EXTERN_FATTN_TILE_CASE_F16(192, 128);
+EXTERN_FATTN_TILE_CASE_BF16(192, 128);
+EXTERN_FATTN_TILE_CASE_F16(256, 256);
+EXTERN_FATTN_TILE_CASE_BF16(256, 256);
+EXTERN_FATTN_TILE_CASE_F16(320, 256);
+EXTERN_FATTN_TILE_CASE_BF16(320, 256);
+EXTERN_FATTN_TILE_CASE_F16(512, 512);
+EXTERN_FATTN_TILE_CASE_BF16(512, 512);
+EXTERN_FATTN_TILE_CASE_F16(576, 512);
+EXTERN_FATTN_TILE_CASE_BF16(576, 512);

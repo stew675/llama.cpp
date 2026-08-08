@@ -9605,6 +9605,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
 
+    // mixed F16/BF16 K/V cache types: the BF16 tile kernel must upcast the non-BF16
+    // tensor to BF16 (previously the dispatch only looked at K, silently misreading V).
+    // nb=1 (decode) and hsk=256 (WMMA gate) force the TILE kernel on RDNA.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 512, 1,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 512, 1,  true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_BF16));
+
+    // BF16 K/V across the remaining head sizes (the upstream matrix only tests BF16
+    // for hsk 64/72): covers the FP32-PV and packed-PV register paths for small/odd DV
+    for (int hsk : { 40, 80, 96, 112, 128, 256 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(hsk, hsk, 4, {4, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+    }
+
+    // 320/256-BF16: reachable with a 320-head model (GQA 32, Mistral4-style) and BF16 KV
+    // during prefill. On RDNA this is the ncols=32 config whose BF16 KQ buffer (FP32 vs
+    // half) pushes static LDS to ~56 KB - verify it launches and computes correctly.
+    test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+
+    // DV > 256 BF16 (512/576-head): use_bf16 is false, the kernel converts BF16 to F16
+    // at tile load instead of the full-cache to_fp16 pass - cover that load overload.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {4, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
     for (int64_t kv : { 4096, 16384 }) {

@@ -51,7 +51,7 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
 };
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
-        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
+        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V, const bool convert_bf16 = false) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     const ggml_tensor * K = dst->src[1];
@@ -62,26 +62,37 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
+    const ggml_type convert_type = convert_bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (need_f16_K && K->type != convert_type) {
         data.end = GGML_PAD(data.end, 128);
         data.K   = data.end;
-        data.end += ggml_nelements(K)*ggml_type_size(GGML_TYPE_F16);
+        data.end += ggml_nelements(K)*ggml_type_size(convert_type);
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && V->type != convert_type) {
         if (V_is_K_view) {
             data.V = data.K;
         } else {
             data.end = GGML_PAD(data.end, 128);
             data.V   = data.end;
-            data.end += ggml_nelements(V)*ggml_type_size(GGML_TYPE_F16);
+            data.end += ggml_nelements(V)*ggml_type_size(convert_type);
         }
     }
 
     return data;
+}
+
+// Host-side check for native BF16 K/V in the tile kernel. Must match the __gfxXXXX__
+// list that defines V_DOT2_F32_BF16_AVAILABLE in device code:
+// RDNA3 (gfx1100-1103), RDNA3.5 (gfx1150-1153), RDNA4 (gfx1200-1201).
+static bool amd_bf16_fattn_tile_available(const int cc) {
+    return (cc >= GGML_CUDA_CC_OFFSET_AMD + 0x1100 && cc <= GGML_CUDA_CC_OFFSET_AMD + 0x1103) ||
+           (cc >= GGML_CUDA_CC_OFFSET_AMD + 0x1150 && cc <= GGML_CUDA_CC_OFFSET_AMD + 0x1153) ||
+           (cc >= GGML_CUDA_CC_OFFSET_AMD + 0x1200 && cc <= GGML_CUDA_CC_OFFSET_AMD + 0x1201);
 }
 
 template <int D, int nthreads>
@@ -969,10 +980,13 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// If convert_bf16 is set, K/V are converted to BF16 instead of F16.
+// Used by the tile kernel when it reads BF16 K/V natively.
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    const bool convert_bf16 = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1003,7 +1017,7 @@ void launch_fattn(
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V, convert_bf16);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1019,26 +1033,41 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    const ggml_type convert_type = convert_bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+
+    if (need_f16_K && K->type != convert_type) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
         if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
+            if (convert_bf16) {
+                to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(K->type);
+                to_bf16(K_data, (nv_bfloat16 *) K_f16, ggml_nelements(K), main_stream);
+            } else {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+                to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
+            }
 
             nb11 = nb11*bs*sizeof(half)/ts;
             nb12 = nb12*bs*sizeof(half)/ts;
             nb13 = nb13*bs*sizeof(half)/ts;
         } else {
             GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
-            const int64_t s01 = nb11 / ts;
-            const int64_t s02 = nb12 / ts;
-            const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            if (convert_bf16) {
+                to_bf16_nc_cuda_t to_bf16 = ggml_get_to_bf16_nc_cuda(K->type);
+                const int64_t s01 = nb11 / ts;
+                const int64_t s02 = nb12 / ts;
+                const int64_t s03 = nb13 / ts;
+                to_bf16(K_data, (nv_bfloat16 *) K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            } else {
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+                const int64_t s01 = nb11 / ts;
+                const int64_t s02 = nb12 / ts;
+                const int64_t s03 = nb13 / ts;
+                to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            }
 
             nb11 = K->ne[0] * sizeof(half);
             nb12 = K->ne[1] * nb11;
@@ -1047,7 +1076,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (need_f16_V && V->type != convert_type) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1060,8 +1089,13 @@ void launch_fattn(
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
             if (ggml_is_contiguously_allocated(V)) {
-                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
-                to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
+                if (convert_bf16) {
+                    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(V->type);
+                    to_bf16(V_data, (nv_bfloat16 *) V_f16, ggml_nelements(V), main_stream);
+                } else {
+                    to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                    to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
+                }
                 V_data = (char *) V_f16;
 
                 nb21 = nb21*bs*sizeof(half)/ts;
@@ -1069,11 +1103,19 @@ void launch_fattn(
                 nb23 = nb23*bs*sizeof(half)/ts;
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
-                const int64_t s01 = nb21 / ts;
-                const int64_t s02 = nb22 / ts;
-                const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                if (convert_bf16) {
+                    to_bf16_nc_cuda_t to_bf16 = ggml_get_to_bf16_nc_cuda(V->type);
+                    const int64_t s01 = nb21 / ts;
+                    const int64_t s02 = nb22 / ts;
+                    const int64_t s03 = nb23 / ts;
+                    to_bf16(V_data, (nv_bfloat16 *) V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                } else {
+                    to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                    const int64_t s01 = nb21 / ts;
+                    const int64_t s02 = nb22 / ts;
+                    const int64_t s03 = nb23 / ts;
+                    to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                }
 
                 nb21 = V->ne[0] * sizeof(half);
                 nb22 = V->ne[1] * nb21;

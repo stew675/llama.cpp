@@ -78,12 +78,21 @@ Consequences:
 
 ## Native BF16 tile loads (TILE)
 
-The tile kernel reads BF16 K/V natively (no to_fp16 pass) on AMD
-RDNA3/3.5/4 (guarded by V_DOT2_F32_BF16_AVAILABLE, explicit __gfxXXXX__
-macros). K/V tiles stay BF16, Q is converted to BF16 at fill, and QK^T uses
-v_dot2_f32_bf16 (exact BF16 products, FP32 accumulation). This preserves
-the full BF16 exponent range through the attention math; the FP16 PV
-accumulation bug (half2 VKQ) is also fixed by accumulating PV in FP32.
+The tile kernel reads BF16 K/V natively (no to_fp16 pass) on AMD RDNA3/3.5/4
+(guarded by V_DOT2_F32_BF16_AVAILABLE, explicit __gfxXXXX__ macros covering
+RDNA3 gfx1100-1103, RDNA3.5 gfx1150-1153, RDNA4 gfx1200-1201; verified against
+the RDNA3/3.5/4 ISA reference documents). K/V tiles stay BF16, Q is converted
+to BF16 at fill, and QK^T uses v_dot2_f32_bf16 (exact BF16 products, FP32
+accumulation). This preserves the full BF16 exponent range through the
+attention math; the FP16 PV accumulation bug (half2 VKQ) is also fixed by
+accumulating PV in FP32.
+
+Mixed K/V cache types are handled by the launcher: if either K or V is BF16
+(e.g. -ctk f16 -ctv bf16), the other tensor is upcast to BF16 so the kernel
+always reads both natively. Types other than F16/BF16 (F32, quantized) are
+converted to the kernel's native type. On non-RDNA targets (CUDA, older HIP
+archs) the BF16 kernel variants are not compiled and BF16 K/V falls back to
+the F16 conversion path.
 
 Two PV modes for BF16 K/V, selected by env var at dispatch time (both
 variants compiled per kernel):

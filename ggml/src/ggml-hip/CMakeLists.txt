@@ -87,6 +87,19 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_SOURCES_ROCM}
                         )
 
+# Native BF16 flash-attention tile kernels (V_DOT2_F32_BF16_AVAILABLE) are
+# implemented and tested only for RDNA3 (gfx1100-1103), RDNA3.5 (gfx1150-1153)
+# and RDNA4 (gfx1200-1201). Other targets keep the F16 conversion path.
+set(GGML_HIP_BF16_ARCHS 1100 1101 1102 1103 1150 1151 1152 1153 1200 1201)
+foreach(arch IN LISTS CMAKE_HIP_ARCHITECTURES)
+    string(REGEX REPLACE "^gfx" "" arch_num "${arch}")
+    if(arch_num IN_LIST GGML_HIP_BF16_ARCHS)
+        add_compile_definitions(GGML_HIP_BF16_FATTN=1)
+        break()
+    endif()
+endforeach()
+unset(GGML_HIP_BF16_ARCHS)
+
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)
     target_compile_definitions(ggml PUBLIC GGML_USE_CUDA)
