@@ -72,15 +72,28 @@ Consequences:
 
 ## Native BF16 tile loads (TILE)
 
-Pattern for reading BF16 K/V in the FP16 tile kernel without a DRAM round
-trip: add a `flash_attn_tile_load_tile` overload for nv_bfloat162 sources
-and convert BF16 -> FP16 while filling the shared-memory tile. The
-conversion (`__bfloat162float` + RNE to FP16) is bit-identical to the
-to_fp16 pass, so BF16 KV numerics do not change; the cost is amortized over
-the tile reuse (ncols2 x nbatch_fa) instead of paid as full-cache traffic.
-The kernel and launch chain are templated on the KV type (F16 and BF16
-instances), and need_f16_K/V is computed from the original K/V types so
-F32/quantized KV still converts.
+The tile kernel reads BF16 K/V natively (no to_fp16 pass) on AMD
+RDNA3/3.5/4 (guarded by V_DOT2_F32_BF16_AVAILABLE, explicit __gfxXXXX__
+macros). K/V tiles stay BF16, Q is converted to BF16 at fill, and QK^T uses
+v_dot2_f32_bf16 (exact BF16 products, FP32 accumulation). This preserves
+the full BF16 exponent range through the attention math; the FP16 PV
+accumulation bug (half2 VKQ) is also fixed by accumulating PV in FP32.
+
+Two PV modes for BF16 K/V, selected by env var at dispatch time (both
+variants compiled per kernel):
+
+- Default (no env var): P stays FP32, PV runs FP32 math. Maximum
+  precision; ~3% slower than F16 at deep context (e.g. 41.7 vs 42.95 t/s
+  at 16K) where the PV cost scales with KV length.
+- GGML_HIP_BF16_PV_DOT2=1: P rounded to BF16 (7-bit mantissa, ~0.4%
+  added error - the BF16 design contract), V rows paired across
+  consecutive KV rows via v_perm_b32, PV via v_dot2_f32_bf16 (one dot2 per
+  head pair, FP32 accumulation). Recovers the 3%: exact F16 parity at
+  depth. The KQ buffer still stores P as FP32; the BF16 pair conversion is
+  amortized over the head dimension.
+
+DV > 256 (rare 512/576-head models) and non-AMD platforms keep the
+FP16-conversion tile path.
 
 ## Key files
 
