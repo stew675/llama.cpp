@@ -975,6 +975,12 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     }
 }
 
+// The BF16 kernel variants use more registers than the FP16 ones, so the compiler
+// cannot always meet the occupancy requested below; the warning is informational.
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpass-failed"
+#endif // __clang__
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, ggml_type type_KV, bool pv_dot2> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_tile(
@@ -1378,6 +1384,9 @@ static __global__ void flash_attn_tile(
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif // __clang__
 
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap, ggml_type type_KV, bool pv_dot2>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
