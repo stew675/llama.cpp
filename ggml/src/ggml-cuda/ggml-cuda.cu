@@ -703,6 +703,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    if (q8_1_arena != nullptr) {
+        CUDA_CHECK(cudaFree(q8_1_arena));
+    }
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -4221,6 +4225,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // The Q8_1 input cache is only valid within one graph execution.
+    cuda_ctx->q8_1_cache_clear();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
