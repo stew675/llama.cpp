@@ -1275,6 +1275,98 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 }
 
+static __device__ __forceinline__ float ssm_op_softplus(float x) {
+    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+}
+
+static __device__ __forceinline__ float ssm_op_sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// Fused SSM gate/beta projections: two Q8_0 matmuls over the same input, plus
+// the gating chain. gate = softplus(alpha*x + dt) * a; beta = sigmoid(beta*x).
+// Grid: (nrows, 1), block: (warp_size, 1). Each workgroup computes one row of
+// both outputs.
+static __global__ void ssm_gate_beta_fused_q8_0(
+        const void * vx_alpha, const void * vx_beta, const block_q8_1 * y,
+        const float * dt, const float * ssm_a,
+        float * dst_gate, float * dst_beta,
+        const int nrows, const int ncols_x) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    constexpr int warp_size = 32;
+    constexpr int qk = 32; // Q8_0 block size
+    constexpr int qi = 4;  // int32 per Q8_0 block
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    const int blocks_per_row_x = ncols_x / qk;
+
+    const block_q8_0 * w_alpha = (const block_q8_0 *) vx_alpha + (int64_t) row * blocks_per_row_x;
+    const block_q8_0 * w_beta  = (const block_q8_0 *) vx_beta  + (int64_t) row * blocks_per_row_x;
+
+    float sum_alpha = 0.0f;
+    float sum_beta  = 0.0f;
+    const int blocks_per_iter = vdr * warp_size / qi;
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx; // qk == QK8_1
+        const int kqs = vdr * (tid % (qi/vdr));
+        sum_alpha += vec_dot_q8_0_q8_1(w_alpha, &y[kby], kbx, kqs);
+        sum_beta  += vec_dot_q8_0_q8_1(w_beta,  &y[kby], kbx, kqs);
+    }
+
+    sum_alpha = warp_reduce_sum<warp_size>(sum_alpha);
+    sum_beta  = warp_reduce_sum<warp_size>(sum_beta);
+
+    if (tid == 0) {
+        dst_gate[row] = ssm_op_softplus(sum_alpha + dt[row]) * ssm_a[row];
+        dst_beta[row] = ssm_op_sigmoid(sum_beta);
+    }
+
+    GGML_UNUSED(nrows);
+}
+
+void ggml_cuda_op_ssm_gate_beta(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0_alpha, const ggml_tensor * src0_beta, const ggml_tensor * src1,
+        const ggml_tensor * dt, const ggml_tensor * ssm_a,
+        ggml_tensor * dst_gate, ggml_tensor * dst_beta) {
+    GGML_ASSERT(src0_alpha->type == GGML_TYPE_Q8_0 && src0_beta->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst_gate->type == GGML_TYPE_F32 && dst_beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0_alpha->ne[0] == src0_beta->ne[0] && src0_alpha->ne[1] == src0_beta->ne[1]);
+    GGML_ASSERT(ggml_nelements(dst_gate) == ggml_nelements(dst_beta));
+
+    cudaStream_t stream = ctx.stream();
+    const size_t ts_src1 = ggml_type_size(src1->type);
+
+    // Quantize src1 to Q8_1 once per graph; reuse the same buffer as the other
+    // matmuls over this input.
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const size_t src1_q8_1_size = src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    const ggml_tensor * src1_key = src1;
+    while (src1_key->view_src != nullptr) {
+        src1_key = src1_key->view_src;
+    }
+    const int64_t src1_s11 = src1->nb[1] / ts_src1;
+    const int64_t src1_s12 = src1->nb[2] / ts_src1;
+    const int64_t src1_s13 = src1->nb[3] / ts_src1;
+    bool src1_q8_1_cached = false;
+    void * src1_q8_1 = ctx.q8_1_cache_get(src1_key, ctx.curr_stream_no, src1_q8_1_size,
+                                          src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                                          src1_s11, src1_s12, src1_s13, src1_q8_1_cached);
+    if (!src1_q8_1_cached) {
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1, GGML_TYPE_Q8_0,
+                               src1->ne[0], src1_s11, src1_s12, src1_s13, ne10_padded,
+                               src1->ne[1], src1->ne[2], src1->ne[3], stream);
+    }
+
+    const int nrows = dst_gate->ne[0];
+    const dim3 block_nums(nrows);
+    const dim3 block_dims(32);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(ssm_gate_beta_fused_q8_0, launch_params,
+        src0_alpha->data, src0_beta->data, (const block_q8_1 *) src1_q8_1, (const float *) dt->data, (const float *) ssm_a->data,
+        (float *) dst_gate->data, (float *) dst_beta->data, nrows, src1->ne[0]);
+}
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
