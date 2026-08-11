@@ -1367,6 +1367,108 @@ void ggml_cuda_op_ssm_gate_beta(
         (float *) dst_gate->data, (float *) dst_beta->data, nrows, src1->ne[0]);
 }
 
+// Fused shared-expert output: down projection plus the gate and residual adds.
+// dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
+// Two kernels: the gate is a single scalar dot over the shared input, computed
+// once by a tiny kernel; the down projection then reads it. Grid: (nrows, 1),
+// block: (warp_size, 1), one warp per row.
+static __global__ void shexp_gate_sigmoid(
+        const float * vx_gate, const float * x_gate, float * dst, const int k_gate) {
+    const int tid = threadIdx.x;
+    constexpr int warp_size = 32;
+
+    float sum_gate = 0.0f;
+#pragma unroll 8
+    for (int i = tid; i < k_gate; i += warp_size) {
+        sum_gate += vx_gate[i] * x_gate[i];
+    }
+    sum_gate = warp_reduce_sum<warp_size>(sum_gate);
+    if (tid == 0) {
+        dst[0] = ssm_op_sigmoid(sum_gate);
+    }
+}
+
+static __global__ void shexp_down_gated_q8_0(
+        const void * vx_down, const block_q8_1 * y_swiglu, const float * gate_sig,
+        const float * moe_out, const float * ffn_residual,
+        float * dst, const int k_down) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    constexpr int warp_size = 32;
+    constexpr int qk = 32; // Q8_0 block size
+    constexpr int qi = 4;  // int32 per Q8_0 block
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+
+    const int blocks_per_row_x = k_down / qk;
+    const block_q8_0 * wd = (const block_q8_0 *) vx_down + (int64_t) row * blocks_per_row_x;
+
+    float sum_down = 0.0f;
+    const int blocks_per_iter = vdr * warp_size / qi;
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kqs = vdr * (tid % (qi/vdr));
+        sum_down += vec_dot_q8_0_q8_1(wd, &y_swiglu[kbx], kbx, kqs);
+    }
+    sum_down = warp_reduce_sum<warp_size>(sum_down);
+
+    if (tid == 0) {
+        dst[row] = sum_down * gate_sig[0] + moe_out[row] + ffn_residual[row];
+    }
+}
+
+void ggml_cuda_op_shexp_down_gate(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * w_down, const ggml_tensor * swiglu,
+        const ggml_tensor * w_gate, const ggml_tensor * x_gate,
+        const ggml_tensor * moe_out, const ggml_tensor * ffn_residual,
+        ggml_tensor * dst) {
+    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0 && w_gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(swiglu->type == GGML_TYPE_F32 && x_gate->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    cudaStream_t stream = ctx.stream();
+    const size_t ts_src1 = ggml_type_size(swiglu->type);
+
+    // Quantize the swiglu to Q8_1 once per graph.
+    const int64_t ne10_padded = GGML_PAD(swiglu->ne[0], MATRIX_ROW_PADDING);
+    const size_t q8_1_size = swiglu->ne[3]*swiglu->ne[2] * swiglu->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    const ggml_tensor * src1_key = swiglu;
+    while (src1_key->view_src != nullptr) {
+        src1_key = src1_key->view_src;
+    }
+    const int64_t s11 = swiglu->nb[1] / ts_src1;
+    const int64_t s12 = swiglu->nb[2] / ts_src1;
+    const int64_t s13 = swiglu->nb[3] / ts_src1;
+    bool cached = false;
+    void * y_swiglu = ctx.q8_1_cache_get(src1_key, ctx.curr_stream_no, q8_1_size,
+                                         swiglu->ne[0], swiglu->ne[1], swiglu->ne[2], swiglu->ne[3],
+                                         s11, s12, s13, cached);
+    if (!cached) {
+        quantize_row_q8_1_cuda((const float *) swiglu->data, nullptr, y_swiglu, GGML_TYPE_Q8_0,
+                               swiglu->ne[0], s11, s12, s13, ne10_padded,
+                               swiglu->ne[1], swiglu->ne[2], swiglu->ne[3], stream);
+    }
+
+    // The gate is a single scalar dot over the shared input. Compute it once
+    // in a tiny kernel, then the down projection reads it. The scratch is a
+    // pool allocation: stream ordering keeps it valid for both launches.
+    ggml_cuda_pool_alloc<float> gate_scratch(ctx.pool(), 1);
+    {
+        const dim3 block_nums(1);
+        const dim3 block_dims(32);
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+        ggml_cuda_kernel_launch(shexp_gate_sigmoid, lp,
+            (const float *) w_gate->data, (const float *) x_gate->data, gate_scratch.get(), w_gate->ne[0]);
+    }
+
+    const int nrows = dst->ne[0];
+    const dim3 block_nums(nrows);
+    const dim3 block_dims(32);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(shexp_down_gated_q8_0, launch_params,
+        w_down->data, (const block_q8_1 *) y_swiglu, gate_scratch.get(),
+        (const float *) moe_out->data, (const float *) ffn_residual->data,
+        (float *) dst->data, w_down->ne[0]);
+}
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
