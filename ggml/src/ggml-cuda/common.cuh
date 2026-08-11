@@ -1656,6 +1656,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    // Index x_scale by the destination channel (token), not the source channel
+    // (expert). Used for the MoE down x topk-weights fusion.
+    bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
 };
 struct ggml_cuda_mm_fusion_args_device {
@@ -1664,6 +1667,7 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
 };
 
