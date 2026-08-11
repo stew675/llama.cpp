@@ -3860,6 +3860,68 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // SSM gated delta net: gate = softplus(alpha*x + dt) * a, beta = sigmoid(beta*x).
+    // Two small Q8_0 projections over the same input plus the gating chain, fused
+    // into one kernel. Both outputs feed only the gated delta net kernel.
+    if (i + 8 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+        const ggml_op ops[9] = {
+            GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
+            GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY
+        };
+        const int out_nodes[] = { i + 5, i + 8 };
+
+        if (ggml_can_fuse_subgraph(cgraph, i, 9, ops, out_nodes, 2)) {
+            ggml_tensor * alpha_w  = cgraph->nodes[i];
+            ggml_tensor * alpha_v  = cgraph->nodes[i + 1];
+            ggml_tensor * bias     = cgraph->nodes[i + 2];
+            ggml_tensor * softplus = cgraph->nodes[i + 3];
+            ggml_tensor * gate_mul = cgraph->nodes[i + 4];
+            ggml_tensor * gate_v   = cgraph->nodes[i + 5];
+            ggml_tensor * beta_w   = cgraph->nodes[i + 6];
+            ggml_tensor * beta_v   = cgraph->nodes[i + 7];
+            ggml_tensor * beta_sig = cgraph->nodes[i + 8];
+
+            const bool wiring_ok =
+                alpha_v->src[0] == alpha_w &&
+                softplus->src[0] == bias &&
+                gate_v->src[0] == gate_mul &&
+                beta_v->src[0] == beta_w &&
+                beta_sig->src[0] == beta_v &&
+                alpha_w->src[1] == beta_w->src[1];
+
+            const ggml_tensor * dt    = nullptr;
+            const ggml_tensor * ssm_a = nullptr;
+            if (wiring_ok) {
+                if (bias->src[0] == alpha_v) {
+                    dt = bias->src[1];
+                } else if (bias->src[1] == alpha_v) {
+                    dt = bias->src[0];
+                }
+                if (gate_mul->src[0] == softplus) {
+                    ssm_a = gate_mul->src[1];
+                } else if (gate_mul->src[1] == softplus) {
+                    ssm_a = gate_mul->src[0];
+                }
+            }
+
+            const bool type_ok =
+                dt && ssm_a &&
+                dt->type == GGML_TYPE_F32 && ssm_a->type == GGML_TYPE_F32 &&
+                ggml_get_unary_op(softplus) == GGML_UNARY_OP_SOFTPLUS &&
+                ggml_get_unary_op(beta_sig)  == GGML_UNARY_OP_SIGMOID &&
+                alpha_w->src[0]->type == GGML_TYPE_Q8_0 && beta_w->src[0]->type == GGML_TYPE_Q8_0 &&
+                alpha_w->src[1]->type == GGML_TYPE_F32 &&
+                alpha_w->src[0]->ne[0] == beta_w->src[0]->ne[0] &&
+                alpha_w->src[0]->ne[1] == beta_w->src[0]->ne[1] &&
+                alpha_w->src[1]->ne[1] == 1; // decode only
+
+            if (wiring_ok && type_ok) {
+                ggml_cuda_op_ssm_gate_beta(*cuda_ctx, alpha_w->src[0], beta_w->src[0], alpha_w->src[1], dt, ssm_a, gate_mul, beta_sig);
+                return 8;
+            }
+        }
+    }
+
     // mul_mat + add, with an optional view (reshape) node between the matmul and the add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
