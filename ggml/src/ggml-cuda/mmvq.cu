@@ -546,6 +546,11 @@ static __global__ void mul_mat_vec_q(
             x_scale        = (const float *) fusion.x_scale;
             gate_scale     = (const float *) fusion.gate_scale;
         }
+        // Per-token scale (MoE down x topk weights). Indexed by channel_dst.
+        if (fusion.x_scale_channel_dst) {
+            use_scale = true;
+            x_scale   = (const float *) fusion.x_scale;
+        }
     }
 
 
@@ -573,13 +578,11 @@ static __global__ void mul_mat_vec_q(
                     gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
                 }
             }
-            if constexpr (type == GGML_TYPE_NVFP4) {
-                if (use_scale) {
-                    x_scales = x_scale[ids ? channel_x : 0];
-                }
-                if (use_gate_scale) {
-                    gate_scales = gate_scale[ids ? channel_x : 0];
-                }
+            if (use_scale) {
+                x_scales = fusion.x_scale_channel_dst ? x_scale[channel_dst] : x_scale[ids ? channel_x : 0];
+            }
+            if (use_gate_scale) {
+                gate_scales = gate_scale[ids ? channel_x : 0];
             }
         }
     }
@@ -661,7 +664,7 @@ static __global__ void mul_mat_vec_q(
             if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
                 float result = tmp[j][i];
                 if constexpr (has_fusion) {
-                    if constexpr (type == GGML_TYPE_NVFP4) {
+                    if (use_scale) {
                         result *= x_scales;
                     }
                     result += x_biases[j];
@@ -793,7 +796,7 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst;
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1182,8 +1185,8 @@ void ggml_cuda_mul_mat_vec_q(
         GGML_ASSERT( !ids || dst->ne[2] == 1);
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
-        // non-negligible for some models such as gpt-oss-20b
-        GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
+        // non-negligible for some models such as gpt-oss-20b. The per-token MoE scale is a second exception.
+        GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4 || fusion->x_scale_channel_dst);
 
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
@@ -1204,9 +1207,15 @@ void ggml_cuda_mul_mat_vec_q(
         if (fusion->x_scale) {
             GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
             GGML_ASSERT(ggml_is_contiguous(fusion->x_scale));
-            GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
+            if (fusion->x_scale_channel_dst) {
+                GGML_ASSERT(ids);
+                GGML_ASSERT(ggml_nelements(fusion->x_scale) == dst->ne[1]);
+            } else {
+                GGML_ASSERT(ggml_nelements(fusion->x_scale) == (ids ? src0->ne[2] : 1));
+            }
             fusion_local.x_scale = fusion->x_scale->data;
         }
+        fusion_local.x_scale_channel_dst = fusion->x_scale_channel_dst;
         if (fusion->gate_scale) {
             GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
             GGML_ASSERT(ggml_is_contiguous(fusion->gate_scale));
