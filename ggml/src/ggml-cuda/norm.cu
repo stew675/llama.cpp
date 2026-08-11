@@ -550,6 +550,146 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
 }
 
+// rms norm (with optional per-element weight) that also quantizes the output
+// row to Q8_1 blocks for the mmvq quantize cache. Warp 0 quantizes the row
+// after the norm; the blocks are packed with the padded row pitch
+// (ncols_padded / QK8_1).
+template <int block_size>
+static __global__ void rms_norm_q8_1_f32(
+        const float * x, float * dst, block_q8_1 * y, const float * mul,
+        const int ncols, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int64_t mul_stride_row, const int ncols_padded, const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+    y   += ((sample*nchannels + channel)*nrows + row)*(ncols_padded/QK8_1);
+    if (mul != nullptr) {
+        mul += row*mul_stride_row;
+    }
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    if (mul == nullptr) {
+        for (int col = tid; col < ncols; col += block_size) {
+            dst[col] = scale * x[col];
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            dst[col] = scale * x[col] * mul[col];
+        }
+    }
+
+    __syncthreads();
+
+    // Quantize the row. Warp w covers the 32-element block at col = tid +
+    // k*block_size, so all warps work in parallel and the warp reductions
+    // overlap. The reduction matches the standalone quantize kernel bit for bit.
+    for (int col = tid; col < ncols; col += block_size) {
+        const int ib = col / QK8_1;
+        const int lane = col % QK8_1;
+        const float xi = dst[col];
+        float amax = fabsf(xi);
+        float sum  = xi;
+        amax = warp_reduce_max(amax);
+        sum  = warp_reduce_sum(sum);
+        const float d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+        y[ib].qs[lane] = q;
+        if (lane == 0) {
+            y[ib].ds = make_half2(d, sum);
+        }
+    }
+}
+
+static void rms_norm_q8_1_cuda(
+        const float * x, float * dst, block_q8_1 * y, const float * mul,
+        const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int64_t mul_stride_row, const int ncols_padded, const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch(rms_norm_q8_1_f32<256>, launch_params, x, dst, y, mul, ncols, stride_row, stride_channel, stride_sample, mul_stride_row, ncols_padded, eps);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+        ggml_cuda_kernel_launch(rms_norm_q8_1_f32<1024>, launch_params, x, dst, y, mul, ncols, stride_row, stride_channel, stride_sample, mul_stride_row, ncols_padded, eps);
+    }
+}
+
+// Fused rms_norm + weight mul + Q8_1 quantize. norm_node is the rms_norm, the
+// following MUL node scales it by the norm weight; the fused kernel writes the
+// MUL output (F32) and quantizes it into the mmvq cache so the matmuls over it
+// skip their own quantize kernel.
+void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_node, const ggml_tensor * mul_node) {
+    const ggml_tensor * src0 = norm_node->src[0];
+    const ggml_tensor * dst  = mul_node;
+    const ggml_tensor * weight = mul_node->src[1];
+    const float * src0_d = (const float *) src0->data;
+    float * dst_d = (float *) dst->data;
+    const float * mul_d = (const float *) weight->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    float eps;
+    memcpy(&eps, norm_node->op_params, sizeof(float));
+    GGML_ASSERT(eps >= 0.0f);
+
+    const int ncols = dst->ne[0];
+    GGML_ASSERT(ncols % QK8_1 == 0);
+    GGML_ASSERT(src0->ne[0] == ncols);
+
+    const int64_t s01 = src0->nb[1] / ggml_type_size(src0->type);
+    const int64_t s02 = src0->nb[2] / ggml_type_size(src0->type);
+    const int64_t s03 = src0->nb[3] / ggml_type_size(src0->type);
+    const int64_t mul_s01 = weight->nb[1] / ggml_type_size(weight->type);
+
+    // Fill the mmvq quantize cache for the norm output so the following
+    // matmuls skip their own quantize kernel. The key must match the mmvq
+    // launcher's (view root of src1, stream, ne, strides).
+    const int64_t ne10_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    const size_t q8_1_size = dst->ne[3]*dst->ne[2] * dst->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    bool found = false;
+    void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size,
+                                      ncols, dst->ne[1], dst->ne[2], dst->ne[3],
+                                      dst->nb[1]/ggml_type_size(dst->type),
+                                      dst->nb[2]/ggml_type_size(dst->type),
+                                      dst->nb[3]/ggml_type_size(dst->type), found);
+
+    if (found) {
+        // another node already quantized this tensor; run the plain norm+mul
+        rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
+                              ncols, dst->ne[1], dst->ne[2], dst->ne[3],
+                              s01, s02, s03,
+                              mul_s01, weight->nb[2]/ggml_type_size(weight->type), weight->nb[3]/ggml_type_size(weight->type),
+                              weight->ne[0], weight->ne[1], weight->ne[2], weight->ne[3],
+                              0, 0, 0, 0, 0, 0, 0, eps, stream);
+        return;
+    }
+
+    rms_norm_q8_1_cuda(src0_d, dst_d, (block_q8_1 *) q8_1, mul_d,
+                       ncols, dst->ne[1], dst->ne[2], dst->ne[3], s01, s02, s03, mul_s01, ne10_padded, eps, stream);
+}
+
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;

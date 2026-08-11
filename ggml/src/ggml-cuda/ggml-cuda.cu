@@ -3287,6 +3287,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // rms_norm + norm-weight MUL whose output feeds an mmvq matmul: fold the
+    // Q8_1 quantize into the norm kernel and pre-fill the matmul quantize
+    // cache. Consumes only the norm+MUL pair; the matmul dispatch that follows
+    // finds the cached blocks and skips its own quantize. The matmul need not
+    // be adjacent (unrelated nodes may sit between in DFS order).
+    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
+        const ggml_tensor * mul = cgraph->nodes[i + 1];
+        if (mul->op == GGML_OP_MUL && mul->src[0] == node) {
+            // The consumers of the norm output are mostly mmvq matmuls; skip
+            // over unrelated nodes and non-mmvq consumers (they read the F32
+            // output, which the fused kernel still writes) until an mmvq
+            // matmul over the norm output is found.
+            const int scan_end = std::min(cgraph->n_nodes, i + 32);
+            for (int j = i + 2; j < scan_end; ++j) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                // A matmul over the norm output may use a view of it; the mmvq
+                // quantize cache keys on the view root, so both match the mul.
+                const ggml_tensor * n_src1 = n->src[1];
+                while (n_src1 != nullptr && n_src1->view_src != nullptr) {
+                    n_src1 = n_src1->view_src;
+                }
+                const bool consumes_mul = n->src[0] == mul || n_src1 == mul;
+                if (!consumes_mul) {
+                    continue;
+                }
+                if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) &&
+                        node->ne[0] % QK8_1 == 0 && ggml_cuda_should_fuse_mul_mat_vec_q(n)) {
+                    ggml_cuda_op_rms_norm_q8_1(*cuda_ctx, node, mul);
+                    return 1;
+                }
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
