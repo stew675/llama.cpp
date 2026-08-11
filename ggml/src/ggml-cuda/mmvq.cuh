@@ -22,3 +22,10 @@ void ggml_cuda_op_ssm_gate_beta(
     const ggml_tensor * src0_alpha, const ggml_tensor * src0_beta, const ggml_tensor * src1,
     const ggml_tensor * dt, const ggml_tensor * ssm_a,
     ggml_tensor * dst_gate, ggml_tensor * dst_beta);
+
+void ggml_cuda_op_shexp_down_gate(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * w_down, const ggml_tensor * swiglu,
+    const ggml_tensor * w_gate, const ggml_tensor * x_gate,
+    const ggml_tensor * moe_out, const ggml_tensor * ffn_residual,
+    ggml_tensor * dst);

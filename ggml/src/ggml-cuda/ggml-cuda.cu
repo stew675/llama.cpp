@@ -3964,6 +3964,55 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Shared-expert output chain: down projection + gate + gating + residual
+    // adds. dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
+    if (i + 5 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+        const ggml_op ops[6] = {
+            GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD
+        };
+        const int out_nodes[] = { i + 5 };
+
+        if (ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 1)) {
+            ggml_tensor * down_mm = cgraph->nodes[i];
+            ggml_tensor * gate_mm = cgraph->nodes[i + 1];
+            ggml_tensor * sigmoid = cgraph->nodes[i + 2];
+            ggml_tensor * gated   = cgraph->nodes[i + 3];
+            ggml_tensor * ffn_out = cgraph->nodes[i + 4];
+            ggml_tensor * l_out   = cgraph->nodes[i + 5];
+
+            const bool wiring_ok =
+                sigmoid->src[0] == gate_mm &&
+                ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+                ((gated->src[0] == down_mm && gated->src[1] == sigmoid) ||
+                 (gated->src[0] == sigmoid && gated->src[1] == down_mm)) &&
+                ((ffn_out->src[0] == gated && ffn_out->src[1] != gated) ||
+                 (ffn_out->src[1] == gated && ffn_out->src[0] != gated)) &&
+                l_out->src[0] == ffn_out && l_out->src[1] != ffn_out;
+
+            const ggml_tensor * moe_out = nullptr;
+            const ggml_tensor * ffn_residual = nullptr;
+            if (wiring_ok) {
+                moe_out = ffn_out->src[0] == gated ? ffn_out->src[1] : ffn_out->src[0];
+                ffn_residual = l_out->src[1];
+            }
+
+            const bool type_ok =
+                wiring_ok && moe_out && ffn_residual &&
+                down_mm->src[0]->type == GGML_TYPE_Q8_0 &&
+                down_mm->src[1]->type == GGML_TYPE_F32 &&
+                gate_mm->src[0]->type == GGML_TYPE_F32 &&
+                gate_mm->src[1]->type == GGML_TYPE_F32 &&
+                down_mm->src[1]->ne[1] == 1 && gate_mm->src[1]->ne[1] == 1; // decode only
+
+            if (wiring_ok && type_ok) {
+                ggml_cuda_op_shexp_down_gate(*cuda_ctx,
+                    down_mm->src[0], down_mm->src[1], gate_mm->src[0], gate_mm->src[1],
+                    moe_out, ffn_residual, l_out);
+                return 5;
+            }
+        }
+    }
+
     // mul_mat + add, with an optional view (reshape) node between the matmul and the add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
