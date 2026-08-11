@@ -3889,6 +3889,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // MoE: ffn_moe_weighted = moe_down * topk_weights. The down projection
+    // output is scaled per token (the topk softmax weights); fold the MUL into
+    // the matmul epilogue. The pattern is [MUL_MAT_ID, MUL] with the MUL's
+    // src1 being a contiguous per-channel F32 vector (a view of the
+    // normalized weights).
+    if (i + 1 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+        ggml_tensor * mm_node  = cgraph->nodes[i];
+        ggml_tensor * mul_node = cgraph->nodes[i + 1];
+
+        const int out_nodes[] = { i + 1 };
+        if (mul_node->op == GGML_OP_MUL &&
+                mul_node->src[0] == mm_node &&
+                (mm_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                (mul_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+            const ggml_tensor * weights = mul_node->src[1];
+            if (weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) &&
+                    weights->ne[0] == 1 && weights->ne[1] == mm_node->ne[1] &&
+                    ggml_are_same_shape(mm_node, mul_node) &&
+                    ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.x_scale             = weights;
+                fusion_data.x_scale_channel_dst = true;
+
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
+                return 1;
+            }
+        }
+    }
+
     // Pair of L2 norms over two views of the same tensor (the SSM conv output
     // q/k slices). The view source is an external compute tensor, so the
     // subgraph helper cannot express the pattern; check the wiring manually.
