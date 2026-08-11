@@ -1324,12 +1324,22 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    const size_t src1_q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // Quantize src1 to Q8_1 once per graph; matmuls sharing the same src1 data
+    // (views of the same tensor included) reuse the buffer.
+    const ggml_tensor * src1_key = src1;
+    while (src1_key->view_src != nullptr) {
+        src1_key = src1_key->view_src;
+    }
+    const int64_t src1_s11 = src1->nb[1] / ts_src1;
+    const int64_t src1_s12 = src1->nb[2] / ts_src1;
+    const int64_t src1_s13 = src1->nb[3] / ts_src1;
+    bool src1_q8_1_cached = false;
+    void * src1_q8_1 = ctx.q8_1_cache_get(src1_key, ctx.curr_stream_no, src1_q8_1_size,
+                                          ne10, ne11, ne12, ne13, src1_s11, src1_s12, src1_s13, src1_q8_1_cached);
+    if (!src1_q8_1_cached) {
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, src1_s11, src1_s12, src1_s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1355,7 +1365,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

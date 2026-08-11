@@ -1534,6 +1534,71 @@ struct ggml_backend_cuda_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+    // Per-graph cache of quantized Q8_1 matmul inputs.
+    // The decode mmvq launcher quantizes src1 to Q8_1 before every matmul.
+    // Matmuls sharing the same src1 data (e.g. the qkv/z/alpha/beta projections
+    // of one layer, or views of the same tensor) quantize it once and reuse the
+    // result. Entries are keyed by the view root of src1 (the tensor that owns
+    // the data) plus the quantize layout, so strided views never collide. The
+    // cache is valid only within one graph execution: a tensor is written once
+    // and its data is immutable until the next graph. Cleared at graph start;
+    // entries are also keyed by the stream they were quantized on, so forked
+    // streams never read unsynchronized data.
+    struct q8_1_cache_entry {
+        const ggml_tensor * src1 = nullptr;
+        int stream_no = 0;
+        int64_t ne10 = 0;
+        int64_t ne11 = 0;
+        int64_t ne12 = 0;
+        int64_t ne13 = 0;
+        int64_t s11 = 0;
+        int64_t s12 = 0;
+        int64_t s13 = 0;
+        size_t offset = 0;
+        size_t size   = 0;
+    };
+    char * q8_1_arena = nullptr;
+    size_t q8_1_arena_size = 0;
+    std::vector<q8_1_cache_entry> q8_1_cache;
+    size_t q8_1_arena_pos = 0;
+
+    void q8_1_cache_clear() {
+        q8_1_cache.clear();
+        q8_1_arena_pos = 0;
+    }
+
+    // Returns the cached buffer for (src1, stream_no, layout) if present,
+    // otherwise allocates a new one from the arena and records it. The buffer
+    // is valid until the next q8_1_cache_clear().
+    void * q8_1_cache_get(const ggml_tensor * src1, int stream_no, size_t size,
+                          int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+                          int64_t s11, int64_t s12, int64_t s13, bool & found) {
+        for (const auto & e : q8_1_cache) {
+            if (e.src1 == src1 && e.stream_no == stream_no &&
+                e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
+                e.s11 == s11 && e.s12 == s12 && e.s13 == s13) {
+                found = true;
+                return q8_1_arena + e.offset;
+            }
+        }
+        found = false;
+        if (q8_1_arena_pos + size > q8_1_arena_size) {
+            const size_t new_size = std::max(size_t(1) << 25, 2*(q8_1_arena_pos + size)); // 32 MiB min
+            char * new_arena = nullptr;
+            CUDA_CHECK(cudaMalloc(&new_arena, new_size));
+            if (q8_1_arena != nullptr) {
+                CUDA_CHECK(cudaMemcpy(new_arena, q8_1_arena, q8_1_arena_pos, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaFree(q8_1_arena));
+            }
+            q8_1_arena = new_arena;
+            q8_1_arena_size = new_size;
+        }
+        void * data = q8_1_arena + q8_1_arena_pos;
+        q8_1_cache.push_back({ src1, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
+        q8_1_arena_pos += size;
+        return data;
+    }
+
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();
