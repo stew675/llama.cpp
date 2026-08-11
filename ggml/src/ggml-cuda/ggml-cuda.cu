@@ -2655,6 +2655,82 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
+static bool ggml_cuda_should_fuse_mul_q8_1(const ggml_tensor * mul,
+                                           const ggml_tensor * mm) {
+    if (mul->op != GGML_OP_MUL || (mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID)) {
+        return false;
+    }
+
+    // The matmul must run on the mmvq path (the only consumer of the arena).
+    if (!ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
+        return false;
+    }
+
+    if (mul->type != GGML_TYPE_F32 || !ggml_is_quantized(mm->src[0]->type)) {
+        return false;
+    }
+
+    // The matmul's activation must be the MUL (or a no-op view of it).
+    const ggml_tensor * mm_src1 = mm->src[1];
+    const ggml_tensor * src1 = mm_src1;
+    while (src1 != nullptr && src1->view_src != nullptr) {
+        src1 = src1->view_src;
+    }
+    if (src1 != mul) {
+        return false;
+    }
+
+    // Same-shape, contiguous F32 inputs; rows must align with Q8_1 blocks.
+    if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(mul->src[0], mul->src[1]) ||
+        !ggml_is_contiguous(mul->src[0]) || !ggml_is_contiguous(mul->src[1]) ||
+        !ggml_is_contiguous(mul) || mul->ne[0] % QK8_1 != 0 ||
+        ggml_nelements(mul) != ggml_nelements(mm_src1)) {
+        return false;
+    }
+
+    return true;
+}
+
+// If the MUL output feeds a single mmvq matmul (directly or via a no-op
+// reshape at the next node), return that matmul; otherwise return nullptr.
+static const ggml_tensor * ggml_cuda_find_mul_q8_1_matmul(const ggml_cgraph * cgraph,
+                                                          int mul_idx, const ggml_tensor * mul) {
+    const int n = cgraph->n_nodes;
+    const ggml_tensor * n1 = (mul_idx + 1 < n) ? cgraph->nodes[mul_idx + 1] : nullptr;
+    if (n1 == nullptr) {
+        return nullptr;
+    }
+
+    const ggml_tensor * mm = nullptr;
+    if (n1->op == GGML_OP_MUL_MAT) {
+        mm = n1;
+    } else if (n1->op == GGML_OP_RESHAPE && mul_idx + 2 < n && cgraph->nodes[mul_idx + 2]->op == GGML_OP_MUL_MAT) {
+        mm = cgraph->nodes[mul_idx + 2];
+    } else {
+        return nullptr;
+    }
+
+    // The MUL output must have exactly one consumer (the matmul or its view).
+    int uses = 0;
+    for (int j = 0; j < n; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] == mul) {
+                uses++;
+            }
+        }
+    }
+    if (uses != 1) {
+        return nullptr;
+    }
+
+    if (!ggml_cuda_should_fuse_mul_q8_1(mul, mm)) {
+        return nullptr;
+    }
+    return mm;
+}
+
 static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm,
                                                     const ggml_tensor * mul,
                                                     const ggml_tensor * rope) {
@@ -4176,7 +4252,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_tensor * mul_node = cgraph->nodes[i + 1];
+
+        // If the product feeds a single decode matmul (directly or via a
+        // no-op reshape), write its Q8_1 quantized value instead of the F32
+        // output; the matmul launcher finds it via the quantize cache.
+        const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, i + 1, mul_node);
+        if (mm != nullptr) {
+            ggml_cuda_op_unary_mul_q8_1(*cuda_ctx, node, mul_node, mm);
+            return cgraph->nodes[i + 2] == mm ? 1 : 2;
+        }
+
+        ggml_cuda_op_unary_mul(*cuda_ctx, node, mul_node);
         return 1;
     }
 
