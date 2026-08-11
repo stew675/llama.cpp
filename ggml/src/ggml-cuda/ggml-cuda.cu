@@ -3856,28 +3856,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
-    // mul_mat + add
+    // mul_mat + add, with an optional view (reshape) node between the matmul and the add
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
-        if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
-            continue;
+        // view (reshape) between the matmul and the add
+        const bool has_view = i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE;
+
+        if (has_view) {
+            // use ggml_can_fuse_subgraph: views in the subgraph are allowed here
+            const ggml_op ops[3] = { op, GGML_OP_RESHAPE, bias_op };
+            const int out_nodes[] = { i + 2 };
+            if (!ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 1) || cgraph->nodes[i + 1]->src[0] != cgraph->nodes[i]) {
+                continue;
+            }
+        } else {
+            if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
+                continue;
+            }
         }
 
         ggml_tensor * mm_node   = cgraph->nodes[i];
-        ggml_tensor * bias_node = cgraph->nodes[i + 1];
+        ggml_tensor * bias_node = cgraph->nodes[has_view ? i + 2 : i + 1];
+
+        // the add reads the matmul output directly, or through the view
+        ggml_tensor * mm_or_view = has_view ? cgraph->nodes[i + 1] : mm_node;
 
         ggml_tensor * bias_tensor = nullptr;
         if (bias_op == GGML_OP_ADD) {
-            if (bias_node->src[0] == mm_node) {
+            if (bias_node->src[0] == mm_or_view) {
                 bias_tensor = bias_node->src[1];
-            } else if (bias_node->src[1] == mm_node) {
+            } else if (bias_node->src[1] == mm_or_view) {
                 bias_tensor = bias_node->src[0];
             } else {
                 continue;
             }
         } else {
-            if (bias_node->src[0] != mm_node) {
+            if (bias_node->src[0] != mm_or_view) {
                 continue;
             }
             bias_tensor = bias_node->src[1];
@@ -3901,14 +3916,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
-            fused_node_count  = 2;
+            fused_node_count  = has_view ? 3 : 2;
             break;
         }
 
         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
-            fused_node_count  = 2;
+            fused_node_count  = has_view ? 3 : 2;
             break;
         }
     }
