@@ -3902,6 +3902,38 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // Pair of L2 norms over two views of the same tensor (the SSM conv output
+    // q/k slices). The view source is an external compute tensor, so the
+    // subgraph helper cannot express the pattern; check the wiring manually.
+    if (i + 2 < cgraph->n_nodes &&
+            cgraph->nodes[i]->op == GGML_OP_L2_NORM &&
+            cgraph->nodes[i + 1]->op == GGML_OP_VIEW &&
+            cgraph->nodes[i + 2]->op == GGML_OP_L2_NORM &&
+            cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1] &&
+            cgraph->nodes[i + 1]->view_src == cgraph->nodes[i]->src[0]->view_src) {
+        ggml_tensor * norm0 = cgraph->nodes[i];
+        ggml_tensor * view  = cgraph->nodes[i + 1];
+        ggml_tensor * norm1 = cgraph->nodes[i + 2];
+
+        float eps0;
+        float eps1;
+        memcpy(&eps0, norm0->op_params, sizeof(float));
+        memcpy(&eps1, norm1->op_params, sizeof(float));
+
+        const bool ok =
+            (norm0->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            (norm1->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            norm0->src[0]->type == GGML_TYPE_F32 && norm1->src[0]->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(norm0->src[0], norm1->src[0]) &&
+            ggml_are_same_stride(norm0->src[0], norm1->src[0]) &&
+            eps0 == eps1;
+
+        if (ok) {
+            ggml_cuda_op_l2_norm_pair(*cuda_ctx, norm0->src[0], norm0, norm1->src[0], norm1, eps0);
+            return 2;
+        }
+    }
+
     // SSM gated delta net: gate = softplus(alpha*x + dt) * a, beta = sigmoid(beta*x).
     // Two small Q8_0 projections over the same input plus the gating chain, fused
     // into one kernel. Both outputs feed only the gated delta net kernel.
