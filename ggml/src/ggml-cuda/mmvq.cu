@@ -610,11 +610,13 @@ static __global__ void mul_mat_vec_q(
     bool use_gate_bias = false;
     bool use_scale = false;
     bool use_gate_scale = false;
+    bool use_dst_gate = false;
     [[maybe_unused]] const void * vgate = nullptr;
     const float * x_bias = nullptr;
     const float * gate_bias = nullptr;
     const float * x_scale = nullptr;
     const float * gate_scale = nullptr;
+    [[maybe_unused]] const void * dst_gate = nullptr;
     ggml_glu_op active_glu;
 
     if constexpr (has_fusion) {
@@ -625,6 +627,10 @@ static __global__ void mul_mat_vec_q(
         x_bias        = (const float *) fusion.x_bias;
         gate_bias     = (const float *) fusion.gate_bias;
         active_glu    = fusion.glu_op;
+        use_dst_gate  = fusion.dst_gate != nullptr && use_gate;
+        if (use_dst_gate) {
+            dst_gate = fusion.dst_gate;
+        }
         if constexpr (type == GGML_TYPE_NVFP4) {
             use_scale      = fusion.x_scale    != nullptr;
             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
@@ -759,19 +765,27 @@ static __global__ void mul_mat_vec_q(
                             gate_value *= gate_scales;
                         }
                         gate_value += gate_biases[j];
-                        switch (active_glu) {
-                            case GGML_GLU_OP_SWIGLU:
-                                result *= ggml_cuda_op_silu_single(gate_value);
-                                break;
-                            case GGML_GLU_OP_GEGLU:
-                                result *= ggml_cuda_op_gelu_single(gate_value);
-                                break;
-                            case GGML_GLU_OP_SWIGLU_OAI:
-                                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
-                                break;
-                            default:
-                                result = result * gate_value;
-                                break;
+                        if (use_dst_gate) {
+                            // separate output: write the gate result to its own destination
+                            // (dst was already offset by sample/channel/row; apply the same to dst_gate)
+                            float * dst_gate_row = (float *) dst_gate + sample_dst*stride_sample_dst +
+                                                   channel_dst*stride_channel_dst + row0 + j*stride_col_dst;
+                            dst_gate_row[i] = gate_value;
+                        } else {
+                            switch (active_glu) {
+                                case GGML_GLU_OP_SWIGLU:
+                                    result *= ggml_cuda_op_silu_single(gate_value);
+                                    break;
+                                case GGML_GLU_OP_GEGLU:
+                                    result *= ggml_cuda_op_gelu_single(gate_value);
+                                    break;
+                                case GGML_GLU_OP_SWIGLU_OAI:
+                                    result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                                    break;
+                                default:
+                                    result = result * gate_value;
+                                    break;
+                            }
                         }
                     }
                 }
@@ -781,7 +795,7 @@ static __global__ void mul_mat_vec_q(
     }
 
     if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_dst_gate, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, dst_gate);
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
@@ -1340,6 +1354,10 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.gate_scale = fusion->gate_scale->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+        if (fusion->dst_gate) {
+            GGML_ASSERT(fusion->dst_gate->type == GGML_TYPE_F32);
+            fusion_local.dst_gate = fusion->dst_gate->data;
+        }
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

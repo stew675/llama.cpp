@@ -3927,6 +3927,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // Dual-output mmvq fusion: two matmuls over the same activation with the
+    // same output shape (e.g. the K and V projections of an attention layer).
+    // The first matmul computes both results; the gate result is written to the
+    // second matmul's destination. Only view/noop nodes may sit between the pair.
+    if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+        ggml_tensor * mm_a = cgraph->nodes[i];
+        if ((mm_a->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_cuda_should_fuse_mul_mat_vec_q(mm_a)) {
+            for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 8); ++j) {
+                ggml_tensor * mid = cgraph->nodes[j];
+                if (ggml_cuda_is_view_or_noop(mid)) {
+                    continue;
+                }
+                if (mid->op != GGML_OP_MUL_MAT || !(mid->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                        mid->src[1] != mm_a->src[1] || mid->ne[0] != mm_a->ne[0] ||
+                        mid->ne[1] != mm_a->ne[1] || mid->ne[2] != mm_a->ne[2] ||
+                        mid->src[0] == mm_a->src[0] || mid->src[0]->type != mm_a->src[0]->type ||
+                        !ggml_cuda_should_fuse_mul_mat_vec_q(mid)) {
+                    break;
+                }
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.gate     = mid->src[0];
+                fusion_data.dst_gate = mid;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_a->src[0], mm_a->src[1], mm_a->src[2], mm_a, &fusion_data);
+                return j - i;
+            }
+        }
+    }
+
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
