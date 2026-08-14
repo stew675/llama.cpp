@@ -3575,6 +3575,72 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 
+    // SSM conv-input fusion: qkv_mixed MUL_MAT output feeds the last row of an
+    // interleaved [conv_kernel_size, channels] conv input (via view nodes and a
+    // dim-0 CONCAT). Fold the concat into the mmvq epilogue: the kernel writes
+    // conv_input[cs*c + cs-1] = result and copies the (cs-1) conv states rows
+    // from the GET_ROWS output into conv_input[cs*c + k]. The CONCAT is skipped.
+    if (node->op == GGML_OP_MUL_MAT && (node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+        const int scan_end = std::min(cgraph->n_nodes, i + 8);
+        for (int j = i + 1; j < scan_end; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op != GGML_OP_CONCAT || n->op_params[0] != 0) {
+                continue;
+            }
+            if (n->type != GGML_TYPE_F32) {
+                continue;
+            }
+            const ggml_tensor * s1 = n->src[1];
+            while (s1 != nullptr && s1->view_src != nullptr) {
+                s1 = s1->view_src;
+            }
+            if (s1 != node) {
+                continue;
+            }
+            const ggml_tensor * s0 = n->src[0];
+            while (s0 != nullptr && s0->view_src != nullptr) {
+                s0 = s0->view_src;
+            }
+            if (s0 == nullptr || s0->op != GGML_OP_GET_ROWS || s0->type != GGML_TYPE_F32) {
+                continue;
+            }
+            // conv_input [cs, C] = states [(cs-1)*C] + qkv [C], dim 0
+            const int64_t C = n->ne[1] * n->ne[2] * n->ne[3];
+            const int64_t cs = n->ne[0];
+            if (cs < 2 || n->ne[1] != s1->ne[0]) {
+                continue;
+            }
+            const int64_t src0_elems = s0->ne[0] * s0->ne[1] * s0->ne[2];
+            const int64_t src1_elems = s1->ne[0] * s1->ne[1] * s1->ne[2];
+            if (src0_elems != (cs - 1) * C || src1_elems != C) {
+                continue;
+            }
+            int out_nodes[] = { j };
+            if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, j - i + 1, out_nodes, 1)) {
+                continue;
+            }
+            // the conv states GET_ROWS must be scheduled before this matmul so
+            // the epilogue reads fresh states (the read is not a graph edge)
+            bool states_ready = false;
+            for (int k = 0; k < i; ++k) {
+                if (cgraph->nodes[k] == s0) {
+                    states_ready = true;
+                    break;
+                }
+            }
+            if (!states_ready) {
+                continue;
+            }
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.conv_input       = n;
+            fusion_data.conv_states      = s0;
+            fusion_data.conv_kernel_size = cs;
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], node, &fusion_data);
+            return j - i;
+        }
+    }
+
     auto get_mul_mat_scale = [](const ggml_tensor * scale_node, const ggml_tensor * mm_node) -> const ggml_tensor * {
         const bool scale_lhs_mm = scale_node->src[0] == mm_node;
         const bool scale_rhs_mm = scale_node->src[1] == mm_node;

@@ -1652,6 +1652,14 @@ struct ggml_cuda_mm_fusion_args_host {
     // when set (with glu_op == GGML_GLU_OP_NONE), the gate result is written
     // to this separate destination instead of being combined into the main output
     const ggml_tensor * dst_gate = nullptr;
+    // SSM conv-input fusion: the matmul output is the last row of an
+    // interleaved [conv_kernel_size, channels] conv input. The kernel writes
+    // conv_input[cs*c + cs-1] = result and copies the (cs-1) conv states rows
+    // from conv_states (a contiguous [(cs-1)*channels] GET_ROWS output) into
+    // conv_input[cs*c + k], k < cs-1. The separate CONCAT kernel is skipped.
+    const ggml_tensor * conv_input = nullptr;
+    const ggml_tensor * conv_states = nullptr;
+    int conv_kernel_size = 0;
     // Index x_scale by the destination channel (token), not the source channel
     // (expert). Used for the MoE down x topk-weights fusion.
     bool x_scale_channel_dst = false;
@@ -1664,6 +1672,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     const void * dst_gate = nullptr;
+    const void * conv_input = nullptr;
+    const void * conv_states = nullptr;
+    int conv_kernel_size = 0;
     bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
 };
