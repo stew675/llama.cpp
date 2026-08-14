@@ -1469,7 +1469,170 @@ void ggml_cuda_op_ssm_gate_beta(
     ggml_cuda_kernel_launch(ssm_gate_beta_fused_q8_0, launch_params,
         src0_alpha->data, src0_beta->data, (const block_q8_1 *) src1_q8_1, (const float *) dt->data, (const float *) ssm_a->data,
         (float *) dst_gate->data, (float *) dst_beta->data, nrows, src1->ne[0]);
+
 }
+
+// Fused SSM pre-scan chain: conv + silu, l2_norm(q, k) and the gate/beta
+// projections in one kernel. Replaces ssm_conv (+silu), l2_norm_pair and
+// ssm_gate_beta. Grid: (n_qk_heads + n_v_heads + ceil(n_v_heads/4), 1),
+// block: (128, 1).
+//   [0, n_qk_heads): q head b (threads 0..31) + k head b (threads 32..63);
+//                    threads 0..63 each handle 4 channels, accumulating the L2
+//                    sum in the same order as l2_norm_pair (cols tid, tid+32,
+//                    tid+64, tid+96). Threads 64..127 idle.
+//   [n_qk_heads, +n_v_heads): v head, one channel per thread.
+//   remainder: gate/beta, one head per warp.
+static __global__ void ssm_conv_l2_gatebeta_fused(
+        const float * conv_input, const float * conv_w,
+        const block_q8_0 * w_alpha, const block_q8_0 * w_beta, const block_q8_1 * y,
+        const float * dt, const float * ssm_a,
+        float * q_norm, float * k_norm, float * v_raw,
+        float * dst_gate, float * dst_beta,
+        const int d_conv, const int head_k_dim, const int n_qk_heads,
+        const int head_v_dim, const int n_v_heads,
+        const float eps, const int ncols_x) {
+    const int tid  = threadIdx.x;
+    const int bidx = blockIdx.x;
+    const int n_qk_ch = head_k_dim * n_qk_heads;
+
+    if (bidx >= n_qk_heads + n_v_heads) {
+        // gate/beta: one head per warp, 4 heads per block
+        const int head = (bidx - n_qk_heads - n_v_heads) * 4 + tid / 32;
+        if (head >= n_v_heads) {
+            return;
+        }
+        const int lane = tid % 32;
+        constexpr int qk = 32;
+        constexpr int qi = 4;
+        constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+        const int blocks_per_row_x = ncols_x / qk;
+        const block_q8_0 * w_a = w_alpha + (int64_t) head * blocks_per_row_x;
+        const block_q8_0 * w_b = w_beta  + (int64_t) head * blocks_per_row_x;
+        float sum_alpha = 0.0f;
+        float sum_beta  = 0.0f;
+        const int blocks_per_iter = vdr * 32 / qi;
+        for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx; // qk == QK8_1
+            const int kqs = vdr * (lane % (qi/vdr));
+            sum_alpha += vec_dot_q8_0_q8_1(w_a, &y[kby], kbx, kqs);
+            sum_beta  += vec_dot_q8_0_q8_1(w_b, &y[kby], kbx, kqs);
+        }
+        sum_alpha = warp_reduce_sum<32>(sum_alpha);
+        sum_beta  = warp_reduce_sum<32>(sum_beta);
+        if (lane == 0) {
+            dst_gate[head] = ssm_op_softplus(sum_alpha + dt[head]) * ssm_a[head];
+            dst_beta[head] = ssm_op_sigmoid(sum_beta);
+        }
+        return;
+    }
+
+    if (bidx >= n_qk_heads) {
+        // v head: one channel per thread
+        const int c = 2*n_qk_ch + (bidx - n_qk_heads)*head_v_dim + tid;
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += conv_input[c*d_conv + j] * conv_w[c*d_conv + j];
+        }
+        v_raw[c] = ggml_cuda_op_silu_single(sumf);
+        return;
+    }
+
+    // q head (warp 0) / k head (warp 1): conv + silu, 4 channels per thread
+    if (tid >= 64) {
+        return;
+    }
+    const bool is_k = tid >= 32;
+    const int  lane = tid % 32;
+    const int  base = is_k ? n_qk_ch : 0;
+    float *    dst_qk = is_k ? k_norm : q_norm;
+    float      xv[4];
+    float      tmp = 0.0f;
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        const int col = lane + 32*r;
+        const int c   = base + bidx*head_k_dim + col;
+        // same arithmetic as ssm_conv_f32: load into registers, then
+        // accumulate the weighted sum (identical rounding)
+        float sumf = 0.0f;
+        float x4[15] = { 0.0f };
+        float w4[15] = { 0.0f };
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            x4[j] = conv_input[c*d_conv + j];
+            w4[j] = conv_w[c*d_conv + j];
+        }
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += x4[j] * w4[j];
+        }
+        xv[r] = ggml_cuda_op_silu_single(sumf);
+        tmp  = __fmaf_rn(xv[r], xv[r], tmp);
+    }
+    tmp = warp_reduce_sum<32>(tmp);
+    const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        dst_qk[bidx*head_k_dim + lane + 32*r] = scale * xv[r];
+    }
+}
+
+void ggml_cuda_op_ssm_conv_l2_gatebeta(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * conv_input, const ggml_tensor * conv_w,
+        const ggml_tensor * src0_alpha, const ggml_tensor * src0_beta, const ggml_tensor * src1,
+        const ggml_tensor * dt, const ggml_tensor * ssm_a,
+        ggml_tensor * q_norm, ggml_tensor * k_norm, ggml_tensor * v_raw,
+        ggml_tensor * dst_gate, ggml_tensor * dst_beta,
+        const int head_k_dim, const int n_qk_heads,
+        const int head_v_dim, const int n_v_heads, const float eps) {
+    GGML_ASSERT(conv_input->type == GGML_TYPE_F32 && conv_w->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0_alpha->type == GGML_TYPE_Q8_0 && src0_beta->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && q_norm->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_norm->type == GGML_TYPE_F32 && v_raw->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst_gate->type == GGML_TYPE_F32 && dst_beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0_alpha->ne[0] == src0_beta->ne[0] && src0_alpha->ne[1] == src0_beta->ne[1]);
+    GGML_ASSERT(ggml_nelements(dst_gate) == ggml_nelements(dst_beta));
+
+    cudaStream_t stream = ctx.stream();
+    const size_t ts_src1 = ggml_type_size(src1->type);
+
+    // Quantize src1 to Q8_1 once per graph; reuse the same buffer as the other
+    // matmuls over this input.
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const size_t src1_q8_1_size = src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    const ggml_tensor * src1_key = src1;
+    while (src1_key->view_src != nullptr) {
+        src1_key = src1_key->view_src;
+    }
+    const int64_t src1_s11 = src1->nb[1] / ts_src1;
+    const int64_t src1_s12 = src1->nb[2] / ts_src1;
+    const int64_t src1_s13 = src1->nb[3] / ts_src1;
+    bool src1_q8_1_cached = false;
+    void * src1_q8_1 = ctx.q8_1_cache_get(src1_key, ctx.curr_stream_no, src1_q8_1_size,
+                                          src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                                          src1_s11, src1_s12, src1_s13, src1_q8_1_cached);
+    if (!src1_q8_1_cached) {
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1, GGML_TYPE_Q8_0,
+                               src1->ne[0], src1_s11, src1_s12, src1_s13, ne10_padded,
+                               src1->ne[1], src1->ne[2], src1->ne[3], stream);
+    }
+
+    const int d_conv  = conv_w->ne[0];
+    const int ncols_x = src1->ne[0];
+
+    const dim3 block_nums(n_qk_heads + n_v_heads + (n_v_heads + 3) / 4);
+    const dim3 block_dims(128);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+    ggml_cuda_kernel_launch(ssm_conv_l2_gatebeta_fused, launch_params,
+        (const float *) conv_input->data, (const float *) conv_w->data,
+        (const block_q8_0 *) src0_alpha->data, (const block_q8_0 *) src0_beta->data, (const block_q8_1 *) src1_q8_1,
+        (const float *) dt->data, (const float *) ssm_a->data,
+        (float *) q_norm->data, (float *) k_norm->data, (float *) v_raw->data,
+        (float *) dst_gate->data, (float *) dst_beta->data,
+        d_conv, head_k_dim, n_qk_heads, head_v_dim, n_v_heads, eps, ncols_x);
+}
+
 
 // Fused shared-expert output: down projection plus the gate and residual adds.
 // dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
