@@ -4381,6 +4381,96 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // Fuse the SSM pre-scan chain: conv+silu, l2_norm(q,k) and the gate/beta
+    // projections (pattern built by qwen35moe, decode only). One kernel instead
+    // of ssm_conv, l2_norm_pair and ssm_gate_beta.
+    if (node->op == GGML_OP_SSM_CONV && node->type == GGML_TYPE_F32 && node->ne[1] == 1 &&
+            i + 15 < cgraph->n_nodes) {
+        const ggml_tensor * silu     = cgraph->nodes[i + 1];
+        const ggml_tensor * q_view   = cgraph->nodes[i + 2];
+        const ggml_tensor * q_norm   = cgraph->nodes[i + 3];
+        const ggml_tensor * k_view   = cgraph->nodes[i + 4];
+        const ggml_tensor * k_norm   = cgraph->nodes[i + 5];
+        const ggml_tensor * v_view   = cgraph->nodes[i + 6];
+        const ggml_tensor * alpha_w  = cgraph->nodes[i + 7];
+        const ggml_tensor * alpha_v  = cgraph->nodes[i + 8];
+        const ggml_tensor * bias     = cgraph->nodes[i + 9];
+        const ggml_tensor * softplus = cgraph->nodes[i + 10];
+        const ggml_tensor * gate_mul = cgraph->nodes[i + 11];
+        const ggml_tensor * gate_v   = cgraph->nodes[i + 12];
+        const ggml_tensor * beta_w   = cgraph->nodes[i + 13];
+        const ggml_tensor * beta_v   = cgraph->nodes[i + 14];
+        const ggml_tensor * beta_sig = cgraph->nodes[i + 15];
+
+        const bool wiring_ok =
+            silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == node &&
+            q_view->op == GGML_OP_VIEW && q_view->view_src == silu &&
+            q_norm->op == GGML_OP_L2_NORM && q_norm->src[0] == q_view &&
+            k_view->op == GGML_OP_VIEW && k_view->view_src == silu &&
+            k_norm->op == GGML_OP_L2_NORM && k_norm->src[0] == k_view &&
+            v_view->op == GGML_OP_VIEW && v_view->view_src == silu &&
+            alpha_w->op == GGML_OP_MUL_MAT &&
+            alpha_v->op == GGML_OP_RESHAPE && alpha_v->src[0] == alpha_w &&
+            bias->op == GGML_OP_ADD && (bias->src[0] == alpha_v || bias->src[1] == alpha_v) &&
+            softplus->op == GGML_OP_UNARY && ggml_get_unary_op(softplus) == GGML_UNARY_OP_SOFTPLUS && softplus->src[0] == bias &&
+            gate_mul->op == GGML_OP_MUL && (gate_mul->src[0] == softplus || gate_mul->src[1] == softplus) &&
+            gate_v->op == GGML_OP_RESHAPE && gate_v->src[0] == gate_mul &&
+            beta_w->op == GGML_OP_MUL_MAT &&
+            beta_v->op == GGML_OP_RESHAPE && beta_v->src[0] == beta_w &&
+            beta_sig->op == GGML_OP_UNARY && ggml_get_unary_op(beta_sig) == GGML_UNARY_OP_SIGMOID && beta_sig->src[0] == beta_v &&
+            alpha_w->src[1] == beta_w->src[1];
+
+        const ggml_tensor * dt    = nullptr;
+        const ggml_tensor * ssm_a = nullptr;
+        if (wiring_ok) {
+            if (bias->src[0] == alpha_v) {
+                dt = bias->src[1];
+            } else if (bias->src[1] == alpha_v) {
+                dt = bias->src[0];
+            }
+            if (gate_mul->src[0] == softplus) {
+                ssm_a = gate_mul->src[1];
+            } else if (gate_mul->src[1] == softplus) {
+                ssm_a = gate_mul->src[0];
+            }
+        }
+
+        // the conv output is split into q [head_k_dim, n_qk_heads], k and v; the
+        // channel bases and dims must match the kernel layout
+        const int64_t n_qk_ch = q_view->ne[0] * q_view->ne[1];
+        const bool type_ok =
+            dt && ssm_a &&
+            node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+            node->src[1]->ne[0] >= 2 && node->src[1]->ne[0] <= 15 &&
+            q_norm->type == GGML_TYPE_F32 && k_norm->type == GGML_TYPE_F32 &&
+            silu->type == GGML_TYPE_F32 &&
+            alpha_w->src[0]->type == GGML_TYPE_Q8_0 && beta_w->src[0]->type == GGML_TYPE_Q8_0 &&
+            alpha_w->src[1]->type == GGML_TYPE_F32 && alpha_w->src[1]->ne[1] == 1 &&
+            gate_mul->type == GGML_TYPE_F32 && beta_sig->type == GGML_TYPE_F32 &&
+            alpha_w->src[0]->ne[0] == beta_w->src[0]->ne[0] &&
+            alpha_w->src[0]->ne[1] == beta_w->src[0]->ne[1] &&
+            q_view->ne[0] == 128 && k_view->ne[0] == 128 && v_view->ne[0] == 128 &&
+            q_view->ne[1] == k_view->ne[1] &&
+            q_view->view_offs == 0 && k_view->view_offs == n_qk_ch*sizeof(float) &&
+            v_view->view_offs == 2*n_qk_ch*sizeof(float) &&
+            silu->ne[0] == 2*n_qk_ch + v_view->ne[0]*v_view->ne[1];
+
+        if (wiring_ok && type_ok) {
+            const int out_nodes[] = { i + 1, i + 3, i + 5, i + 11, i + 15 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 16, out_nodes, 5)) {
+                float eps;
+                memcpy(&eps, q_norm->op_params, sizeof(float));
+                ggml_cuda_op_ssm_conv_l2_gatebeta(*cuda_ctx,
+                    node->src[0], node->src[1],
+                    alpha_w->src[0], beta_w->src[0], alpha_w->src[1], dt, ssm_a,
+                    (ggml_tensor *) q_norm, (ggml_tensor *) k_norm, (ggml_tensor *) silu,
+                    (ggml_tensor *) gate_mul, (ggml_tensor *) beta_sig,
+                    q_view->ne[0], q_view->ne[1], v_view->ne[0], v_view->ne[1], eps);
+                return 15;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
