@@ -418,7 +418,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
         // RDNA3 (W7900): stricter whitelist than RDNA4.
         // Q2_K / Q5_K / IQ4_XS regress in full quant sweeps.
-        if (ncols_dst == 1) {
+        // Apply to the whole mmvq range (ncols_dst 1..8), not just decode: the
+        // speculative verify batch (n_draft+1 tokens) must use the same nwarps
+        // as decode so its per-row dot-product accumulation is bit-identical.
+        if (ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
             switch (type) {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
