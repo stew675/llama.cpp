@@ -438,7 +438,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // wave32 datapath on the large-K decode matmuls; nwarps=8 (the RDNA3_0
         // table) over-parallelizes the small ones. Swept 2025-08: nwarps=2 wins
         // (~+0.6% decode on Qwen3.6-35B-A3B Q8_0), nwarps=4 regresses.
-        if (ncols_dst == 1) {
+        // Apply to the whole mmvq range (ncols_dst 1..8), not just decode: the
+        // speculative verify batch (n_draft+1 tokens) must use the same nwarps
+        // as decode so its per-row dot-product accumulation is bit-identical.
+        if (ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
             switch (type) {
                 case GGML_TYPE_Q8_0:
                     return 2;
@@ -1397,10 +1400,11 @@ static __global__ void ssm_gate_beta_fused_q8_0(
         float * dst_gate, float * dst_beta,
         const int nrows, const int ncols_x) {
     const int row = blockIdx.x;
-    const int tid = threadIdx.x;
     constexpr int warp_size = 32;
+    constexpr int nwarps = 2; // matches calc_nwarps(Q8_0, ncols_dst=1, RDNA3_5)
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
     constexpr int qk = 32; // Q8_0 block size
-    constexpr int qi = 4;  // int32 per Q8_0 block
+    constexpr int qi = QI8_0; // int32 per Q8_0 block
     constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
     const int blocks_per_row_x = ncols_x / qk;
 
@@ -1409,7 +1413,7 @@ static __global__ void ssm_gate_beta_fused_q8_0(
 
     float sum_alpha = 0.0f;
     float sum_beta  = 0.0f;
-    const int blocks_per_iter = vdr * warp_size / qi;
+    const int blocks_per_iter = vdr * nwarps*warp_size / qi;
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx; // qk == QK8_1
         const int kqs = vdr * (tid % (qi/vdr));
@@ -1417,10 +1421,25 @@ static __global__ void ssm_gate_beta_fused_q8_0(
         sum_beta  += vec_dot_q8_0_q8_1(w_beta,  &y[kby], kbx, kqs);
     }
 
+    // cross-warp reduction, same order as mul_mat_vec_q
+    __shared__ float sh_alpha[nwarps-1][warp_size];
+    __shared__ float sh_beta[nwarps-1][warp_size];
+    if (threadIdx.y > 0) {
+        sh_alpha[threadIdx.y-1][threadIdx.x] = sum_alpha;
+        sh_beta[threadIdx.y-1][threadIdx.x] = sum_beta;
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+    for (int l = 0; l < nwarps-1; ++l) {
+        sum_alpha += sh_alpha[l][threadIdx.x];
+        sum_beta  += sh_beta[l][threadIdx.x];
+    }
     sum_alpha = warp_reduce_sum<warp_size>(sum_alpha);
     sum_beta  = warp_reduce_sum<warp_size>(sum_beta);
 
-    if (tid == 0) {
+    if (threadIdx.x == 0) {
         dst_gate[row] = ssm_op_softplus(sum_alpha + dt[row]) * ssm_a[row];
         dst_beta[row] = ssm_op_sigmoid(sum_beta);
     }
@@ -1464,7 +1483,7 @@ void ggml_cuda_op_ssm_gate_beta(
 
     const int nrows = dst_gate->ne[0];
     const dim3 block_nums(nrows);
-    const dim3 block_dims(32);
+    const dim3 block_dims(32, 2);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     ggml_cuda_kernel_launch(ssm_gate_beta_fused_q8_0, launch_params,
         src0_alpha->data, src0_beta->data, (const block_q8_1 *) src1_q8_1, (const float *) dt->data, (const float *) ssm_a->data,
@@ -1496,29 +1515,46 @@ static __global__ void ssm_conv_l2_gatebeta_fused(
     const int n_qk_ch = head_k_dim * n_qk_heads;
 
     if (bidx >= n_qk_heads + n_v_heads) {
-        // gate/beta: one head per warp, 4 heads per block
-        const int head = (bidx - n_qk_heads - n_v_heads) * 4 + tid / 32;
-        if (head >= n_v_heads) {
-            return;
-        }
-        const int lane = tid % 32;
+        // gate/beta: two warps per head, 2 heads per block. The per-lane loop
+        // and the cross-warp reduction replicate mul_mat_vec_q (nwarps=2) so the
+        // sums are bit-identical to the unfused mmvq path used by verify batches.
+        const int head = (bidx - n_qk_heads - n_v_heads) * 2 + tid / 64;
+        const bool valid = head < n_v_heads;
+        const int tid_in_head = tid % 64;
+        const int lane = tid_in_head % 32;
+        const int warp_in_head = tid_in_head / 32;
+        constexpr int warp_size = 32;
         constexpr int qk = 32;
-        constexpr int qi = 4;
+        constexpr int qi = QI8_0;
         constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
         const int blocks_per_row_x = ncols_x / qk;
         const block_q8_0 * w_a = w_alpha + (int64_t) head * blocks_per_row_x;
         const block_q8_0 * w_b = w_beta  + (int64_t) head * blocks_per_row_x;
         float sum_alpha = 0.0f;
         float sum_beta  = 0.0f;
-        const int blocks_per_iter = vdr * 32 / qi;
-        for (int kbx = lane / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-            const int kby = kbx; // qk == QK8_1
-            const int kqs = vdr * (lane % (qi/vdr));
-            sum_alpha += vec_dot_q8_0_q8_1(w_a, &y[kby], kbx, kqs);
-            sum_beta  += vec_dot_q8_0_q8_1(w_b, &y[kby], kbx, kqs);
+        const int blocks_per_iter = vdr * 2 * warp_size / qi;
+        if (valid) {
+            for (int kbx = tid_in_head / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+                const int kby = kbx; // qk == QK8_1
+                const int kqs = vdr * (tid_in_head % (qi/vdr));
+                sum_alpha += vec_dot_q8_0_q8_1(w_a, &y[kby], kbx, kqs);
+                sum_beta  += vec_dot_q8_0_q8_1(w_b, &y[kby], kbx, kqs);
+            }
         }
-        sum_alpha = warp_reduce_sum<32>(sum_alpha);
-        sum_beta  = warp_reduce_sum<32>(sum_beta);
+        __shared__ float sh_alpha[2][warp_size];
+        __shared__ float sh_beta[2][warp_size];
+        if (valid && warp_in_head == 1) {
+            sh_alpha[head % 2][lane] = sum_alpha;
+            sh_beta[head % 2][lane] = sum_beta;
+        }
+        __syncthreads();
+        if (warp_in_head == 1 || !valid) {
+            return;
+        }
+        sum_alpha += sh_alpha[head % 2][lane];
+        sum_beta  += sh_beta[head % 2][lane];
+        sum_alpha = warp_reduce_sum<warp_size>(sum_alpha);
+        sum_beta  = warp_reduce_sum<warp_size>(sum_beta);
         if (lane == 0) {
             dst_gate[head] = ssm_op_softplus(sum_alpha + dt[head]) * ssm_a[head];
             dst_beta[head] = ssm_op_sigmoid(sum_beta);
@@ -1621,7 +1657,7 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
     const int d_conv  = conv_w->ne[0];
     const int ncols_x = src1->ne[0];
 
-    const dim3 block_nums(n_qk_heads + n_v_heads + (n_v_heads + 3) / 4);
+    const dim3 block_nums(n_qk_heads + n_v_heads + (n_v_heads + 1) / 2);
     const dim3 block_dims(128);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     ggml_cuda_kernel_launch(ssm_conv_l2_gatebeta_fused, launch_params,
@@ -1660,24 +1696,38 @@ static __global__ void shexp_down_gated_q8_0(
         const float * moe_out, const float * ffn_residual,
         float * dst, const int k_down) {
     const int row = blockIdx.x;
-    const int tid = threadIdx.x;
     constexpr int warp_size = 32;
+    constexpr int nwarps = 2; // matches calc_nwarps(Q8_0, ncols_dst=1, RDNA3_5)
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
     constexpr int qk = 32; // Q8_0 block size
-    constexpr int qi = 4;  // int32 per Q8_0 block
+    constexpr int qi = QI8_0; // int32 per Q8_0 block
     constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
 
     const int blocks_per_row_x = k_down / qk;
     const block_q8_0 * wd = (const block_q8_0 *) vx_down + (int64_t) row * blocks_per_row_x;
 
     float sum_down = 0.0f;
-    const int blocks_per_iter = vdr * warp_size / qi;
+    const int blocks_per_iter = vdr * nwarps*warp_size / qi;
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kqs = vdr * (tid % (qi/vdr));
         sum_down += vec_dot_q8_0_q8_1(wd, &y_swiglu[kbx], kbx, kqs);
     }
+
+    // cross-warp reduction, same order as mul_mat_vec_q
+    __shared__ float sh_down[nwarps-1][warp_size];
+    if (threadIdx.y > 0) {
+        sh_down[threadIdx.y-1][threadIdx.x] = sum_down;
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+    for (int l = 0; l < nwarps-1; ++l) {
+        sum_down += sh_down[l][threadIdx.x];
+    }
     sum_down = warp_reduce_sum<warp_size>(sum_down);
 
-    if (tid == 0) {
+    if (threadIdx.x == 0) {
         dst[row] = sum_down * gate_sig[0] + moe_out[row] + ffn_residual[row];
     }
 }
@@ -1728,7 +1778,7 @@ void ggml_cuda_op_shexp_down_gate(
 
     const int nrows = dst->ne[0];
     const dim3 block_nums(nrows);
-    const dim3 block_dims(32);
+    const dim3 block_dims(32, 2);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
     ggml_cuda_kernel_launch(shexp_down_gated_q8_0, launch_params,
         w_down->data, (const block_q8_1 *) y_swiglu, gate_scratch.get(),
