@@ -389,10 +389,13 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
     }
     if (table_id == MMVQ_PARAMETERS_RDNA4) {
-        // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
+        // nwarps=8 benefits types with simple vec_dot on RDNA4.
         // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
         // pressure and lookup table contention at higher thread counts.
-        if (ncols_dst == 1) {
+        // Apply to the whole mmvq range (ncols_dst 1..8), not just decode: the
+        // speculative verify batch (n_draft+1 tokens) must use the same nwarps
+        // as decode so its per-row dot-product accumulation is bit-identical.
+        if (ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
             switch (type) {
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
@@ -1392,8 +1395,9 @@ static __device__ __forceinline__ float ssm_op_sigmoid(float x) {
 
 // Fused SSM gate/beta projections: two Q8_0 matmuls over the same input, plus
 // the gating chain. gate = softplus(alpha*x + dt) * a; beta = sigmoid(beta*x).
-// Grid: (nrows, 1), block: (warp_size, 1). Each workgroup computes one row of
-// both outputs.
+// Grid: (nrows, 1), block: (warp_size, nwarps), nwarps per row. Each workgroup
+// computes one row of both outputs.
+template <int nwarps>
 static __global__ void ssm_gate_beta_fused_q8_0(
         const void * vx_alpha, const void * vx_beta, const block_q8_1 * y,
         const float * dt, const float * ssm_a,
@@ -1401,7 +1405,6 @@ static __global__ void ssm_gate_beta_fused_q8_0(
         const int nrows, const int ncols_x) {
     const int row = blockIdx.x;
     constexpr int warp_size = 32;
-    constexpr int nwarps = 2; // matches calc_nwarps(Q8_0, ncols_dst=1, RDNA3_5)
     const int tid = warp_size*threadIdx.y + threadIdx.x;
     constexpr int qk = 32; // Q8_0 block size
     constexpr int qi = QI8_0; // int32 per Q8_0 block
@@ -1422,8 +1425,8 @@ static __global__ void ssm_gate_beta_fused_q8_0(
     }
 
     // cross-warp reduction, same order as mul_mat_vec_q
-    __shared__ float sh_alpha[nwarps-1][warp_size];
-    __shared__ float sh_beta[nwarps-1][warp_size];
+    __shared__ float sh_alpha[nwarps > 1 ? nwarps-1 : 1][warp_size];
+    __shared__ float sh_beta[nwarps > 1 ? nwarps-1 : 1][warp_size];
     if (threadIdx.y > 0) {
         sh_alpha[threadIdx.y-1][threadIdx.x] = sum_alpha;
         sh_beta[threadIdx.y-1][threadIdx.x] = sum_beta;
@@ -1482,12 +1485,25 @@ void ggml_cuda_op_ssm_gate_beta(
     }
 
     const int nrows = dst_gate->ne[0];
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const int nwarps = calc_nwarps(GGML_TYPE_Q8_0, 1, get_device_table_id(cc));
     const dim3 block_nums(nrows);
-    const dim3 block_dims(32, 2);
+    const dim3 block_dims(32, nwarps);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(ssm_gate_beta_fused_q8_0, launch_params,
-        src0_alpha->data, src0_beta->data, (const block_q8_1 *) src1_q8_1, (const float *) dt->data, (const float *) ssm_a->data,
-        (float *) dst_gate->data, (float *) dst_beta->data, nrows, src1->ne[0]);
+    const auto launch = [&](auto nwarps_c) {
+        constexpr int NW = decltype(nwarps_c)::value;
+        ggml_cuda_kernel_launch(ssm_gate_beta_fused_q8_0<NW>, launch_params,
+            src0_alpha->data, src0_beta->data, (const block_q8_1 *) src1_q8_1, (const float *) dt->data, (const float *) ssm_a->data,
+            (float *) dst_gate->data, (float *) dst_beta->data, nrows, src1->ne[0]);
+    };
+    switch (nwarps) {
+        case 1:  launch(std::integral_constant<int, 1>{}); break;
+        case 2:  launch(std::integral_constant<int, 2>{}); break;
+        case 4:  launch(std::integral_constant<int, 4>{}); break;
+        case 8:  launch(std::integral_constant<int, 8>{}); break;
+        default: GGML_ASSERT(false); break;
+    }
 
 }
 
@@ -1501,6 +1517,7 @@ void ggml_cuda_op_ssm_gate_beta(
 //                    tid+64, tid+96). Threads 64..127 idle.
 //   [n_qk_heads, +n_v_heads): v head, one channel per thread.
 //   remainder: gate/beta, one head per warp.
+template <int nwarps>
 static __global__ void ssm_conv_l2_gatebeta_fused(
         const float * conv_input, const float * conv_w,
         const block_q8_0 * w_alpha, const block_q8_0 * w_beta, const block_q8_1 * y,
@@ -1515,15 +1532,18 @@ static __global__ void ssm_conv_l2_gatebeta_fused(
     const int n_qk_ch = head_k_dim * n_qk_heads;
 
     if (bidx >= n_qk_heads + n_v_heads) {
-        // gate/beta: two warps per head, 2 heads per block. The per-lane loop
-        // and the cross-warp reduction replicate mul_mat_vec_q (nwarps=2) so the
-        // sums are bit-identical to the unfused mmvq path used by verify batches.
-        const int head = (bidx - n_qk_heads - n_v_heads) * 2 + tid / 64;
+        // gate/beta: nwarps per head, heads_per_block heads per block. The
+        // per-lane loop and the cross-warp reduction replicate mul_mat_vec_q
+        // (nwarps) so the sums are bit-identical to the unfused mmvq path used
+        // by verify batches.
+        constexpr int warp_size = 32;
+        constexpr int threads_per_head = nwarps * warp_size;
+        constexpr int heads_per_block = (128 / threads_per_head) > 0 ? 128 / threads_per_head : 1;
+        const int head = (bidx - n_qk_heads - n_v_heads) * heads_per_block + tid / threads_per_head;
         const bool valid = head < n_v_heads;
-        const int tid_in_head = tid % 64;
+        const int tid_in_head = tid % threads_per_head;
         const int lane = tid_in_head % 32;
         const int warp_in_head = tid_in_head / 32;
-        constexpr int warp_size = 32;
         constexpr int qk = 32;
         constexpr int qi = QI8_0;
         constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
@@ -1532,7 +1552,7 @@ static __global__ void ssm_conv_l2_gatebeta_fused(
         const block_q8_0 * w_b = w_beta  + (int64_t) head * blocks_per_row_x;
         float sum_alpha = 0.0f;
         float sum_beta  = 0.0f;
-        const int blocks_per_iter = vdr * 2 * warp_size / qi;
+        const int blocks_per_iter = vdr * nwarps * warp_size / qi;
         if (valid) {
             for (int kbx = tid_in_head / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
                 const int kby = kbx; // qk == QK8_1
@@ -1541,18 +1561,20 @@ static __global__ void ssm_conv_l2_gatebeta_fused(
                 sum_beta  += vec_dot_q8_0_q8_1(w_b, &y[kby], kbx, kqs);
             }
         }
-        __shared__ float sh_alpha[2][warp_size];
-        __shared__ float sh_beta[2][warp_size];
-        if (valid && warp_in_head == 1) {
-            sh_alpha[head % 2][lane] = sum_alpha;
-            sh_beta[head % 2][lane] = sum_beta;
+        __shared__ float sh_alpha[heads_per_block][nwarps > 1 ? nwarps-1 : 1][warp_size];
+        __shared__ float sh_beta[heads_per_block][nwarps > 1 ? nwarps-1 : 1][warp_size];
+        if (valid && warp_in_head > 0) {
+            sh_alpha[head % heads_per_block][warp_in_head-1][lane] = sum_alpha;
+            sh_beta[head % heads_per_block][warp_in_head-1][lane] = sum_beta;
         }
         __syncthreads();
-        if (warp_in_head == 1 || !valid) {
+        if (warp_in_head > 0 || !valid) {
             return;
         }
-        sum_alpha += sh_alpha[head % 2][lane];
-        sum_beta  += sh_beta[head % 2][lane];
+        for (int l = 0; l < nwarps-1; ++l) {
+            sum_alpha += sh_alpha[head % heads_per_block][l][lane];
+            sum_beta  += sh_beta[head % heads_per_block][l][lane];
+        }
         sum_alpha = warp_reduce_sum<warp_size>(sum_alpha);
         sum_beta  = warp_reduce_sum<warp_size>(sum_beta);
         if (lane == 0) {
@@ -1564,6 +1586,9 @@ static __global__ void ssm_conv_l2_gatebeta_fused(
 
     if (bidx >= n_qk_heads) {
         // v head: one channel per thread
+        if (tid >= head_v_dim) {
+            return;
+        }
         const int c = 2*n_qk_ch + (bidx - n_qk_heads)*head_v_dim + tid;
         float sumf = 0.0f;
 #pragma unroll
@@ -1657,16 +1682,31 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
     const int d_conv  = conv_w->ne[0];
     const int ncols_x = src1->ne[0];
 
-    const dim3 block_nums(n_qk_heads + n_v_heads + (n_v_heads + 1) / 2);
-    const dim3 block_dims(128);
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const int nwarps = calc_nwarps(GGML_TYPE_Q8_0, 1, get_device_table_id(cc));
+    const int threads_per_head = nwarps * 32;
+    const int heads_per_block = (128 / threads_per_head) > 0 ? 128 / threads_per_head : 1;
+    const dim3 block_nums(n_qk_heads + n_v_heads + (n_v_heads + heads_per_block - 1) / heads_per_block);
+    const dim3 block_dims(heads_per_block * threads_per_head);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(ssm_conv_l2_gatebeta_fused, launch_params,
-        (const float *) conv_input->data, (const float *) conv_w->data,
-        (const block_q8_0 *) src0_alpha->data, (const block_q8_0 *) src0_beta->data, (const block_q8_1 *) src1_q8_1,
-        (const float *) dt->data, (const float *) ssm_a->data,
-        (float *) q_norm->data, (float *) k_norm->data, (float *) v_raw->data,
-        (float *) dst_gate->data, (float *) dst_beta->data,
-        d_conv, head_k_dim, n_qk_heads, head_v_dim, n_v_heads, eps, ncols_x);
+    const auto launch = [&](auto nwarps_c) {
+        constexpr int NW = decltype(nwarps_c)::value;
+        ggml_cuda_kernel_launch(ssm_conv_l2_gatebeta_fused<NW>, launch_params,
+            (const float *) conv_input->data, (const float *) conv_w->data,
+            (const block_q8_0 *) src0_alpha->data, (const block_q8_0 *) src0_beta->data, (const block_q8_1 *) src1_q8_1,
+            (const float *) dt->data, (const float *) ssm_a->data,
+            (float *) q_norm->data, (float *) k_norm->data, (float *) v_raw->data,
+            (float *) dst_gate->data, (float *) dst_beta->data,
+            d_conv, head_k_dim, n_qk_heads, head_v_dim, n_v_heads, eps, ncols_x);
+    };
+    switch (nwarps) {
+        case 1:  launch(std::integral_constant<int, 1>{}); break;
+        case 2:  launch(std::integral_constant<int, 2>{}); break;
+        case 4:  launch(std::integral_constant<int, 4>{}); break;
+        case 8:  launch(std::integral_constant<int, 8>{}); break;
+        default: GGML_ASSERT(false); break;
+    }
 }
 
 
@@ -1674,7 +1714,7 @@ void ggml_cuda_op_ssm_conv_l2_gatebeta(
 // dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
 // Two kernels: the gate is a single scalar dot over the shared input, computed
 // once by a tiny kernel; the down projection then reads it. Grid: (nrows, 1),
-// block: (warp_size, 1), one warp per row.
+// block: (warp_size, nwarps), nwarps per row.
 static __global__ void shexp_gate_sigmoid(
         const float * vx_gate, const float * x_gate, float * dst, const int k_gate) {
     const int tid = threadIdx.x;
@@ -1691,13 +1731,13 @@ static __global__ void shexp_gate_sigmoid(
     }
 }
 
+template <int nwarps>
 static __global__ void shexp_down_gated_q8_0(
         const void * vx_down, const block_q8_1 * y_swiglu, const float * gate_sig,
         const float * moe_out, const float * ffn_residual,
         float * dst, const int k_down) {
     const int row = blockIdx.x;
     constexpr int warp_size = 32;
-    constexpr int nwarps = 2; // matches calc_nwarps(Q8_0, ncols_dst=1, RDNA3_5)
     const int tid = warp_size*threadIdx.y + threadIdx.x;
     constexpr int qk = 32; // Q8_0 block size
     constexpr int qi = QI8_0; // int32 per Q8_0 block
@@ -1714,7 +1754,7 @@ static __global__ void shexp_down_gated_q8_0(
     }
 
     // cross-warp reduction, same order as mul_mat_vec_q
-    __shared__ float sh_down[nwarps-1][warp_size];
+    __shared__ float sh_down[nwarps > 1 ? nwarps-1 : 1][warp_size];
     if (threadIdx.y > 0) {
         sh_down[threadIdx.y-1][threadIdx.x] = sum_down;
     }
@@ -1777,13 +1817,26 @@ void ggml_cuda_op_shexp_down_gate(
     }
 
     const int nrows = dst->ne[0];
+    const int device = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    const int nwarps = calc_nwarps(GGML_TYPE_Q8_0, 1, get_device_table_id(cc));
     const dim3 block_nums(nrows);
-    const dim3 block_dims(32, 2);
+    const dim3 block_dims(32, nwarps);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(shexp_down_gated_q8_0, launch_params,
-        w_down->data, (const block_q8_1 *) y_swiglu, gate_scratch.get(),
-        (const float *) moe_out->data, (const float *) ffn_residual->data,
-        (float *) dst->data, w_down->ne[0]);
+    const auto launch = [&](auto nwarps_c) {
+        constexpr int NW = decltype(nwarps_c)::value;
+        ggml_cuda_kernel_launch(shexp_down_gated_q8_0<NW>, launch_params,
+            w_down->data, (const block_q8_1 *) y_swiglu, gate_scratch.get(),
+            (const float *) moe_out->data, (const float *) ffn_residual->data,
+            (float *) dst->data, w_down->ne[0]);
+    };
+    switch (nwarps) {
+        case 1:  launch(std::integral_constant<int, 1>{}); break;
+        case 2:  launch(std::integral_constant<int, 2>{}); break;
+        case 4:  launch(std::integral_constant<int, 4>{}); break;
+        case 8:  launch(std::integral_constant<int, 8>{}); break;
+        default: GGML_ASSERT(false); break;
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
