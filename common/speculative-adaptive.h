@@ -16,19 +16,22 @@
 // it actually holds.
 //
 // B starts at the drop pressure D = max(20, 4*depth) on every depth change.
-// When B reaches the cap T = D + 20 the depth climbs one step and B resets to
-// D; when B falls to 0 the depth drops one step and B resets to D. The climb
-// budget is a flat 20, so from the reset point a climb costs
-// ceil(20 / max(1, depth - 1)) full accepts: slow off the floor (20 full
-// accepts at depth 1-2), moderate in the middle (10 at depth 3, 5 at depth
-// 5), quicker at depth (3 at depth 8+, 2 at 11+). The drop pressure is flat
-// 20 up to depth 5 and then grows 4 per step (32 at depth 8, 40 at 10, 48 at
-// 12), so a total miss drains depth and a drop costs max(ceil(20/depth), 4)
-// misses: shallow depths fall slowly, deep depths fall in ~4 misses regardless of how deep
-// they are. That keeps prose/reasoning pinned at the floor, lets code climb
-// only while it earns it, and lets verbatim recall ride on to the ceiling. At
-// the floor B clamps at 0 instead of dropping the depth; at the ceiling it
-// clamps at the cap instead of growing unbounded.
+// When B reaches the cap T = D + 20 the depth climbs one step; when B falls
+// to 0 the depth drops one step. The surplus above the cap (bounded at the
+// depth, so at most one step per update) carries into the new depth's bucket,
+// and a deficit below zero carries down the same way, instead of being
+// discarded. The climb budget is a flat 20, so from the reset point a climb
+// costs ceil(20 / max(1, depth - 1)) full accepts: slow off the floor (20
+// full accepts at depth 1-2), moderate in the middle (10 at depth 3, 5 at
+// depth 5), quicker at depth (3 at depth 8+, 2 at 11+). The drop pressure is
+// flat 20 up to depth 5 and then grows 4 per step (32 at depth 8, 40 at 10,
+// 48 at 12), so a total miss drains depth and a drop costs
+// max(ceil(20/depth), 4) misses: shallow depths fall slowly, deep depths
+// fall in ~4 misses regardless of how deep they are. That keeps
+// prose/reasoning pinned at the floor, lets code climb only while it earns
+// it, and lets verbatim recall ride on to the ceiling. At the floor B clamps
+// at 0 instead of dropping the depth; at the ceiling it clamps at the cap
+// instead of growing unbounded.
 struct common_speculative_adaptive {
     int n_cur    = 0;  // current adaptive draft depth N
     int n_bucket = 0;  // accumulated bucket: net accepted surplus over the depth
@@ -76,12 +79,17 @@ struct common_speculative_adaptive {
         n_bucket += delta;
 
         // At the bucket boundaries adjust the current depth if possible. Otherwise
-        // both n_cur and n_bucket always get clamped to their minimum/maximum values
+        // both n_cur and n_bucket always get clamped to their minimum/maximum values.
+        // The surplus above the cap (clamped at the depth, so at most one climb per
+        // update) carries into the new depth's bucket, and a deficit below zero
+        // carries down the same way, instead of being discarded
         if (n_bucket >= bucket_cap()) {
             // At or above the high water mark
             if (n_cur < cap) {
+                n_bucket = std::min(n_bucket, bucket_cap() + n_cur);
+                n_bucket -= bucket_cap();
                 n_cur++;
-                n_bucket = drop_pressure();
+                n_bucket += drop_pressure();
             } else {
                 n_cur = cap;
                 n_bucket = bucket_cap();
@@ -89,8 +97,9 @@ struct common_speculative_adaptive {
         } else if (n_bucket <= 0) {
             // At or below low water mark
             if (n_cur > floor) {
+                n_bucket -= drop_pressure();
                 n_cur--;
-                n_bucket = drop_pressure();
+                n_bucket += bucket_cap();
             } else {
                 n_cur = floor;
                 n_bucket = 0;

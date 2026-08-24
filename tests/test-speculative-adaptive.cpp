@@ -107,7 +107,8 @@ static void test_climb(void) {
     assert(ctrl.n_bucket == 28);
 
     // depth 7 full accepts add +6 each; cap 48 (drop 28 + climb 20), so 4
-    // of them climb from the reset of 28
+    // of them climb; the 4th overshoots to 52 and the 4-token surplus carries
+    // into depth 8
     for (int i = 0; i < 3; ++i) {
         ctrl.update(7, 8, 1);
         assert(ctrl.n_cur == 7);
@@ -115,7 +116,7 @@ static void test_climb(void) {
     assert(ctrl.n_bucket == 46);
     ctrl.update(7, 8, 1);
     assert(ctrl.n_cur == 8);
-    assert(ctrl.n_bucket == 32);
+    assert(ctrl.n_bucket == 36);
 
     // at the ceiling the bucket saturates at the cap (52) instead of growing
     // unbounded; the first full accept clamps it down to the cap
@@ -132,7 +133,8 @@ static void test_climb(void) {
     assert(ctrl.n_bucket == 44);
 
     // deep climbs are fast: at depth 10 a full accept adds +9 and the drop
-    // pressure is 40, so 3 of them climb; at depth 11 two of them climb
+    // pressure is 40, so 3 of them climb; the 3rd overshoots to 67 and the
+    // 7-token surplus carries into depth 11
     ctrl.reset(12, 1);
     ctrl.n_cur    = 10;
     ctrl.n_bucket = 40;
@@ -143,15 +145,16 @@ static void test_climb(void) {
     assert(ctrl.n_bucket == 58);
     ctrl.update(10, 12, 1);
     assert(ctrl.n_cur == 11);
-    assert(ctrl.n_bucket == 44);
+    assert(ctrl.n_bucket == 51);
 
-    // at depth 11 a full accept adds +10: two of them climb
+    // at depth 11 a full accept adds +10: two of them climb; the 2nd overshoots
+    // to 71 and the 7-token surplus carries into depth 12
     ctrl.update(11, 12, 1);
     assert(ctrl.n_cur == 11);
-    assert(ctrl.n_bucket == 54);
+    assert(ctrl.n_bucket == 61);
     ctrl.update(11, 12, 1);
     assert(ctrl.n_cur == 12);
-    assert(ctrl.n_bucket == 48);
+    assert(ctrl.n_bucket == 55);
 }
 
 static void test_drop(void) {
@@ -171,7 +174,8 @@ static void test_drop(void) {
     assert(ctrl.n_cur == 1);
     assert(ctrl.n_bucket == 0);
 
-    // at depth 3 a total miss adds -3, so 7 misses drain the bucket of 20
+    // at depth 3 a total miss adds -3, so 7 misses drain the bucket of 20;
+    // the 7th drains 1 past zero and the deficit carries into depth 2
     ctrl.reset(8, 1);
     ctrl.n_cur    = 3;
     ctrl.n_bucket = 20;
@@ -182,10 +186,11 @@ static void test_drop(void) {
     assert(ctrl.n_bucket == 2);
     ctrl.update(0, 8, 1);
     assert(ctrl.n_cur == 2);
-    assert(ctrl.n_bucket == 20);
+    assert(ctrl.n_bucket == 19);
 
-    // at depth 2 a near miss drains 1: 20 near misses drop one step
-    for (int i = 0; i < 19; ++i) {
+    // at depth 2 a near miss drains 1: 19 near misses (starting from the
+    // carried 19) drop one step
+    for (int i = 0; i < 18; ++i) {
         ctrl.update(1, 8, 1);
         assert(ctrl.n_cur == 2);
     }
@@ -229,7 +234,7 @@ static void test_drop(void) {
     assert(ctrl.n_bucket == 20);
 
     // at depth 9 a total miss adds -9: two misses drain 18 and drop, and the
-    // reset honors the depth-scaled drop pressure of 32 at depth 8
+    // deficit (the bucket landed exactly on 0) carries into depth 8's bucket
     ctrl.reset(8, 1);
     ctrl.n_cur    = 9;
     ctrl.n_bucket = 18;
@@ -238,7 +243,7 @@ static void test_drop(void) {
     assert(ctrl.n_bucket == 9);
     ctrl.update(0, 8, 1);
     assert(ctrl.n_cur == 8);
-    assert(ctrl.n_bucket == 32);
+    assert(ctrl.n_bucket == 16);
 }
 
 static void test_momentum(void) {
@@ -262,7 +267,8 @@ static void test_momentum(void) {
     assert(ctrl.n_bucket == 25);
     assert(ctrl.n_cur == 3);
 
-    // 7 more full accepts reach 39; one more reaches the cap of 40 and climbs
+    // 7 more full accepts reach 39; one more reaches the cap of 40 and climbs,
+    // carrying the 1-token surplus into depth 4
     for (int i = 0; i < 7; ++i) {
         ctrl.update(3, 8, 1);
     }
@@ -270,7 +276,7 @@ static void test_momentum(void) {
     assert(ctrl.n_cur == 3);
     ctrl.update(3, 8, 1);
     assert(ctrl.n_cur == 4);
-    assert(ctrl.n_bucket == 20);
+    assert(ctrl.n_bucket == 21);
 }
 
 static void test_misses(void) {
@@ -333,9 +339,9 @@ static void test_floor(void) {
     }
     assert(ctrl.n_cur == 3);
     assert(ctrl.n_bucket == 2);
-    ctrl.update(0, 8, 2); // the 7th drops to the floor
+    ctrl.update(0, 8, 2); // the 7th drains 1 past zero, carrying the deficit
     assert(ctrl.n_cur == 2);
-    assert(ctrl.n_bucket == 20);
+    assert(ctrl.n_bucket == 19);
     for (int i = 0; i < 20; ++i) {
         ctrl.update(0, 8, 2); // 10 misses drain the 20-token bucket
     }
@@ -388,26 +394,27 @@ static void test_other_feed(void) {
     assert(ctrl.n_cur == 3);
     assert(ctrl.n_bucket == 20);
 
-    // ngram accepts 40 tokens in one round: +39, past the cap of 40, one climb
+    // ngram accepts 40 tokens in one round: +39, past the cap of 40; the
+    // overflow is clamped at the depth (3), so 3 surplus carries into depth 4
     ctrl.update(40, 12, 3);
     assert(ctrl.n_cur == 4);
-    assert(ctrl.n_bucket == 20);
+    assert(ctrl.n_bucket == 23);
 
-    // the next strong round climbs again: one step per round while the run lasts
+    // the next strong round climbs again: overflow clamped at 4 carries on
     ctrl.update(40, 12, 3);
     assert(ctrl.n_cur == 5);
-    assert(ctrl.n_bucket == 20);
+    assert(ctrl.n_bucket == 24);
 
     // a modest over-full accept (>= depth but short of the cap) gives partial
     // credit: at depth 5 the cap is 40, so accepting 10 adds +9, no climb yet
     ctrl.update(10, 12, 3);
     assert(ctrl.n_cur == 5);
-    assert(ctrl.n_bucket == 29);
+    assert(ctrl.n_bucket == 33);
 
     // a weak ngram round (accepting fewer than the depth) drains like a miss
     ctrl.update(2, 12, 3);
     assert(ctrl.n_cur == 5);
-    assert(ctrl.n_bucket == 26);
+    assert(ctrl.n_bucket == 30);
 
     // at the ceiling the depth is clamped: strong rounds saturate the bucket
     // at the cap (drop 48 + climb 20 = 68 at depth 12)

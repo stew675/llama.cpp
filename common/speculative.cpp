@@ -1762,10 +1762,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // feed the adaptive controller on every verification result: our own
         // drafts with their accepted count, and when another speculator
-        // (ngram-mod) produced the accepted draft, its accepted count (which
-        // can exceed the current depth), so a strong run by ngram-mod scales
-        // the adaptive MTP depth up in time for the backstop once the run ends
-        if (adaptive && (!is_other || n_accepted > 0)) {
+        // (ngram-mod) produced the accepted draft, its accepted count but only
+        // when it met the current depth (a genuinely strong round) - weak
+        // ngram wins on novel content are not evidence about the MTP content
+        // and would only drain the bucket, so they are not fed
+        if (adaptive && (!is_other || n_accepted >= adaptive_ctrl[seq_id].n_cur)) {
             const int depth_before = adaptive_ctrl[seq_id].n_cur;
             adaptive_ctrl[seq_id].update(n_accepted, params.n_max, params.n_min_adaptive);
             if (adaptive_ctrl[seq_id].n_cur != depth_before) {
