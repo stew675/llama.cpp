@@ -90,6 +90,8 @@ struct gdn_chunked_scan_smem {
     float bt[GDN_CHUNKED_CS];   // beta
 };
 
+__device__ int gdn_dbg_f32 = 0;
+
 // ---------------------------------------------------------------------------------------------
 // kkt_solve: gram once per (chunk, k-head, seq), A per v-head, KQ_gram per k-head.
 // ---------------------------------------------------------------------------------------------
@@ -510,6 +512,10 @@ gdn_chunked_scan_cuda(
                 *(float4 *) (obase + (int64_t) t * H * S_v + v0g + vv) =
                     make_float4(acc[0], acc[1], acc[2], acc[3]);
             }
+            if (gdn_dbg_f32 != 0 && c == 0 && h == 0 && t == 0 && vv == 0 && tid == 0)
+                printf("  fp32[DBG] o[0][0..3] = %f %f %f %f | KQ00=%f vnew[0]=%f %f | eg0=%f QS0=%f\n",
+                       acc[0], acc[1], acc[2], acc[3], s.AK[0], s.UV[0][0], s.UV[0][1],
+                       s.eg[0], s.QS[0][0]);
         }
 
         // the o phase reads s.S (the chunk's INCOMING state) and s.UV; the state update below
@@ -576,6 +582,10 @@ static void launch_gdn_chunked(
         float scale, int64_t state_seq_stride, cudaStream_t stream) {
     const int n_chunks = (int) ((n_tokens + GDN_CHUNKED_CS - 1) / GDN_CHUNKED_CS);
     const int64_t hg_ratio = H / H_k;
+    if (getenv("GDN_DBG_F32") != nullptr) {
+        const int one = 1;
+        GGML_ASSERT(hipMemcpyToSymbol(gdn_dbg_f32, &one, sizeof(int), 0, hipMemcpyHostToDevice) == hipSuccess);
+    }
 
     if (getenv("GDN_DBG_SKIP_KKT") == nullptr) {
         dim3 grid((unsigned) n_chunks, (unsigned) H, (unsigned) n_seqs);

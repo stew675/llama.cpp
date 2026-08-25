@@ -24,3 +24,7 @@
 #include "common.cuh"
 
 void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// bf16/WMMA tensor-core variant (S_v == 128 only; near-lossless). Selected by
+// GGML_CUDA_GDN_CHUNKED_BF16=1 in the dispatch seam; the fp32 chunked path stays the default.
+void ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
