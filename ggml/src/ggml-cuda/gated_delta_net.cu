@@ -291,20 +291,23 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // no fused-state-cache cpy to honour -- the grid maps one block per (chunk, head, seq).
     // Everything else (decode, MTP snapshots, KDA vector gates) stays on the sequential kernel.
     // GGML_CUDA_GDN_CHUNKED=0 forces the sequential fallback (A/B perf comparison).
-    if (cache == nullptr && !kda && K == 1 && n_tokens > 1 &&
+    // The fused GDN->cpy (cache != nullptr) is honoured for K == 1: the chunked kernel writes
+    // its new state directly into the cache slot, so the cpy node can be skipped.
+    if ((cache == nullptr || K == 1) && !kda && K == 1 && n_tokens > 1 &&
         (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
         const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
         if (env == nullptr || strcmp(env, "0") != 0) {
             // GGML_CUDA_GDN_CHUNKED_BF16=1 selects the bf16/WMMA tensor-core path (S_v == 128
             // only; near-lossless, not bit-exact). Everything else keeps the fp32 chunked path.
+            float * state_d_ext = cache ? cache->data : nullptr;
 #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
             const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
             if (S_v == 128 && envb != nullptr && strcmp(envb, "0") != 0) {
-                ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst);
+                ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext);
                 return;
             }
 #endif
-            ggml_cuda_op_gated_delta_net_chunked(ctx, dst);
+            ggml_cuda_op_gated_delta_net_chunked(ctx, dst, state_d_ext);
             return;
         }
     }

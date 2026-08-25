@@ -609,7 +609,7 @@ static void launch_gdn_chunked(
     }
 }
 
-void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext) {
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
     ggml_tensor * src_v     = dst->src[2];
@@ -642,7 +642,9 @@ void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_
     const float * s_d = (const float *) src_state->data;
 
     float * dst_d     = (float *) dst->data;
-    float * state_d   = dst_d + S_v * H * n_tokens * n_seqs;   // K == 1: single slot
+    // state_d_ext: fused-cache slot base when the GDN->cpy is fused (K == 1: single slot);
+    // nullptr keeps the default tail-of-output layout.
+    float * state_d   = state_d_ext ? state_d_ext : dst_d + S_v * H * n_tokens * n_seqs;
 
     const int64_t sq1 = nbq1 / sizeof(float);
     const int64_t sq2 = nbq2 / sizeof(float);
