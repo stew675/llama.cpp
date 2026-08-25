@@ -290,10 +290,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // fused chunked prefill: more than one token per sequence, no snapshots, scalar gate, and
     // no fused-state-cache cpy to honour -- the grid maps one block per (chunk, head, seq).
     // Everything else (decode, MTP snapshots, KDA vector gates) stays on the sequential kernel.
+    // GGML_CUDA_GDN_CHUNKED=0 forces the sequential fallback (A/B perf comparison).
     if (cache == nullptr && !kda && K == 1 && n_tokens > 1 &&
         (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
-        ggml_cuda_op_gated_delta_net_chunked(ctx, dst);
-        return;
+        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
+        if (env == nullptr || strcmp(env, "0") != 0) {
+            ggml_cuda_op_gated_delta_net_chunked(ctx, dst);
+            return;
+        }
     }
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
