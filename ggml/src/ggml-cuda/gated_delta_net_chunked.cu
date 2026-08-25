@@ -48,7 +48,7 @@
 //   g,beta:[1,  H,   n_tokens, n_seqs] contiguous (non-KDA scalar-per-head gate)
 //   state: [S_v, S_v, H, n_seqs] contiguous, stored transposed: state[v*S_v + k] = S[k][v]
 //   out:   attn [S_v, H, n_tokens, n_seqs] followed by the new state (K == 1: one slot)
-//   scratch: A [n_chunks][H][n_seqs][CS*CS] (per v-head) and KQ_gram [n_chunks][H_k][n_seqs][CS*CS]
+//   scratch: A [n_chunks][H][n_seqs][PACKED_CS] (per v-head) and KQ_gram [n_chunks][H_k][n_seqs][PACKED_CS]
 //
 // The v-head h reads q/k from k-head h % H_k (fastmodulo on the same magics as the sequential
 // kernel) and its g/beta from head h.
@@ -72,9 +72,15 @@ struct gdn_chunked_kkt_smem {
 
 template <int S_v>
 struct gdn_chunked_scan_smem {
-    float AK[GDN_CHUNKED_CS][GDN_CHUNKED_CS];  // A (v_corr/P), then KQ (intra-chunk attention)
+    // A and KQ are unit-upper; only the upper triangle + diagonal is stored, packed by
+    // COLUMN: pack[j][i] for i <= j lives at j*(j+1)/2 + i, so each column is a contiguous
+    // run and the v_corr/o column contractions read linearly. The kkt writes the pack
+    // directly (scattered stores are fine); the scan copies it contiguously.
+    float AK[PACKED_CS];                       // A (v_corr/P), then KQ (intra-chunk attention)
     float S[S_v][GDN_CHUNKED_VT];              // this block's state slice, resident across chunks
     float UV[GDN_CHUNKED_CS][GDN_CHUNKED_VT];  // U, then v_new
+    float QS[GDN_CHUNKED_CS][GDN_CHUNKED_VT];  // S^T Q_s (the o phase's state term), computed
+                                               // in the U phase so Q is read once per chunk
     float Vb[GDN_CHUNKED_CS][GDN_CHUNKED_VT];  // V_b slice [token][v], staged for the v_corr
     // gate arrays (per chunk, per head)
     float gc[GDN_CHUNKED_CS];   // raw gate, pre-cumsum
@@ -94,8 +100,8 @@ gdn_chunked_kkt_cuda(
         const float * __restrict__ q,
         const float * __restrict__ g,
         const float * __restrict__ beta,
-        float * __restrict__ A_sc,    // [n_chunks][H_v][n_seqs][CS*CS] fp32
-        float * __restrict__ KQ_sc,   // [n_chunks][H_k][n_seqs][CS*CS] fp32 (upper + diag only)
+        float * __restrict__ A_sc,    // [n_chunks][H_v][n_seqs][PACKED_CS] fp32
+        float * __restrict__ KQ_sc,   // [n_chunks][H_k][n_seqs][PACKED_CS] fp32 (upper + diag)
         int64_t H_k, int64_t H_v, int64_t hg_ratio, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1, int64_t sq2, int64_t sq3,
         float scale)
@@ -210,13 +216,18 @@ gdn_chunked_kkt_cuda(
         }
         __syncthreads();
 
-        // store A -> scratch (full 64x64, row-major)
+        // store A -> scratch, PACKED by column (j*(j+1)/2 + i for i <= j)
         {
-            const int64_t off = ((int64_t) c * H_v + vh) * n_seqs * (GDN_CHUNKED_CS * GDN_CHUNKED_CS)
-                              + (int64_t) seq * (GDN_CHUNKED_CS * GDN_CHUNKED_CS);
-            for (int i = tid; i < GDN_CHUNKED_CS * GDN_CHUNKED_CS / 4; i += GDN_CHUNKED_NTHREADS)
-                ((float4 *) (A_sc + off))[i] = ((float4 *) &s.A[0][0])[i];
-        }        __syncthreads();
+            const int64_t off = ((int64_t) c * H_v + vh) * n_seqs * PACKED_CS
+                              + (int64_t) seq * PACKED_CS;
+            if (tid < GDN_CHUNKED_CS) {
+                const int col = tid;
+                const int64_t base = off + (int64_t) col * (col + 1) / 2;
+                for (int i = 0; i <= col; ++i)
+                    A_sc[base + i] = s.A[i][col];
+            }
+        }
+        __syncthreads();
     }
 
     // ---- KQ gram per k-head: stage Q_s (transposed), KQ[i][j] = sum_d K[d][i] (Q[d][j] scale)
@@ -248,12 +259,19 @@ gdn_chunked_kkt_cuda(
                     for (int dd = 0; dd < 4; ++dd)
                         KQ[e][f] += ki[e][dd] * qj[f][dd];
         }
-        const int64_t off = ((int64_t) c * H_k + hg) * n_seqs * (GDN_CHUNKED_CS * GDN_CHUNKED_CS)
-                          + (int64_t) seq * (GDN_CHUNKED_CS * GDN_CHUNKED_CS);
+        // store KQ_gram -> scratch PACKED per k-head, WITHOUT the decay: the decay is per
+        // v-head (GQA: 3 v-heads share one k-head with different gates), so the scan applies
+        // its own head's decay after the contiguous copy.
+        const int64_t off = ((int64_t) c * H_k + hg) * n_seqs * PACKED_CS
+                          + (int64_t) seq * PACKED_CS;
 #pragma unroll
         for (int e = 0; e < 4; ++e)
-            *(float4 *) (KQ_sc + off + (int64_t) (i0 + e) * GDN_CHUNKED_CS + j0) =
-                make_float4(KQ[e][0], KQ[e][1], KQ[e][2], KQ[e][3]);
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                const int i = i0 + e, j = j0 + f;
+                if (i <= j)
+                    KQ_sc[off + (int64_t) j * (j + 1) / 2 + i] = KQ[e][f];
+            }
     }
 #undef TK
 }
@@ -272,8 +290,8 @@ gdn_chunked_scan_cuda(
         const float * __restrict__ state_in,
         float * __restrict__ attn_out,
         float * __restrict__ state_out,
-        const float * __restrict__ A_sc,    // [n_chunks][H_v][n_seqs][CS*CS]
-        const float * __restrict__ KQ_sc,   // [n_chunks][H_k][n_seqs][CS*CS]
+        const float * __restrict__ A_sc,    // [n_chunks][H_v][n_seqs][PACKED_CS]
+        const float * __restrict__ KQ_sc,   // [n_chunks][H_k][n_seqs][PACKED_CS]
         int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
@@ -318,10 +336,10 @@ gdn_chunked_scan_cuda(
         const float * gbase = g + ((int64_t) seq * n_tokens + c0) * H + h;
         const float * bbase = beta + ((int64_t) seq * n_tokens + c0) * H + h;
 
-        const int64_t A_off = ((int64_t) c * H + h) * n_seqs * (GDN_CHUNKED_CS * GDN_CHUNKED_CS)
-                            + (int64_t) seq * (GDN_CHUNKED_CS * GDN_CHUNKED_CS);
-        const int64_t KQ_off = ((int64_t) c * H_k + hq) * n_seqs * (GDN_CHUNKED_CS * GDN_CHUNKED_CS)
-                             + (int64_t) seq * (GDN_CHUNKED_CS * GDN_CHUNKED_CS);
+        const int64_t A_off = ((int64_t) c * H + h) * n_seqs * PACKED_CS
+                            + (int64_t) seq * PACKED_CS;
+        const int64_t KQ_off = ((int64_t) c * H_k + hq) * n_seqs * PACKED_CS
+                             + (int64_t) seq * PACKED_CS;
         float * obase = attn_out + ((int64_t) seq * n_tokens + c0) * H * S_v + h * S_v;
 
         // ---- phase 1: gate, beta, chunk-local inclusive cumsum ------------------------------
@@ -351,11 +369,11 @@ gdn_chunked_scan_cuda(
         }
         __syncthreads();
 
-        // ---- load A into s.AK (the v_corr / predicted-v operand) ----------------------------
+        // ---- load A into s.AK (the v_corr / predicted-v operand): contiguous packed copy ----
         {
             const float4 * src = (const float4 *) (A_sc + A_off);
-            float4 * dst = (float4 *) &s.AK[0][0];
-            for (int i = tid; i < GDN_CHUNKED_CS * GDN_CHUNKED_CS / 4; i += GDN_CHUNKED_NTHREADS)
+            float4 * dst = (float4 *) &s.AK[0];
+            for (int i = tid; i < PACKED_CS / 4; i += GDN_CHUNKED_NTHREADS)
                 dst[i] = src[i];
         }
         __syncthreads();
@@ -373,30 +391,46 @@ gdn_chunked_scan_cuda(
         }
 
 
-        // ---- U[j][v] = sum_k K_b[k][j] * S[k][v]  -> s.UV ----------------------------------
+        // ---- U[j][v] = sum_k K_b[k][j] S[k][v]  -> s.UV  AND  QS[j][v] = sum_k Q_s[k][j] S[k][v]
+        // ---- -> s.QS. All 256 threads participate (thread (j, v0) owns v = v0, v0+4, v0+8,
+        // ---- v0+12): 8 warps issue the Q column reads, hiding the HBM latency that stalled
+        // ---- the old 2-warp U phase; the S reads broadcast across the j threads of a warp.
         {
-            const int j = tid >> 2;         // 0..63 (token)
-            const int vv = (tid & 3) * 4;   // 0..12 (state v within the slice)
-            float acc[4];
+            const int j  = tid >> 2;        // 0..63 (token)
+            const int v0 = tid & 3;         // v = v0, v0+4, v0+8, v0+12
+            float u[4], q[4];
 #pragma unroll
-            for (int e = 0; e < 4; ++e) acc[e] = 0.0f;
+            for (int e = 0; e < 4; ++e) { u[e] = 0.0f; q[e] = 0.0f; }
             const float bj = s.bt[j];
+            // K and Q are both read as float4 over k; 8 warps issue them, hiding the L2/HBM
+            // latency that stalled the old 2-warp phase. Q is software-pipelined 8 deep
+            // (read once per chunk, folded into the o phase's state term via s.QS).
+            float4 qb[8];
+            int kg = 0;
+            for (; kg < 8 && kg * 4 < S_v; ++kg)
+                qb[kg] = *(const float4 *) (qbase + kg * 4 + (int64_t) TK(j) * sq2);
+#pragma unroll
             for (int k0 = 0; k0 < S_v; k0 += 4) {
+                const float4 qq = qb[0];
                 const float4 kk = *(const float4 *) (kbase + k0 + (int64_t) TK(j) * sq2);
-                float4 ss[4];
 #pragma unroll
-                for (int e = 0; e < 4; ++e)
-                    ss[e] = *(const float4 *) &s.S[k0 + e][vv];
-#pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const float kb = kk[e] * bj;
-                    acc[0] += kb * ss[e].x;
-                    acc[1] += kb * ss[e].y;
-                    acc[2] += kb * ss[e].z;
-                    acc[3] += kb * ss[e].w;
+                for (int f = 0; f < 4; ++f) {
+                    const float kb = kk[f] * bj;
+                    const float qs = qq[f] * scale;
+                    const float s0 = s.S[k0 + f][v0];
+                    const float s1 = s.S[k0 + f][v0 + 4];
+                    const float s2 = s.S[k0 + f][v0 + 8];
+                    const float s3 = s.S[k0 + f][v0 + 12];
+                    u[0] += kb * s0;  u[1] += kb * s1;  u[2] += kb * s2;  u[3] += kb * s3;
+                    q[0] += qs * s0;  q[1] += qs * s1;  q[2] += qs * s2;  q[3] += qs * s3;
                 }
+                qb[0] = qb[1]; qb[1] = qb[2]; qb[2] = qb[3]; qb[3] = qb[4];
+                qb[4] = qb[5]; qb[5] = qb[6]; qb[6] = qb[7];
+                if (k0 + 32 < S_v)
+                    qb[7] = *(const float4 *) (qbase + (k0 + 32) + (int64_t) TK(j) * sq2);
             }
-            *(float4 *) &s.UV[j][vv] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+            s.UV[j][v0]      = u[0];  s.UV[j][v0 + 4]  = u[1];  s.UV[j][v0 + 8]  = u[2];  s.UV[j][v0 + 12] = u[3];
+            s.QS[j][v0]      = q[0];  s.QS[j][v0 + 4]  = q[1];  s.QS[j][v0 + 8]  = q[2];  s.QS[j][v0 + 12] = q[3];
         }
         __syncthreads();
 
@@ -407,8 +441,9 @@ gdn_chunked_scan_cuda(
             float vc[4], pr[4];
 #pragma unroll
             for (int e = 0; e < 4; ++e) { vc[e] = 0.0f; pr[e] = 0.0f; }
-            for (int i = 0; i < GDN_CHUNKED_CS; ++i) {
-                const float a = s.AK[i][j];
+            const int pbase = j * (j + 1) / 2;   // packed-upper base: column j is contiguous
+            for (int i = 0; i <= j; ++i) {
+                const float a = s.AK[pbase + i];
                 const float4 vv4 = *(const float4 *) &s.Vb[i][vv];
                 const float4 uu = *(const float4 *) &s.UV[i][vv];
                 const float ei = s.eg[i];
@@ -430,58 +465,40 @@ gdn_chunked_scan_cuda(
 
         }
         __syncthreads();
-        // ---- load KQ_gram into s.AK, apply the per-head decay and the (i <= j) mask ---------
+        // ---- load KQ_gram into s.AK (contiguous packed copy), then apply this v-head's ------
+        // ---- decay in place: the gram is shared per k-head (GQA), the decay is per v-head ----
         {
+            const float4 * src = (const float4 *) (KQ_sc + KQ_off);
+            float4 * dst = (float4 *) &s.AK[0];
+            for (int i = tid; i < PACKED_CS / 4; i += GDN_CHUNKED_NTHREADS)
+                dst[i] = src[i];
+            __syncthreads();
+            // 4x4 upper tiles over the 64x64 logical matrix, each entry packed at j(j+1)/2 + i
             const int i0t = (tid & 15) * 4;
             const int j0t = (tid >> 4) * 4;
-            const float4 * src = (const float4 *) (KQ_sc + KQ_off + (int64_t) i0t * GDN_CHUNKED_CS + j0t);
 #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int i = i0t + e;
-                const float4 row = src[e * (GDN_CHUNKED_CS / 4)];   // rows are 64 floats apart
+            for (int e = 0; e < 4; ++e)
 #pragma unroll
                 for (int f = 0; f < 4; ++f) {
-                    const int j = j0t + f;
-                    s.AK[i][j] = (i <= j) ? __expf(s.gcs[j] - s.gcs[i]) * row[f] : 0.0f;
+                    const int i = i0t + e, j = j0t + f;
+                    if (i <= j)
+                        s.AK[j * (j + 1) / 2 + i] *= __expf(s.gcs[j] - s.gcs[i]);
                 }
-            }
         }
         __syncthreads();
 
-        // ---- o[t][v] = eg[t] * sum_k Q_s[k][t] S[k][v] + sum_j KQ[j][t] v_new[j][v] ---------
+        // ---- o[t][v] = eg[t] * QS[t][v] + sum_j KQ[j][t] v_new[j][v]  (LDS only) -----------
         if (tid < GDN_CHUNKED_CS * GDN_CHUNKED_VT / 4) {
             const int t = tid >> 2;         // 0..63
             const int vv = (tid & 3) * 4;   // 0..12
+            const float4 qs = *(const float4 *) &s.QS[t][vv];
+            const float egt = s.eg[t];
             float acc[4];
 #pragma unroll
-            for (int e = 0; e < 4; ++e) acc[e] = 0.0f;
-            // software-pipeline the Q reads (4 deep): the 32 k-groups' float4s are independent
-            float4 qq[4];
-#pragma unroll
-            for (int e = 0; e < 4; ++e) qq[e] = make_float4(0.f, 0.f, 0.f, 0.f);
-            int kg = 0;
-            for (; kg < 4 && kg * 4 < S_v; ++kg)
-                qq[kg] = *(const float4 *) (qbase + kg * 4 + (int64_t) TK(t) * sq2);
-            for (int k0 = 0; k0 < S_v; k0 += 4) {
-                const float4 qc = qq[0];
-                float4 ss[4];
-#pragma unroll
-                for (int e = 0; e < 4; ++e)
-                    ss[e] = *(const float4 *) &s.S[k0 + e][vv];
-#pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    const float qs = qc[e] * scale * s.eg[t];   // e^{g_t} scales ONLY the state term
-                    acc[0] += qs * ss[e].x;
-                    acc[1] += qs * ss[e].y;
-                    acc[2] += qs * ss[e].z;
-                    acc[3] += qs * ss[e].w;
-                }
-                qq[0] = qq[1]; qq[1] = qq[2]; qq[2] = qq[3];
-                if (k0 + 16 < S_v)
-                    qq[3] = *(const float4 *) (qbase + (k0 + 16) + (int64_t) TK(t) * sq2);
-            }
-            for (int j = 0; j < GDN_CHUNKED_CS; ++j) {
-                const float kq = s.AK[j][t];
+            for (int e = 0; e < 4; ++e) acc[e] = egt * qs[e];
+            const int pbase = t * (t + 1) / 2;   // packed-upper base: column t is contiguous
+            for (int j = 0; j <= t; ++j) {
+                const float kq = s.AK[pbase + j];
                 const float4 vn = *(const float4 *) &s.UV[j][vv];
                 acc[0] += kq * vn.x;
                 acc[1] += kq * vn.y;
@@ -629,8 +646,8 @@ void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_
     cudaStream_t stream = ctx.stream();
 
     const int64_t n_chunks = (n_tokens + GDN_CHUNKED_CS - 1) / GDN_CHUNKED_CS;
-    ggml_cuda_pool_alloc<float> A_sc (ctx.pool(), (size_t) n_chunks * H     * n_seqs * GDN_CHUNKED_CS * GDN_CHUNKED_CS);
-    ggml_cuda_pool_alloc<float> KQ_sc(ctx.pool(), (size_t) n_chunks * neqk1 * n_seqs * GDN_CHUNKED_CS * GDN_CHUNKED_CS);
+    ggml_cuda_pool_alloc<float> A_sc (ctx.pool(), (size_t) n_chunks * H     * n_seqs * PACKED_CS);
+    ggml_cuda_pool_alloc<float> KQ_sc(ctx.pool(), (size_t) n_chunks * neqk1 * n_seqs * PACKED_CS);
 
     switch (S_v) {
         case 16:  launch_gdn_chunked<16 >(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, A_sc.get(), KQ_sc.get(),
