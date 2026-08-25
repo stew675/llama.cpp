@@ -59,6 +59,12 @@
 #define GDN_CHUNKED_NTHREADS 256
 #define GDN_CHUNKED_VT 16   // state v-rows per scan block (S_v/16 blocks per head)
 
+// State-phase K prefetch depth (float4s in flight per thread). The state phase's chunk K
+// re-read is the scan's bottleneck (one un-overlapped HBM load per token); batching the
+// independent per-token loads into a rotating window lets the scheduler overlap their
+// latency with the 64-FMA accumulator chains. CS=64 divides evenly by 2/4/8; each step adds
+// 4 floats of registers per thread (4 = 16, 8 = 32).
+
 template <int S_v>
 struct gdn_chunked_kkt_smem {
     // (the gram contracts over d with float4-over-d reads straight from HBM -- the LDS staging
@@ -535,19 +541,35 @@ gdn_chunked_scan_cuda(
 #pragma unroll
                     for (int f = 0; f < 4; ++f)
                         acc[e][f] = eg0 * s.S[k0 + e][vv + f];
-                for (int t = 0; t < GDN_CHUNKED_CS; ++t) {
-                    const float4 kk = *(const float4 *) (kbase + k0 + (int64_t) TK(t) * sq2);
-                    const float4 vn = *(const float4 *) &s.UV[t][vv];
-                    const float elt = s.el[t];
+#define GDN_CHUNKED_STATE_PIPE 8   // tune: 2/4/8
+                float4 kk[GDN_CHUNKED_STATE_PIPE];
 #pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        const float kke = kk[e] * elt;
-                        acc[e][0] += kke * vn.x;
-                        acc[e][1] += kke * vn.y;
-                        acc[e][2] += kke * vn.z;
-                        acc[e][3] += kke * vn.w;
+                for (int u = 0; u < GDN_CHUNKED_STATE_PIPE; ++u)
+                    kk[u] = *(const float4 *) (kbase + k0 + (int64_t) TK(u) * sq2);
+                for (int t = 0; t < GDN_CHUNKED_CS; t += GDN_CHUNKED_STATE_PIPE) {
+#pragma unroll
+                    for (int u = 0; u < GDN_CHUNKED_STATE_PIPE; ++u) {
+                        const float4 vn = *(const float4 *) &s.UV[t + u][vv];
+                        const float elt = s.el[t + u];
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const float kke = kk[u][e] * elt;
+                            acc[e][0] += kke * vn.x;
+                            acc[e][1] += kke * vn.y;
+                            acc[e][2] += kke * vn.z;
+                            acc[e][3] += kke * vn.w;
+                        }
+                    }
+                    // prefetch the next group into the (now dead) window: the loads are
+                    // independent of the FMAs above, so the scheduler overlaps them with the
+                    // accumulator chains; the last group's guard skips the OOB re-read.
+                    if (t + GDN_CHUNKED_STATE_PIPE < GDN_CHUNKED_CS) {
+#pragma unroll
+                        for (int u = 0; u < GDN_CHUNKED_STATE_PIPE; ++u)
+                            kk[u] = *(const float4 *) (kbase + k0 + (int64_t) TK(t + GDN_CHUNKED_STATE_PIPE + u) * sq2);
                     }
                 }
+#undef GDN_CHUNKED_STATE_PIPE
 #pragma unroll
                 for (int e = 0; e < 4; ++e)
 #pragma unroll
