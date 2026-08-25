@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "gated_delta_net_chunked.cuh"
 #include "ggml-cuda/common.cuh"
 
 template <int S_v, bool KDA, bool keep_rs_t>
@@ -285,6 +286,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
+
+    // fused chunked prefill: more than one token per sequence, no snapshots, scalar gate, and
+    // no fused-state-cache cpy to honour -- the grid maps one block per (chunk, head, seq).
+    // Everything else (decode, MTP snapshots, KDA vector gates) stays on the sequential kernel.
+    if (cache == nullptr && !kda && K == 1 && n_tokens > 1 &&
+        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
+        ggml_cuda_op_gated_delta_net_chunked(ctx, dst);
+        return;
+    }
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;

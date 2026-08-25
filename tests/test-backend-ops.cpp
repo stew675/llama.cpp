@@ -10064,6 +10064,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
+    // fused chunked prefill (n_seq_tokens > 1): padded chunk, exact chunk, and GQA strides
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 130, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  128, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,  100, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 16,  65, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 300, 2, 2, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
