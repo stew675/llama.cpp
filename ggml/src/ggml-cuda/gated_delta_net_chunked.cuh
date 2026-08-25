@@ -25,6 +25,8 @@
 
 void ggml_cuda_op_gated_delta_net_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);
 
-// bf16/WMMA tensor-core variant (S_v == 128 only; near-lossless). Selected by
-// GGML_CUDA_GDN_CHUNKED_BF16=1 in the dispatch seam; the fp32 chunked path stays the default.
+// bf16/WMMA tensor-core variant (S_v == 128 only; near-lossless: PPL +0.056% / KL 0.0036 on
+// wikitext-2 vs the fp32 path). DEFAULT for S_v == 128 on the HIP build (opt out with
+// GGML_CUDA_GDN_CHUNKED_BF16=0); the fp32 chunked path stays the fallback and the
+// bit-exact option.
 void ggml_cuda_op_gated_delta_net_chunked_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, float * state_d_ext = nullptr);

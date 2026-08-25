@@ -297,12 +297,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
         (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
         const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
         if (env == nullptr || strcmp(env, "0") != 0) {
-            // GGML_CUDA_GDN_CHUNKED_BF16=1 selects the bf16/WMMA tensor-core path (S_v == 128
-            // only; near-lossless, not bit-exact). Everything else keeps the fp32 chunked path.
+            // GGML_CUDA_GDN_CHUNKED_BF16=0 opts OUT of the bf16/WMMA tensor-core path; it is
+            // the DEFAULT for S_v == 128 on the HIP build (near-lossless: PPL +0.056%, KL
+            // 0.0036 on wikitext-2 vs the fp32 path; not bit-exact). Everything else keeps
+            // the fp32 chunked path.
             float * state_d_ext = cache ? cache->data : nullptr;
 #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
             const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
-            if (S_v == 128 && envb != nullptr && strcmp(envb, "0") != 0) {
+            if (S_v == 128 && (envb == nullptr || strcmp(envb, "0") != 0)) {
                 ggml_cuda_op_gated_delta_net_chunked_bf16(ctx, dst, state_d_ext);
                 return;
             }

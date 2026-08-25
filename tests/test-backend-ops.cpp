@@ -4401,11 +4401,19 @@ struct test_gated_delta_net : public test_case {
     }
 
     double max_nmse_err() override {
-        // The bf16/WMMA chunked path (GGML_CUDA_GDN_CHUNKED_BF16=1) is near-lossless, not
-        // bit-exact: bf16 operands, fp32 accumulation. r4d measured its oracle error at 3.3e-3
-        // against FLA on this hardware; vs the fp32 sequential kernel expect the same class.
-        if (getenv("GGML_CUDA_GDN_CHUNKED_BF16") != nullptr) {
-            return 5e-2;
+        // The bf16/WMMA chunked path is the DEFAULT for S_v == 128 prefill on the HIP build
+        // (opt out: GGML_CUDA_GDN_CHUNKED_BF16=0). It is near-lossless, not bit-exact (bf16
+        // operands, fp32 accumulation); r4d measured its oracle error at 3.3e-3 vs FLA on this
+        // hardware, and the wikitext-2 A/B is PPL +0.056% / KL 0.0036. Only the cases the bf16
+        // kernel actually runs get the relaxed gate (S_v == 128, non-KDA, K == 1, prefill);
+        // the sequential/keep-rs/KDA cases stay tight (they run the fp32 kernels).
+        if (head_size == 128 && !kda && K == 1 && n_seq_tokens > 1) {
+            const char * env  = getenv("GGML_CUDA_GDN_CHUNKED");
+            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
+            if ((env == nullptr || strcmp(env, "0") != 0) &&
+                (envb == nullptr || strcmp(envb, "0") != 0)) {
+                return 5e-2;
+            }
         }
         return test_case::max_nmse_err();
     }
