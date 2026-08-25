@@ -435,34 +435,37 @@ gdn_chunked_scan_cuda(
         __syncthreads();
 
         // ---- v_new[j][v] = sum_i A[i][j] V_b[i][v] - sum_i eg[i] A[i][j] U[i][v] -> s.UV ----
+        // ---- 256 threads: thread (j, v0) owns v = v0, v0+4, v0+8, v0+12 (the scalar V_b/U
+        // ---- reads broadcast across the j threads of a warp, like the U phase) -------------
         {
-            const int j = tid >> 2;
-            const int vv = (tid & 3) * 4;
+            const int j  = tid >> 2;
+            const int v0 = tid & 3;
             float vc[4], pr[4];
 #pragma unroll
             for (int e = 0; e < 4; ++e) { vc[e] = 0.0f; pr[e] = 0.0f; }
             const int pbase = j * (j + 1) / 2;   // packed-upper base: column j is contiguous
             for (int i = 0; i <= j; ++i) {
                 const float a = s.AK[pbase + i];
-                const float4 vv4 = *(const float4 *) &s.Vb[i][vv];
-                const float4 uu = *(const float4 *) &s.UV[i][vv];
                 const float ei = s.eg[i];
-                vc[0] += a * vv4.x;
-                vc[1] += a * vv4.y;
-                vc[2] += a * vv4.z;
-                vc[3] += a * vv4.w;
-                pr[0] += ei * a * uu.x;
-                pr[1] += ei * a * uu.y;
-                pr[2] += ei * a * uu.z;
-                pr[3] += ei * a * uu.w;
+                const float b0 = s.Vb[i][v0];
+                const float b1 = s.Vb[i][v0 + 4];
+                const float b2 = s.Vb[i][v0 + 8];
+                const float b3 = s.Vb[i][v0 + 12];
+                const float u0 = s.UV[i][v0];
+                const float u1 = s.UV[i][v0 + 4];
+                const float u2 = s.UV[i][v0 + 8];
+                const float u3 = s.UV[i][v0 + 12];
+                vc[0] += a * b0;  vc[1] += a * b1;  vc[2] += a * b2;  vc[3] += a * b3;
+                pr[0] += ei * a * u0;  pr[1] += ei * a * u1;  pr[2] += ei * a * u2;  pr[3] += ei * a * u3;
             }
             // every thread's last read of s.UV (the U data) must land before any thread
             // overwrites it with v_new: the barrier is inside the (uniform) block scope so
             // every thread reaches it before the store
             __syncthreads();
-            *(float4 *) &s.UV[j][vv] = make_float4(vc[0] - pr[0], vc[1] - pr[1], vc[2] - pr[2], vc[3] - pr[3]);
-
-
+            s.UV[j][v0]      = vc[0] - pr[0];
+            s.UV[j][v0 + 4]  = vc[1] - pr[1];
+            s.UV[j][v0 + 8]  = vc[2] - pr[2];
+            s.UV[j][v0 + 12] = vc[3] - pr[3];
         }
         __syncthreads();
         // ---- load KQ_gram into s.AK (contiguous packed copy), then apply this v-head's ------
