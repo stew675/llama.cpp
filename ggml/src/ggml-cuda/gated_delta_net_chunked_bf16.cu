@@ -561,7 +561,6 @@ gdn_bf16_scan_cuda(
 
         // consume the previous iteration's prefetch: stage K/V to LDS (bf16)
         {
-            if (dbg == 3) GDN_BF16_PREFETCH(ci);                     // no prefetch: load now
             _Pragma("unroll") for (int u = 0; u < GDN_BF16_NKB; ++u)
                 GDN_BF16_PFSTORE(&s.k[kr0 + GDN_BF16_KRU * u][kc], kb[u]);
             _Pragma("unroll") for (int u = 0; u < GDN_BF16_NVB; ++u)
@@ -574,7 +573,7 @@ gdn_bf16_scan_cuda(
                    (double) gdn_bf2f(s.S[4][0]), (double) gdn_bf2f(s.S[5][0]),
                    (double) gdn_bf2f(s.S[6][0]), (double) gdn_bf2f(s.S[7][0]));
         GDN_BAR();                                                   // (1)
-        if (dbg != 3) GDN_BF16_PREFETCH(min(ci + 1, nchunk - 1));    // issue next chunk's loads
+        GDN_BF16_PREFETCH(min(ci + 1, nchunk - 1));                  // issue next chunk's loads
 
         const float glast = s.ge[nval - 1];   // e^{g_last} (the state carry factor)
 
@@ -645,11 +644,7 @@ gdn_bf16_scan_cuda(
             for (int i = 0; i < GDN_BF16_NTV; ++i)
 #pragma unroll
                 for (int e = 0; e < 8; ++e) mxU = fmaxf(mxU, fabsf(u[i][e]));
-            if (dbg != 0 && ci == 0 && w == 0 && lane == 0)
-                printf("  scan[DBG] W t0 bv=%d h=%d: V=%f beta=%f ge=%f U=%f | W0=%f\n",
-                       bv, (int) h,
-                       (double) gdn_bf2f(s.D[0][0]), (double) s.bt[0], (double) s.ge[0],
-                       (double) u[0][0], (double) (s.bt[0] * (gdn_bf2f(s.D[0][0]) - s.ge[0] * u[0][0])));
+
             float wa[GDN_BF16_NTV][8];
 #pragma unroll
             for (int e = 0; e < 8; ++e) {           // beta / ge read once for both tiles
@@ -726,12 +721,7 @@ gdn_bf16_scan_cuda(
                 *(uint2 *) (dp + 4) = gdn_f2bf4(d[i][4] * gvv[4], d[i][5] * gvv[5],
                                                 d[i][6] * gvv[6], d[i][7] * gvv[7]);
             }
-            if (dbg != 0 && ci == 0 && w == 0 && lane == 0)
-                printf("  scan[DBG] Vprime-store bv=%d h=%d: d0=%f %f %f %f | W[0][0..3]=%f %f %f %f\n",
-                       bv, (int) h,
-                       (double) d[0][0], (double) d[0][1], (double) d[0][2], (double) d[0][3],
-                       (double) gdn_bf2f(s.W[0][0]), (double) gdn_bf2f(s.W[0][1]),
-                       (double) gdn_bf2f(s.W[0][2]), (double) gdn_bf2f(s.W[0][3]));
+
 #undef paf
 #undef pwnf
         }
@@ -752,17 +742,9 @@ gdn_bf16_scan_cuda(
                 const int ko = sk * 16;
                 gdn_v8bf b = pAf(ko);
 #pragma unroll
-                for (int i = 0; i < GDN_BF16_NTV; ++i)
-                    if (dbg != 4) O[i] = gdn_mma(pdnf(i, ko), b, O[i]);
+                for (int i = 0; i < GDN_BF16_NTV; ++i) O[i] = gdn_mma(pdnf(i, ko), b, O[i]);
             }
-            if (dbg != 0 && ci == 0 && w == 0 && lane == 0)
-                printf("  scan[DBG] O-final t0 bv=%d h=%d: %f %f %f %f | sArow0=%f %f %f %f | Drow0=%f %f %f %f\n",
-                       bv, (int) h,
-                       (double) O[0][0], (double) O[0][1], (double) O[0][2], (double) O[0][3],
-                       (double) gdn_bf2f(s.A[0][0]), (double) gdn_bf2f(s.A[0][1]),
-                       (double) gdn_bf2f(s.A[0][2]), (double) gdn_bf2f(s.A[0][3]),
-                       (double) gdn_bf2f(s.D[0][0]), (double) gdn_bf2f(s.D[0][1]),
-                       (double) gdn_bf2f(s.D[0][2]), (double) gdn_bf2f(s.D[0][3]));
+
 #pragma unroll
             for (int i = 0; i < GDN_BF16_BT / (16 * 2); ++i) {
                 __builtin_amdgcn_sched_group_barrier(0x100, (1 + GDN_BF16_NTV) * 2, 0);
@@ -823,25 +805,7 @@ gdn_bf16_scan_cuda(
 #pragma unroll
                     for (int j = 0; j < GDN_BF16_SVT; ++j)
                         St[ki * GDN_BF16_SVT + j] = gdn_mma(ak, bv[j], St[ki * GDN_BF16_SVT + j]);
-                    if (dbg != 0 && ci == 0 && w == 0 && lane == 1 && ki == 0 && sk == 3) {
-                        float ma = 0.0f, mb = 0.0f, ms = 0.0f;
-                        printf("  scan[DBG] state-mma lane1 sk3: ak0=%f el[k0]=%f bv0=%f St00=%f\n",
-                               (double) gdn_bf2f(__builtin_bit_cast(unsigned short, ak[0])),
-                               (double) s.gv[48], (double) gdn_bf2f(__builtin_bit_cast(unsigned short, bv[0][0])),
-                               (double) St[0][0]);
-#pragma unroll
-                        for (int e = 0; e < 8; ++e) {
-                            ma = fmaxf(ma, fabsf(gdn_bf2f(__builtin_bit_cast(unsigned short, ak[e]))));
-                            mb = fmaxf(mb, fabsf(gdn_bf2f(__builtin_bit_cast(unsigned short, bv[0][e]))));
-                        }
-#pragma unroll
-                        for (int t2 = 0; t2 < GDN_BF16_NST; ++t2)
-#pragma unroll
-                            for (int e2 = 0; e2 < 8; ++e2) ms = fmaxf(ms, fabsf(St[t2][e2]));
-                        printf("  scan[DBG] sk3: maxAk=%f maxBv=%f maxSt=%f el60..63=%f %f %f %f\n",
-                               (double) ma, (double) mb, (double) ms,
-                               (double) s.gv[60], (double) s.gv[61], (double) s.gv[62], (double) s.gv[63]);
-                    }
+
                 }
             }
 #pragma unroll
