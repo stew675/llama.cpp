@@ -117,12 +117,17 @@ __device__ __forceinline__ unsigned gdn_rowGo(unsigned rowstride, int row0, int 
 __device__ __forceinline__ gdn_v8bf gdn_fragGo(const unsigned short * base, unsigned off) {
     return gdn_fragP(base + off);
 }
-// Same, but the source is fp32: 8 consecutive floats at the element offset, packed to bf16.
+// Same, but the source is fp32: 8 floats at the element offset, packed to bf16. NOTE: the
+// fragment layout is the "two runs of four" -- registers 0..3 = k 0..3, registers 4..7 =
+// k 8..11 -- so the source reads are pf[0] (elements 0..3) and pf[2] (elements 8..11), NOT
+// pf[1]! The LDS version (fragP) reads pw[0] and pw[2] for the same reason; a contiguous
+// pf[1] read feeds the wrong k's into the WMMA and scrambles every contraction (the P gram
+// and the O state term came out ~0.53x before this was fixed).
 __device__ __forceinline__ gdn_v8bf gdn_fragGo32(const float * base, unsigned off) {
     const float4 * pf = (const float4 *) (base + off);
     union { uint2 w[2]; gdn_v8bf f; } u;
     u.w[0] = gdn_f2bf4(pf[0].x, pf[0].y, pf[0].z, pf[0].w);
-    u.w[1] = gdn_f2bf4(pf[1].x, pf[1].y, pf[1].z, pf[1].w);
+    u.w[1] = gdn_f2bf4(pf[2].x, pf[2].y, pf[2].z, pf[2].w);
     return u.f;
 }
 // Fragment from a 32-BIT LDS BYTE OFFSET off the shared-block base (see libr4d's fragO).
@@ -212,7 +217,7 @@ gdn_bf16_kkt_cuda(
     const int lim = rows - 1;
 
     const float * kp = k + (int64_t) nq * sq3 + (int64_t) c0 * sq2 + (int64_t) hg * sq1;
-    const unsigned krow = (unsigned) (H_k * GDN_BF16_KD);   // token stride, in float elements
+    const unsigned krow = (unsigned) sq2;   // token stride, in float elements (permuted-safe)
 
     // ---- zero the parts no store ever reaches: the upper tiles of A and the TMP slack ----
     for (int i = tid; i < GDN_BF16_BT * GDN_BF16_AP / 8; i += GDN_BF16_KKT_NTHR)
@@ -465,7 +470,7 @@ gdn_bf16_scan_cuda(
 #define GDN_BF16_KRU (2 * GDN_BF16_NW)
 #define GDN_BF16_VRU (4 * GDN_BF16_NW)
     GDN_BF16_PFV_T kb[GDN_BF16_NKB], vb[GDN_BF16_NVB];
-    const unsigned krs = (unsigned) (H_k * GDN_BF16_KD), vrs = (unsigned) (H * GDN_BF16_VD);
+    const unsigned krs = (unsigned) sq2, vrs = (unsigned) sv2;   // token strides (permuted-safe)
     unsigned koff0[GDN_BF16_NKB], voff0[GDN_BF16_NVB];
     {
         _Pragma("unroll") for (int u = 0; u < GDN_BF16_NKB; ++u)
@@ -520,7 +525,7 @@ gdn_bf16_scan_cuda(
                                         + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
         const size_t ars = (size_t) H * GDN_BF16_BT;
         const float * qg = q + (int64_t) iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
-        const size_t qrs = (size_t) H_k * GDN_BF16_KD;
+        const size_t qrs = (size_t) sq2;   // token stride of q (permuted-safe)
         const float * gbase = g + ((int64_t) nq * n_tokens + c0) * H + h;
         const float * bbase = beta + ((int64_t) nq * n_tokens + c0) * H + h;
         float * obase = attn_out + ((int64_t) nq * n_tokens + c0) * H * GDN_BF16_VD + (int64_t) h * GDN_BF16_VD;
@@ -566,12 +571,6 @@ gdn_bf16_scan_cuda(
             _Pragma("unroll") for (int u = 0; u < GDN_BF16_NVB; ++u)
                 GDN_BF16_PFSTORE(&s.D[vr0 + GDN_BF16_VRU * u][vc], vb[u]);
         }
-        if (dbg != 0 && ci == 1 && w == 0 && lane == 0)
-            printf("  scan[DBG] start c1: s.S[0][0..7]=%f %f %f %f %f %f %f %f\n",
-                   (double) gdn_bf2f(s.S[0][0]), (double) gdn_bf2f(s.S[1][0]),
-                   (double) gdn_bf2f(s.S[2][0]), (double) gdn_bf2f(s.S[3][0]),
-                   (double) gdn_bf2f(s.S[4][0]), (double) gdn_bf2f(s.S[5][0]),
-                   (double) gdn_bf2f(s.S[6][0]), (double) gdn_bf2f(s.S[7][0]));
         GDN_BAR();                                                   // (1)
         GDN_BF16_PREFETCH(min(ci + 1, nchunk - 1));                  // issue next chunk's loads
 
@@ -610,6 +609,7 @@ gdn_bf16_scan_cuda(
                     O[i] = gdn_mma(b, aq, O[i]);                          // O^T: m = v
                     p[i] = gdn_mma(pknf(i, ko), aq, p[i]);                // P^T: m = j
                 }
+                
             }
             // group the k loop: per 2 steps ask for the reads against the previous WMMAs
 #pragma unroll
@@ -629,12 +629,7 @@ gdn_bf16_scan_cuda(
             for (int i = 0; i < GDN_BF16_NTV; ++i)
 #pragma unroll
                 for (int e = 0; e < 8; ++e) O[i][e] *= g;
-            if (dbg != 0 && ci == 0 && w == 0 && lane == 0) {
-                printf("  scan[DBG] O-state-term t0: %f %f %f %f | P: %f %f %f %f | u: %f %f\n",
-                       (double) O[0][0], (double) O[0][1], (double) O[0][2], (double) O[0][3],
-                       (double) p[0][0], (double) p[0][1], (double) p[0][2], (double) p[0][3],
-                       (double) u[0][0], (double) u[0][1]);
-            }
+            
         }
 
         float mxU = 0.0f;
@@ -764,6 +759,7 @@ gdn_bf16_scan_cuda(
                     *(float4 *) (q2 + 4) = make_float4(O[i][4], O[i][5], O[i][6], O[i][7]);
                 }
             }
+            
         }
 
         // ---- S' = e^{g_last} * S + V''^T @ K  (V'' carries the direct e^{g_last-g_t} decay) --
@@ -788,18 +784,19 @@ gdn_bf16_scan_cuda(
                     // operand (<= 1, no clamp): S' += sum_t el[t] * V'[t] * K[t]^T
                     gdn_v8bf ak = gdn_fragT(&s.k[0][0], GDN_BF16_KP, (kt0 + ki) * 16, sk * 16, lane);
                     {
-                        // el[t] folded into the K^T operand, rebuilt via a union. NOTE: ak[e] is
-                        // __bf16 -- the element-wise assignment from unsigned short converts the
-                        // VALUE (truncating), so the scaled fragment must be assembled from the
-                        // raw ushort bits (as fragT itself does).
+                        // el[t] folded into the K^T operand, rebuilt via a union. NOTE: ak[e]
+                        // element-indexed reads are MISCOMPILED on this compiler (every index
+                        // reads element 0 -- the same bug class as the __bf16 assignment), so
+                        // the el-scaled fragment must be assembled from the raw ushort bits.
                         const int k0 = sk * 16 + 4 * hi;
-                        union { unsigned short h[8]; gdn_v8bf f; } au;
+                        union { unsigned short h[8]; gdn_v8bf f; } ab, au;
+                        ab.f = ak;
 #pragma unroll
                         for (int e = 0; e < 4; ++e)
-                            au.h[e] = gdn_f2bf(gdn_bf2f(__builtin_bit_cast(unsigned short, ak[e])) * s.gv[k0 + e]);
+                            au.h[e] = gdn_f2bf(gdn_bf2f(ab.h[e]) * s.gv[k0 + e]);
 #pragma unroll
                         for (int e = 0; e < 4; ++e)
-                            au.h[4 + e] = gdn_f2bf(gdn_bf2f(__builtin_bit_cast(unsigned short, ak[4 + e])) * s.gv[k0 + 8 + e]);
+                            au.h[4 + e] = gdn_f2bf(gdn_bf2f(ab.h[4 + e]) * s.gv[k0 + 8 + e]);
                         ak = au.f;
                     }
 #pragma unroll
@@ -819,15 +816,7 @@ gdn_bf16_scan_cuda(
         // its U/O reads of s.S this chunk
         SWRITE();
         GDN_BAR();                                                   // (4)
-        if (dbg != 0 && w == 0 && lane == 0) {
-            float mx = 0.0f;
-#pragma unroll
-            for (int t = 0; t < GDN_BF16_NST; ++t)
-#pragma unroll
-                for (int e = 0; e < 8; ++e) mx = fmaxf(mx, fabsf(St[t][e]));
-            printf("  scan[DBG] ci=%d glast=%f maxSt=%f maxU=%f\n",
-                   ci, (double) glast, (double) mx, (double) mxU);
-        }
+        
     }
 
     // ---- write the final state: state[v][k] = S[k][v] ---------------------------------------
