@@ -61,9 +61,9 @@
 
 template <int S_v>
 struct gdn_chunked_kkt_smem {
-    float Kt[GDN_CHUNKED_CS][S_v];             // K chunk, then Q_s chunk, staged TRANSPOSED
-                                               // ([token][d]: d contiguous) so the gram reads are
-                                               // float4 over the contraction dimension d
+    // (the gram contracts over d with float4-over-d reads straight from HBM -- the LDS staging
+    // was 32KB of unnecessary shared memory that capped this kernel at 1 block/CU; the A and
+    // the gate arrays alone are ~17KB, so 3 blocks fit per CU)
     float A[GDN_CHUNKED_CS][GDN_CHUNKED_CS];   // the KKT inverse (built per v-head)
     float gc[GDN_CHUNKED_CS];   // raw gate, pre-cumsum
     float gcs[GDN_CHUNKED_CS];  // chunk-local inclusive cumsum
@@ -109,8 +109,12 @@ gdn_chunked_kkt_cuda(
     __shared__ gdn_chunked_kkt_smem<S_v> s;
     const int tid = threadIdx.x;
     const int c   = blockIdx.x;   // chunk
-    const int hg  = blockIdx.y;   // k-head
+    const int vh  = blockIdx.y;   // v-HEAD (grid is now H_v wide: each block does ONE v-head's
+                                  // A, so the hg_ratio back-substitutions run in parallel
+                                  // blocks instead of serially inside one block)
     const int seq = blockIdx.z;   // sequence (uniform length: no cu needed)
+    const int hg  = vh % H_k;     // the k-head whose K/Q this v-head reads
+    const int m   = vh / H_k;     // 0..hg_ratio-1; only the m==0 block of a k-head stores KQ
 
     const int c0 = c * GDN_CHUNKED_CS;
     const int nval = min(GDN_CHUNKED_CS, (int) n_tokens - c0);
@@ -119,23 +123,18 @@ gdn_chunked_kkt_cuda(
 
     const float * kbase = k + (int64_t) seq * sq3 + (int64_t) c0 * sq2 + hg * sq1;
     const float * qbase = q + (int64_t) seq * sq3 + (int64_t) c0 * sq2 + hg * sq1;
-    const float * gbase = g + ((int64_t) seq * n_tokens + c0) * H_v + hg;
+    const float * gbase = g + ((int64_t) seq * n_tokens + c0) * H_v + vh;
 
     // gram tile ownership: 4x4 tiles, upper triangle only (i0 <= j0)
     const int i0 = (tid & 15) * 4;
     const int j0 = (tid >> 4) * 4;
     const bool upper = (i0 <= j0);
 
-    // ---- stage the K chunk, transposed: Kt[t][d] --------------------------------------------
-    // i maps to (d0 = 4 d-rows, t) with the d-group count S_v/4 varying by instantiation
-    for (int i = tid; i < S_v * GDN_CHUNKED_CS / 4; i += GDN_CHUNKED_NTHREADS) {
-        const int d0 = (i % (S_v / 4)) * 4, t = i / (S_v / 4);   // d is contiguous in HBM
-        const float4 kv = *(const float4 *) (kbase + d0 + (int64_t) TK(t) * sq2);
-        *(float4 *) &s.Kt[t][d0] = kv;
-    }
-    __syncthreads();
-
     // ---- gram G[i][j] = sum_d K[d][i] K[d][j] in registers (upper only; symmetric) ---------
+    // d is contiguous in HBM, so the contraction reads float4-over-d straight from L2/L1 --
+    // no LDS staging needed (the transposed-staging form was a leftover from the debugging
+    // saga: the original [d][t] layout flipped the float4 orientation, the fix was to read
+    // direct, not to add a 32KB staging buffer).
     float G[4][4];
 #pragma unroll
     for (int e = 0; e < 4; ++e)
@@ -146,10 +145,10 @@ gdn_chunked_kkt_cuda(
             float ki[4][4], kj[4][4];
 #pragma unroll
             for (int e = 0; e < 4; ++e)
-                *(float4*) &ki[e][0] = *(const float4 *) &s.Kt[i0 + e][d0];
+                *(float4*) &ki[e][0] = *(const float4 *) (kbase + d0 + (int64_t) TK(i0 + e) * sq2);
 #pragma unroll
             for (int f = 0; f < 4; ++f)
-                *(float4*) &kj[f][0] = *(const float4 *) &s.Kt[j0 + f][d0];
+                *(float4*) &kj[f][0] = *(const float4 *) (kbase + d0 + (int64_t) TK(j0 + f) * sq2);
 #pragma unroll
             for (int e = 0; e < 4; ++e)
 #pragma unroll
@@ -160,15 +159,14 @@ gdn_chunked_kkt_cuda(
         }
     }
 
-    // ---- per v-head: A = (I + strict_upper(beta . G . decay))^-1, store --------------------
-    for (int m = 0; m < hg_ratio; ++m) {
-        const int vh = hg + m * H_k;
-        const float * gb = gbase + (int64_t) m * H_k;
+    // ---- this block's v-head: A = (I + strict_upper(beta . G . decay))^-1, store -----------
+    // (grid is H_v wide, so there is no per-block v-head loop; the gates are this v-head's)
+    {
         const float * bb = beta + ((int64_t) seq * n_tokens + c0) * H_v + vh;
 
         if (tid < GDN_CHUNKED_CS) {
             if (tid < nval) {
-                s.gc[tid] = gb[(int64_t) tid * H_v];
+                s.gc[tid] = gbase[(int64_t) tid * H_v];
                 s.bt[tid] = bb[(int64_t) tid * H_v];
             } else {
                 s.gc[tid] = 0.0f;   // ggml_pad semantics: zero-padded gate keeps the cumsum flat
@@ -230,14 +228,10 @@ gdn_chunked_kkt_cuda(
         __syncthreads();
     }
 
-    // ---- KQ gram per k-head: stage Q_s (transposed), KQ[i][j] = sum_d K[d][i] (Q[d][j] scale)
-    for (int i = tid; i < S_v * GDN_CHUNKED_CS / 4; i += GDN_CHUNKED_NTHREADS) {
-        const int d0 = (i % (S_v / 4)) * 4, t = i / (S_v / 4);
-        const float4 qv = *(const float4 *) (qbase + d0 + (int64_t) TK(t) * sq2);
-        *(float4 *) &s.Kt[t][d0] = make_float4(qv.x * scale, qv.y * scale, qv.z * scale, qv.w * scale);
-    }
-    __syncthreads();
-    if (upper) {
+    // ---- KQ gram per k-head: KQ[i][j] = scale * sum_d K[d][i] Q[d][j] (direct reads) ------
+    // (only the m == 0 block of a k-head computes and stores it; the scan reads the per-k-head
+    // copy and applies its own v-head's decay)
+    if (upper && m == 0) {
         float KQ[4][4];
 #pragma unroll
         for (int e = 0; e < 4; ++e)
@@ -250,7 +244,7 @@ gdn_chunked_kkt_cuda(
                 *(float4*) &ki[e][0] = *(const float4 *) (kbase + d0 + (int64_t) TK(i0 + e) * sq2);
 #pragma unroll
             for (int f = 0; f < 4; ++f)
-                *(float4*) &qj[f][0] = *(const float4 *) &s.Kt[j0 + f][d0];
+                *(float4*) &qj[f][0] = *(const float4 *) (qbase + d0 + (int64_t) TK(j0 + f) * sq2);
 #pragma unroll
             for (int e = 0; e < 4; ++e)
 #pragma unroll
@@ -270,7 +264,7 @@ gdn_chunked_kkt_cuda(
             for (int f = 0; f < 4; ++f) {
                 const int i = i0 + e, j = j0 + f;
                 if (i <= j)
-                    KQ_sc[off + (int64_t) j * (j + 1) / 2 + i] = KQ[e][f];
+                    KQ_sc[off + (int64_t) j * (j + 1) / 2 + i] = scale * KQ[e][f];
             }
     }
 #undef TK
@@ -584,7 +578,7 @@ static void launch_gdn_chunked(
     const int64_t hg_ratio = H / H_k;
 
     if (getenv("GDN_DBG_SKIP_KKT") == nullptr) {
-        dim3 grid((unsigned) n_chunks, (unsigned) H_k, (unsigned) n_seqs);
+        dim3 grid((unsigned) n_chunks, (unsigned) H, (unsigned) n_seqs);
         const dim3 block(GDN_CHUNKED_NTHREADS);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
         ggml_cuda_kernel_launch(gdn_chunked_kkt_cuda<S_v>, launch_params,
