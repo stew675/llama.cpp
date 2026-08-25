@@ -587,7 +587,7 @@ static void launch_gdn_chunked(
     }
     if (getenv("GDN_DBG_SKIP_SCAN") != nullptr) return;
     {
-        dim3 grid((unsigned) (S_v / GDN_CHUNKED_VT), (unsigned) H, (unsigned) n_seqs);
+        dim3 grid((unsigned) (S_v / GDN_CHUNKED_VT), (unsigned) (H_k * hg_ratio), (unsigned) n_seqs);
         const dim3 block(GDN_CHUNKED_NTHREADS);
         const uint3 neqk1_magic = init_fastdiv_values(neqk1);
         const uint3 rq3_magic   = init_fastdiv_values(rq3);
