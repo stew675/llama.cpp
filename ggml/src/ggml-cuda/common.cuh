@@ -1546,6 +1546,7 @@ struct ggml_backend_cuda_context {
     // streams never read unsynchronized data.
     struct q8_1_cache_entry {
         const ggml_tensor * src1 = nullptr;
+        const void * data = nullptr;
         int stream_no = 0;
         int64_t ne10 = 0;
         int64_t ne11 = 0;
@@ -1574,7 +1575,7 @@ struct ggml_backend_cuda_context {
                           int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
                           int64_t s11, int64_t s12, int64_t s13, bool & found) {
         for (const auto & e : q8_1_cache) {
-            if (e.src1 == src1 && e.stream_no == stream_no &&
+            if (e.src1 == src1 && e.data == src1->data && e.stream_no == stream_no &&
                 e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
                 e.s11 == s11 && e.s12 == s12 && e.s13 == s13) {
                 found = true;
@@ -1594,7 +1595,7 @@ struct ggml_backend_cuda_context {
             q8_1_arena_size = new_size;
         }
         void * data = q8_1_arena + q8_1_arena_pos;
-        q8_1_cache.push_back({ src1, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
+        q8_1_cache.push_back({ src1, src1->data, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
         q8_1_arena_pos += size;
         return data;
     }
