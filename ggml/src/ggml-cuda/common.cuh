@@ -1496,6 +1496,27 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Cache key for the per-context CUDA/HIP graph cache: one graph per
+// (first graph node, token count).  Decode (1 token) and the speculative verify
+// widths (2..MMVQ_MAX_BATCH_SIZE) therefore each keep their own captured graph
+// instead of invalidating one another's warmup when the batch width changes.
+struct ggml_cuda_graph_key {
+    const void * first_node_ptr;
+    int64_t      n_tokens;
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return first_node_ptr == other.first_node_ptr && n_tokens == other.n_tokens;
+    }
+};
+
+struct ggml_cuda_graph_key_hash {
+    size_t operator()(const ggml_cuda_graph_key & k) const {
+        size_t h = std::hash<const void *>()(k.first_node_ptr);
+        h ^= std::hash<int64_t>()(k.n_tokens) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1509,13 +1530,14 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Map from (first_node_ptr, token count) to cuda_graph - allows multiple graphs per context
+    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe), and a separate
+    // graph per decode/verify width.
+    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1530,9 +1552,9 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
