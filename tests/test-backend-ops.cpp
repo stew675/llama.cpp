@@ -1535,14 +1535,64 @@ struct test_case {
                 }
             }
 
+            if (getenv("GDN_DBG_SAVE") != nullptr && (int64_t) f1.size() > 100000) {
+                FILE * ff = fopen("/tmp/gdn_dev.bin", "wb");
+                if (ff) { fwrite(f1.data(), sizeof(float), f1.size(), ff); fclose(ff); }
+            }
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
-                //for (int i = 0; i < (int) f1.size(); i++) {
-                //    printf("%5d %9.6f %9.6f, diff = %9.6f\n", i, f1[i], f2[i], f1[i] - f2[i]);
-                //}
-                //printf("\n");
-                //exit(1);
+                // GDN bf16 debug: dump the first mismatches with indices + a diff histogram
+                if (getenv("GDN_DBG_DUMP") != nullptr) {
+                    // find the 16 largest |diff| elements and print them with indices
+                    struct dg { int idx; float d; } top[16];
+                    for (int i = 0; i < 16; ++i) top[i].d = -1.0f;
+                    for (int i = 0; i < (int) f1.size(); ++i) {
+                        const float d = fabsf(f1[i] - f2[i]);
+                        for (int j = 0; j < 16; ++j) {
+                            if (d > top[j].d) {
+                                for (int k = 15; k > j; --k) top[k] = top[k-1];
+                                top[j] = {i, d};
+                                break;
+                            }
+                        }
+                    }
+                    printf("\n  largest diffs (attn size %d):", (int) f1.size() / 2);
+                    for (int j = 0; j < 16; ++j)
+                        printf("\n  [%d] dev=%.6f cpu=%.6f", top[j].idx, f1[top[j].idx], f2[top[j].idx]);
+                    if (getenv("GDN_DBG_DUMP") != nullptr) {
+                        // top attn diffs (first half of the tensor)
+                        const int64_t nattn2 = (int64_t) f1.size() / 2;
+                        struct dg2 { int64_t idx; float d; } top2[8];
+                        for (int i = 0; i < 8; ++i) top2[i].d = -1.0f;
+                        for (int64_t i = 0; i < nattn2; ++i) {
+                            const float d = fabsf(f1[i] - f2[i]);
+                            for (int j = 0; j < 8; ++j)
+                                if (d > top2[j].d) {
+                                    for (int k = 7; k > j; --k) top2[k] = top2[k-1];
+                                    top2[j] = {i, d};
+                                    break;
+                                }
+                        }
+                        printf("\n  top attn diffs:");
+                        for (int j = 0; j < 8; ++j)
+                            printf("\n  [%lld] dev=%.6f cpu=%.6f", (long long) top2[j].idx, f1[top2[j].idx], f2[top2[j].idx]);
+                    }
+                    // attn vs state stats: max |dev|, max |cpu| per part
+                    const int64_t nattn = (int64_t) f1.size() / 2;
+                    float ma_dev_a = 0, ma_cpu_a = 0, ma_dev_s = 0, ma_cpu_s = 0;
+                    for (int64_t i = 0; i < nattn; ++i) {
+                        ma_dev_a = fmaxf(ma_dev_a, fabsf(f1[i]));
+                        ma_cpu_a = fmaxf(ma_cpu_a, fabsf(f2[i]));
+                    }
+                    for (int64_t i = nattn; i < (int64_t) f1.size(); ++i) {
+                        ma_dev_s = fmaxf(ma_dev_s, fabsf(f1[i]));
+                        ma_cpu_s = fmaxf(ma_cpu_s, fabsf(f2[i]));
+                    }
+                    printf("\n  attn: max|dev|=%.4f max|cpu|=%.4f | state: max|dev|=%.4f max|cpu|=%.4f\n",
+                           ma_dev_a, ma_cpu_a, ma_dev_s, ma_cpu_s);
+                    printf("\n");
+                }
                 ud->ok = false;
             }
             return true;
@@ -4721,6 +4771,25 @@ struct test_gated_delta_net : public test_case {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
+    double max_nmse_err() override {
+        // The bf16/WMMA chunked path is the DEFAULT for S_v == 128 prefill on RDNA3/RDNA4
+        // (opt out: GGML_CUDA_GDN_CHUNKED_BF16=0). It is not bit-exact (bf16 operands, fp32
+        // accumulation) -- ~1.3e-5 op NMSE with realistic gates -- so only the cases the bf16
+        // kernel actually runs get the relaxed gate (S_v == 128, non-KDA, K == 1, prefill);
+        // the sequential/keep-rs/KDA cases stay tight (they run the fp32 kernels).
+        // The gates are realistic (-0.5 .. -1e-4); the old -20 .. range decayed the state to
+        // zero and hid the n_seqs > 1 `A_sc` aliasing bug fixed in r30.
+        if (head_size == 128 && !kda && K == 1 && n_seq_tokens > 1) {
+            const char * env  = getenv("GGML_CUDA_GDN_CHUNKED");
+            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
+            if ((env == nullptr || strcmp(env, "0") != 0) &&
+                (envb == nullptr || strcmp(envb, "0") != 0)) {
+                return 1e-4;
+            }
+        }
+        return test_case::max_nmse_err();
+    }
+
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
@@ -4754,7 +4823,7 @@ struct test_gated_delta_net : public test_case {
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K, /*n_rs_batch=*/1);
         return out;
     }
 
@@ -4762,7 +4831,7 @@ struct test_gated_delta_net : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
+                init_tensor_uniform(t, -0.5f, -1e-4f);   // realistic gates: the state must persist (the old -20.. range decayed it to 0 and hid n_seqs > 1 bugs)
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
@@ -4818,7 +4887,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
 
-        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K, /*n_rs_batch=*/1);
         ggml_set_name(gdn_out, "gdn_out");
 
         // attn scores view (first part of the gdn output)
@@ -4862,6 +4931,23 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+
+    double max_nmse_err() override {
+        // the bf16/WMMA chunked kernel is the S_v == 128 default (opt out:
+        // GGML_CUDA_GDN_CHUNKED_BF16=0) and is not bit-exact (~1e-5 NMSE), so the cases it
+        // actually runs get the same relaxed gate as test_gated_delta_net; the sequential
+        // cases stay tight.  Same threshold logic as the dispatch: max(K, 16, n_rs_batch).
+        const int64_t chunk_min = K > 16 ? K : 16;
+        if (head_size == 128 && n_seq_tokens > chunk_min) {
+            const char * env  = getenv("GGML_CUDA_GDN_CHUNKED");
+            const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
+            if ((env == nullptr || strcmp(env, "0") != 0) &&
+                (envb == nullptr || strcmp(envb, "0") != 0)) {
+                return 1e-4;
+            }
+        }
+        return test_case::max_nmse_err();
+    }
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -11372,6 +11458,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2));
+    // fused chunked prefill (n_seq_tokens > 1): padded chunk, exact chunk, and GQA strides
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 130, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  128, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,  100, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 16,  65, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 300, 2, 2, true));
+    // model-shaped prefill (Qwen3.8-27B: H_k=16, S_v=128, H_v=48) for perf sweeps
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  128, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  256, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 2, 3));
+    // model-exact: H_k=16, S_v=128, 4 chunks x 2 seqs, v_repeat=2 (the 4B Qwen3.5 prefill op)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  256, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  256, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
@@ -11415,6 +11516,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    // bf16-eligible fused-cache (S_v == 128), the model's real prefill path (cache != nullptr).
+    // K == 1 is the chunked case the fused kernel writes in full.  A long prefill with K > 1 only
+    // guarantees slot 0 (the older slots are caller-owned: a batch longer than max(K, 16,
+    // n_rs_batch) is never rolled back into, see ggml_cuda_op_gated_delta_net_impl), so the K > 1
+    // snapshot path is covered with a sequential batch instead.
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 256, 2, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128, 256, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 16, 128,   8, 1, 2));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
@@ -11899,6 +12008,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // Qwen3.8-27B-shaped: H_k=16, H_v=48 (v_repeat=3), S_v=128, scalar gates (non-KDA)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  64, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 2, 3));
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
