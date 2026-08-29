@@ -1006,6 +1006,36 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     cp_async_wait_all();
                 }
                 __syncthreads();
+
+                // gfx11 signed-zero leak: a KV row that is masked (P == +0.0) for every query
+                // column of this block still feeds its V to the WMMA, where the masked cell's
+                // x + (-0.0) products are accumulated inexactly on gfx11 and leak the cell's
+                // (possibly stale/freed) content into the output. Never let such a row's V
+                // reach the multiply: zero it after it is staged, using the mask tile that is
+                // already in shared memory. Only the plain (non-swizzled) layout is handled;
+                // the swizzled layout is NVIDIA-only where the hardware does not exhibit the
+                // leak. V_is_K_view (MLA) reuses K data as V and needs the K tile zeroed
+                // instead - not implemented here (RDNA caps route those heads to the tile kernel).
+                if constexpr (!V_is_K_view && !swz_V) {
+                    if (ncols2 > 1 || mask_h) { // tile_mask is valid iff the mask-add ran
+                        const int tid = threadIdx.y * warp_size + threadIdx.x;
+#pragma unroll
+                        for (int i = tid; i < nbatch_fa; i += nwarps*warp_size) {
+                            bool dead = true;
+#pragma unroll
+                            for (int j = 0; j < ncols1; ++j) {
+                                dead = dead && (__half2float(tile_mask[j*(nbatch_fa + 8) + i]) <= -1e30f);
+                            }
+                            if (dead) {
+                                half2 * const row = tile_V + i*stride_tile_V;
+                                for (int k = 0; k < i0_diff/2; ++k) {
+                                    row[k] = make_half2(0.0f, 0.0f);
+                                }
+                            }
+                        }
+                        __syncthreads();
+                    }
+                }
             }
         }
         const half2 * tile_V_i = !V_is_K_view || i0_stop > 2*nbatch_K2 ? tile_V : tile_V + i0_start/2;
