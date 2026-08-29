@@ -81,6 +81,21 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static bool ggml_backend_dev_is_cuda(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    const auto type = ggml_backend_dev_type(dev);
+    if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return false;
+    }
+
+    const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+
+    return name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0);
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -96,6 +111,18 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    // Only a tensor split distributes a single attention op across devices; tell the HIP FA chooser
+    // so it can pick a per-GPU-bandwidth-friendly kernel config instead of the whole-card one.
+    {
+        int n_cuda_dev = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            if (ggml_backend_dev_is_cuda(ggml_backend_dev_get(i))) {
+                n_cuda_dev++;
+            }
+        }
+        ggml_set_fa_tensor_parallel(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1);
+    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
