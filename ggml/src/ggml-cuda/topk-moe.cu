@@ -14,6 +14,14 @@ struct topk_moe_config {
 };
 
 // Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
+//
+// Must be bit-identical to the generic softmax -> block_reduce chain, otherwise whether this
+// fusion fires (an address-overlap decision in ggml_cuda_check_fusion_memory_ranges) changes the
+// model output.  The generic soft_max_f32 kernel launches one thread per column (a power of two
+// >= ncols, capped at 1024) and reduces with a per-warp butterfly followed by a cross-warp
+// butterfly.  Here lane l holds column `l + i*WARP_SIZE`, so the generic per-warp phase is exactly
+// warp_reduce_sum(vals[i]); the cross-warp phase then re-reduces those per-warp results.  The
+// fused kernel used to do a single flat warp reduction, which differs by ULPs.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
     float max_val = -INFINITY;
@@ -27,25 +35,37 @@ __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const in
         }
     }
 
+    // max is associative and exact, so any reduction order gives the same result
     max_val = warp_reduce_max(max_val);
 
-    float sum = 0.f;
+    if (experts_per_thread == 1) {
+        // the generic kernel uses a single warp for ncols <= WARP_SIZE: one warp reduction
+        const bool  active  = !use_limit || (lane < limit);
+        vals[0]             = active ? expf(vals[0] - max_val) : 0.f;
+        const float sum     = warp_reduce_sum(vals[0]);
+        const float inv_sum = 1.0f / sum;
 
-#pragma unroll
-    for (int i = 0; i < experts_per_thread; i++) {
-        const int  idx    = lane + i * WARP_SIZE;
-        const bool active = !use_limit || (idx < limit);
         if (active) {
-            const float val = expf(vals[i] - max_val);
-            vals[i]         = val;
-            sum += val;
-        } else {
-            vals[i] = 0.f;
+            vals[0] *= inv_sum;
+        }
+        return;
+    }
+
+    // phase 1: per "virtual warp" (the generic kernel's consecutive 32-column group)
+    float partial = 0.f;
+#pragma unroll
+    for (int w = 0; w < experts_per_thread; w++) {
+        const int   idx    = lane + w * WARP_SIZE;
+        const bool  active = !use_limit || (idx < limit);
+        vals[w]            = active ? expf(vals[w] - max_val) : 0.f;
+        const float rw     = warp_reduce_sum(vals[w]);
+        if (lane == w) {
+            partial = rw;
         }
     }
 
-    sum = warp_reduce_sum(sum);
-
+    // phase 2: re-reduce the per-warp results (lanes >= experts_per_thread contribute 0)
+    const float sum     = warp_reduce_sum(lane < experts_per_thread ? partial : 0.f);
     const float inv_sum = 1.0f / sum;
 
 #pragma unroll
@@ -255,13 +275,15 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 
     if (config.with_norm) {
-        wt_sum              = warp_reduce_sum(wt_sum);
-        wt_sum              = max(wt_sum, clamp_val);
-        const float inv_sum = 1.0f / wt_sum;
-
-        for (int i = 0; i < experts_per_thread; i++) {
-            output_weights[i] *= inv_sum;
+        if (n_expert_used <= WARP_SIZE) {
+            // match the generic sum_rows -> reduce_rows_f32 order exactly: lane j holds the
+            // weight of selection j in output_weights[0] (all k < WARP_SIZE rounds write index 0),
+            // and the generic kernel reduces with a warp butterfly over lanes 0..k-1
+            wt_sum = warp_reduce_sum(threadIdx.x < n_expert_used ? output_weights[0] : 0.f);
+        } else {
+            wt_sum = warp_reduce_sum(wt_sum);
         }
+        wt_sum = max(wt_sum, clamp_val);
     }
 
     if (config.delayed_softmax) {
@@ -272,7 +294,11 @@ __global__ void topk_moe_cuda(const float *         logits,
     for (int i = 0; i < experts_per_thread; i++) {
         const int idx = i * WARP_SIZE + threadIdx.x;
         if (idx < n_expert_used) {
-            weights[idx] = output_weights[i] * scale_val;
+            float w = output_weights[i];
+            if (config.with_norm) {
+                w = w / wt_sum; // generic div (weights / weights_sum), not a reciprocal multiply
+            }
+            weights[idx] = w * scale_val;
         }
     }
 }

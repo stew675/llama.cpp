@@ -393,8 +393,16 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            // iq4_nl is a 32-value sub-block type: a row that is a whole number of QK_K
+            // super-blocks takes the super-block kernel, any other width (e.g. the qwen4exp
+            // indexer key row, 128) takes the per-block dequantize_q4_nl path.
+            if (ne00 % QK_K == 0) {
+                get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            } else {
+                get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            }
             break;
         case GGML_TYPE_IQ4_XS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,

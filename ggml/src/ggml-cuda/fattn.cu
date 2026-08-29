@@ -501,6 +501,24 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
     FATTN_VEC_CASES_ALL_D(BF16, BF16)
 
+    // iq4_nl pairs (not part of upstream's checked-in cross product; shipped with this enablement)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, F16)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q4_0)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q4_1)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q5_0)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q5_1)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q8_0)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, BF16)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, IQ4_NL)
+
+    FATTN_VEC_CASES_ALL_D(F16,  IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q4_0, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q4_1, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q5_0, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q5_1, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q8_0, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(BF16, IQ4_NL)
+
     return nullptr;
 }
 
@@ -532,7 +550,11 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
-// K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
+// KV cache types that at least one of the flash-attention families reachable
+//   below can consume: the tile/mma-f16 kernels stage K/V through
+//   ggml_get_to_fp16_cuda (q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl included), and the
+//   vec kernel reads K/V natively per (K,V) instance selected by
+//   GGML_CUDA_FA_QUANTS (the iq4_nl pairs are shipped alongside this enablement).
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -542,6 +564,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q8_0:
             return true;
         default:
@@ -736,28 +759,31 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // GGML_CUDA_FA_WMMA_MAX_HEAD overrides the per-arch cap (experiment/escape hatch).
     const char * wmma_max_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
     const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 256 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
+    // Speculative verify batches (n_q = n_draft+1 <= 8) must stay on the tile
+    // kernel: decode (n_q = 1) never uses WMMA, so a WMMA verify batch would
+    // produce different logits than decode (GREEDY-PURITY band invariant).
+    // Upstream's head>128 gqa-eff threshold (16) is kept on top.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
-            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
+            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16) && Q->ne[1] > 8) {
         // The kernel instantiates logit_softcap only for heads 128/256/512.
         if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }
     }
 
-    // If there are no tensor cores available, use the generic tile kernel:
-    if (can_use_vector_kernel) {
-        if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-            if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
-            }
-        } else {
-            if (Q->ne[1] <= 2) {
-                return BEST_FATTN_KERNEL_VEC;
-            }
-        }
-    }
+    // If there are no tensor cores available, the generic tile kernel is used.
+    //
+    // The former VEC fallback here (upstream: VEC for n_q == 1 with no GQA opt, and for
+    // n_q <= 2 with a quantized K/V) split the decode/verify band across two kernel families:
+    // measured on gfx1201 with q8_0/q4_0 K/V, n_q = 1,2 took VEC and n_q >= 3 took TILE, and
+    // since the two families order the online-softmax/PV reduction differently, n_q = 1
+    // disagreed bit-wise with every verify width -- so plain greedy decode and spec-draft-mtp
+    // verify produced different tokens with a quantized KV cache (greedy-purity invariant,
+    // GREEDY-PURITY.md).  Both conditions are always inside the n_q <= 8 band, so removing
+    // them only changes n_q <= 2 (prefill always fell through to TILE) and makes the whole
+    // band use TILE, matching the WMMA guard above and the ntiles_dst_eff fix in launch_fattn.
+    // Cost, measured 3x gfx1201, q8_0 KV: tg128 -0.5..-0.9%, pp512 -0.2% (within noise on the
+    // 4B, -0.2% on the 27B); MTP acceptance is bit-identical (the verify widths did not move).
     return BEST_FATTN_KERNEL_TILE;
 }
 
