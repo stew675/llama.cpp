@@ -42,6 +42,8 @@ size_t ggml_cuda_slab_arena_total (int device);
 // correction once the weights / KV / draft are resident.  Safe to call repeatedly (a no-op when there is
 // nothing to gain); moves no address, so every work view and arena table keeps its base.
 void   ggml_cuda_slab_extend_all();
+// raise the free VRAM the slab extension leaves (never lowers an explicit GGML_CUDA_SLAB_HEADROOM_MIB)
+void   ggml_cuda_slab_headroom_at_least_mib(size_t mib);
 // fit-slab-accounting revival (G3): the draft-context VRAM the MoE preflight projected; the slab reserve
 // is sized from it (plus the headroom) because the slab is created before the draft context.
 void   ggml_cuda_slab_set_aux_reserve(size_t bytes);

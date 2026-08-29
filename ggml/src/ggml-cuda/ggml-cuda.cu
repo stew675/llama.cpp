@@ -761,13 +761,20 @@ static size_t ggml_cuda_slab_min_arena_bytes() {
 // Session 5), which would allow this default to go back down.
 #define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 4096
 
+static size_t g_slab_headroom_min_mib = 0;
+void ggml_cuda_slab_headroom_at_least_mib(size_t mib) {
+    g_slab_headroom_min_mib = mib;
+}
 static size_t ggml_cuda_slab_headroom_bytes() {
     static size_t mib = SIZE_MAX;
+    static bool   env_set = false;
     if (mib == SIZE_MAX) {
         const char * env = getenv("GGML_CUDA_SLAB_HEADROOM_MIB");
-        mib = env != NULL ? (size_t) atoll(env) : GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT;
+        env_set = env != NULL;
+        mib = env_set ? (size_t) atoll(env) : GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT;
     }
-    return mib * 1024 * 1024;
+    const size_t eff = (!env_set && g_slab_headroom_min_mib > mib) ? g_slab_headroom_min_mib : mib;
+    return eff * 1024 * 1024;
 }
 
 // Public MiB form, for the cache's own fallback message.

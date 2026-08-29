@@ -1808,6 +1808,22 @@ void alloc_all_locked() {
     // the first moment the weights / KV / draft are all resident, so measure what they did NOT need and
     // hand it to the arena before sizing.  Without it that VRAM sits idle (~1.9 GiB/card measured) even
     // though the cache is capped by its region.
+    // -sm layer (every table unsplit, tables on more than one device): each device runs its layers' attention over
+    // the whole context, so leave 6 GiB, not the default, free after the extension (255k needle: the later-layer
+    // device ran out of VRAM with 4 GiB of headroom).
+    {
+        bool all_unsplit = !g_tables.empty();
+        int  dev_mask = 0;
+        for (const table_t & t : g_tables) {
+            all_unsplit = all_unsplit && t.split_axis < 0;
+            if (t.device >= 0 && t.device < 31) {
+                dev_mask |= 1 << t.device;
+            }
+        }
+        if (all_unsplit && (dev_mask & (dev_mask - 1)) != 0) {
+            ggml_cuda_slab_headroom_at_least_mib(6144);
+        }
+    }
     ggml_cuda_slab_extend_all();
     // Fail-soft / --fit (§3.1 #5, issue #33): the arena is the LOWEST-priority VRAM consumer.  Size it
     // from what is actually free NOW - after --fit, the compute-graph reserve and the KV cache have all
