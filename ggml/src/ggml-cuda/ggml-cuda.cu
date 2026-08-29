@@ -3813,14 +3813,53 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+// The batch token count a CUDA/HIP graph carries.  The first node's ne[1] is NOT a
+// reliable token count: with expert offload (-ncmoe) the scheduler splits the graph
+// around the CPU-resident experts, so a one-token decode split routinely starts with
+// an expert-path tensor of shape [n_ff, n_expert_used, n_tokens] and ne[1] ==
+// n_expert_used (10) even at one token.  Read it from the first op that actually
+// carries it instead:
+//   - MUL_MAT_ID  -> result is [n_out, n_expert_used, n_tokens], so ne[2] is n_tokens
+//   - MUL_MAT     -> result is [src0->ne[1], src1->ne[1], ...], so src1->ne[1] is n_tokens
+// The MUL_MAT arm requires a constant, unbatched weight (src0 is op NONE and 2-D) so the
+// probe reads a layer's activation batch; attention score matmuls are skipped.
+static int64_t ggml_cuda_graph_n_tokens(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            return node->ne[2];
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr &&
+            node->src[0]->op == GGML_OP_NONE && node->src[0]->ne[2] == 1) {
+            return node->src[1]->ne[1];
+        }
+    }
+
+    // No weight matmul found in this split: fall back to the first node's second dim.
+    return cgraph->n_nodes > 0 ? cgraph->nodes[0]->ne[1] : 0;
+}
+
+// One graph per (first node, token count): decode and each speculative verify width keep
+// their own captured graph instead of invalidating one another's warmup.
+static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    return ggml_cuda_graph_key { cgraph->nodes[0], ggml_cuda_graph_n_tokens(cgraph) };
+}
+
+// Whether a CUDA/HIP graph should skip the graph-capture path.  Only a true PRE-FILL (a
+// varying ubatch, where capture never amortises) is skipped; single-token decode and the
+// spec-verify widths (n_tokens <= MMVQ_MAX_BATCH_SIZE, a fixed shape every step) keep HIP
+// graph replay.  GGML_CUDA_DISABLE_VERIFY_GRAPHS=1 restores the pre-r20 behaviour where
+// every multi-token graph skipped the graph path.
+static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
+    static const bool verify_graphs_off = getenv("GGML_CUDA_DISABLE_VERIFY_GRAPHS") != nullptr;
+    return ggml_cuda_graph_n_tokens(cgraph) > (verify_graphs_off ? 1 : MMVQ_MAX_BATCH_SIZE);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -3859,8 +3898,30 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+#ifdef GGML_USE_HIP
+    // HIP/ROCm <= 10.0 leaks device memory in hipGraphExecUpdate: the driver's
+    // GraphKernelArgManager bump-allocates a fresh kernel-argument slot on every update
+    // and only reclaims slots when the exec is destroyed (ROCm/rocm-systems#10713; driver
+    // fix in PR #11434).  A split-moe decode recaptures the graph on the order of once per
+    // few tokens, so a long-lived exec grows by a few KB per token.  Destroying and
+    // re-instantiating is the only reclaim path that exists today and was measured flat
+    // over a soak; it also cannot leave a stale executable behind, which the update path
+    // can silently do when the driver drops an error.  Cheap in practice: this runs only
+    // on the recapture path, not per token.  Set GGML_HIP_GRAPH_FORCE_UPDATE=1 to take the
+    // update path anyway (e.g. on a ROCm that has the driver fix).
+    static const bool force_update = getenv("GGML_HIP_GRAPH_FORCE_UPDATE") != nullptr;
+    if (!force_update) {
+        if (graph->instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+            graph->instance = nullptr;
+        }
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        return;
+    }
+#endif // GGML_USE_HIP
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -6767,7 +6828,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // per-op timing instrumentation (env-gated, diagnostic only)
@@ -7067,7 +7128,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
@@ -7094,7 +7155,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
-    const void * graph_key = nullptr;
+    ggml_cuda_graph_key graph_key = {};
 
     // op timing instruments each node with stream events, which is not possible during capture
     const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
@@ -7108,6 +7169,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (!op_timing && graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
+            // PRE-FILL graphs use varying ubatch sizes, so each is a separate graph
+            // key and CUDA-graph capture never amortizes: the per-call update_required
+            // probe + failed capture is pure overhead. Measured pp512 is ~6.7% faster
+            // with graphs OFF. Only single-token decode (stable shape) benefits from
+            // graph replay. Skip the whole graph path (incl. the update_required probe)
+            // for multi-token graphs. Note this must not use nodes[0]->ne[1] directly:
+            // a split-MoE decode split can start on an expert tensor whose ne[1] is
+            // n_expert_used (see ggml_cuda_graph_is_multi_token).
+            if (ggml_cuda_graph_is_multi_token(cgraph)) {
+                use_cuda_graph = false;
+            } else {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
@@ -7130,6 +7202,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+            } // else: not prefill
         }
     }
 #endif // USE_CUDA_GRAPH
@@ -7314,7 +7387,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
