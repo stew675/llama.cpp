@@ -6849,15 +6849,17 @@ struct test_argsort : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
     ggml_sort_order order;
+    const bool ties;
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne, order);
+        return VARS_TO_STR4(type, ne, order, ties);
     }
 
     test_argsort(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {16, 10, 10, 10},
-            ggml_sort_order order = GGML_SORT_ORDER_ASC)
-        : type(type), ne(ne), order(order) {}
+            ggml_sort_order order = GGML_SORT_ORDER_ASC,
+            bool ties = false)
+        : type(type), ne(ne), order(order), ties(ties) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
@@ -6882,11 +6884,13 @@ struct test_argsort : public test_case {
                 std::shuffle(data.begin(), data.end(), rng);
                 ggml_backend_tensor_set(t, data.data(), 0, ne[0]*ne[1]*ne[2]*ne[3] * sizeof(int));
             } else if (t->type == GGML_TYPE_F32) {
-                // initialize with unique values to avoid ties
+                // unique values unless `ties` is set: a duplicate-heavy row
+                // exercises the deterministic index tie-break (the fused MoE
+                // router depends on it being stable and CPU-identical)
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     std::vector<float> data(t->ne[0]);
                     for (int i = 0; i < t->ne[0]; i++) {
-                        data[i] = i;
+                        data[i] = ties ? (float) (i / 4) : (float) i;
                     }
                     std::shuffle(data.begin(), data.end(), rng);
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
@@ -9456,6 +9460,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // iq4_nl is a 32-value sub-block type: exercise row widths that are not a whole number of
+    // QK_K super-blocks (the qwen4exp indexer key row is 128) - the sub-block get_rows path.
+    for (int n : {32, 128, 160, 224}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 1, 1, false, false));
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
@@ -10975,6 +10984,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2049, 2, 1, 3}, order));
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2, 8, 8192, 1}, order)); // bailingmoe2 (group selection)
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
+        // duplicate values spanning more than one bitonic block: the index tie-break must be
+        // deterministic and match the CPU (fused MoE router determinism, GREEDY-PURITY 20/31)
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 8, 1, 1}, order, /*ties=*/true));
+        test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {4096, 2, 1, 1}, order, /*ties=*/true));
     }
 
     for (int n = 1; n < 5; ++n) {

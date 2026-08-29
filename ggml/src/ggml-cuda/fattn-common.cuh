@@ -300,6 +300,48 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
     return sum;
 }
 
+// K side of the vector (per-(K,V)-pair) flash-attention kernel for iq4_nl.  Same index
+//   arithmetic and scale handling as q4_0, but the 4-bit codes are values in kvalues_iq4nl
+//   rather than q-8, so they must be expanded through the table before the dp4a (the same
+//   idiom the mmvq iq4_nl kernel uses); there is no bias term to correct for.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iq4_nl(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_iq4_nl * K_iq4_nl = (const block_iq4_nl *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib    = k_KQ /  QI8_1;
+        const int iqs4  = k_KQ %  QI4_0;
+        const int shift = k_KQ & (QI8_1/2);
+
+        int v;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_iq4_nl[ib].qs + sizeof(int)*iqs4);
+        v = (v >> shift) & 0x0F0F0F0F;
+
+        // .x holds the looked-up values of the low nibbles (the four elements this
+        //   thread's int covers), .y the high ones (the +QK4_NL/2 half), which `shift`
+        //   has already zeroed here - so only .x is needed, exactly as many ints as the
+        //   q4_0 vector dot feeds to dp4a.
+        const int vq = get_int_from_table_16(v, kvalues_iq4nl).x;
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+
+        const int sumi = ggml_cuda_dp4a(vq, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += __half2float(K_iq4_nl[ib].d) * sumi * Q_ds.x;
+    }
+
+    return sum;
+}
+
 template <int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -589,6 +631,49 @@ static __device__ __forceinline__ void dequantize_V_q5_1(const void * __restrict
     }
 }
 
+// iq4_nl keeps the q4_0/q5_0 nibble layout (nibble j of the block carries elements j and
+//   j + QK4_NL/2) but maps each 4-bit code through kvalues_iq4nl instead of the q-8 offset
+//   and stores no bias, so the index arithmetic below is q4_0's and only the value map
+//   differs.  kvalues_iq4nl is a __device__ table (ggml-common.h), already read by the mmvq
+//   and mmq iq4_nl kernels.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_iq4_nl(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_iq4_nl * x = (const block_iq4_nl *) vx;
+
+    const int64_t ib    =  i0            /  QK4_NL;
+    const int     iqs   =  i0            % (QK4_NL/2);
+    const int     shift = (i0 % QK4_NL) / (QK4_NL/2);
+
+    int q;
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
+    q >>= 4*shift;
+    q &= 0x0F0F0F0F;
+
+    const uint8_t * q8 = (const uint8_t *) &q;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d = __half2half2(x[ib].d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d * make_half2(kvalues_iq4nl[q8[l0 + 0]], kvalues_iq4nl[q8[l0 + 1]]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        const float d = x[ib].d;
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * kvalues_iq4nl[q8[l]];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q8_0 * x = (const block_q8_0 *) vx;
@@ -636,6 +721,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_IQ4_NL) {
+        return vec_dot_fattn_vec_KQ_iq4_nl<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else {
@@ -658,6 +745,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_IQ4_NL) {
+        return dequantize_V_iq4_nl<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else {
