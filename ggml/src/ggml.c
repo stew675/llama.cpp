@@ -5567,6 +5567,17 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+// Frontend hint for the CUDA/HIP FA chooser (see ggml.h).  Process-wide; set once per context.
+static bool g_fa_tensor_parallel = false;
+
+void ggml_set_fa_tensor_parallel(bool enable) {
+    g_fa_tensor_parallel = enable;
+}
+
+bool ggml_get_fa_tensor_parallel(void) {
+    return g_fa_tensor_parallel;
+}
+
 void ggml_flash_attn_ext_set_n_kv_max(
         struct ggml_tensor * a,
         int32_t              n_kv_max) {

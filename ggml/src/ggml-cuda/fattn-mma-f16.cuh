@@ -127,7 +127,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 }
 
-static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna(const int DKQ, const int DV, const int ncols) {
+static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_rdna(const int DKQ, const int DV, const int ncols, const bool is_rdna3_5) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64,  8, 128, 2,  64,  32,  32,  32, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 16, 128, 2,  64,  32,  32,  32, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE( 64,  64, 32, 128, 2,  64,  32,  32,  32, 1, true);
@@ -160,20 +160,27 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 256, 2,  64, 128, 128,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
+    // Strix Halo (gfx1151) tuned row ("B's halo row", locally the `halo` machine): half the KV/V
+    // tile with Q_in_reg=false.  Kept for RDNA3_5 where it was tuned, but it is the wrong shape for
+    // the discrete cards -- it costs ~1.5x per attention cell on gfx1201 and ~11% at pp150k, so
+    // RDNA4/RDNA3_0 take upstream's #28102 config below.
+    if (is_rdna3_5 && DKQ == 256 && DV == 256 && ncols == 64) {
+        return fattn_mma_config(256, 1, 32, 128, 64, 64, 1, false);
+    }
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  64, 128, 128,  64, 1, true);
 
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 256, 2,  64,  96,  16,  16, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 256, 2,  64,  96,  16,  16, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 128, 2,  32, 128, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 16, 128, 2,  64,  96,  16,  16, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 32, 256, 2, 128,  96,  16,  16, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 128, 2,  32, 128, 128, 128, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512,  8, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16, 128, 3,  64,  96,  64, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128, 128, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 16, 128, 2,  64,  96,  16,  16, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 256, 2, 128,  96,  64,  16, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 128, 2,  32, 160, 128, 128, 1, true);
 
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
@@ -242,7 +249,7 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
         return ggml_cuda_fattn_mma_get_config_cdna(DKQ, DV, ncols);
     }
     if (amd_wmma_available(cc)) {
-        return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
+        return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, GGML_CUDA_CC_IS_RDNA3_5(cc));
     }
     GGML_ASSERT(volta_mma_available(cc));
     return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
@@ -258,7 +265,11 @@ static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(cons
 #elif defined(VOLTA_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_volta(DKQ, DV, ncols);
 #elif defined(AMD_WMMA_AVAILABLE)
-    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
+#if defined(RDNA3_5)
+    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, true);
+#else
+    return ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols, false);
+#endif
 #else
     GGML_UNUSED_VARS(DKQ, DV, ncols);
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
@@ -1814,7 +1825,9 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        // The tile_Q buffer is reused for the next k00 iteration, so all warps must sync here
+        // before its data is overwritten. With np > 1 only some warps read back, but they all write.
+        if (np > 1 || k00 + nbatch_combine < DV/2) {
             __syncthreads();
         }
     }
@@ -1901,7 +1914,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256) {
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 576) {
         NO_DEVICE_CODE;
         return;
     }
@@ -1987,6 +2000,11 @@ static __global__ void flash_attn_ext_f16(
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
+
+        // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
+        // have finished reading the combined results before any of them starts the next call.
+        // (With np == 1 the end-of-k00 barrier does not fire, so this is required for correctness.)
+        __syncthreads();
 
         kbc += iter_k;
         kbc -= kbc % iter_k;

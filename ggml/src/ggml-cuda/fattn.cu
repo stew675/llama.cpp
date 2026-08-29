@@ -245,8 +245,19 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
-    // On RDNA it is preferable to minimize wasted compute vs. duplicate I/O for the mask.
-    if (amd_wmma_available(cc)) {
+    // 2026-09-14: split-aware RDNA ncols2.  Whole-card attention is compute-bound and prefers stock's
+    // AMD rule (minimize wasted compute: ncols2 divides the GQA ratio); tensor-split attention is
+    // per-GPU bandwidth-bound and prefers the wider generic ncols2 (fewer K/V re-reads).  The frontend
+    // sets the hint (llama_context: split_mode == LLAMA_SPLIT_MODE_TENSOR with > 1 GPU).
+    // Measured on 27B head-256: single 703.7 vs 664.8, tensor 1152.3 vs 1219.9 t/s.
+    // 2026-09-18 (issue #30): that split-aware rule is RDNA4-tuned.  On RDNA3_0 (gfx1100) the wider
+    // generic ncols2 loses deep prefill under tensor split (2x RX 7900 XTX, 27B Q8_0 f16 pp100K:
+    // 667.5 vs stock 805.0 t/s = ~17%, crossing stock between 8K and 32K), while decode is
+    // unaffected.  RDNA3_0 therefore keeps the stock AMD rule (minimize wasted compute) regardless
+    // of the tensor-split hint; RDNA4/RDNA3_5 keep the split-aware behaviour.
+    const bool tensor_parallel = ggml_get_fa_tensor_parallel() && !GGML_CUDA_CC_IS_RDNA3_0(cc);
+
+    if (amd_wmma_available(cc) && !tensor_parallel) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
@@ -556,6 +567,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
@@ -697,9 +711,37 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+    // Extended 2026-08-28/29 to heads beyond 128 behind per-arch caps (RDNA4 576, RDNA3_0 256, RDNA3_5 320);
+    // upstream's 2026-09-11 gfx1201 FA tuning (16378d93f) supplies the head>128 batch threshold (16)
+    // and the head-256 config cases; the per-arch cap and softcap guard are kept on top.
+    // RDNA4 WMMA has higher throughput than RDNA3; heads up to 576 (incl. the DKQ != DV shapes)
+    // are enabled by default there. RDNA3_0 (gfx1100-1103) verified 2026-08-28: FLASH_ATTN_EXT
+    // 4568/4568 vs CPU ref, gemma-4-12b head 240 pp2048 2263 vs 2226 (+1.7%), harness +14.2%
+    // at hsk=256/nh=8/nb=256, all other >128 shapes within +/-1% (neutral). 2026-09-18 (issue #30):
+    // the 2026-09-14 RDNA prefill tuning overwrote the RDNA3_0-side config rows with RDNA4 #28102
+    // values, which turned head 512 from the 2026-08-28 'neutral' into a 3.5-10% loss vs the tile
+    // kernel (gemma-4-26B-A4B, head 512, pp2048 @ d98304: f16 791 vs 819 tile, bf16 776 vs 851 tile,
+    // q8_0 784 vs 773 tile) -- and the tile kernel is exactly stock's choice there.  The RDNA3_0 cap
+    // is therefore back at 256 (the head-256 WMMA row is itself a +44-52% deep-prefill win over tile
+    // on gfx1100, so it stays); RDNA4 (576) and RDNA3_5 (320) are untouched. RDNA3_5 (gfx115x)
+    // verified 2026-08-29 on gfx1151 (Strix Halo iGPU): FLASH_ATTN_EXT 4568/4568 vs CPU ref with
+    // the cap lifted; harness wins at hsk=256 (+34%) and hsk=320 (+36%) prefill, but hsk=512
+    // (-5.6%) and hsk=576 (-7.4%) regress, so the default cap is 320 (covers Gemma4 240-head,
+    // Mistral4 MLA 320; DeepSeek-MLA 576 keeps the tile kernel). End-to-end gemma-4-12b head 240
+    // pp2048 +3.6%, pp4096 +6.7%, decode neutral. Set GGML_CUDA_FA_WMMA_256=0 to force
+    // the WMMA path off for heads > 128 (e.g. to compare against the tile kernel), or
+    // GGML_CUDA_FA_WMMA_MAX_HEAD to override the cap.
+    const char * wmma_256_env = getenv("GGML_CUDA_FA_WMMA_256");
+    const bool wmma_256 = wmma_256_env == nullptr || std::atoi(wmma_256_env) != 0;
+    // GGML_CUDA_FA_WMMA_MAX_HEAD overrides the per-arch cap (experiment/escape hatch).
+    const char * wmma_max_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
+    const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 256 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
-        return BEST_FATTN_KERNEL_MMA_F16;
+        // The kernel instantiates logit_softcap only for heads 128/256/512.
+        if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
     }
 
     // If there are no tensor cores available, use the generic tile kernel:

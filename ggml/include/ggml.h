@@ -2512,6 +2512,11 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Frontend hint: attention ops are distributed across devices (tensor split / tensor parallel).
+    // The CUDA/HIP FA chooser uses it to select an RDNA WMMA ncols2 that is per-GPU-bandwidth
+    // friendly instead of compute-optimal for a whole card.  Set once per context; default false.
+    GGML_API void ggml_set_fa_tensor_parallel(bool enable);
+    GGML_API bool ggml_get_fa_tensor_parallel(void);
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
