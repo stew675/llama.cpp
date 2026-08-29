@@ -1567,6 +1567,65 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    // Op-offload H2D staging ring (issue #50 WIP).  Whole-tensor host->device uploads of offloaded
+    // weights are issued on a dedicated copy stream (stream 1) into a small ring of device slots, so
+    // the upload of one split overlaps the compute of the previous one.  stage_buffer grows a slot on
+    // demand and returns null on allocation failure (the caller then falls back to the in-order path).
+    static constexpr int H2D_STAGE_SLOTS = 16;
+    void * h2d_stage[H2D_STAGE_SLOTS]      = {};
+    size_t h2d_stage_size[H2D_STAGE_SLOTS] = {};
+    size_t h2d_stage_total                 = 0;
+
+    // Total device budget for the staging ring, GGML_SCHED_STAGE_MAX_MB MiB (default 2048).  A growth
+    // that would exceed it returns null and the scheduler stops staging (a partially staged ubatch is
+    // worse than either), so the feature can never turn a load into an OOM (block-15 arena precedent).
+    static size_t h2d_stage_budget() {
+        static const size_t budget = []() {
+            const char * e = getenv("GGML_SCHED_STAGE_MAX_MB");
+            const long mb = e ? atol(e) : 2048;
+            return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) 0;
+        }();
+        return budget;
+    }
+
+    void * h2d_stage_buffer(int slot, size_t size) {
+        GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
+        if (size > h2d_stage_size[slot]) {
+            const size_t old_size = h2d_stage_size[slot];
+            const size_t new_size = size + 512;
+            if (h2d_stage_total - old_size + new_size > h2d_stage_budget()) {
+                return nullptr;
+            }
+            if (h2d_stage[slot] != nullptr) {
+                CUDA_CHECK(cudaFree(h2d_stage[slot]));
+                h2d_stage[slot]      = nullptr;
+                h2d_stage_size[slot] = 0;
+            }
+            void * p = nullptr;
+            if (cudaMalloc(&p, new_size) != cudaSuccess) {
+                (void) cudaGetLastError(); // clear the sticky error
+                return nullptr;
+            }
+            h2d_stage[slot]      = p;
+            h2d_stage_size[slot] = new_size;
+            h2d_stage_total += new_size - old_size;
+        }
+        return h2d_stage[slot];
+    }
+
+    void h2d_stage_free() {
+        for (int s = 0; s < H2D_STAGE_SLOTS; ++s) {
+            if (h2d_stage[s] != nullptr) {
+                CUDA_CHECK(cudaFree(h2d_stage[s]));
+                h2d_stage[s]      = nullptr;
+                h2d_stage_size[s] = 0;
+            }
+        }
+        h2d_stage_total = 0;
+    }
+
+    cudaStream_t copy_stream() { return stream(device, 1); }
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

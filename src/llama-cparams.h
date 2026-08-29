@@ -49,14 +49,25 @@ struct llama_cparams {
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
     bool auto_fhc;
+    bool fused_hc_mix;       // use the fused hyper-connection mixer (qwen4exp decode)
+    bool fused_hc_combine;   // use the fused hyper-connection combine (qwen4exp decode)
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+    bool drop_compute_buffers; // release the wide-prefill compute layout at the prefill->decode transition
+
+    ggml_type type_k;          // KV cache types, as handed to the memory module (the qwen4exp
+    ggml_type type_v;          // QSA arm selection needs to know what the sparse kernel can read)
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+
+    // Llama-Frankenstein F1: keep the extracted layer inputs on the device (target context) and let a draft
+    // context read them there (lf_dev_inject is set only while such a draft KV injection is being decoded)
+    bool lf_layer_inp_dev = false;
+    bool lf_dev_inject    = false;
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

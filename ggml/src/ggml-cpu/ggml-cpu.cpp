@@ -7,7 +7,9 @@
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef GGML_USE_CPU_HBM
@@ -167,10 +169,182 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
+// Choose the number of threads for a CPU graph compute.
+//
+// A very small CPU graph - typically the input/PLE embedding GET_ROWS (and a handful of
+// state copies) that the scheduler peels off the front of a GPU graph - gains nothing
+// from an OpenMP fork, and paying for it once per graph is actively harmful at the graph
+// rates speculative decoding reaches: every parallel region re-arms the runtime's active
+// wait (KMP_BLOCKTIME), so the idle workers spin instead of sleeping and a spec-decode
+// workload (n_max + 1 back-to-back graphs per token) pins every core for the whole run.
+// Run such graphs inline on the calling thread instead; a real (prefill-sized) gather or
+// any larger graph keeps the configured thread count.  Disable the heuristic with
+// GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD=1 for A/B and bisection.
+//
+// The "tiny" test counts the tensors the graph *reads*, not just its node outputs: a
+// CPU-offloaded FFN chunk is a handful of MUL_MAT nodes with ~16 KiB activation outputs
+// that each read tens of MiB of weights, so an output-only estimate serializes the weight
+// reads on one thread (issue #52: 8.7 -> 1.7 t/s).  GET_ROWS is the exception - its src0
+// is the (possibly huge) embedding table of which only the gathered rows are read - so
+// counting it would permanently disable the heuristic for the host-resident-embedding
+// case it exists for.
+//
+// 2. A graph whose MUL_MAT_ID weights are HOST-RESIDENT BUT NOT OURS is an offloaded MoE (the
+//    `-ncmoe` case: the expert tables live in a GPU backend's pinned host buffer so both the
+//    device and the CPU can read them - see the block-06 pinned-expert work).  It is NOT tiny
+//    in work whatever its outputs measure: a 1-token decode streams `n_expert_used` expert
+//    slices per node, several MiB each.  r17 exempted MUL_MAT_ID's src0 from the byte count
+//    instead, which serialized every offloaded-MoE decode on one thread; that measurement
+//    (Qwen3.6-35B-A3B Q8_0 `-ncmoe 99` 24.3 -> 13.8 t/s) was taken with the worker pool sitting
+//    on the cores the host had pinned its GPU IRQs to, and the exemption costs 22-74 % once the
+//    thread count leaves those cores alone (measured 2026-09-28, 16-core Zen5, 3 GPUs with IRQs
+//    on cores 13-15: Q4_K_M 29.1 -> 38.9, gemma-4-26B-A4B 22.0 -> 38.2, at d0 and at d16384).
+//    These graphs therefore run MULTI-THREADED but CAPPED - see
+//    `ggml_backend_cpu_moe_offload_cap()`; the thread count is the user's lever and the cap is
+//    only a default that keeps the pipeline from starving the device side.
+//
+// 3. Everything else keeps the configured thread count.
+static bool ggml_backend_cpu_weight_is_offloaded(const struct ggml_tensor * w) {
+    if (w == nullptr || w->buffer == nullptr) {
+        return false;
+    }
+    const ggml_backend_buffer_type_t buft = w->buffer->buft;
+    if (buft == nullptr) {
+        return false;
+    }
+    // host-resident, but placed there by another backend: the signature of experts being
+    // shuffled between the CPU and a GPU rather than owned by this CPU backend
+    return ggml_backend_buft_is_host(buft) && buft != ggml_backend_cpu_buffer_type();
+}
+
+// Default thread cap for an offloaded-MoE graph.  A CPU+GPU split is a *pipeline*: the device side
+// needs CPU time of its own - command submission, and the IRQ handlers a host may have pinned to
+// specific cores - so the CPU side must not own every core.  Half the logical CPUs is the one rule
+// that lands in the right place both on a multi-CCD part (one CCD, measured within 1-2 % of the
+// best thread count on Qwen3.6-35B-A3B Q8_0, Q4_K_M and gemma-4-26B-A4B) and on an SMT part (its
+// physical cores).  On the 16-core Zen5 above: cap 8 -> 30.2 / 38.9 / 37.7 t/s, `-t 16` uncapped ->
+// 11.3 / 19.6 / 14.8.
+//
+// GGML_CPU_MOE_OFFLOAD_THREADS=N overrides it: N > 0 is an explicit cap, 0 removes the cap and uses
+// the configured thread count.  An override above the default warns once, because on a host that
+// pins GPU IRQs to specific cores (or spans CCDs) it usually costs more than it buys.
+static int ggml_backend_cpu_moe_offload_cap(void) {
+    static int cap = -1;
+    if (cap >= 0) {
+        return cap;
+    }
+
+    const unsigned hw = std::thread::hardware_concurrency();
+    int def = hw > 1 ? (int) (hw / 2) : 1;
+    if (def < 1) {
+        def = 1;
+    }
+
+    const char * env = getenv("GGML_CPU_MOE_OFFLOAD_THREADS");
+    if (env != nullptr) {
+        const int v = atoi(env);
+        if (v <= 0) {
+            GGML_LOG_WARN("%s: GGML_CPU_MOE_OFFLOAD_THREADS=%s removes the offloaded-MoE thread cap, so the "
+                          "CPU side will use every configured thread.  If this host pins GPU IRQs to particular "
+                          "cores, or spans more than one CCD, that usually loses more than it buys (16-core "
+                          "example: capped 8 -> 38.9 t/s, uncapped 16 -> 19.6).  Prefer sizing -t (or "
+                          "--cpu-mask) to leave those cores free.\n", __func__, env);
+            cap = 0;
+        } else {
+            if (v > def) {
+                GGML_LOG_WARN("%s: GGML_CPU_MOE_OFFLOAD_THREADS=%d is above the default cap of %d for the "
+                              "offloaded-MoE decode; make sure the extra threads do not land on cores the host "
+                              "needs for GPU IRQ handling, or on a second CCD, or throughput will drop.\n",
+                              __func__, v, def);
+            }
+            cap = v;
+        }
+    } else {
+        cap = def;
+    }
+
+    return cap;
+}
+
+static int ggml_backend_cpu_graph_n_threads(const struct ggml_cgraph * cgraph, int n_threads) {
+    if (n_threads <= 1) {
+        return n_threads;
+    }
+
+    static const bool disabled = getenv("GGML_CPU_DISABLE_TINY_GRAPH_SINGLE_THREAD") != nullptr;
+    if (disabled) {
+        return n_threads;
+    }
+
+    // Case 2: does this graph compute an offloaded MoE?  Walked for every graph (a bare op compare
+    // per node), so that a prefill-sized offloaded-MoE split is capped too, not just a tiny one.
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID || !ggml_backend_cpu_weight_is_offloaded(node->src[0])) {
+            continue;
+        }
+        const int cap = ggml_backend_cpu_moe_offload_cap();
+        if (cap > 0 && cap < n_threads) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                GGML_LOG_INFO("%s: offloaded MoE (host-resident expert weights): using %d of %d threads "
+                              "(default cap %d; GGML_CPU_MOE_OFFLOAD_THREADS overrides, -t/--cpu-mask are the "
+                              "usual levers)\n", __func__, cap, n_threads, cap);
+            }
+            return cap;
+        }
+        return n_threads;
+    }
+
+    // bounds chosen so an ordinary model graph (CPU-only inference, or a large prefill
+    // gather on a CPU split) never qualifies; the split graphs this targets are 1-7 nodes
+    // of a few hundred KiB each
+    constexpr int    max_nodes = 32;
+    constexpr size_t max_bytes = 16ull*1024*1024;
+
+    if (cgraph->n_nodes > max_nodes) {
+        return n_threads;
+    }
+
+    size_t total_bytes = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const struct ggml_tensor * node = cgraph->nodes[i];
+        if (!ggml_is_view(node)) {
+            total_bytes += ggml_nbytes(node);
+            if (total_bytes > max_bytes) {
+                return n_threads;
+            }
+        }
+
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            const struct ggml_tensor * src = node->src[j];
+            if (src == NULL) {
+                continue;
+            }
+            // GET_ROWS only reads the gathered rows of its table (src0), which can be
+            // orders of magnitude larger than the bytes it actually touches, so counting it
+            // would defeat the heuristic for exactly the gather case it exists for.  (An
+            // *offloaded* MUL_MAT_ID never reaches this loop - case 2 above returns first.)
+            if (node->op == GGML_OP_GET_ROWS && j == 0) {
+                continue;
+            }
+            total_bytes += ggml_nbytes(src);
+            if (total_bytes > max_bytes) {
+                return n_threads;
+            }
+        }
+    }
+
+    return 1;
+}
+
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    const int n_threads = ggml_backend_cpu_graph_n_threads(cgraph, cpu_ctx->n_threads);
+
+    struct ggml_cplan cplan = ggml_graph_plan(cgraph, n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
@@ -206,7 +380,18 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .graph_compute           = */ ggml_backend_cpu_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
+    /* .stage_buffer            = */ NULL,
+    /* .stage_upload            = */ NULL,
+    /* .stage_wait              = */ NULL,
+    /* .stage_d2d               = */ NULL,
+    /* .stage_h2d_gbps          = */ NULL,
+    /* .stage_input             = */ NULL,
     /* .graph_optimize          = */ NULL,
+    /* .moe_cache_update        = */ NULL,
+    /* .moe_cache_take_over     = */ NULL,
+    /* .moe_cache_promote       = */ NULL,
+    /* .moe_cache_band          = */ NULL,
+    /* .moe_cache_gather        = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_cpu_guid(void) {

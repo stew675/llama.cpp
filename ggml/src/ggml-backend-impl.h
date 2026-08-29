@@ -30,6 +30,26 @@ extern "C" {
         size_t                (*get_alloc_size_n)(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)         (ggml_backend_buffer_type_t buft);
+        // (optional) APPENDED, so the positional iface initializers elsewhere in the tree stay valid and
+        // every backend that does not set it is zero-initialized: extra slack, in percent, added to each
+        // COMPUTE buffer allocation (defaults to 0 = no size change at all).  The graph allocator sizes
+        // the compute buffer from a *measure* graph, but a runtime graph can have a different live-tensor
+        // set and need a little more; growing it is a free-then-allocate-larger, so it needs a contiguous
+        // block BIGGER than the one just released, which fails once free VRAM belongs to a low-priority
+        // cache.  A backend that can be that tight opts in so the slack is taken while memory is plentiful.
+        size_t                (*get_compute_margin_pct)(ggml_backend_buffer_type_t buft);
+        // (optional) APPENDED like the field above.  Allocate a buffer knowing how it will be used, so a
+        // backend can pick a different allocator for the COMPUTE buffer than for model weights.  The
+        // graph allocator is the only caller and it always knows the usage.  Defaults to alloc_buffer.
+        ggml_backend_buffer_t (*alloc_buffer_usage)(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage);
+        // (optional) APPENDED.  Uniform chunk size, in bytes, for the COMPUTE buffer, 0 = unset.  When set
+        // the graph allocator rounds each compute-buffer allocation up to whole chunks and adds ONE spare
+        // chunk, so a later graph whose layout grows within that chunk does not trigger a
+        // free-then-allocate-larger -- the re-alloc only fires when the layout crosses the next chunk
+        // high-water mark.  That makes the dangerous free/alloc (and any arena yield it causes) rare
+        // instead of per-ubatch, and the spare chunk doubles as the over-read guard at the buffer's end.
+        // When 0, `get_compute_margin_pct` still applies.
+        size_t                (*get_compute_chunk_bytes)(ggml_backend_buffer_type_t buft);
     };
 
     struct ggml_backend_buffer_type {
@@ -101,6 +121,12 @@ extern "C" {
     GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
+    // Optional per-buffer-type compute-buffer slack in percent; 0 when the buffer type does not opt in.
+    GGML_API size_t ggml_backend_buft_get_compute_margin_pct(ggml_backend_buffer_type_t buft);
+    // Allocate a buffer for the given usage; falls back to alloc_buffer when the type does not care.
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage);
+    // Optional uniform COMPUTE-buffer chunk size in bytes; 0 when the type does not opt in.
+    GGML_API size_t ggml_backend_buft_get_compute_chunk_bytes(ggml_backend_buffer_type_t buft);
 
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
@@ -152,8 +178,81 @@ extern "C" {
         // wait for an event on on a different stream
         void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
 
+        // (optional) op-offload H2D staging (issue #50 WIP): overlap a whole-tensor host->device
+        // weight upload with the previous split's compute.  `stage_buffer` returns a device buffer of
+        // at least `size` bytes for ring `slot` (NULL on allocation failure); `stage_upload` issues the
+        // host->device copy into `dst` on the backend's auxiliary copy stream and records `ev` there;
+        // `stage_wait` makes that copy stream wait for `ev` (recorded on the main stream); `stage_d2d`
+        // copies the staged bytes to their destination on the main stream.  A backend that does not
+        // implement these leaves all four NULL and the scheduler keeps the in-order copy path.
+        void * (*stage_buffer)(ggml_backend_t backend, int slot, size_t size);
+        void   (*stage_upload)(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev);
+        void   (*stage_wait)  (ggml_backend_t backend, ggml_backend_event_t ev);
+        void   (*stage_d2d)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
+        // (optional) measured H2D bandwidth in GB/s (one-off calibration, cached); 0 if unknown.  The
+        // scheduler uses it to pick the staging gate (a narrow link needs a wider batch).
+        float  (*stage_h2d_gbps)(ggml_backend_t backend);
+
+        // (optional) op-offload H2D staging owned by the split's backend.  The four hooks above
+        // assume one destination and a device event on the split backend's device; under `-sm tensor`
+        // neither exists -- one logical upload is spliced across N devices, and the split's consumers
+        // read per-device "simple" tensors rather than the split tensor's `data`, so a redirect of
+        // that pointer can never reach the op.  Such a backend stages the input itself instead: it is
+        // called with the source `input` (a host weight) and the split input `input_cpy`, lands each
+        // device's chunk in that device's own ring, and returns true; the scheduler then skips its own
+        // copy path for this input.  Only consulted when the staging gate is open (the backend must
+        // implement `stage_h2d_gbps` so the gate is calibrated, and must advertise this hook so the
+        // scheduler does not report staging as unsupported).
+        bool   (*stage_input)(ggml_backend_t backend, struct ggml_tensor * input, struct ggml_tensor * input_cpy);
+
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) MoE expert cache (wip/moe-expert-cache): called by the scheduler when a
+        // host-resident `MUL_MAT_ID` weight is about to be uploaded, with the *host master*
+        // (`weight`), the scheduler's redirected device tensor the op will read (`weight_cpy`),
+        // and a contiguous host copy of the routing (`ids`, `n_used x n_tok` int32).  This is the
+        // only place both the master and the routing are available: the op-offload redirect makes
+        // the op's `src0->data` point at `weight_cpy`.  Lets the backend drive its residency
+        // policy, fill its own compact slots from the true master, and stage the slot-remapped
+        // ids.  Returns true when it took the input over, in which case the scheduler skips its
+        // own expert copy and the op reads the compact arena (via `moe_cache_get_table`).  A
+        // backend that does not implement it leaves it NULL and the scheduler is unchanged.
+        //
+        // `slice_off`/`split_axis` describe the device's slice of the host master under `-sm tensor`
+        // (wip/moe-expert-cache Phase 3): `split_axis` is the axis the master is split on (0/1, or -1
+        // for an unsplit whole-expert table) and `slice_off` is the byte offset of this device's slice
+        // inside one host expert blob.  When the split backend is the Meta backend it does not
+        // implement the policy itself; it computes these per device from the meta split state and
+        // forwards to each simple backend's hook with that device's simple tensor as `weight_cpy`.
+        bool (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis);
+
+        // wip/moe-expert-cache (session 7) identity/device-remap fast path.  Return true iff this expert
+        // input is cache-managed and the consumer can read the arena WITHOUT the host routing: an
+        // identity table (slot == expert, raw ids) or a device-remap table (a device slot map + a small
+        // remap kernel).  The scheduler calls this BEFORE the ids readback; a true lets it skip the
+        // readback, the full device synchronize it forces, the used-expert pruning and the copy.
+        // `need_promote` is set for a device-remap table, whose routing must be recorded for the deferred
+        // promotion pass.  The Meta backend forwards to each simple backend and returns true only if
+        // every device took over.
+        bool (*moe_cache_take_over)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, bool * need_promote);
+
+        // wip/moe-expert-cache: deferred promotion for a device-remap table - run the LFRU admission +
+        // fills for the used experts (`ids`, a contiguous host `n_used x n_tok` int32 copy) and refresh
+        // the device slot map.  Called by the scheduler once per token, after the graph.
+        bool (*moe_cache_promote)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1);
+
+        // wip/moe-expert-cache (B2): device-side host-weight expert gather for an offloaded `MUL_MAT_ID`
+        // prefill.  Copy only the routed experts from the host master (`weight`) into the device tensor
+        // the op reads (`weight_cpy`), reading the routing (`ids`, device, strided) on the device.  Lets
+        // the scheduler skip the per-op ids readback + full device synchronize it forces.  `slice_off`/
+        // `split_axis` are the per-device slice geometry (0/-1 for an unsplit table).  The Meta backend
+        // forwards to each simple backend and returns true only if every device took it.
+        // MoE expert cache: the widest routed `MUL_MAT_ID` batch (in tokens) this backend's cache takes over
+        // (its decode/verify band).  The scheduler keys its band decisions (the take-over before the ids
+        // readback, the per-layer split grouping and rebalance) off it.  NULL = the historical 8.
+        int64_t (*moe_cache_band)(ggml_backend_t backend);
+        bool (*moe_cache_gather)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, size_t slice_off, int split_axis);
     };
 
     struct ggml_backend {
@@ -216,6 +315,37 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+
+        // (optional) MoE expert cache early auto-sizing (wip/moe-cache-autosize): called once by the
+        // model layer after the target context's memory is allocated and before an auxiliary (MTP draft)
+        // context is created, with the bytes of host-resident expert weights on this device.  Lets a
+        // backend make its auto-enable / floor decision before an auxiliary context is sized for a cache
+        // that will never serve it (measured ~3.5x slower under MTP).
+        bool (*moe_cache_preflight)(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes);
+
+        // (optional) MoE expert cache: hold `bytes` of the free VRAM for the post-prefill compute
+        // layout, so the auto-sized arena does not take the space a later compute growth needs.
+        // WIP r42 (TODO #42).
+        void (*moe_cache_set_reserve)(ggml_backend_dev_t dev, size_t bytes);
+
+        // (optional) MoE expert cache: aggregate the arena's cumulative hit/miss counters (WIP r42,
+        // per-turn logging).  Returns false when the cache is disabled.
+        bool (*moe_cache_stats)(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes);
+
+        // (optional) OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer DROP returned
+        // the VRAM.  Called at the prefill -> decode transition, after the wide compute layout has been
+        // released and the narrow one re-reserved, so the stood-down tables can be re-allocated (the
+        // survivors were never freed).  Returns true when anything was re-armed.  Appended like the
+        // fields above, so every backend that does not set it is zero-initialized.
+        bool (*moe_cache_rearm)(ggml_backend_dev_t dev);
+
+        // (optional) OPEN 2 (TODO #42): the size of this device's movable-boundary slab WORK region
+        // (0 when the device has no slab).  The reserve is sized for the WIDEST graph the parameters
+        // allow and the work region holds it until a drop releases it; this lets the context tell whether
+        // the live region is still wider than the narrow layout the workload actually settled on, so the
+        // reserve can follow the workload instead of a worst case.  Appended like the fields above, so
+        // every backend that does not set it is zero-initialized.
+        size_t (*slab_work_size)(ggml_backend_dev_t dev);
     };
 
     struct ggml_backend_device {

@@ -44,6 +44,29 @@ extern "C" {
     GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
 
+    // Early MoE expert cache auto-sizing (wip/moe-cache-autosize): called by the model layer after the
+    // target context is allocated, before an auxiliary context is created.  No-op for backends without a
+    // cache.  Returns true when a cache remains active.
+    GGML_API bool                  ggml_backend_dev_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes);
+
+    // WIP r42 (TODO #42): reserve `bytes` of this device's free VRAM for the post-prefill compute
+    // layout.  Called at the prefill -> decode transition, before the MoE expert cache arena is sized.
+    GGML_API void                  ggml_backend_dev_moe_cache_set_reserve(ggml_backend_dev_t dev, size_t bytes);
+
+    // WIP r42: aggregate the MoE expert cache arena's cumulative hit/miss counters (per-turn logging).
+    // Returns false when the backend has no cache or it is disabled.
+    GGML_API bool                  ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes);
+
+    // OPEN 2 (TODO #42): re-arm the MoE expert cache arena after a compute-buffer drop returned the VRAM.
+    // Called at the prefill -> decode transition, after the wide compute layout is released and the narrow
+    // one re-reserved, so the stood-down tables can be re-allocated while the survivors stay resident.
+    // Returns true when anything was re-armed.
+    GGML_API bool                  ggml_backend_dev_moe_cache_rearm(ggml_backend_dev_t dev);
+
+    // OPEN 2 (TODO #42): the size of the device's movable-boundary slab WORK region, or 0 when it has no
+    // slab.  `llama_context` uses it to right-size the compute reserve to the observed workload.
+    GGML_API size_t                ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev);
+
     //
     // Backend buffer
     //
@@ -406,6 +429,15 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // returns true if the device was created by ggml_backend_meta_device()
+    GGML_API bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
+
+    // number of "simple" devices wrapped by a meta device
+    GGML_API size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t dev);
+
+    // the index-th "simple" device wrapped by a meta device
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t dev, size_t index);
 
     //
     // Utils

@@ -221,6 +221,13 @@ extern "C" {
         LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
     };
 
+    // how host-resident MoE expert weights (the `-ncmoe`/`-cmoe` GGML_OP_MUL_MAT_ID tables) are backed
+    enum llama_host_experts_mode {
+        LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // use the env (LLAMA_MMAP_HOST_EXPERTS=0 selects mmap), else pinned
+        LLAMA_HOST_EXPERTS_MODE_PINNED =  0, // keep them in the device's pinned host buffer (ROCm_Host) - fast path
+        LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // leave them in the pageable model mmap (CPU_Mapped) - reclaimable RAM
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -329,6 +336,9 @@ extern "C" {
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
+        // how the host-resident expert weights (`-ncmoe`/`-cmoe`) are backed; see llama_host_experts_mode
+        enum llama_host_experts_mode host_experts_mode;
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
@@ -413,6 +423,10 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool drop_compute_buffers; // release the wide-prefill compute layout at the prefill->decode
+                                   // transition so the MoE expert-cache arena can be larger.  Safe for a
+                                   // single-wide-prefill workload (llama-cli); a server that can receive
+                                   // another wide prefill must leave it off (see common/common.h).
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -575,6 +589,11 @@ extern "C" {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
+
+    // WIP r42 (TODO #42): release the context's grow-only compute buffers so the next graph re-reserves
+    // them from that graph.  Used to make the MTP draft context reserve lazily (after the target's
+    // first prefill).
+    LLAMA_API void llama_context_drop_compute_buffers(struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
@@ -592,6 +611,24 @@ extern "C" {
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
+
+    // MoE expert cache early auto-sizing (wip/moe-cache-autosize): let the backend make its
+    // enable/floor decision once the target context is created and before an auxiliary (MTP draft)
+    // context exists, so a "disabled" cache cannot leave the draft sized for it.  No-op when no
+    // host-resident expert weights are present or the backend has no cache.
+    LLAMA_API void llama_model_moe_cache_preflight(const struct llama_model * model, size_t aux_reserve_bytes);
+
+    // WIP r42: aggregate the MoE expert cache arena's cumulative hit/miss counters for per-turn logging
+    // (a before/after delta gives the turn's decode hit rate).  Returns false when no cache is active.
+    LLAMA_API bool llama_moe_cache_stats(const struct llama_model * model, int64_t * hits, int64_t * misses, int64_t * arena_bytes);
+
+    // Host-resident MoE expert bytes on the model's device `dev_index` (same order as
+    // llama_model_get_device).  0 when no expert weight is host-resident on that device.
+    LLAMA_API size_t llama_model_moe_host_expert_bytes(const struct llama_model * model, uint32_t dev_index);
+
+    // wip/moe-cache-autosize: default auxiliary-context memory reserve subtracted from the cache's
+    // arena projection (MiB).  Measured ~3.7 GiB for the MTP draft on gfx1201.
+    #define LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT 4096
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
 
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);

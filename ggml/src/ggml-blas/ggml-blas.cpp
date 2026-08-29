@@ -275,6 +275,12 @@ static struct ggml_backend_i blas_backend_i = {
     /* .graph_compute           = */ ggml_backend_blas_graph_compute,
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
+    /* .stage_buffer            = */ NULL,
+    /* .stage_upload            = */ NULL,
+    /* .stage_wait              = */ NULL,
+    /* .stage_d2d               = */ NULL,
+    /* .stage_h2d_gbps          = */ NULL,
+    /* .stage_input             = */ NULL,
     /* .graph_optimize          = */ NULL,
 };
 

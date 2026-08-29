@@ -354,6 +354,47 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
 
 }
 
+// gemma4's fused expert tensor (`ffn_gate_up_exps`) has a SEGMENTED split layout (n_segments/nr).
+// When the expert table is host-resident (`-ncmoe`/`-cmoe` pushes a CPU-buffer override for it),
+// the per-ubatch upload has no correct path under tensor split: ggml_backend_meta_set_tensor_async
+// only understands a contiguous single-segment slice, so the meta assert fires.  An all-resident
+// model, or one offloaded by `-ngl`/`--fit` (whole layers on the CPU backend, no per-ubatch upload),
+// is fine.  Detect the override so only the crashing configuration is rejected, with a clear message
+// instead of an assert (issue #99).
+static bool llm_params_have_host_expert_override(const llama_model_params & params) {
+    if (params.tensor_buft_overrides == nullptr) {
+        return false;
+    }
+    // Representative gemma4 expert weight names; the `-ncmoe`/`-cmoe` patterns are
+    // `...ffn_(up|down|gate|gate_up)_(ch)?exps`, which these match.
+    static const char * const probes[] = {
+        "blk.0.ffn_gate_up_exps.weight",
+        "blk.0.ffn_down_exps.weight",
+    };
+    for (const llama_model_tensor_buft_override * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+        if (o->buft == nullptr) {
+            continue;
+        }
+        const ggml_backend_dev_t dev = ggml_backend_buft_get_device(o->buft);
+        const enum ggml_backend_dev_type dev_type =
+            dev == nullptr ? GGML_BACKEND_DEVICE_TYPE_CPU : ggml_backend_dev_type(dev);
+        if (dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;   // the expert table stays device-resident
+        }
+        try {
+            const std::regex pat(o->pattern);
+            for (const char * probe : probes) {
+                if (std::regex_search(std::string(probe), pat)) {
+                    return true;
+                }
+            }
+        } catch (const std::regex_error &) {
+            // an invalid pattern is reported by the loader; ignore it here
+        }
+    }
+    return false;
+}
+
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params) {
     llama_model * model = llama_model_mapping(arch, params);
 
@@ -361,6 +402,12 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
         model->arch = arch;
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
             throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
+        }
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && arch == LLM_ARCH_GEMMA4 &&
+            llm_params_have_host_expert_override(params)) {
+            throw std::runtime_error("LLAMA_SPLIT_MODE_TENSOR is not supported for gemma4 with host-resident "
+                                     "experts (-ncmoe/-cmoe): the fused expert tensor's segmented per-ubatch "
+                                     "upload has no tensor-split path -- use -sm layer for that config");
         }
     }
 
@@ -1602,9 +1649,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
+    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
+    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
+    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
+    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
+    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
+    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
+    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
+    // stays host-resident either way (see create_tensor).
+    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
+    if (dev_input_on) {
+        pimpl->dev_input = get_layer_buft_list(n_layer_all);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1807,6 +1866,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+
+    // wip/moe-cache-autosize: host-resident MoE expert bytes for the --fit arena floor reservation
+    moe_host_expert_bytes = ml.moe_host_expert_bytes;
 
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
@@ -2935,6 +2997,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.host_experts_mode           =*/ LLAMA_HOST_EXPERTS_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -3364,6 +3427,53 @@ bool llama_model_is_diffusion(const llama_model * model) {
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model) {
     return model->tensors_by_name;
+}
+
+void llama_model_moe_cache_preflight(const llama_model * model, size_t aux_reserve_bytes) {
+    if (model == nullptr) {
+        return;
+    }
+    // Walk the HOST-EXPERT map, not `model->devices`.  The map is keyed by the real device that owns the
+    // host-expert buffer, while `model->devices` holds the scheduler's META device under `-sm tensor`;
+    // looking a meta device up in the map returns 0 for every device, which silently skipped the whole
+    // preflight -- and with it BOTH auto floors (`MOE_EXPERT_CACHE_MIN_MIB` and `_MIN_RES_PCT`) -- in the
+    // `-sm tensor` + host-expert configuration.  That left `alloc_all_locked`'s floor as the only one,
+    // and that one runs AFTER the tables are registered and graphs are planned against them: a late
+    // `g_enabled = false` there plans the MTP draft and the target with different kernels (measured MTP
+    // acceptance 0.00874 instead of the streaming path's 0.89506).  The map's keys are real devices -- the
+    // post-prefill drop already relies on that (`ggml_backend_dev_slab_work_size(kv.first)`).
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (kv.second > 0) {
+            ggml_backend_dev_moe_cache_preflight(kv.first, kv.second, aux_reserve_bytes);
+        }
+    }
+}
+
+bool llama_moe_cache_stats(const llama_model * model, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
+    if (model == nullptr) {
+        return false;
+    }
+    // The arena is one process-global cache, so any MoE-capable device returns the same aggregate.
+    // Under -sm tensor the model's device list is a Meta wrapper, so try the host-expert devices first.
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (ggml_backend_dev_moe_cache_stats(kv.first, hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < model->devices.size(); i++) {
+        if (ggml_backend_dev_moe_cache_stats(llama_model_get_device(model, (uint32_t) i), hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
+    if (model == nullptr || dev_index >= model->devices.size()) {
+        return 0;
+    }
+    const auto it = model->moe_host_expert_bytes.find(llama_model_get_device(model, dev_index));
+    return it != model->moe_host_expert_bytes.end() ? it->second : 0;
 }
 
 int32_t llama_model_n_expert(const struct llama_model * model) {

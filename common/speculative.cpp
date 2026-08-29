@@ -2777,6 +2777,15 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->context.reset(ctx_dft);
     }
+
+    // WIP r42 / stage 2 (TODO #42): the MTP draft context reserves its compute buffers at construction,
+    // sized for the target's full -ub (~1.7 GiB per device).  That resident dead weight is what makes
+    // the target's first-prefill compute growth (a contiguous ~11.8 GiB allocation) run out of VRAM on
+    // 2 GPUs.  Release the draft buffers here (before the target's first prefill); the draft is not used
+    // during the target's prefill and re-reserves lazily on its first real (n_max+1-token) graph.
+    if (spec_mtp && pimpl->context) {
+        llama_context_drop_compute_buffers(pimpl->context.get());
+    }
 }
 
 common_speculative_init_result::~common_speculative_init_result() = default;

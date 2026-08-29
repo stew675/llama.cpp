@@ -35,7 +35,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        std::vector<size_t> * host_expert_bytes_out = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -144,6 +145,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 
+    if (host_expert_bytes_out != nullptr) {
+        host_expert_bytes_out->assign(nd, 0);
+        for (size_t i = 0; i < nd; i++) {
+            (*host_expert_bytes_out)[i] = llama_model_moe_host_expert_bytes(model, (uint32_t) i);
+        }
+    }
+
     common_memory_breakdown_print(ctx);
 
     llama_free(ctx);
@@ -180,9 +188,6 @@ static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
-    }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();
@@ -261,7 +266,8 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    std::vector<size_t> host_expert_bytes;
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &host_expert_bytes);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -288,6 +294,254 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             margins.push_back(margins_s[id]);
         }
+    }
+
+    // wip/moe-cache-autosize (policy c): when host experts are in use and the arena size was NOT set
+    // explicitly, reserve a floor for the MoE expert cache in --fit's per-device margin.  --fit then
+    // sizes the context around it, and the arena takes any remaining free device memory afterwards.
+    // An explicit MOE_EXPERT_CACHE_MIB is used verbatim (no reservation); a fully resident model (no
+    // host expert tensor) is untouched.
+    if (nd > 0) {
+        const char * mib_env    = getenv("MOE_EXPERT_CACHE_MIB");
+        const bool   cache_auto = (mib_env == nullptr || mib_env[0] == '\0');
+        int64_t host_total = 0;
+        for (size_t id = 0; id < host_expert_bytes.size(); id++) {
+            host_total += (int64_t) host_expert_bytes[id];
+        }
+        if (cache_auto && host_total > 0) {
+            const char * min_mib_env = getenv("MOE_EXPERT_CACHE_MIN_MIB");
+            const char * min_res_env = getenv("MOE_EXPERT_CACHE_MIN_RES_PCT");
+            const int    min_mib     = min_mib_env ? atoi(min_mib_env) : 0;
+            const int    min_res_pct = min_res_env ? atoi(min_res_env) : 18;
+            int64_t floor_total = 0;
+            for (size_t id = 0; id < nd; id++) {
+                int64_t floor_b = min_mib > 0 ? (int64_t) min_mib * MiB : 0;
+                if (min_res_pct > 0 && host_expert_bytes[id] > 0) {
+                    const int64_t res_b = (int64_t) host_expert_bytes[id] * min_res_pct / 100;
+                    if (res_b > floor_b) {
+                        floor_b = res_b;
+                    }
+                }
+                if (floor_b > 0) {
+                    margins[id] += floor_b;
+                    floor_total += floor_b;
+                }
+            }
+            const char * reserve_env = getenv("MOE_EXPERT_CACHE_RESERVE_MIB");
+            const int    reserve_mib = reserve_env ? atoi(reserve_env) : 1024;
+            LOG_WRN("%s: -ncmoe is active and MOE_EXPERT_CACHE_MIB is unset: reserving a floor of %.0f MiB "
+                    "for the MoE expert cache arena (%.0f%% of the %.0f MiB of host experts; min %d MiB/device) "
+                    "before fitting the context.  --fit sizes the context around it, then the arena takes any "
+                    "remaining free device memory (keeping MOE_EXPERT_CACHE_RESERVE_MIB=%d MiB per device).  "
+                    "Set MOE_EXPERT_CACHE_MIB to size the arena explicitly.\n",
+                    __func__, (double) floor_total / MiB, (double) min_res_pct, (double) host_total / MiB,
+                    min_mib, reserve_mib);
+        }
+    }
+
+    // ===== tensor split (-sm tensor / LLAMA_SPLIT_MODE_TENSOR) =====
+    //
+    // Under tensor split every GPU wraps into a single Meta device, so the layer-granular algorithm
+    // below (whole layers per device, layer counts written into tensor_split) does not apply.  The
+    // measurement above therefore yields one Meta entry whose components have mixed meaning:
+    //   - model   is the whole offloaded tensor set, counted once (a per-device total once split)
+    //   - context and compute are per-device: the Meta buffer reports its largest sub-buffer
+    // The fit estimates total device memory as model + n_devices * (context + compute), assigns
+    // tensor_split proportional to each device's free memory minus its margin (so the loader's
+    // proportional sharding leaves every device at the same fill fraction), then reduces n_ctx and,
+    // if needed, n_gpu_layers until the estimate fits the summed targets.
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        std::vector<ggml_backend_dev_t> tdevs; // the "simple" devices behind the Meta wrapper
+        for (ggml_backend_dev_t dev : devs) {
+            if (ggml_backend_dev_is_meta(dev)) {
+                const size_t n_dev = ggml_backend_meta_dev_n_devs(dev);
+                for (size_t i = 0; i < n_dev; i++) {
+                    tdevs.push_back(ggml_backend_meta_dev_simple_dev(dev, i));
+                }
+            } else {
+                tdevs.push_back(dev);
+            }
+        }
+        if (tdevs.empty()) {
+            throw common_params_fit_exception("no devices behind the Meta device, abort");
+        }
+        const size_t ntd = tdevs.size();
+        if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
+            throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+        }
+        if (!tensor_split) {
+            throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
+        }
+        // per-device target = free memory minus the requested margin
+        std::vector<int64_t> ttarget(ntd);
+        int64_t target_sum = 0;
+        for (size_t id = 0; id < ntd; id++) {
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(tdevs[id], &free, &total);
+            ttarget[id] = std::max<int64_t>(0, (int64_t) free - (int64_t) margins_s[id]);
+            target_sum += ttarget[id];
+            LOG_TRC("%s: tensor split: device %zu target %" PRId64 " MiB (free %" PRId64 " MiB, margin %zu MiB)\n",
+                __func__, id, ttarget[id]/MiB, (int64_t) free/MiB, margins_s[id]/MiB);
+        }
+
+        // A user-pinned -ts is honored: the fit keeps the requested balance and only chooses
+        // n_ctx / n_gpu_layers so that balance fits.  Without one, the split is pinned
+        // proportional to the targets.
+        bool ts_pinned = false;
+        std::vector<double> ratio(ntd, 0.0);
+        if (mparams->tensor_split) {
+            double sum = 0.0;
+            for (size_t id = 0; id < ntd; id++) {
+                ratio[id] = std::max(0.0, (double) mparams->tensor_split[id]);
+                sum += ratio[id];
+            }
+            if (sum > 0.0) {
+                ts_pinned = true;
+                for (size_t id = 0; id < ntd; id++) {
+                    ratio[id] /= sum;
+                }
+                LOG_TRC("%s: tensor split: honoring the user tensor_split ratios\n", __func__);
+            }
+        }
+        if (!ts_pinned) {
+            // tensor_split proportional to the target, so the loader shards the model in the same
+            // ratio.  Only the ratios matter; use MiB so the values stay small and print cleanly
+            // (llama-fit-params renders tensor_split as uint32_t).
+            double sum = 0.0;
+            for (size_t id = 0; id < ntd; id++) {
+                sum += (double) ttarget[id];
+            }
+            for (size_t id = 0; id < ntd; id++) {
+                tensor_split[id] = (float) (ttarget[id] / MiB);
+                ratio[id] = sum > 0.0 ? (double) ttarget[id] / sum : 0.0;
+            }
+            for (size_t id = ntd; id < llama_max_devices(); id++) {
+                tensor_split[id] = 0.0f;
+            }
+            mparams->tensor_split = tensor_split;
+        }
+
+        // The estimate is a per-device total: a device holding ratio r gets r * D, so the fit must
+        // satisfy r_i * D <= target_i for every used device, i.e. D <= min_i(target_i / r_i).
+        // With the auto split (r_i = target_i / sum(target)) that is exactly sum(target), so the
+        // two cases share one budget.
+        int64_t budget = target_sum;
+        for (size_t id = 0; id < ntd; id++) {
+            if (ratio[id] > 0.0) {
+                budget = std::min<int64_t>(budget, (int64_t) ((double) ttarget[id] / ratio[id]));
+            }
+        }
+
+        // total device memory estimate; the Meta buffer reports the largest sub-buffer for
+        // context/compute, so counting them once per device is the safe (slightly high) direction
+        auto estimate = [&](const dmds_t & dmds) -> int64_t {
+            int64_t model = 0;
+            int64_t ctx   = 0;
+            int64_t comp  = 0;
+            for (size_t id = 0; id < nd; id++) {
+                model += dmds[id].mb.model;
+                ctx   += dmds[id].mb.context;
+                comp  += dmds[id].mb.compute;
+            }
+            return model + (int64_t) ntd * (ctx + comp);
+        };
+        // the Meta devices of the main and extra models are distinct objects, so add_extra_memory()
+        // could not attribute the extra model to the main Meta entry -- do it here
+        auto extra_estimate = [&]() -> int64_t {
+            if (extra == nullptr) {
+                return 0;
+            }
+            extra->cparams->n_ctx = cparams->n_ctx;
+            std::vector<ggml_backend_dev_t> devs_extra;
+            uint32_t ngl_extra = 0;
+            uint32_t nct_extra = 0;
+            uint32_t nex_extra = 0;
+            dmds_t measured;
+            try {
+                measured = common_get_device_memory_data_impl(
+                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+            } catch (const std::runtime_error & e) {
+                LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
+                return 0;
+            }
+            int64_t model = 0;
+            int64_t ctx   = 0;
+            int64_t comp  = 0;
+            for (size_t id = 0; id + 1 < measured.size(); id++) {
+                model += measured[id].mb.model;
+                ctx   += measured[id].mb.context;
+                comp  += measured[id].mb.compute;
+            }
+            if (extra->shares_model) {
+                model = 0; // the extra context runs on the main model's weights
+            }
+            return model + (int64_t) ntd * (ctx + comp);
+        };
+
+        int64_t used_total = estimate(dmds_full) + extra_estimate();
+        if (ts_pinned) {
+            LOG_TRC("%s: tensor split: %zu devices, estimated use %" PRId64 " MiB vs. %" PRId64 " MiB effective budget "
+                "(sum of targets %" PRId64 " MiB, pinned tensor_split)\n",
+                __func__, ntd, used_total/MiB, budget/MiB, target_sum/MiB);
+        } else {
+            LOG_TRC("%s: tensor split: %zu devices, estimated use %" PRId64 " MiB vs. %" PRId64 " MiB target\n",
+                __func__, ntd, used_total/MiB, budget/MiB);
+        }
+
+        if (used_total <= budget) {
+            LOG_TRC("%s: tensor split: no changes needed\n", __func__);
+            return;
+        }
+
+        // reduce the context size first
+        if (n_ctx_auto && n_ctx_max > n_ctx_min_total) {
+            const uint32_t n_ctx_save = cparams->n_ctx;
+            cparams->n_ctx = n_ctx_min_total;
+            dmds_t dmds_min = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            const int64_t used_min = estimate(dmds_min) + extra_estimate();
+            cparams->n_ctx = n_ctx_save;
+
+            if (used_min <= budget && used_total > used_min) {
+                const uint32_t n_ctx = n_ctx_min_total + (uint32_t) (
+                    (int64_t) (n_ctx_max - n_ctx_min_total) * (budget - used_min) / (used_total - used_min));
+                const uint32_t align = 256 * n_streams;
+                cparams->n_ctx = std::max(std::min(n_ctx, n_ctx_max) - std::min(n_ctx, n_ctx_max) % align, n_ctx_min_total);
+                LOG_TRC("%s: tensor split: context size reduced from %" PRIu32 " to %" PRIu32 "\n",
+                    __func__, n_ctx_max, cparams->n_ctx);
+                return;
+            }
+            LOG_TRC("%s: tensor split: context reduction alone is not enough (needs %" PRId64 " MiB at the minimum context), reducing the offloaded layers\n",
+                __func__, used_min/MiB);
+        } else if (!n_ctx_auto) {
+            LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
+        }
+
+        // reduce the number of offloaded layers with a binary search over the estimate
+        uint32_t ngl_lo = 0;
+        uint32_t ngl_hi = hp_ngl + 1;
+        uint32_t ngl_best = 0;
+        int64_t  used_best = 0;
+        while (ngl_lo <= ngl_hi) {
+            const uint32_t ngl_mid = ngl_lo + (ngl_hi - ngl_lo) / 2;
+            mparams->n_gpu_layers = (int32_t) ngl_mid;
+            dmds_t dmds_ngl = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            const int64_t used = estimate(dmds_ngl) + extra_estimate();
+            LOG_TRC("%s: tensor split: n_gpu_layers=%" PRIu32 " -> %" PRId64 " MiB\n", __func__, ngl_mid, used/MiB);
+            if (used <= budget) {
+                ngl_best  = ngl_mid;
+                used_best = used;
+                ngl_lo    = ngl_mid + 1;
+            } else if (ngl_mid == 0) {
+                break;
+            } else {
+                ngl_hi = ngl_mid - 1;
+            }
+        }
+        mparams->n_gpu_layers = (int32_t) ngl_best;
+        LOG_TRC("%s: tensor split: offloading %" PRIu32 " layers, estimated use %" PRId64 " MiB\n",
+            __func__, ngl_best, used_best/MiB);
+        return;
     }
 
     std::vector<std::string> dev_names;
