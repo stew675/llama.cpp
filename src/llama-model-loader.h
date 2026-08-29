@@ -80,6 +80,8 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    // Host-resident expert weights (`-ncmoe`/`-cmoe`) are always pinned (`ROCm_Host`).  The pageable
+    // `--host-experts mmap` mode was removed (issue #116).
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
@@ -126,6 +128,10 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
+    // Allow a CPU expert override to match an appended nextn/MTP layer (the SPECULATIVE head).  False
+    // for the main model so `-ncmoe`/`-cmoe` cannot offload the head; true for a separately loaded MTP
+    // draft model so its own `--spec-draft-n-cpu-moe` is honoured.
+    bool allow_nextn_cpu_offload = false;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -139,6 +145,10 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+
+    // wip/moe-cache-autosize: bytes of host-resident MoE expert weights per device, accumulated by
+    // `create_tensor` (works under `no_alloc`, unlike a scan of the allocated tensors).
+    std::map<ggml_backend_dev_t, size_t> moe_host_expert_bytes;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -158,7 +168,18 @@ struct llama_model_loader {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
             }
-            return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
+            const int c = strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft));
+            if (c != 0) {
+                return c < 0;
+            }
+            // Distinct buffer types can share a name (e.g. the per-device pinned host buffers: one
+            // name, a per-device `device`).  They must not share a context, or every device's host
+            // tensors land in the first device's buffer (and so in its ops' device).
+            ggml_backend_dev_t lhs_dev = ggml_backend_buft_get_device(lhs.buft);
+            ggml_backend_dev_t rhs_dev = ggml_backend_buft_get_device(rhs.buft);
+            const char * lhs_name = lhs_dev ? ggml_backend_dev_name(lhs_dev) : "";
+            const char * rhs_name = rhs_dev ? ggml_backend_dev_name(rhs_dev) : "";
+            return strcmp(lhs_name, rhs_name) < 0;
         }
     };
 
@@ -179,9 +200,11 @@ struct llama_model_loader {
         std::vector<std::string> & splits, // optional, only need if the split does not follow naming scheme
         FILE * file,
         llama_load_mode load_mode,
+        llama_host_experts_mode host_experts_mode,
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool allow_nextn_cpu_offload,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 

@@ -56,6 +56,11 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // WIP r42 (TODO #42): free the scheduler's compute buffers so the next graph re-reserves them from
+    // that graph (the buffers are otherwise grow-only).  Used to release a wide-prefill layout before
+    // the MoE expert cache arena is sized.
+    void drop_compute_buffers();
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -388,6 +393,13 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+
+    // OPEN 2: per host-expert device, the size of the movable-boundary slab's WORK region as it stood right
+    // after the last compute-reserve drop.  That is the narrow layout this workload settled on, and the
+    // value the next pass compares the live region against to decide whether the wide reserve is being held
+    // without need (see the drop decision in `process_ubatch`).  Only written when a backend reports a slab
+    // (`ggml_backend_dev_slab_work_size` != 0), so it stays empty on non-slab backends.
+    std::map<ggml_backend_dev_t, size_t> slab_narrow_boundary;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

@@ -86,26 +86,32 @@ for ncols in [8, 16, 32, 64]:
         if ncols2 > ncols:
             continue
         ncols1 = ncols // ncols2
-        with open(f"fattn-mma-f16-instance-ncols1_{ncols1}-ncols2_{ncols2}.cu", "w") as f:
-            f.write(SOURCE_FATTN_MMA_START)
 
-            for head_size_kq in HEAD_SIZES_KQ:
-                if head_size_kq == 40:
-                    continue
-                if head_size_kq == 72:
-                    continue
-                # Skip compilation of unused ncols2 values for niche head sizes:
-                if head_size_kq == 192 and ncols2 not in (8, 16): # MiMo-V2.5
-                    continue
-                if head_size_kq == 320 and ncols2 != 32: # Mistral Small 4
-                    continue
-                if head_size_kq == 512 and ncols2 not in (2, 4, 8): # Gemma 4 (+ MTP)
-                    continue
-                if head_size_kq == 576 and ncols2 not in (4, 16, 32): # Deepseek, GLM 4.7 Flash
-                    continue
-                if head_size_kq not in (192, 320, 576) and ncols2 in (16, 32):
-                    continue
-                head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
+        # One translation unit per (ncols1, ncols2, head size) instead of one per
+        # (ncols1, ncols2).  The set of emitted template instantiations is exactly the
+        # same; only their grouping changes, so this is build-time only (the native-KV
+        # arm chain in fattn-mma-f16.cuh duplicates the whole WMMA kernel per KV type,
+        # which made the 8-case files ~200 s each and the backend build one-file-bound).
+        # CMake globs template-instances/fattn-mma*.cu, so no CMake change is needed.
+        for head_size_kq in HEAD_SIZES_KQ:
+            if head_size_kq == 40:
+                continue
+            if head_size_kq == 72:
+                continue
+            # Skip compilation of unused ncols2 values for niche head sizes:
+            if head_size_kq == 192 and ncols2 not in (8, 16): # MiMo-V2.5
+                continue
+            if head_size_kq == 320 and ncols2 != 32: # Mistral Small 4
+                continue
+            if head_size_kq == 512 and ncols2 not in (2, 4, 8): # Gemma 4 (+ MTP)
+                continue
+            if head_size_kq == 576 and ncols2 not in (4, 16, 32): # Deepseek, GLM 4.7 Flash
+                continue
+            if head_size_kq not in (192, 320, 576) and ncols2 in (16, 32):
+                continue
+            head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
+            with open(f"fattn-mma-f16-instance-ncols1_{ncols1}-ncols2_{ncols2}-dkq{head_size_kq}-dv{head_size_v}.cu", "w") as f:
+                f.write(SOURCE_FATTN_MMA_START)
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))
 
 for type in TYPES_MMQ:

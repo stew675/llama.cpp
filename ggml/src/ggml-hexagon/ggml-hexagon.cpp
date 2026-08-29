@@ -7886,6 +7886,12 @@ static struct ggml_backend_i hexagon_backend_i = {
     /* .graph_compute           = */ ggml_backend_hexagon_graph_compute,
     /* .event_record            = */ ggml_backend_hexagon_event_record,
     /* .event_wait              = */ ggml_backend_hexagon_event_wait,
+    /* .stage_buffer            = */ NULL,
+    /* .stage_upload            = */ NULL,
+    /* .stage_wait              = */ NULL,
+    /* .stage_d2d               = */ NULL,
+    /* .stage_h2d_gbps          = */ NULL,
+    /* .stage_input             = */ NULL,
     /* .graph_optimize          = */ ggml_backend_hexagon_graph_optimize,
 };
 

@@ -500,6 +500,9 @@ struct common_params {
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
+    // how host-resident expert weights (`-ncmoe`/`-cmoe`) are backed when the model is mmap'd
+    enum llama_host_experts_mode host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
@@ -586,6 +589,16 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+
+    // release the wide-prefill compute layout at the prefill->decode transition so the MoE expert-cache
+    // arena can be sized large.  ON by default everywhere: under the movable-boundary slab a later wide
+    // prefill reclaims the wide layout by MOVING THE SLAB BOUNDARY (evicting only the arena tables that
+    // live in the chunks the work pool takes), so the drop no longer makes a server unsafe -- verified
+    // with wide1 -> short -> wide2 at -ub 8192: 0 aborts, coherent, arena restored to 35254.8 MiB.  Before
+    // the slab this was cli-only, because the server could not reclaim the wide layout (the whole arena
+    // freed still did not yield one contiguous ~12.4-12.9 GiB block).  LLAMA_DROP_COMPUTE_BUFFERS=0 is the
+    // kill switch; it is only needed where the compute layout CANNOT be reclaimed (a non-slab backend).
+    bool drop_compute_buffers = true;
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

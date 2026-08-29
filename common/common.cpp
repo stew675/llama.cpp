@@ -1335,6 +1335,23 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // MoE expert cache early auto-sizing (wip/moe-cache-autosize): decide BEFORE the context exists, so
+    // that (a) the decision precedes every graph -- flipping `g_enabled` after graphs have been planned
+    // makes the MTP draft and the target plan different kernels -- and (b) the projected arena reflects
+    // the VRAM the WEIGHTS left free.  Called after the context instead, it would see only the headroom
+    // left after the KV cache, the compute buffers and the slab, and would decline the cache on every
+    // default run.  Subtract an estimate of the auxiliary (MTP draft) context's own memory (measured
+    // ~3.7 GiB) so the projection is realistic; MOE_EXPERT_CACHE_AUX_RESERVE_MIB overrides it.
+    {
+        const bool has_aux = params.speculative.has_dft() || params.speculative.has_mtp();
+        size_t aux_bytes = 0;
+        if (has_aux) {
+            const char * e = getenv("MOE_EXPERT_CACHE_AUX_RESERVE_MIB");
+            aux_bytes = (size_t) (e != nullptr ? atoll(e) : LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT) * 1024 * 1024;
+        }
+        llama_model_moe_cache_preflight(model, aux_bytes);
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
@@ -1705,6 +1722,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
+    mparams.host_experts_mode = params.host_experts_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
@@ -1767,6 +1785,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.drop_compute_buffers = params.drop_compute_buffers;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

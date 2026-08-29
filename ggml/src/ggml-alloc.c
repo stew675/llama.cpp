@@ -421,6 +421,52 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
+// TODO #42: let a buffer type opt in to allocating each compute chunk with a small "reasonable overhead"
+// so that a later graph whose layout needs a little more room does not force a grow-in-place
+// reallocation.
+//
+// `ggml_gallocr_reserve_n_impl` sizes the compute buffer from a *measure* graph.  A runtime graph can
+// carry a different live-tensor set (the host-expert staging table, the MTP taps), so it can need a
+// little more: measured 6564 MiB -> 6780 MiB (+3.3 %) on a 2-GPU server, and a 11765.52 MiB allocation
+// in the failing cli case.  The growth is a `ggml_vbuffer_free` immediately followed by a larger
+// allocation, so it needs a *contiguous* block BIGGER than the one it just gave back -- free VRAM
+// elsewhere does not help, which is why handing the leftover VRAM to the MoE expert-cache arena made
+// this fail, and why freeing arena tables fixes it.
+//
+// Padding the allocation (not the layout) is what makes the difference: the realloc trigger is
+// `new_chunk_size > cur_chunk_size`, and `cur_chunk_size` is the *allocated* size, so a growth inside
+// the slack simply does not trigger.  Note this is NOT the same as reserving more tokens -- a token
+// slack adds tensors to the layout and moves the peak with it, whereas this only enlarges the buffer
+// underneath the layout's existing offsets.  (An earlier session tested the token slack, concluded
+// "a headroom does not help", and that conclusion does not apply here.)
+//
+// The slack is **opt-in per buffer type** (`get_compute_margin_pct`), so a backend that does not set it
+// gets byte-for-byte the allocation size it always got: the default is 0 and only the RDNA/ROCm path
+// opts in (see the note in `common.cuh`).  It is also compute-only by construction -- `ggml_vbuffer_alloc`
+// has a single call site and it always passes `GGML_BACKEND_BUFFER_USAGE_COMPUTE`; model weights go
+// through `ggml_backend_buft_alloc_buffer_n_plan` instead, so they are untouched.
+static size_t ggml_vbuffer_chunk_alloc_size(ggml_backend_buffer_type_t buft, size_t chunk_size, enum ggml_backend_buffer_usage usage) {
+    if (usage != GGML_BACKEND_BUFFER_USAGE_COMPUTE || chunk_size == 0 || chunk_size > SIZE_MAX / 2) {
+        return chunk_size;
+    }
+    // OPEN 2: chunk-quantized allocation.  Round the chunk up to whole `chunk` units and add ONE spare
+    // unit, so the grow-in-place realloc only fires when the layout crosses the next high-water mark
+    // instead of on every few-percent growth.  The allocated size is what the realloc trigger compares
+    // against (`new_chunk_size > cur_chunk_size`), so growth inside the spare costs nothing, and the
+    // spare unit is also the mapped over-read guard at the end of the buffer.  Uniform units are what
+    // lets the VMM pool treat workspace and arena memory as interchangeable.
+    const size_t chunk = ggml_backend_buft_get_compute_chunk_bytes(buft);
+    if (chunk > 0) {
+        const size_t n_units = (chunk_size + chunk - 1) / chunk + 1;
+        return n_units * chunk;
+    }
+    const size_t margin_pct = ggml_backend_buft_get_compute_margin_pct(buft);
+    if (margin_pct == 0) {
+        return chunk_size;   // no opt-in (the default): exactly the size that has always been used
+    }
+    return chunk_size + chunk_size / 100 * margin_pct;
+}
+
 static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
@@ -428,8 +474,10 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     }
 
     for (int n = 0; n < talloc->n_chunks; n++) {
-        size_t chunk_size = talloc->chunks[n]->max_size;
-        buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
+        // Reserve the layout's size plus the compute-buffer margin, so a later, slightly larger layout
+        // reuses this buffer instead of freeing it and asking for a bigger contiguous block.
+        const size_t chunk_size = ggml_vbuffer_chunk_alloc_size(buft, talloc->chunks[n]->max_size, usage);
+        buf->chunks[n] = ggml_backend_buft_alloc_buffer_usage(buft, chunk_size, usage);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
             return NULL;

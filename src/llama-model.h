@@ -737,6 +737,9 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // wip/moe-cache-autosize: host-resident MoE expert bytes per device (from the loader)
+    std::map<ggml_backend_dev_t, size_t> moe_host_expert_bytes;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 

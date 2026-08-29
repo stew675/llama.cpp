@@ -1496,6 +1496,11 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// fit-slab-accounting revival (G4, issue #117): is the movable-boundary slab live on this device?  The
+// H2D staging ring consults it before growing -- see `h2d_stage_buffer` in this header.  Defined in
+// ggml-cuda.cu (declared in ggml-cuda-vmm.h, which this header does not include).
+bool ggml_cuda_slab_active(int device);
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1566,6 +1571,150 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+
+    // Op-offload H2D staging ring (issue #50 WIP).  Whole-tensor host->device uploads of offloaded
+    // weights are issued on a dedicated copy stream (stream 1) into a small ring of device slots, so
+    // the upload of one split overlaps the compute of the previous one.  stage_buffer grows a slot on
+    // demand and returns null on allocation failure (the caller then falls back to the in-order path).
+    static constexpr int H2D_STAGE_SLOTS = 16;
+    void * h2d_stage[H2D_STAGE_SLOTS]      = {};
+    size_t h2d_stage_size[H2D_STAGE_SLOTS] = {};
+    size_t h2d_stage_total                 = 0;
+
+    // Total device budget for the staging ring, GGML_SCHED_STAGE_MAX_MB MiB (default 2048).  A growth
+    // that would exceed it returns null and the scheduler stops staging (a partially staged ubatch is
+    // worse than either), so the feature can never turn a load into an OOM (block-15 arena precedent).
+    static size_t h2d_stage_budget() {
+        static const size_t budget = []() {
+            const char * e = getenv("GGML_SCHED_STAGE_MAX_MB");
+            const long mb = e ? atol(e) : 2048;
+            return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) 0;
+        }();
+        return budget;
+    }
+
+    // fit-slab-accounting revival (G4, issue #117): optional raw device allocations -- the op-offload
+    // H2D staging ring and the FA prefill staging arena -- live OUTSIDE both the compute-graph reserve
+    // and the movable-boundary slab.  When the slab is active, the VRAM outside it (the slab's
+    // GGML_CUDA_SLAB_HEADROOM_MIB) is the only source for the consumers it cannot route: hipBLASLt's
+    // Tensile code objects + workspace, and the MTP draft buffer.  An unbounded optional transient can
+    // consume that reserve, after which the next `ggml_cuda_device_malloc` cannot be satisfied -- the
+    // arena's physical is mapped INTO the slab and ROCm will not unmap a sub-range, so the arena cannot
+    // yield it back -- and the run aborts (`exit 134`) or, on a thin headroom, corrupts silently.
+    // Bound every optional transient to `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`% of the currently-free
+    // VRAM (default 50, 0 disables).  A refusal is fail-soft: the caller falls back (serial staging /
+    // native K/V read).  Inert when the slab is inactive (no headroom policy to protect).
+    static int optional_alloc_max_free_pct() {
+        static const int n = []() {
+            const char * e = getenv("GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT");
+            int v = e ? atoi(e) : 50;
+            if (v < 0)   v = 0;
+            if (v > 100) v = 100;
+            return v;
+        }();
+        return n;
+    }
+
+    // Returns true when growing an optional allocation to a total of `new_total` bytes stays within the
+    // cap above.  Slab-inactive devices and a 0 cap always allow (the pre-slab behaviour); a failed
+    // measurement also allows (fail-soft, never invert a working run into a refuse on a driver hiccup).
+    bool optional_alloc_within_free_cap(size_t new_total) const {
+        if (!ggml_cuda_slab_active(device)) {
+            return true;
+        }
+        const int pct = optional_alloc_max_free_pct();
+        if (pct <= 0) {
+            return true;
+        }
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            return true;
+        }
+        if (new_total <= free_b / 100 * (size_t) pct) {
+            return true;
+        }
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("optional device allocation refused: %.0f MiB total against %.0f MiB free "
+                          "(the movable-boundary slab is active; the cap is %d%%).  The caller falls "
+                          "back.  Raise GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT to allow.\n",
+                          (double) new_total / (1024 * 1024), (double) free_b / (1024 * 1024), pct);
+        }
+        return false;
+    }
+
+    // Total device budget for the staging ring.  GGML_SCHED_STAGE_MAX_MB (MiB) bounds it explicitly
+    // (A/B and VRAM control).  When it is unset the budget is **auto-sized so the full ring can hold
+    // the largest upload seen**: the old fixed 2048 MiB default held only four 450 MiB expert tables,
+    // so the fifth growth tripped the budget and the scheduler disabled staging for the rest of the run
+    // (issue #93: qwen4exp `-ncmoe`, whose tables are 450 MiB, silently lost the ring).  A growth past
+    // the budget returns null and the scheduler falls back; a failed cudaMalloc is still handled, so
+    // this cannot turn a load into an OOM the explicit path would have avoided.
+    size_t h2d_stage_budget(size_t new_size) {
+        const size_t explicit_budget = h2d_stage_budget_explicit();
+        if (explicit_budget > 0) {
+            return explicit_budget;
+        }
+        size_t max_slot = new_size;
+        for (int s = 0; s < H2D_STAGE_SLOTS; ++s) {
+            if (h2d_stage_size[s] > max_slot) {
+                max_slot = h2d_stage_size[s];
+            }
+        }
+        return (size_t) h2d_stage_slots() * (max_slot + 512);
+    }
+
+    void * h2d_stage_buffer(int slot, size_t size) {
+        GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
+        if (size > h2d_stage_size[slot]) {
+            const size_t old_size = h2d_stage_size[slot];
+            const size_t new_size = size + 512;
+            if (h2d_stage_total - old_size + new_size > h2d_stage_budget()) {
+                return nullptr;
+            }
+            // fit-slab-accounting revival (G4, issue #117): bound the ring by the free VRAM it would
+            // still leave.  See `optional_alloc_within_free_cap` above.
+            if (!optional_alloc_within_free_cap(h2d_stage_total - old_size + new_size)) {
+                return nullptr;
+            }
+            if (h2d_stage[slot] != nullptr) {
+                CUDA_CHECK(cudaFree(h2d_stage[slot]));
+                h2d_stage[slot]      = nullptr;
+                h2d_stage_size[slot] = 0;
+            }
+            void * p = nullptr;
+            if (cudaMalloc(&p, new_size) != cudaSuccess) {
+                (void) cudaGetLastError(); // clear the sticky error
+                return nullptr;
+            }
+            h2d_stage[slot]      = p;
+            h2d_stage_size[slot] = new_size;
+            h2d_stage_total     += new_size - old_size;
+        }
+        if (h2d_stage_slab[slot]) {
+            // wip/slab-ring-region: the ring region is reserved only while the WIDE view is (the boundary is
+            // above the narrow floor).  If it is not, this slot's VA belongs to the arena and must not be
+            // read; refuse so the scheduler takes the serial fallback.
+            if (ggml_cuda_slab_ring_slot_capacity(device) == 0) {
+                return nullptr;
+            }
+        }
+        return h2d_stage[slot];
+    }
+
+    void h2d_stage_free() {
+        for (int s = 0; s < H2D_STAGE_SLOTS; ++s) {
+            if (h2d_stage[s] != nullptr) {
+                CUDA_CHECK(cudaFree(h2d_stage[s]));
+                h2d_stage[s]      = nullptr;
+                h2d_stage_size[s] = 0;
+            }
+        }
+        h2d_stage_total = 0;
+    }
+
+    cudaStream_t copy_stream() { return stream(device, 1); }
 
     ~ggml_backend_cuda_context();
 

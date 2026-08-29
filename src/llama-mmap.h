@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 #include <cstdio>
@@ -24,6 +25,10 @@ struct llama_file {
 
     size_t tell() const;
     size_t size() const;
+
+    // the path this file was opened from (`"(file*)"` for a FILE* handle).  Used by the host-expert
+    // DIO pool (wip/host-expert-dio-cache) to reopen the GGUF with O_DIRECT after the loader is gone.
+    const std::string & path() const;
 
     int file_id() const; // fileno overload
 
