@@ -109,6 +109,10 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    // a rollback candidate decodes the sampled token plus a full draft, which can be longer than
+    // the snapshot depth; never allow the bound to drop below the snapshot depth itself
+    cparams.n_rs_batch = std::max(cparams.n_rs_seq + 1, params.n_rs_batch);
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
@@ -316,6 +320,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
+    LLAMA_LOG_INFO("%s: n_rs_batch            = %u\n",   __func__, cparams.n_rs_batch);
     LLAMA_LOG_INFO("%s: n_outputs_max         = %u\n",   __func__, cparams.n_outputs_max);
     LLAMA_LOG_INFO("%s: n_outputs_max_per_seq = %u\n",   __func__, cparams.n_outputs_max_per_seq);
 

@@ -24,6 +24,7 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                     uint32_t   n_rs_batch,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -73,8 +74,19 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // largest per-seq batch that can be rolled back into; batches above this bound cannot be
+    // speculative verify batches, so their rollback snapshots are never read
+    uint32_t n_rs_batch = 0;
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+
+    // Shape of the most recently prepared ubatch, used by the rollback guard in seq_rm():
+    // a rollback may only remove tokens the last batch decoded, and a batch that can be
+    // rolled back into never decodes more than n_rs_batch tokens.  See the guard there.
+    uint32_t  last_ubatch_nseq_tokens = 0;
+    llama_pos last_ubatch_pos_last    = -1;
+    bool      warned_rollback_boundary = false;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 

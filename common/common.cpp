@@ -1738,6 +1738,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // the longest draft any enabled speculator can produce plus the sampled token; a speculative
+    // verify batch with more tokens than this cannot be rolled back into
+    cparams.n_rs_batch        = std::max(1, common_speculative_n_max(&params.speculative) + 1);
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
