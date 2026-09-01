@@ -952,13 +952,14 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
-#else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#elif defined(GGML_USE_MUSA)
 
-// HIP and MUSA lack the host-mapped pinned-memory APIs (cudaHostAllocPortable
-// / cudaHostAllocMapped / cudaHostGetDevicePointer) and __nanosleep that this
-// implementation relies on, so the internal AllReduce is a CUDA-only feature.
-// The dispatcher in ggml-cuda.cu treats a nullptr pipeline as "init failed"
-// and silently falls back to the meta backend's generic AllReduce.
+// MUSA lacks the host-mapped pinned-memory APIs (cudaHostAllocPortable
+// / cudaHostAllocMapped / cudaHostGetDevicePointer) that this implementation
+// relies on, so the internal AllReduce is a CUDA/HIP feature (see
+// allreduce-hip.cu for the HIP port).  The dispatcher in ggml-cuda.cu treats
+// a nullptr pipeline as "init failed" and silently falls back to the meta
+// backend's generic AllReduce.
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
     return nullptr;
 }
@@ -966,6 +967,21 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline *) {
 }
 bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tensor **) {
     return false;
+}
+
+// WIP fused-stage hook: no-op on non-HIP builds (the internal AR is HIP-only).
+void ggml_cuda_ar_stage_hook_set(int device, ggml_cuda_ar_stage_fn fn, void * user_data) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(fn);
+    GGML_UNUSED(user_data);
+}
+
+void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
+                                 const float * data, int64_t count) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(stream);
+    GGML_UNUSED(data);
+    GGML_UNUSED(count);
 }
 
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
