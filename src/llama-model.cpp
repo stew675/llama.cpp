@@ -3466,6 +3466,9 @@ bool llama_moe_cache_stats(const llama_model * model, int64_t * hits, int64_t * 
         }
     }
     return false;
+        const size_t bytes = llama_model_moe_host_expert_bytes(model, (uint32_t) i);
+        if (bytes > 0) {
+            ggml_backend_dev_moe_cache_preflight(llama_model_get_device(model, (uint32_t) i), bytes, aux_reserve_bytes);
 }
 
 size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {

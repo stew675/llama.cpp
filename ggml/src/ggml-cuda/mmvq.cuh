@@ -39,3 +39,11 @@ void ggml_cuda_op_shexp_down_gate(
     const ggml_tensor * w_gate, const ggml_tensor * x_gate,
     const ggml_tensor * moe_out, const ggml_tensor * ffn_residual,
     ggml_tensor * dst);
+
+// qwen4exp IQ4_NL/Q8_0 routed down projection fused with the 10-expert weighted sum (RDNA3.5,
+// single-token): ggml_cuda_mul_mat_id_weighted_rdna3_5_ok returns whether the graph pattern's
+// experts/weights/dst match the specialized kernel's shape fingerprint.
+bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);

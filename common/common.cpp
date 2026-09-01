@@ -1360,6 +1360,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
+    // MoE expert cache early auto-sizing (wip/moe-cache-autosize): decide before the MTP draft context
+    // is created (common_speculative_init runs after common_init_result).  Subtract an estimate of the
+    // auxiliary context's own memory (measured ~3.7 GiB for the MTP draft) so the projected arena is
+    // realistic; MOE_EXPERT_CACHE_AUX_RESERVE_MIB overrides it.
+    {
+        const bool has_aux = params.speculative.has_dft() || params.speculative.has_mtp();
+        size_t aux_bytes = 0;
+        if (has_aux) {
+            const char * e = getenv("MOE_EXPERT_CACHE_AUX_RESERVE_MIB");
+            aux_bytes = (size_t) (e != nullptr ? atoll(e) : LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT) * 1024 * 1024;
+        }
+        llama_model_moe_cache_preflight(model, aux_bytes);
+    }
+
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
