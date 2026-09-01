@@ -1456,6 +1456,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (buft == nullptr) { // e.g. TENSOR_SKIP
             return nullptr;
         }
+        GGML_ASSERT(buft != nullptr);
         if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
             moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), buft, buft_list_layer);
         }
