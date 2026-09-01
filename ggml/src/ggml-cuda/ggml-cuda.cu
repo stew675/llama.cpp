@@ -1006,6 +1006,15 @@ struct ggml_backend_cuda_comm_context {
     }
 };
 
+// Shared size heuristic: tensors below these element counts are latency-bound
+// (token generation), above them bandwidth-bound (prefill).  The internal
+// host-staged pipeline wins on latency; NCCL/RCCL P2P wins on bandwidth.
+static bool ggml_backend_cuda_comm_is_small(int64_t ne, size_t n_backends) {
+    return (n_backends <= 2 && ne < 32768) ||
+           (n_backends == 3 && ne < 131072) ||
+           (n_backends >= 4 && ne < 262144);
+}
+
 #ifdef GGML_USE_NCCL
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32.
@@ -1028,7 +1037,7 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
     // For small tensors, simply reduce them as FP32.
     // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
+    if (ggml_backend_cuda_comm_is_small(ne, n_backends)) {
         for (size_t i = 0; i < n_backends; ++i) {
             if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                 ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
@@ -1090,7 +1099,7 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
     GGML_ASSERT(comm_ctx->ar_pipeline != nullptr);
 
     const size_t n_backends = comm_ctx->backends.size();
-    GGML_ASSERT(n_backends == 2);
+    GGML_ASSERT(n_backends >= 2);
     GGML_ASSERT(tensors[0] != nullptr);
 
     const int64_t   ne   = ggml_nelements(tensors[0]);
@@ -1170,29 +1179,31 @@ static void ggml_backend_cuda_comm_init_none(ggml_backend_cuda_comm_context * re
     ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_butterfly;
 }
 
-static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
+// Try to bring up the internal host-staged AR pipeline (2 GPUs only).  Returns
+// true on success.  On failure it does NOT clobber ret->try_allreduce, so a
+// hybrid setup can keep the NCCL path.
+static bool ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context * ret) {
     ret->ar_pipeline = ggml_cuda_ar_pipeline_init(ret->dev_ids.data(), ret->dev_ids.size());
     if (ret->ar_pipeline) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
-        return;
+        return true;
     }
 
     // Clear sticky CUDA error from the failed init.
     (void) cudaGetLastError();
-    GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
-                  "falling back to meta-backend butterfly\n");
-    ggml_backend_cuda_comm_init_none(ret);
+    GGML_LOG_DEBUG("internal AllReduce init failed (n_devices != 2?); "
+                   "not using the internal path\n");
+    return false;
 }
 
-static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
+// Try to bring up the NCCL/RCCL comms.  Returns true on success.
+static bool ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * ret) {
 #ifdef GGML_USE_NCCL
     // Disabling NCCL path when CUDA virtual devices are in use since NCCL requires one distinct physical GPU per rank.
     const ggml_cuda_device_info & info = ggml_cuda_info();
     if (info.device_count > info.physical_device_count) {
-        GGML_LOG_WARN("NCCL disabled: virtual devices in use; "
-                      "falling back to internal AllReduce\n");
-        ggml_backend_cuda_comm_init_internal(ret);
-        return;
+        GGML_LOG_WARN("NCCL disabled: virtual devices in use\n");
+        return false;
     }
 
     const size_t n = ret->dev_ids.size();
@@ -1200,26 +1211,52 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ncclResult_t rc = ncclCommInitAll(ret->comms.data(), (int) n, ret->dev_ids.data());
     if (rc == ncclSuccess) {
         ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
-        return;
+        return true;
     }
 
     ret->comms.clear();
-    GGML_LOG_WARN("NCCL init failed (%s); falling back to internal AllReduce\n",
-                  ncclGetErrorString(rc));
+    GGML_LOG_WARN("NCCL init failed (%s)\n", ncclGetErrorString(rc));
 #else // GGML_USE_NCCL
 #ifndef GGML_USE_HIP
-    GGML_LOG_WARN("NCCL not compiled in; falling back to internal AllReduce.  "
+    GGML_LOG_WARN("NCCL not compiled in.  "
                   "Recompile with -DGGML_CUDA_NCCL=ON for best multi-GPU performance.\n");
 #endif // !GGML_USE_HIP
 #endif // GGML_USE_NCCL
-
-    ggml_backend_cuda_comm_init_internal(ret);
+    return false;
 }
 
-// Top-level init.  Picks one of the three init paths based on
-// GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
-// any fallback.  Unrecognised env values warn and fall through to the
-// platform default.
+// Hybrid: NCCL/RCCL (P2P, BF16 round-trip) for bandwidth-bound large tensors,
+// plus the internal host-staged pipeline (low per-call latency) for
+// latency-bound small tensors.  The per-size routing happens in
+// ggml_backend_cuda_comm_allreduce_tensor: small tensors go to the internal
+// pipeline directly; everything else falls through to try_allreduce, which we
+// set to NCCL when available.
+static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
+    const bool has_nccl     = ggml_backend_cuda_comm_init_nccl(ret);
+    const bool has_internal = ggml_backend_cuda_comm_init_internal(ret);
+#ifdef GGML_USE_NCCL
+    if (has_nccl) {
+        // Large tensors -> NCCL (P2P).  Small tensors are routed to the
+        // internal pipeline by the dispatcher regardless of this pointer.
+        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+    } else if (!has_internal) {
+        // Neither path came up; butterfly fallback below (try_allreduce stays
+        // as-is until comm_init_none is called by the caller).
+        ret->try_allreduce = nullptr;
+    }
+#else
+    // No NCCL/RCCL compiled in (has_nccl is always false); only the internal
+    // pipeline can serve AR.
+    (void) has_nccl;
+    if (!has_internal) {
+        ret->try_allreduce = nullptr;
+    }
+#endif
+}
+
+// Top-level init.  Picks a comm setup based on GGML_CUDA_ALLREDUCE (or the
+// platform default) and lets the chain handle any fallback.  Unrecognised env
+// values warn and fall through to the platform default.
 static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_backends) {
     for (size_t i = 0; i < n_backends; i++) {
         if (!ggml_backend_is_cuda(backends[i])) {
@@ -1235,37 +1272,55 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     }
 
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
+    bool ok = false;
     if (!env) {
-        // Platform default: Linux uses NCCL, otherwise (generally Windows) internal
+        // Platform default: Linux uses the hybrid (NCCL for large, internal
+        // for small); otherwise (generally Windows) internal only.
 #if defined(__linux__)
-        ggml_backend_cuda_comm_init_nccl(ret);
+        ggml_backend_cuda_comm_init_hybrid(ret);
+        ok = ret->try_allreduce != nullptr;
 #else
-        ggml_backend_cuda_comm_init_internal(ret);
+        ok = ggml_backend_cuda_comm_init_internal(ret);
 #endif // defined(__linux__)
     } else {
         std::string env_str(env);
-        if (env_str == "nccl") {
-            ggml_backend_cuda_comm_init_nccl(ret);
+        if (env_str == "hybrid") {
+            ggml_backend_cuda_comm_init_hybrid(ret);
+            ok = ret->try_allreduce != nullptr;
+        } else if (env_str == "nccl") {
+            ok = ggml_backend_cuda_comm_init_nccl(ret) || ggml_backend_cuda_comm_init_internal(ret);
         } else if (env_str == "internal") {
-            ggml_backend_cuda_comm_init_internal(ret);
+            ok = ggml_backend_cuda_comm_init_internal(ret);
         } else if (env_str == "none") {
-            ggml_backend_cuda_comm_init_none(ret);
+            ok = false;
         } else {
             GGML_LOG_WARN("unknown GGML_CUDA_ALLREDUCE value: %s\n", env);
-            ggml_backend_cuda_comm_init_none(ret);
+            ok = false;
         }
+    }
+
+    if (!ok) {
+        ggml_backend_cuda_comm_init_none(ret);
     }
 
     return ret;
 }
 
-// Top-level dispatch -- calls the function pointer chosen by comm_init.
+// Top-level dispatch -- calls the function pointer chosen by comm_init, with
+// one hybrid rule: when the internal host-staged pipeline is available,
+// latency-bound small tensors (token generation) go through it directly, and
+// bandwidth-bound large tensors (prefill) fall through to NCCL/RCCL P2P.
 // Returns false to let the meta-backend's butterfly run.
 static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct ggml_tensor ** tensors) {
     if (comm_ctx_v == nullptr) {
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    const int64_t ne = ggml_nelements(tensors[0]);
+    const size_t n_backends = comm_ctx->backends.size();
+    if (comm_ctx->ar_pipeline != nullptr && ggml_backend_cuda_comm_is_small(ne, n_backends)) {
+        return ggml_backend_cuda_comm_try_allreduce_internal(comm_ctx, tensors);
+    }
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
@@ -4744,6 +4799,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
+            }
+
+            // WIP fused-stage: capture the AR stage kernel as the graph's LAST
+            // node so each device's wire staging + arrival token are ready at
+            // subgraph-end instead of after the separate AR kernel's dispatch
+            // (which carries a per-device graph->kernel premium).  No-op when
+            // the internal AR pipeline isn't in fused mode.
+            if (cgraph->n_nodes > 0 && cgraph->nodes[cgraph->n_nodes-1] != nullptr) {
+                const ggml_tensor * last = cgraph->nodes[cgraph->n_nodes-1];
+                ggml_cuda_ar_stage_hook_run(cuda_ctx->device, cuda_ctx->stream(),
+                                            static_cast<const float *>(last->data),
+                                            ggml_nelements(last));
             }
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
