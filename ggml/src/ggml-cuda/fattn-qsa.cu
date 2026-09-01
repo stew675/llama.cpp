@@ -95,6 +95,18 @@ static __global__ void flash_attn_qsa(
     __shared__ float KQ_w[NHEADS_MAX][WARP_SIZE];
     float * KQ_warp = KQ_w[head];
 
+    // K tile staged in shared memory. All heads read the same cells (gqa),
+    // so one cooperative gather per tile serves the whole block instead of
+    // 12 redundant L2 gathers per warp. Rows are padded by one half2 so the
+    // four cells in flight per score step land on disjoint LDS banks. V is
+    // read directly from L2 in the VKQ pass (4 half2 per lane per cell,
+    // L1-absorbed across the heads) to keep the smem footprint small enough
+    // for 3 blocks per CU.
+    using kv2_t = std::conditional_t<type_KV == GGML_TYPE_F16, half2, nv_bfloat162>;
+    __shared__ kv2_t K_smem[WARP_SIZE][D/2 + 1];
+    __shared__ kv2_t V_smem[WARP_SIZE][D/2 + 1];
+    __shared__ half  M_smem[WARP_SIZE];  // per-cell mask, staged with K
+
     // 8 lanes per cell -> 4 cells in flight per warp per group-step.
     constexpr int NTHREADS_KQ = 8;
     constexpr int NCELLS      = WARP_SIZE / NTHREADS_KQ;          // 4 cells per step
@@ -106,15 +118,15 @@ static __global__ void flash_attn_qsa(
     const int lane_in_group = tid & (NTHREADS_KQ - 1);            // 0..7
 
     if constexpr (type_KV == GGML_TYPE_F16) {
-        // Q replicated per lane, strided like the vec kernel:
-        //   lane p holds Q half2 at (p*4 + k) + 32*j for j in 0..3, k in 0..3
+        // Q replicated per lane, strided to match the smem K layout:
+        //   lane p holds Q half2 at (p + 8*k) + 32*j for j in 0..3, k in 0..3
         half2 Q_h2[nchunks_KQ];
         const float2 * Q_col = (const float2 *) Q;
 #pragma unroll
         for (int j = 0; j < NSTEPS_Q; ++j) {
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                const float2 qf = Q_col[lane_in_group*4 + k + 32*j];
+                const float2 qf = Q_col[lane_in_group + 8*k + 32*j];
                 Q_h2[j*4 + k] = __float22half2_rn(make_float2(qf.x*scale, qf.y*scale));
             }
         }
@@ -127,28 +139,74 @@ static __global__ void flash_attn_qsa(
         for (int tile0 = 0; tile0 < n_top_k; tile0 += WARP_SIZE) {
             const int tile_len = min(WARP_SIZE, n_top_k - tile0);
 
-            // Score pass: NSTEPS steps, NCELLS cells in flight per step.
-            // The K gathers for the 4 cells of a step are independent.
+            // Cooperative gather of the tile's K/V cells into shared memory.
+            // All heads read the same cells (gqa), so one L2 fetch serves the
+            // whole block instead of 12 redundant per-warp gathers.  8B loads
+            // keep 4B alignment on the padded rows; loads issue back to back.
+            {
+                const int flat = threadIdx.y*WARP_SIZE + tid;
+                const int nv2  = tile_len*(D/4);        // 8B vectors per tensor
+                const int shift = (D == 256) ? 6 : (D == 128) ? 5 : 4;
+                const int mask  = (1 << shift) - 1;
+                for (int i = flat; i < nv2; i += blockDim.x*blockDim.y) {
+                    const int cell = i >> shift;
+                    const int off  = i & mask;
+                    const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
+                    const uint2 k = ((const uint2 *) (K + (int64_t) cell_g*nb11))[off];
+                    const uint2 v = ((const uint2 *) (V + (int64_t) cell_g*nb21))[off];
+                    *((uint2 *) &K_smem[cell][off*2]) = k;
+                    *((uint2 *) &V_smem[cell][off*2]) = v;
+                }
+                if (flat < tile_len) {
+                    M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];
+                }
+            }
+            __syncthreads();
+
+            // Score pass: all NSTEPS partials accumulate in registers first
+            // (the steps are independent), then one batched shuffle reduce at
+            // the end.  This breaks the per-step serial reduce chain.
             float KQ_max_new = KQ_max;
+            float partial[NSTEPS] = {};
+            // Process the steps in pairs: prefetch 2 cells' K into registers,
+            // then run both mad chains.  Bounds register pressure to 2*16 K
+            // half2 while keeping the loads and accumulators independent.
 #pragma unroll
-            for (int i = 0; i < NSTEPS; ++i) {
-                const int cell_in_tile = (tid/NTHREADS_KQ)*NSTEPS + i;
-                float partial = 0.0f;
-                int cell = -1;
-                if (cell_in_tile < tile_len) {
-                    cell = identity ? tile0 + cell_in_tile : idx[tile0 + cell_in_tile];
-                    const half2 * K_cell = (const half2 *) (K + cell*nb11);
+            for (int i = 0; i < NSTEPS; i += 2) {
+                half2 Kreg[2][nchunks_KQ];
 #pragma unroll
-                    for (int j = 0; j < NSTEPS_Q; ++j) {
+                for (int c = 0; c < 2; ++c) {
+                    const int cell_in_tile = (tid/NTHREADS_KQ)*NSTEPS + i + c;
+                    if (cell_in_tile < tile_len) {
+                        const half2 * K_cell = K_smem[cell_in_tile];
 #pragma unroll
-                        for (int k = 0; k < 4; ++k) {
-                            ggml_cuda_mad(partial, K_cell[lane_in_group*4 + k + 32*j], Q_h2[j*4 + k]);
+                        for (int j = 0; j < NSTEPS_Q; ++j) {
+#pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                Kreg[c][j*4 + k] = K_cell[lane_in_group + 8*k + 32*j];
+                            }
                         }
                     }
                 }
-                partial = warp_reduce_sum<NTHREADS_KQ>(partial);
-
-                const float score = (cell_in_tile < tile_len) ? partial + __half2float(maskh[cell]) : -FLT_MAX/2.0f;
+#pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    const int cell_in_tile = (tid/NTHREADS_KQ)*NSTEPS + i + c;
+                    if (cell_in_tile < tile_len) {
+#pragma unroll
+                        for (int j = 0; j < NSTEPS_Q; ++j) {
+#pragma unroll
+                            for (int k = 0; k < 4; ++k) {
+                                ggml_cuda_mad(partial[i + c], Kreg[c][j*4 + k], Q_h2[j*4 + k]);
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < NSTEPS; ++i) {
+                const int cell_in_tile = (tid/NTHREADS_KQ)*NSTEPS + i;
+                const float red = warp_reduce_sum<NTHREADS_KQ>(partial[i]);
+                const float score = (cell_in_tile < tile_len) ? red + __half2float(M_smem[cell_in_tile]) : -FLT_MAX/2.0f;
                 KQ_max_new = fmaxf(KQ_max_new, score + FATTN_KQ_MAX_OFFSET);
                 KQ_warp[cell_in_tile] = score;
             }
@@ -173,21 +231,22 @@ static __global__ void flash_attn_qsa(
             KQ_sum += warp_reduce_sum(KQ_reg);
 
             // VKQ pass: for each cell of the tile, all lanes accumulate their
-            // D chunk, weighted by the (broadcast) exp weight.  Independent
-            // gathers -> they pipeline.
+            // D chunk, weighted by the (broadcast) exp weight.  Unrolled so
+            // the independent V gathers pipeline.
+#pragma unroll 4
             for (int c = 0; c < WARP_SIZE; ++c) {
                 const float w = (c < tile_len) ? KQ_warp[c] : 0.0f;
                 if (w != 0.0f) {
-                    const int cell_c = (c < tile_len) ? (identity ? tile0 + c : idx[tile0 + c]) : 0;
-                    const half2 * V_cell = (const half2 *) (V + cell_c*nb21);
+                    const half2 * V_cell = V_smem[c];
 #pragma unroll
-                for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
-                    const half2 v = V_cell[tid + k*WARP_SIZE];
-                    VKQ[k].x += __half2float(v.x)*w;
-                    VKQ[k].y += __half2float(v.y)*w;
-                }
+                    for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
+                        const half2 v = V_cell[tid + k*WARP_SIZE];
+                        VKQ[k].x += __half2float(v.x)*w;
+                        VKQ[k].y += __half2float(v.y)*w;
+                    }
                 }
             }
+            __syncthreads();
         }
 
         float * dst_col = dst + ((sequence*int(ne01.z) + col)*ne02 + head)*D;
@@ -204,7 +263,7 @@ static __global__ void flash_attn_qsa(
         for (int j = 0; j < NSTEPS_Q; ++j) {
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
-                const float2 qf = Q_col[lane_in_group*4 + k + 32*j];
+                const float2 qf = Q_col[lane_in_group + 8*k + 32*j];
                 Q_bf16[j*4 + k] = __float22bfloat162_rn(make_float2(qf.x*scale, qf.y*scale));
             }
         }
@@ -217,25 +276,39 @@ static __global__ void flash_attn_qsa(
         for (int tile0 = 0; tile0 < n_top_k; tile0 += WARP_SIZE) {
             const int tile_len = min(WARP_SIZE, n_top_k - tile0);
 
+            // Cooperative gather of the tile's K cells into shared memory:
+            {
+                const int flat  = threadIdx.y*WARP_SIZE + tid;
+                const int nload = tile_len*(D/2);
+                for (int i = flat; i < nload; i += blockDim.x*blockDim.y) {
+                    const int cell = i/(D/2);
+                    const int off  = i%(D/2);
+                    const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
+                    K_smem[cell][off] = ((const nv_bfloat162 *) (K + (int64_t) cell_g*nb11))[off];
+                }
+            }
+            __syncthreads();
+
             float KQ_max_new = KQ_max;
+            float partial[NSTEPS] = {};
             for (int i = 0; i < NSTEPS; ++i) {
                 const int cell_in_tile = (tid/NTHREADS_KQ)*NSTEPS + i;
-                float partial = 0.0f;
-                int cell = -1;
                 if (cell_in_tile < tile_len) {
-                    cell = identity ? tile0 + cell_in_tile : idx[tile0 + cell_in_tile];
-                    const nv_bfloat162 * K_cell = (const nv_bfloat162 *) (K + cell*nb11);
+                    const nv_bfloat162 * K_cell = K_smem[cell_in_tile];
 #pragma unroll
                     for (int j = 0; j < NSTEPS_Q; ++j) {
 #pragma unroll
                         for (int k = 0; k < 4; ++k) {
-                            ggml_cuda_mad(partial, K_cell[lane_in_group*4 + k + 32*j], Q_bf16[j*4 + k]);
+                            ggml_cuda_mad(partial[i], K_cell[lane_in_group + 8*k + 32*j], Q_bf16[j*4 + k]);
                         }
                     }
                 }
-                partial = warp_reduce_sum<NTHREADS_KQ>(partial);
-
-                const float score = (cell_in_tile < tile_len) ? partial + __half2float(maskh[cell]) : -FLT_MAX/2.0f;
+            }
+#pragma unroll
+            for (int i = 0; i < NSTEPS; ++i) {
+                const int cell_in_tile = (tid/NTHREADS_KQ)*NSTEPS + i;
+                const float red = warp_reduce_sum<NTHREADS_KQ>(partial[i]);
+                const float score = (cell_in_tile < tile_len) ? red + __half2float(M_smem[cell_in_tile]) : -FLT_MAX/2.0f;
                 KQ_max_new = fmaxf(KQ_max_new, score + FATTN_KQ_MAX_OFFSET);
                 KQ_warp[cell_in_tile] = score;
             }
@@ -257,20 +330,21 @@ static __global__ void flash_attn_qsa(
             KQ_warp[tid] = KQ_reg;
             KQ_sum += warp_reduce_sum(KQ_reg);
 
-#pragma unroll
+#pragma unroll 4
             for (int c = 0; c < WARP_SIZE; ++c) {
                 const float w = (c < tile_len) ? KQ_warp[c] : 0.0f;
                 if (w != 0.0f) {
                     const int cell_c = (c < tile_len) ? (identity ? tile0 + c : idx[tile0 + c]) : 0;
-                    const nv_bfloat162 * V_cell = (const nv_bfloat162 *) (V + cell_c*nb21);
+                    const nv_bfloat162 * V_cell = (const nv_bfloat162 *) (V + (int64_t) cell_c*nb21);
 #pragma unroll
-                for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
-                    const nv_bfloat162 v = V_cell[tid + k*WARP_SIZE];
-                    VKQ[k].x += __bfloat162float(__low2bfloat16(v))*w;
-                    VKQ[k].y += __bfloat162float(__high2bfloat16(v))*w;
-                }
+                    for (int k = 0; k < D/(2*WARP_SIZE); ++k) {
+                        const nv_bfloat162 v = V_cell[tid + k*WARP_SIZE];
+                        VKQ[k].x += __bfloat162float(__low2bfloat16(v))*w;
+                        VKQ[k].y += __bfloat162float(__high2bfloat16(v))*w;
+                    }
                 }
             }
+            __syncthreads();
         }
 
         float * dst_col = dst + ((sequence*int(ne01.z) + col)*ne02 + head)*D;
