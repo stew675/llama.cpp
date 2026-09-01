@@ -790,6 +790,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 
+    // qwen4exp QSA sparse attention: same split as FLASH_ATTN_EXT (q by head,
+    // K/V by kv-head, result by head); idx and mask are mirrored.
+    auto handle_flash_attn_qsa = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        const bool kv_split = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2;
+        const bool kv_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        GGML_ASSERT(kv_split || kv_mirrored);
+        return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
+    };
+
     auto handle_lightning_indexer = [&](
             const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         for (size_t i = 0; i < 4; i++) {
@@ -1011,6 +1026,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_FLASH_ATTN_EXT: {
                 split_state = handle_flash_attn_ext(src_ss);
+            } break;
+            case GGML_OP_FLASH_ATTN_QSA: {
+                split_state = handle_flash_attn_qsa(src_ss);
             } break;
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);

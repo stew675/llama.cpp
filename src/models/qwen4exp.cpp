@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -693,7 +694,38 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
+    // LLAMA_QSA_SPARSE_FA=1 uses the fused sparse kernel (attend only the top-k
+    // cells) instead of the dense mask path.  The default is the dense mask path.
+    static const bool qsa_sparse = []() {
+        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    ggml_tensor * cur;
+
+    if (qsa_sparse) {
+        // same view/permute as build_attn_mha does internally
+        const int64_t n_stream = k->ne[3];
+        ggml_tensor * q_p = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+        q_p = ggml_permute(ctx0, q_p, 0, 2, 1, 3);
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+        cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f);
+        ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
+        cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        cb(cur, "kqv_out", il);
+
+        // the rotation is its own inverse, so undo it on the value side of the output
+        if (inp->self_v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        }
+
+        return cur;
+    }
+
+    cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

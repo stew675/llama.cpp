@@ -574,6 +574,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_FLASH_ATTN_QSA,
 
         GGML_OP_UNARY,
 
@@ -2456,6 +2457,26 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // qwen4exp QSA sparse attention: attend only over the cells that the
+    // indexer's top-k names, instead of the whole KV cache.  The mask is the
+    // base kq_mask and is gathered in-kernel at the idx positions.
+    GGML_API struct ggml_tensor * ggml_flash_attn_qsa(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 logit_softcap);
+
+    GGML_API void ggml_flash_attn_qsa_set_prec(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    GGML_API enum ggml_prec ggml_flash_attn_qsa_get_prec(
+            const struct ggml_tensor * a);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
