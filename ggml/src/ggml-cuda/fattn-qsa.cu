@@ -102,7 +102,9 @@ static __global__ void flash_attn_qsa(
     // read directly from L2 in the VKQ pass (4 half2 per lane per cell,
     // L1-absorbed across the heads) to keep the smem footprint small enough
     // for 3 blocks per CU.
-    using kv2_t = std::conditional_t<type_KV == GGML_TYPE_F16, half2, nv_bfloat162>;
+    // smem holds F16 for F16 and Q8_0 inputs (the load dequantizes Q8_0);
+    // BF16 keeps its native type.
+    using kv2_t = std::conditional_t<type_KV == GGML_TYPE_BF16, nv_bfloat162, half2>;
     __shared__ kv2_t K_smem[WARP_SIZE][D/2 + 1];
     __shared__ kv2_t V_smem[WARP_SIZE][D/2 + 1];
     __shared__ half  M_smem[WARP_SIZE];  // per-cell mask, staged with K
@@ -117,7 +119,7 @@ static __global__ void flash_attn_qsa(
     static_assert(nchunks_KQ == 4*NSTEPS_Q, "D/2 must be divisible by 4*NTHREADS_KQ");
     const int lane_in_group = tid & (NTHREADS_KQ - 1);            // 0..7
 
-    if constexpr (type_KV == GGML_TYPE_F16) {
+    if constexpr (type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q8_0) {
         // Q replicated per lane, strided to match the smem K layout:
         //   lane p holds Q half2 at (p + 8*k) + 32*j for j in 0..3, k in 0..3
         half2 Q_h2[nchunks_KQ];
@@ -143,19 +145,43 @@ static __global__ void flash_attn_qsa(
             // All heads read the same cells (gqa), so one L2 fetch serves the
             // whole block instead of 12 redundant per-warp gathers.  8B loads
             // keep 4B alignment on the padded rows; loads issue back to back.
+            // Q8_0 inputs are dequantized to F16 here, once per tile.
             {
                 const int flat = threadIdx.y*WARP_SIZE + tid;
-                const int nv2  = tile_len*(D/4);        // 8B vectors per tensor
-                const int shift = (D == 256) ? 6 : (D == 128) ? 5 : 4;
-                const int mask  = (1 << shift) - 1;
-                for (int i = flat; i < nv2; i += blockDim.x*blockDim.y) {
-                    const int cell = i >> shift;
-                    const int off  = i & mask;
-                    const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
-                    const uint2 k = ((const uint2 *) (K + (int64_t) cell_g*nb11))[off];
-                    const uint2 v = ((const uint2 *) (V + (int64_t) cell_g*nb21))[off];
-                    *((uint2 *) &K_smem[cell][off*2]) = k;
-                    *((uint2 *) &V_smem[cell][off*2]) = v;
+                if constexpr (type_KV == GGML_TYPE_Q8_0) {
+                    // one thread per (cell, 32-element block): D/32 blocks per
+                    // cell, each block {half d, int8 qs[32]} dequantized to
+                    // 16 half2s of F16 in the smem row.
+                    const int nblk = tile_len*(D/32);
+                    for (int i = flat; i < nblk; i += blockDim.x*blockDim.y) {
+                        const int cell = i / (D/32);
+                        const int blk  = i % (D/32);
+                        const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
+                        const block_q8_0 * Kb = (const block_q8_0 *) (K + (int64_t) cell_g*nb11);
+                        const block_q8_0 * Vb = (const block_q8_0 *) (V + (int64_t) cell_g*nb21);
+                        const float dk = __half2float(Kb[blk].d);
+                        const float dv = __half2float(Vb[blk].d);
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) {
+                            const half2 kh = __floats2half2_rn(dk*Kb[blk].qs[2*j], dk*Kb[blk].qs[2*j+1]);
+                            const half2 vh = __floats2half2_rn(dv*Vb[blk].qs[2*j], dv*Vb[blk].qs[2*j+1]);
+                            K_smem[cell][blk*16 + j] = kh;
+                            V_smem[cell][blk*16 + j] = vh;
+                        }
+                    }
+                } else {
+                    const int nv2  = tile_len*(D/4);        // 8B vectors per tensor
+                    const int shift = (D == 256) ? 6 : (D == 128) ? 5 : 4;
+                    const int mask  = (1 << shift) - 1;
+                    for (int i = flat; i < nv2; i += blockDim.x*blockDim.y) {
+                        const int cell = i >> shift;
+                        const int off  = i & mask;
+                        const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
+                        const uint2 k = ((const uint2 *) (K + (int64_t) cell_g*nb11))[off];
+                        const uint2 v = ((const uint2 *) (V + (int64_t) cell_g*nb21))[off];
+                        *((uint2 *) &K_smem[cell][off*2]) = k;
+                        *((uint2 *) &V_smem[cell][off*2]) = v;
+                    }
                 }
                 if (flat < tile_len) {
                     M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];
@@ -456,6 +482,13 @@ void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             case 256: ggml_cuda_flash_attn_qsa_case<256, GGML_TYPE_BF16>(ctx, dst, identity); break;
             default: GGML_ABORT("unsupported head size");
         }
+    } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) {
+        switch (D) {
+            case 64:  ggml_cuda_flash_attn_qsa_case< 64, GGML_TYPE_Q8_0>(ctx, dst, identity); break;
+            case 128: ggml_cuda_flash_attn_qsa_case<128, GGML_TYPE_Q8_0>(ctx, dst, identity); break;
+            case 256: ggml_cuda_flash_attn_qsa_case<256, GGML_TYPE_Q8_0>(ctx, dst, identity); break;
+            default: GGML_ABORT("unsupported head size");
+        }
     } else {
         GGML_ABORT("unsupported K/V type");
     }
@@ -473,7 +506,8 @@ bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst) {
 
     const bool kv_ok =
         (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) ||
-        (K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16);
+        (K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16) ||
+        (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0);
 
     return Q->type == GGML_TYPE_F32 && idx->type == GGML_TYPE_I32 && kv_ok &&
         (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256);
