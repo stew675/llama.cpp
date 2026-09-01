@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.cuh"
+#include "unary.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -485,20 +486,27 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     typedef tile<16,  8, int> tile_C;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
+    constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps        = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr bool split_j      = type == GGML_TYPE_Q8_0 && J == 128 && !fallback && I == 64 && nwarps == 8;
+    constexpr int j_group       = split_j ? J/2 : J;
 
-    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
+    const int warp_i = split_j ? threadIdx.y % 4 : threadIdx.y;
+    const int warp_j = split_j ? threadIdx.y / 4 : 0;
+    const int i0 = (warp_i / ntx) * (ntx*tile_C::I);
 
     const bool y_scale_used = y_scale != nullptr;
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+    for (int j0 = 0; j0 < j_group; j0 += ntx*tile_C::J) {
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
 #pragma unroll
             for (int l = 0; l < tile_C::ne; ++l) {
-                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                const int j = warp_j*j_group + j0 + (warp_i % ntx)*tile_C::J + tile_C::get_j(l);
 
                 if (j > j_max) {
                     continue;
@@ -869,13 +877,14 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
-template <ggml_type type, int J, bool fallback, bool fixup>
+template <ggml_type type, int J, bool fallback, bool fixup, bool has_gate = false>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
+        const char * __restrict__ x_gate = nullptr, const ggml_glu_op glu_op = GGML_GLU_OP_COUNT, const float glu_limit = 0.0f) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
@@ -900,6 +909,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int blocks_per_iter = ITER_K / qk;
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
+    float sum_gate[J*I / (nwarps*warp_size)] = {0.0f};
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
@@ -938,6 +948,69 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         __syncthreads();
     }
 
+    if constexpr (has_gate) {
+        // fused gate+up: second weight stream, same activations. The gate
+        // accumulation order per K-block is identical to the unfused gate
+        // run, so the GLU result is bit-identical to the separate path.
+        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+            load_tiles(x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum_gate, 0);
+
+            __syncthreads();
+
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum_gate, MMQ_TILE_NE_K);
+
+            __syncthreads();
+        }
+
+        // GLU epilogue: out = glu(gate, up), elementwise per thread-owned slot.
+#pragma unroll
+        for (int l = 0; l < J*I / (nwarps*warp_size); ++l) {
+            const float gate_val = sum_gate[l];
+            switch (glu_op) {
+                case GGML_GLU_OP_SWIGLU:
+                    sum[l] = ggml_cuda_op_silu_single(gate_val) * sum[l];
+                    break;
+                case GGML_GLU_OP_GEGLU:
+                    sum[l] = ggml_cuda_op_gelu_single(gate_val) * sum[l];
+                    break;
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    sum[l] = ggml_cuda_op_swiglu_oai_single(gate_val, sum[l]);
+                    break;
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    sum[l] = ggml_cuda_op_swiglu_clamp_single(gate_val, sum[l], glu_limit);
+                    break;
+                default:
+                    sum[l] = sum[l] * gate_val;
+                    break;
+            }
+        }
+    }
+
     if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
     } else {
@@ -948,7 +1021,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback>
+template <ggml_type type, int J, bool fallback, bool has_gate = false>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -957,7 +1030,8 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx,
+        const char * __restrict__ x_gate = nullptr, const ggml_glu_op glu_op = GGML_GLU_OP_COUNT, const float glu_limit = 0.0f) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1051,10 +1125,11 @@ static __global__ void mul_mat_q(
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
 
         constexpr bool fixup = false;
-        mul_mat_q_process_tile<type, J, fallback, fixup>
+        mul_mat_q_process_tile<type, J, fallback, fixup, has_gate>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
+             x_gate, glu_op, glu_limit);
         return;
     }
 
@@ -1154,8 +1229,7 @@ static __global__ void mul_mat_q(
         kbc -= fastmodulo(kbc, blocks_per_ne00);
 
         kb0_start = 0;
-        kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));
-    }
+        kb0_stop  = min(blocks_per_ne00.z, uint32_t(kbc_stop - kbc));    }
 
     if (kbc >= kbc_stop) {
         return;
@@ -1380,6 +1454,11 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    // Fused gate+up: second weight stream (same shape/strides as x) + GLU epilogue.
+    // When x_gate != nullptr the kernel computes both dots and writes glu(x_gate_dot, x_dot).
+    const char * x_gate = nullptr;
+    ggml_glu_op glu_op = GGML_GLU_OP_COUNT;
+    float glu_limit = 0.0f;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1389,7 +1468,173 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// ---- RDNA3.5 routed-compact MoE MMQ (port of halo-box/strix-llama.cpp) ----
+// mul_mat_id tiles are enumerated per real (expert, J-tile) pair via a descriptor list built by a
+// single block (one thread per expert), instead of a (x-tile, expert) block grid whose J-tiling is
+// sized to the total row count: for MoE every block used to enumerate ceil(ncols_max/J) mostly-empty
+// tiles per expert. The compact kernel runs only the real tiles, with the J width chosen per
+// rows-per-expert range (mmq_rdna3_5_id_get_J), measured on gfx1151 for the 2048x512 and 3072x1024
+// expert shapes. Numerics are bit-identical to the plain mul_mat_q path (same mul_mat_q_process_tile,
+// same per-tile accumulation order; only the tile enumeration differs). Gate: RDNA3_5 only, matching
+// the source-of-record B; gfx1201 (RDNA4) stays off until validated on the gfx1201 box in the
+// delivery flow. Opt-out for A/B validation: GGML_CUDA_DISABLE_MMQ_ROUTED=1.
+#define MMQ_ROUTED_MAX_EXPERTS 1024
+#ifndef MMQ_IQ_ID_J_MID
+#define MMQ_IQ_ID_J_MID 64
+#endif
+
+static constexpr bool mmq_rdna3_5_id_n_experts_ok(const int64_t n_experts) {
+    return n_experts >= 8 && n_experts <= MMQ_ROUTED_MAX_EXPERTS;
+}
+
+static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t rows_per_expert) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 64 ? 48 : 128;
+        // the IQ expert types of the Unsloth qwen4exp mixes (512 experts, 10 active: 40 rows per expert at ubatch 2048)
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 32 ? 48 : rows_per_expert <= 64 ? MMQ_IQ_ID_J_MID : 128;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return rows_per_expert <= 12 ? 16 : rows_per_expert <= 24 ? 32 : rows_per_expert <= 48 ? 48 :
+                rows_per_expert <= 64 ? 32 : 128;
+        default:
+            return 0;
+    }
+}
+
+static constexpr bool mmq_rdna3_5_id_use_compact(const ggml_type type, const int J) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+            return J == 16 || J == 48 || J == 128;
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return J == 16 || J == 48 || J == MMQ_IQ_ID_J_MID || J == 128;
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return J == 16 || J == 32 || J == 48 || J == 64 || J == 96 || J == 128;
+        default:
+            return false;
+    }
+}
+
+static constexpr bool mmq_rdna3_5_id_use_j48_128e(const ggml_type type, const int64_t n_experts, const int64_t rows_per_expert) {
+    return n_experts == 128 && rows_per_expert >= 96 && rows_per_expert <= 160 &&
+        (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0);
+}
+
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0,   4) ==  16);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0,  16) ==  48);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0,  64) ==  48);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q8_0, 128) == 128);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q6_K,  16) ==  32);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q4_K,  32) ==  48);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q5_K,  64) ==  32);
+static_assert(mmq_rdna3_5_id_get_J(GGML_TYPE_Q4_0,  16) ==   0);
+static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 48));
+static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_Q8_0, 32));
+static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_Q6_K, 32));
+static_assert(!mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ2_XS, 48));
+static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ4_XS, MMQ_IQ_ID_J_MID));
+static_assert(mmq_rdna3_5_id_use_compact(GGML_TYPE_IQ4_NL, MMQ_IQ_ID_J_MID));
+
+// one descriptor per real (expert, J-tile) pair; the builder runs as a single block with one thread per expert
+template <int J>
+static __global__ void build_mmq_routed_descriptors(
+        const int32_t * expert_bounds, uint32_t * descriptors, int n_experts, int max_descriptors) {
+    __shared__ int tile_counts[MMQ_ROUTED_MAX_EXPERTS];
+    const int expert = threadIdx.x;
+
+    for (int i = expert; i < max_descriptors; i += blockDim.x) {
+        descriptors[i] = UINT32_MAX;
+    }
+
+    if (expert < n_experts) {
+        const int count = expert_bounds[expert + 1] - expert_bounds[expert];
+        tile_counts[expert] = (count + J - 1) / J;
+    }
+    __syncthreads();
+
+    if (expert < n_experts) {
+        int descriptor = 0;
+        for (int i = 0; i < expert; ++i) {
+            descriptor += tile_counts[i];
+        }
+        for (int jt = 0; jt < tile_counts[expert]; ++jt) {
+            descriptors[descriptor + jt] = uint32_t(expert) | (uint32_t(jt) << 16);
+        }
+    }
+}
+
 template <ggml_type type, int J, bool fallback>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+static __global__ void mul_mat_q_routed_compact(
+        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const uint32_t * __restrict__ descriptors,
+        const int max_descriptors, float * __restrict__ dst, const float * __restrict__ y_scale,
+        const uint3 blocks_per_ne00, const int nrows_x, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const uint3 channel_ratio, const int stride_channel_x,
+        const uint3 sample_ratio, const int stride_sample_x) {
+    // Skip unused template specializations for faster compilation:
+    if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    const int wt = blockIdx.z;
+    const int it = blockIdx.x;
+
+    extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+    for (int descriptor_idx = blockIdx.y; descriptor_idx < max_descriptors; descriptor_idx += gridDim.y) {
+        const uint32_t descriptor = descriptors[descriptor_idx];
+        if (descriptor == UINT32_MAX) {
+            return;
+        }
+
+        const int zt = descriptor & 0xFFFF;
+        const int jt = descriptor >> 16;
+        const int col_low  = expert_bounds[zt + 0];
+        const int col_high = expert_bounds[zt + 1];
+        const int col_diff = col_high - col_low;
+
+        if (descriptor_idx != int(blockIdx.y)) {
+            __syncthreads();
+        }
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += nwarps * warp_size) {
+            const int j = j0 + threadIdx.y * warp_size + threadIdx.x;
+            if (j0 + nwarps * warp_size > J && j >= J) {
+                break;
+            }
+            ids_dst_shared[j] = jt * J + j < col_diff ? ids_dst[col_low + jt * J + j] : 0;
+        }
+        __syncthreads();
+
+        const int offset_x = fastdiv(wt, sample_ratio) * stride_sample_x +
+            fastdiv(zt, channel_ratio) * stride_channel_x + it * I * stride_row_x;
+        const int offset_y = (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
+        const int tile_x_max_i = nrows_x - it * I - 1;
+        const int tile_y_max_j = col_diff - jt * J - 1;
+        const float * y_scale_tile = y_scale ? y_scale + col_low + jt * J : nullptr;
+
+        constexpr bool fixup = false;
+        mul_mat_q_process_tile<type, J, fallback, fixup>
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + it * I, nullptr, y_scale_tile,
+             stride_row_x, ncols_y, stride_col_dst,
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+    }
+}
+
+template <ggml_type type, int J, bool fallback, bool has_gate = false>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -1403,8 +1648,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, has_gate>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, has_gate>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
@@ -1423,15 +1668,41 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    // RDNA3.5 routed-compact MoE MMQ (port of halo-box/strix-llama.cpp): replaces the mostly-empty
+    // (x-tile, expert) block grid with one descriptor per real (expert, J-tile) pair. Bit-identical to
+    // the plain path below (same process_tile). has_gate is excluded (the fused gate+up op keeps its
+    // own epilogue path); off on all other archs until validated there.
+    // GGML_CUDA_DISABLE_MMQ_ROUTED=1 disables ONLY this compact dispatch (the per-expert J selection
+    // in mul_mat_q_switch_J stays; both are part of the same port).
+    const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+        !has_gate && !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc) && mmq_rdna3_5_id_use_compact(type, J) &&
+        getenv("GGML_CUDA_DISABLE_MMQ_ROUTED") == nullptr;
+    if (use_compact_routed) {
+        const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
+        ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
+        build_mmq_routed_descriptors<J><<<1, MMQ_ROUTED_MAX_EXPERTS, 0, stream>>>
+            (args.expert_bounds, descriptors.get(), args.nchannels_y, max_descriptors);
+
+        const int descriptor_blocks = (args.ncols_dst + J - 1) / J;
+        const dim3 block_nums_compact(nty, descriptor_blocks, args.nsamples_y);
+        mul_mat_q_routed_compact<type, J, fallback><<<block_nums_compact, block_dims, nbytes_shared, stream>>>
+            (args.x, args.y, args.ids_dst, args.expert_bounds, descriptors.get(), max_descriptors, args.dst, args.y_scale,
+             blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
+             channel_ratio_fd, args.stride_channel_x, sample_ratio_fd, args.stride_sample_x);
+        return;
+    }
+
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, J, fallback, has_gate><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, has_gate ? args.x_gate : nullptr, args.glu_op, args.glu_limit);
         return;
     }
+
+    GGML_ASSERT(!has_gate); // gate fusion is only implemented for the non-stream-k path
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
@@ -1471,7 +1742,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
-template <ggml_type type, bool fallback>
+template <ggml_type type, bool fallback, bool has_gate = false>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id    = ggml_cuda_get_device();
     const int    cc    = ggml_cuda_info().devices[id].cc;
@@ -1480,9 +1751,65 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
+    if constexpr (!has_gate) {
+        // RDNA3.5 mul_mat_id: pick the J width from the rows-per-expert range instead of the generic
+        // tile-count loop (which sizes J to the flattened row count and leaves every per-expert tile
+        // mostly empty). Mirrors halo-box/strix-llama.cpp mmq_rdna3_5_id_get_J (gfx1151-measured).
+        if (mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && args.ids_dst != nullptr && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback &&
+                (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS) &&
+                (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y == 48) {
+            constexpr int J_rdna3_5 = 48;
+            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_rdna3_5, fallback, cc);
+            if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                J_best = J_rdna3_5;
+                ntiles_J_best = 1;
+            }
+        } else if (args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback) {
+            const int64_t rows_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
+            const bool use_j48_128e = mmq_rdna3_5_id_use_j48_128e(type, args.nchannels_y, rows_per_expert);
+            int J_rdna3_5 = use_j48_128e ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);
+            if constexpr (type == GGML_TYPE_Q6_K) {
+                const char * env = getenv("GGML_Q6_COMPACT_J");
+                if (env) {
+                    J_rdna3_5 = atoi(env);
+                }
+            }
+            if (J_rdna3_5 != 0) {
+                const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_rdna3_5, fallback, cc);
+                if (config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+                    J_best = J_rdna3_5;
+                    ntiles_J_best = 1;
+                }
+            }
+        }
+    }
+
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
+            continue;
+        }
+
+        // The fused gate+up kernel keeps two accumulators live (sum and
+        // sum_gate). J_max_gate is per-type, measured on gfx1201 (RDNA4):
+        // - Q6_K (q6_K_q8_1_mma): ~255 VGPR at J>=96 kills occupancy -> 64
+        // - Q4_K/Q5_K (q8_1_q8_1_mma): J=32..80 spill (256 VGPR + 100+
+        //   spills), J>=96 clean; J=96 measured best -> 96
+        // - Q8_0/Q3_K (q8_0_q8_1_mma / q3_K_q8_1_mma): low register per
+        //   accumulator; J=64 gives the best occupancy/compute balance -> 64
+        // Applied on RDNA4/RDNA3_5/RDNA3_0 (Strix Halo gfx1151 validation
+        // 2026-09-05 and RX 7900XTX gfx1100 validation 2026-09-05): the caps
+        // transfer - on gfx1151 uncapping regressed pp2048 ~1673->1111 and
+        // pp16384 ~1423->1334; on gfx1100 (Q3_K) uncapping (J=128) regressed
+        // pp2048 5405->4819 and pp16384 4487->4070 (below the 3-op fallback)
+        // and a Q3_K@96 probe (5094/4251) also lost to the cap 64, so no
+        // per-arch port tuning is needed for the fused MMQ.
+        const int J_max_gate = (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA3_0(cc))
+            ? (type == GGML_TYPE_Q6_K ? 64 :
+               type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ? 96 :
+               type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q3_K ? 64 : 128)
+            : 128;
+        if (has_gate && J > J_max_gate) {
             continue;
         }
 
@@ -1500,52 +1827,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
     switch (J_best) {
         case   8:
-            launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,   8, fallback, has_gate>(ctx, args, stream);
             break;
         case  16:
-            launch_mul_mat_q<type,  16, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  16, fallback, has_gate>(ctx, args, stream);
             break;
         case  24:
-            launch_mul_mat_q<type,  24, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  24, fallback, has_gate>(ctx, args, stream);
             break;
         case  32:
-            launch_mul_mat_q<type,  32, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  32, fallback, has_gate>(ctx, args, stream);
             break;
         case  40:
-            launch_mul_mat_q<type,  40, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  40, fallback, has_gate>(ctx, args, stream);
             break;
         case  48:
-            launch_mul_mat_q<type,  48, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  48, fallback, has_gate>(ctx, args, stream);
             break;
         case  56:
-            launch_mul_mat_q<type,  56, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  56, fallback, has_gate>(ctx, args, stream);
             break;
         case  64:
-            launch_mul_mat_q<type,  64, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  64, fallback, has_gate>(ctx, args, stream);
             break;
         case  72:
-            launch_mul_mat_q<type,  72, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  72, fallback, has_gate>(ctx, args, stream);
             break;
         case  80:
-            launch_mul_mat_q<type,  80, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  80, fallback, has_gate>(ctx, args, stream);
             break;
         case  88:
-            launch_mul_mat_q<type,  88, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  88, fallback, has_gate>(ctx, args, stream);
             break;
         case  96:
-            launch_mul_mat_q<type,  96, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type,  96, fallback, has_gate>(ctx, args, stream);
             break;
         case 104:
-            launch_mul_mat_q<type, 104, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 104, fallback, has_gate>(ctx, args, stream);
             break;
         case 112:
-            launch_mul_mat_q<type, 112, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 112, fallback, has_gate>(ctx, args, stream);
             break;
         case 120:
-            launch_mul_mat_q<type, 120, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 120, fallback, has_gate>(ctx, args, stream);
             break;
         case 128:
-            launch_mul_mat_q<type, 128, fallback>(ctx, args, stream);
+            launch_mul_mat_q<type, 128, fallback, has_gate>(ctx, args, stream);
             break;
         default:
             fprintf(stderr, "J_best=%d\n", J_best);
@@ -1554,19 +1881,22 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     }
 }
 
-template <ggml_type type>
+template <ggml_type type, bool has_gate = false>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     if (args.nrows_x % 128 == 0) {
         constexpr bool fallback = false;
-        mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
+        mul_mat_q_switch_J<type, fallback, has_gate>(ctx, args, stream);
     } else {
         constexpr bool fallback = true;
-        mul_mat_q_switch_J<type, fallback>(ctx, args, stream);
+        mul_mat_q_switch_J<type, fallback, has_gate>(ctx, args, stream);
     }
 }
 
 #define DECL_MMQ_CASE(type)                                                        \
     template void mul_mat_q_case<type>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+
+#define DECL_MMQ_CASE_GATE(type)                                                   \
+    template void mul_mat_q_case<type, true>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
 extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
 extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
@@ -1597,6 +1927,13 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 // -------------------------------------------------------------------------------------------------------------------------
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mm_fusion_args_host * fusion = nullptr, const ggml_tensor * swiglu = nullptr);
+
+void ggml_cuda_mul_mat_q_swiglu(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu);
+
+void ggml_cuda_mul_mat_q_pair(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
