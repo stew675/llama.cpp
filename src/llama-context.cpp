@@ -241,6 +241,15 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
 
+    cparams.fused_hc_mix = true;
+    {
+        const char * LLAMA_FUSED_HC_MIX = getenv("LLAMA_FUSED_HC_MIX");
+        if (LLAMA_FUSED_HC_MIX) {
+            cparams.fused_hc_mix = atoi(LLAMA_FUSED_HC_MIX) != 0;
+            LLAMA_LOG_INFO("%s: fused hc_mix = %d (env)\n", __func__, cparams.fused_hc_mix);
+        }
+    }
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 

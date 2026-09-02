@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "FLASH_ATTN_QSA",
     "INDEXER_TOPK",
+    "HC_MIX",
 
     "UNARY",
 
@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1201,6 +1202,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "flash_attn_qsa(q, k, v, idx, mask)",
+    "indexer_topk(q, k, weights, mask)",
+    "hc_mix(x, w_norm, w_down, w_up)",
 
     "unary(x)",
 
@@ -1218,7 +1221,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6611,6 +6614,39 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_hc_mix
+
+struct ggml_tensor * ggml_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * xn,
+        struct ggml_tensor  * w_down,
+        struct ggml_tensor  * w_up,
+        int64_t               hc) {
+    GGML_ASSERT(xn->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_up->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(hc > 0);
+
+    const int64_t hc_dim   = xn->ne[0];
+    const int64_t n_tokens = xn->ne[1];
+
+    GGML_ASSERT(hc_dim % hc == 0);
+    GGML_ASSERT(w_down->ne[0] == hc_dim);
+    GGML_ASSERT(w_up->ne[1] == hc_dim && w_up->ne[0] == w_down->ne[1]);
+    GGML_ASSERT(xn->ne[2] == 1 && xn->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim / hc, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) hc);
+
+    result->op     = GGML_OP_HC_MIX;
+    result->src[0] = xn;
+    result->src[1] = w_down;
+    result->src[2] = w_up;
 
     return result;
 }

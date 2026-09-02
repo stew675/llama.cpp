@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
+#include "quants.h"
 #include "simd-gemm.h"
 #include "ggml.h"
 #include "unary-ops.h"
@@ -12160,5 +12161,122 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+// ggml_compute_forward_hc_mix
+
+// Fused hyper-connection mixer tail: two Q8_0 matrix-vector products with
+// silu/sigmoid gating plus the stream collapse. xn is the rms-normed and
+// gamma-scaled input (the graph keeps those nodes for the inject MUL_MAT).
+// Reference for the unfused chain; used only on the CPU backend (the GPU
+// fused kernel must match the GPU unfused chain, not this function).
+static void ggml_compute_forward_hc_mix_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * xn      = dst->src[0];
+    const ggml_tensor * w_down  = dst->src[1];
+    const ggml_tensor * w_up    = dst->src[2];
+
+    GGML_ASSERT(xn->type     == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
+    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
+
+    const int64_t hc       = ggml_get_op_params_i32(dst, 0);
+    const int64_t hc_dim   = xn->ne[0];
+    const int64_t n_tokens = xn->ne[1];
+    const int64_t n_embd   = hc_dim / hc;
+    const int64_t hc_lr    = w_down->ne[1];
+
+    GGML_ASSERT(hc_lr % QK8_0 == 0 && hc_dim % QK8_0 == 0);
+    GGML_ASSERT(w_down->ne[0] == hc_dim);
+    GGML_ASSERT(w_up->ne[0]   == hc_lr  && w_up->ne[1] == hc_dim);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (n_tokens + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, n_tokens);
+
+    // scratch for the current token: lo [hc_lr], gate [hc_dim]
+    float * lo   = (float *) params->wdata + ith*(hc_lr + hc_dim);
+    float * gate = lo + hc_lr;
+
+    const float inv_hc = 1.0f / (float) hc;
+
+    for (int64_t it = ir0; it < ir1; ++it) {
+        const float * xn_t = (const float *) xn->data + it*hc_dim;
+
+        // lo = w_down^T xn  (Q8_0 blocks, f32 accumulate)
+        const block_q8_0 * wd = (const block_q8_0 *) w_down->data;
+        for (int64_t j = 0; j < hc_lr; ++j) {
+            const block_q8_0 * wd_j = wd + j*(hc_dim/QK8_0);
+            float sum = 0.0f;
+            for (int64_t b = 0; b < hc_dim/QK8_0; ++b) {
+                const float d = GGML_FP16_TO_FP32(wd_j[b].d);
+                const int8_t * q = wd_j[b].qs;
+                const float * xb = xn_t + b*QK8_0;
+                float acc = 0.0f;
+                for (int64_t k = 0; k < QK8_0; ++k) {
+                    acc += q[k] * xb[k];
+                }
+                sum += d * acc;
+            }
+            lo[j] = sum;
+        }
+
+        // silu(lo / hc)
+        for (int64_t j = 0; j < hc_lr; ++j) {
+            const float v = lo[j] * inv_hc;
+            lo[j] = v / (1.0f + expf(-v));
+        }
+
+        // gate = sigmoid(w_up^T lo)
+        const block_q8_0 * wu = (const block_q8_0 *) w_up->data;
+        for (int64_t r = 0; r < hc_dim; ++r) {
+            const block_q8_0 * wu_r = wu + r*(hc_lr/QK8_0);
+            float sum = 0.0f;
+            for (int64_t b = 0; b < hc_lr/QK8_0; ++b) {
+                const float d = GGML_FP16_TO_FP32(wu_r[b].d);
+                const int8_t * q = wu_r[b].qs;
+                const float * lb = lo + b*QK8_0;
+                float acc = 0.0f;
+                for (int64_t k = 0; k < QK8_0; ++k) {
+                    acc += q[k] * lb[k];
+                }
+                sum += d * acc;
+            }
+            gate[r] = 1.0f / (1.0f + expf(-sum));
+        }
+
+        // collapse the gated streams to the mean
+        float * dst_t = (float *) dst->data + it*n_embd;
+        for (int64_t j = 0; j < n_embd; ++j) {
+            float sum = 0.0f;
+            for (int64_t c = 0; c < hc; ++c) {
+                sum += xn_t[c*n_embd + j] * gate[c*n_embd + j];
+            }
+            dst_t[j] = sum * inv_hc;
+        }
+    }
+}
+
+
+void ggml_compute_forward_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_hc_mix_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            } break;
     }
 }

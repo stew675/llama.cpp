@@ -576,6 +576,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_FLASH_ATTN_QSA,
         GGML_OP_INDEXER_TOPK,
+        GGML_OP_HC_MIX,
 
         GGML_OP_UNARY,
 
@@ -2694,6 +2695,20 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix: fused hyper-connection mixer tail (qwen4exp / Flash-Next decode).
+    // xn [hc*hc_embd, n_tokens] F32 (rms-normed + gamma-scaled input) -> mixed [n_embd, n_tokens]
+    //   lo   = silu(w_down^T xn / hc)
+    //   gate = sigmoid(w_up^T lo)
+    //   mixed = (1/hc) * sum_c xn * gate  (collapse of the hc streams)
+    // hc goes in op_params. Bit-exactness: the CUDA kernel mirrors the mmvq
+    // Q8_0 accumulation the unfused chain uses at M=1.
+    GGML_API struct ggml_tensor * ggml_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_up,
+            int64_t               hc);
 
     // custom operators
 

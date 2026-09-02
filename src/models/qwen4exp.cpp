@@ -235,6 +235,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
 
+    // decode (nt == 1): fuse everything after the norm into one dispatch. The
+    // prefill path keeps the unfused chain so its numerics (mmq vs mmvq
+    // accumulation) are untouched; xn above still feeds the inject MUL_MAT.
+    if (nt == 1 && cparams.fused_hc_mix) {
+        ggml_tensor * mixed = ggml_hc_mix(ctx0, xn, w_down, w_up, hc);
+        cb(mixed, "hc_mixed", il);
+        if (inject) {
+            *inject = build_lora_mm(w_inject, xn);
+            cb(*inject, "hc_inject", il);
+        }
+        return mixed;
+    }
+
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
