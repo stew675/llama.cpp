@@ -91,6 +91,45 @@ static __global__ void hc_mix_down_dots(
     }
 }
 
+// F32 inject product: inject[r] = sum_k w_inject[k, r] * xn[k], replicating the
+// mul_mat_vec_f numerics for the F32 inject MUL_MAT: float2 pairs, per-thread
+// acc += v*u over col2 in the tid-stride order, block of 256 threads (the
+// dispatch's block_size for K = hc_dim), warp_reduce then the zero-padded
+// warp-sums butterfly. 4 blocks (one per inject row) x 256 threads.
+static __global__ void hc_mix_inject_f32(
+        const float * xn, const float * w_inject, float * dst,
+        const int ncols2) {
+    const int r   = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const float2 * x2 = (const float2 *) xn;
+    const float2 * w2 = (const float2 *) (w_inject + (int64_t) r*2*ncols2);
+
+    float sumf = 0.0f;
+    for (int col2 = tid; col2 < ncols2; col2 += blockDim.x) {
+        const float2 tmpx = x2[col2];
+        const float2 tmpw = w2[col2];
+        sumf += tmpx.x*tmpw.x;
+        sumf += tmpx.y*tmpw.y;
+    }
+
+    sumf = warp_reduce_sum<32>(sumf);
+    __shared__ float buf[32];
+    if (tid < 32) {
+        buf[tid] = 0.0f;
+    }
+    __syncthreads();
+    buf[tid/32] = sumf;
+    __syncthreads();
+    if (tid < 32) {
+        sumf = buf[tid];
+        sumf = warp_reduce_sum<32>(sumf);
+        if (tid == 0) {
+            dst[r] = sumf;
+        }
+    }
+}
+
 // silu(lo/hc) and Q8_1 quantize of the low-rank vector, then the Q8_0 matrix-
 // vector product w^T v (the "up" dot). The quantize kernel is merged into the
 // dot kernel: every block quantizes all of v in its prologue (the writes are
@@ -188,16 +227,18 @@ static __global__ void hc_mix_collapse(
 }
 
 void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * x       = dst->src[0];
-    const ggml_tensor * w_norm  = dst->src[1];
-    const ggml_tensor * w_down  = dst->src[2];
-    const ggml_tensor * w_up    = dst->src[3];
+    const ggml_tensor * x         = dst->src[0];
+    const ggml_tensor * w_norm    = dst->src[1];
+    const ggml_tensor * w_down    = dst->src[2];
+    const ggml_tensor * w_up      = dst->src[3];
+    const ggml_tensor * w_inject  = dst->src[4];
 
-    GGML_ASSERT(x->type      == GGML_TYPE_F32);
-    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
-    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
-    GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
-    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type      == GGML_TYPE_F32);
 
     const int   hc  = ggml_get_op_params_i32(dst, 0);
     const float eps = ggml_get_op_params_f32(dst, 1);
@@ -207,7 +248,6 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t hc_dim   = n_embd * hc;
     const int64_t n_tokens = x->ne[2];
     const int64_t hc_lr    = w_down->ne[1];
-    const int64_t dst_stride = n_embd + hc_dim;
 
     GGML_ASSERT(n_tokens == 1);             // decode-only fused op
     GGML_ASSERT(hc_dim % 32 == 0 && hc_lr % 32 == 0);
@@ -215,12 +255,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(x->nb[2] == hc_dim*sizeof(float));  // streams contiguous
     GGML_ASSERT(w_norm->ne[0] == hc_dim);
     GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
-    GGML_ASSERT(dst->ne[0] == dst_stride);
+    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
+    GGML_ASSERT(dst->ne[0] == n_embd + hc);
 
     const float * x_d   = (const float *) x->data;
     const float * wn_d  = (const float *) w_norm->data;
     float * dst_d       = (float *) dst->data;
-    float * xn          = dst_d + n_embd;   // the persisted xn tail
+    float * inject      = dst_d + n_embd;   // the inject tail
 
     cudaStream_t stream = ctx.stream();
 
@@ -229,11 +270,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     ggml_cuda_pool & pool = ctx.pool();
 
+    ggml_cuda_pool_alloc<float>      xn_alloc(pool, hc_dim);
     ggml_cuda_pool_alloc<block_q8_1> y_xn_alloc(pool, blocks_down);
     ggml_cuda_pool_alloc<float>      lo_alloc(pool, hc_lr);
     ggml_cuda_pool_alloc<block_q8_1> y_v_alloc(pool, blocks_up);
     ggml_cuda_pool_alloc<float>      gate_alloc(pool, hc_dim);
 
+    float      * xn   = xn_alloc.get();
     block_q8_1 * y_xn = y_xn_alloc.get();
     float      * lo   = lo_alloc.get();
     block_q8_1 * y_v  = y_v_alloc.get();
@@ -262,7 +305,7 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int rpb_down = calc_rpb(blocks_down);
     const int rpb_up   = calc_rpb(blocks_up);
 
-    // xn = rms(x) * w_norm into the dst tail: one 1024-thread block per stream
+    // xn = rms(x) * w_norm: one 1024-thread block per stream (grid hc)
     {
         const dim3 block_nums(hc);
         const dim3 block_dims(1024);
@@ -287,6 +330,15 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 (const block_q8_0 *) w_down->data, lo, hc_lr,
                 nullptr, nullptr, 0,
                 y_xn, blocks_down);
+    }
+
+    // inject = w_inject^T xn (F32, mmvf numerics) into the dst tail
+    {
+        const dim3 block_nums(hc);
+        const dim3 block_dims(256);
+        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(hc_mix_inject_f32, launch_params,
+                xn, (const float *) w_inject->data, inject, (int) (hc_dim / 2));
     }
 
     // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override);
@@ -375,7 +427,8 @@ void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     GGML_ASSERT(block_out->ne[0] == n_embd);
     GGML_ASSERT(inject->ne[0] == hc);
     GGML_ASSERT(residual->nb[1] == n_embd*sizeof(float));  // contiguous rows
-    GGML_ASSERT(inject->nb[1]   == hc*sizeof(float));
+    // inject may be a view into the mix output (nb[1] = the mix dst stride);
+    // at nt == 1 only nb[0] is used, so no contiguity check on nb[1]
 
     cudaStream_t stream = ctx.stream();
 

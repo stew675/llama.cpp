@@ -6628,12 +6628,14 @@ struct ggml_tensor * ggml_hc_mix(
         struct ggml_tensor  * w_norm,
         struct ggml_tensor  * w_down,
         struct ggml_tensor  * w_up,
+        struct ggml_tensor  * w_inject,
         int64_t               hc,
         float                 eps) {
-    GGML_ASSERT(x->type      == GGML_TYPE_F32);
-    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
-    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
-    GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
     GGML_ASSERT(hc > 0);
 
     const int64_t n_embd    = x->ne[0];
@@ -6644,9 +6646,10 @@ struct ggml_tensor * ggml_hc_mix(
     GGML_ASSERT(w_norm->ne[0] == hc_dim);
     GGML_ASSERT(w_down->ne[0] == hc_dim);
     GGML_ASSERT(w_up->ne[1] == hc_dim && w_up->ne[0] == w_down->ne[1]);
+    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
     GGML_ASSERT(x->ne[3] == 1);
 
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + hc_dim, n_tokens);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd + hc, n_tokens);
 
     ggml_set_op_params_i32(result, 0, (int32_t) hc);
     ggml_set_op_params_f32(result, 1, eps);
@@ -6656,6 +6659,7 @@ struct ggml_tensor * ggml_hc_mix(
     result->src[1] = w_norm;
     result->src[2] = w_down;
     result->src[3] = w_up;
+    result->src[4] = w_inject;
 
     return result;
 }

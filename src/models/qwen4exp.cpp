@@ -235,19 +235,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // unfused chain so its numerics (mmq vs mmvq accumulation) are untouched.
     // The head call (il = -1) has no inject weight and stays unfused.
     if (nt == 1 && cparams.fused_hc_mix && w_inject != nullptr) {
-        ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up,
+        ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up, w_inject,
                 hc, hparams.f_norm_rms_eps);
-        // mixed = the head of dst [n_embd]; xn = the tail [hc_dim] (the graph
-        // keeps the inject MUL_MAT so it consumes the same xn as the unfused
-        // chain - the F32 inject path is left untouched)
+        // mixed = the head of dst [n_embd]; inject = the tail [hc]
         ggml_tensor * mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt,
-                ggml_row_size(GGML_TYPE_F32, n_embd + hc_dim), 0);
+                ggml_row_size(GGML_TYPE_F32, n_embd + hc), 0);
         cb(mixed, "hc_mixed", il);
         if (inject) {
-            ggml_tensor * xn = ggml_view_2d(ctx0, dst_t, hc_dim, nt,
-                    ggml_row_size(GGML_TYPE_F32, n_embd + hc_dim), ggml_row_size(GGML_TYPE_F32, n_embd));
-            cb(xn, "hc_norm", il);
-            *inject = build_lora_mm(w_inject, xn);
+            *inject = ggml_view_2d(ctx0, dst_t, hc, nt,
+                    ggml_row_size(GGML_TYPE_F32, n_embd + hc), ggml_row_size(GGML_TYPE_F32, n_embd));
             cb(*inject, "hc_inject", il);
         }
         return mixed;

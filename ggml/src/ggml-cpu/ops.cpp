@@ -12175,16 +12175,18 @@ void ggml_compute_forward_lightning_indexer(
 static void ggml_compute_forward_hc_mix_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    const ggml_tensor * x       = dst->src[0];
-    const ggml_tensor * w_norm  = dst->src[1];
-    const ggml_tensor * w_down  = dst->src[2];
-    const ggml_tensor * w_up    = dst->src[3];
+    const ggml_tensor * x         = dst->src[0];
+    const ggml_tensor * w_norm    = dst->src[1];
+    const ggml_tensor * w_down    = dst->src[2];
+    const ggml_tensor * w_up      = dst->src[3];
+    const ggml_tensor * w_inject  = dst->src[4];
 
-    GGML_ASSERT(x->type      == GGML_TYPE_F32);
-    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
-    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
-    GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
-    GGML_ASSERT(dst->type    == GGML_TYPE_F32);
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type      == GGML_TYPE_F32);
 
     const int64_t hc       = ggml_get_op_params_i32(dst, 0);
     const float   eps      = ggml_get_op_params_f32(dst, 1);
@@ -12198,6 +12200,7 @@ static void ggml_compute_forward_hc_mix_f32(
     GGML_ASSERT(w_norm->ne[0] == hc_dim);
     GGML_ASSERT(w_down->ne[0] == hc_dim);
     GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
+    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -12206,17 +12209,16 @@ static void ggml_compute_forward_hc_mix_f32(
     const int64_t ir0 = dr * ith;
     const int64_t ir1 = MIN(ir0 + dr, n_tokens);
 
-    // scratch for the current token: lo [hc_lr], gate [hc_dim]; xn lives in
-    // the dst tail [n_embd .. n_embd + hc_dim)
-    float * lo   = (float *) params->wdata + ith*(hc_lr + hc_dim);
+    // scratch for the current token: xn [hc_dim], lo [hc_lr], gate [hc_dim]
+    float * xn   = (float *) params->wdata + ith*(2*hc_dim + hc_lr);
+    float * lo   = xn + hc_dim;
     float * gate = lo + hc_lr;
 
     const float inv_hc = 1.0f / (float) hc;
 
     for (int64_t it = ir0; it < ir1; ++it) {
         const float * x_t = (const float *) x->data + it*hc_dim;
-        float * dst_t     = (float *) dst->data + it*(n_embd + hc_dim);
-        float * xn        = dst_t + n_embd;
+        float * dst_t     = (float *) dst->data + it*(n_embd + hc);
 
         // grouped rms over each stream, then the gamma scale (the reference
         // rounds rms(x) per element before the gamma MUL)
@@ -12282,6 +12284,16 @@ static void ggml_compute_forward_hc_mix_f32(
                 sum += xn[c*n_embd + j] * gate[c*n_embd + j];
             }
             dst_t[j] = sum * inv_hc;
+        }
+
+        // inject = w_inject^T xn into the dst tail [hc]
+        const float * wi = (const float *) w_inject->data;
+        for (int64_t r = 0; r < hc; ++r) {
+            float sum = 0.0f;
+            for (int64_t k = 0; k < hc_dim; ++k) {
+                sum += wi[(int64_t) r*hc_dim + k] * xn[k];
+            }
+            dst_t[n_embd + r] = sum;
         }
     }
 }

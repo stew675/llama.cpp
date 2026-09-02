@@ -2698,26 +2698,29 @@ extern "C" {
             struct ggml_tensor  * comb);
 
     // hc_mix: fused hyper-connection mixer (qwen4exp / Flash-Next decode).
-    // x [n_embd, hc, n_tokens] F32 (the raw hc residual) -> dst [n_embd +
-    // hc_dim, n_tokens] whose head is mixed [n_embd, n_tokens] and whose tail
-    // is xn = rms(x) * w_norm [hc_dim, n_tokens] (the model views both out of
-    // the one tensor; the inject MUL_MAT consumes the xn view). The op runs
-    // the grouped RMSNorm over each stream (eps in op_params), the gamma
-    // scale, the two Q8_0 LoRA products with silu/sigmoid gating, and the
-    // stream collapse:
-    //   xn    = rms(x) * w_norm
-    //   lo    = silu(w_down^T xn / hc)
-    //   gate  = sigmoid(w_up^T lo)
-    //   mixed = (1/hc) * sum_c xn * gate
+    // x [n_embd, hc, n_tokens] F32 (the raw hc residual) -> dst [n_embd + hc,
+    // n_tokens] whose head is mixed [n_embd, n_tokens] and whose tail is the
+    // inject scatter [hc, n_tokens] (the model views both out of the one
+    // tensor; the combine consumes the inject view). The op runs the grouped
+    // RMSNorm over each stream (eps in op_params), the gamma scale (w_norm),
+    // the two Q8_0 LoRA products with silu/sigmoid gating, the stream
+    // collapse, and the F32 inject product:
+    //   xn     = rms(x) * w_norm
+    //   lo     = silu(w_down^T xn / hc)
+    //   gate   = sigmoid(w_up^T lo)
+    //   mixed  = (1/hc) * sum_c xn * gate
+    //   inject = w_inject^T xn
     // Bit-exactness: the CUDA kernels mirror the unfused ops (rms_norm_f32,
-    // the gamma MUL rounding, and the mmvq Q8_0 accumulation at M = 1), so xn
-    // and mixed are byte-identical to the RMS + MUL + fused-chain outputs.
+    // the gamma MUL rounding, the mmvq Q8_0 accumulation at M = 1, and the
+    // mmvf float2-pair FMA accumulation for the F32 inject), so mixed and
+    // inject are byte-identical to the unfused chain outputs.
     GGML_API struct ggml_tensor * ggml_hc_mix(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * w_norm,
             struct ggml_tensor  * w_down,
             struct ggml_tensor  * w_up,
+            struct ggml_tensor  * w_inject,
             int64_t               hc,
             float                 eps);
 
