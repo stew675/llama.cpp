@@ -575,6 +575,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_FLASH_ATTN_QSA,
+        GGML_OP_INDEXER_TOPK,
 
         GGML_OP_UNARY,
 
@@ -2477,6 +2478,18 @@ extern "C" {
 
     GGML_API enum ggml_prec ggml_flash_attn_qsa_get_prec(
             const struct ggml_tensor * a);
+
+    // fused expand + mask + top-k for the indexer: value[c] = score[cell_blk[c]] + additive[c]
+    // src0: block scores [n_blocks, n_tps, n_stream] F32
+    // src1: cell -> block map [n_kv, n_stream] I32
+    // src2: per-cell additive [n_kv, n_tps, n_stream] F16 or F32 (attention mask or bias)
+    // k:   number of top cells to return
+    GGML_API struct ggml_tensor * ggml_indexer_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * cell_blk,
+            struct ggml_tensor  * additive,
+            int                   k);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

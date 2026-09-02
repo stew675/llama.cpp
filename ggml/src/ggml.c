@@ -1084,6 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "FLASH_ATTN_QSA",
+    "INDEXER_TOPK",
 
     "UNARY",
 
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1217,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5585,6 +5586,36 @@ enum ggml_prec ggml_flash_attn_qsa_get_prec(
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 2);
 
     return (enum ggml_prec) prec_i32;
+}
+
+// ggml_indexer_top_k
+
+struct ggml_tensor * ggml_indexer_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * cell_blk,
+        struct ggml_tensor  * additive,
+        int                   k) {
+    GGML_ASSERT(score->type   == GGML_TYPE_F32);
+    GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
+    GGML_ASSERT(score->ne[0] > 0);
+    GGML_ASSERT(cell_blk->ne[0] == additive->ne[0]);
+    GGML_ASSERT(cell_blk->ne[1] == score->ne[2]);
+    GGML_ASSERT(additive->ne[1] == score->ne[1]);
+    GGML_ASSERT(additive->ne[2] == score->ne[2]);
+    GGML_ASSERT(k > 0);
+    GGML_ASSERT(k <= (int) cell_blk->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, score->ne[1], 1, score->ne[2]);
+
+    result->op     = GGML_OP_INDEXER_TOPK;
+    result->src[0] = score;
+    result->src[1] = cell_blk;
+    result->src[2] = additive;
+    ggml_set_op_params_i32(result, 0, k);
+
+    return result;
 }
 
 // ggml_flash_attn_back
