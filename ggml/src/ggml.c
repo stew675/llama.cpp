@@ -5608,7 +5608,10 @@ struct ggml_tensor * ggml_indexer_top_k(
     GGML_ASSERT(cell_blk->ne[0] == additive->ne[0]);
     GGML_ASSERT(cell_blk->ne[1] == score->ne[2]);
     GGML_ASSERT(additive->ne[1] == score->ne[1]);
-    GGML_ASSERT(additive->ne[2] == score->ne[2]);
+    // the additive is the kq mask [n_kv, n_tps, 1, n_stream] (the size-1 dim is a
+    // no-op stride the kernel reads as 3D) or a 3D bias [n_kv, n_tps, n_stream]
+    GGML_ASSERT(additive->ne[2] == score->ne[2] ||
+            (additive->ne[2] == 1 && additive->ne[3] == score->ne[2]));
     GGML_ASSERT(k > 0);
     GGML_ASSERT(k <= (int) cell_blk->ne[0]);
 
