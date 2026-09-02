@@ -76,7 +76,9 @@ static __global__ void indexer_topk_radix_histogram(
     const int s = row / n_tps;
     __shared__ int histogram[NBINS];
 
-    histogram[tid] = 0;
+    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
+        histogram[i] = 0;
+    }
     __syncthreads();
 
     const indexer_topk_radix_state state = states[row];
@@ -109,11 +111,14 @@ static __global__ void indexer_topk_radix_select(
     __shared__ int histogram[NBINS];
 
     int count = 0;
-    for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
-        const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
-        count += block_histograms[offset + tid];
+    for (int i = tid; i < NBINS; i += BLOCK_SIZE) {
+        count = 0;
+        for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
+            const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
+            count += block_histograms[offset + i];
+        }
+        histogram[i] = count;
     }
-    histogram[tid] = count;
     __syncthreads();
 
     if (tid == 0) {
@@ -179,7 +184,7 @@ static void indexer_topk_radix_cuda(
     constexpr int BLOCK_SIZE = 256;
     constexpr int RADIX_BITS = 8;
     constexpr int NBINS = 1 << RADIX_BITS;
-    const int blocks_per_row = std::min((ncols + 1023) / 1024, 64);
+    const int blocks_per_row = std::min((ncols + 1023) / 1024, 8);
 
     ggml_cuda_pool_alloc<indexer_topk_radix_state> states_alloc(pool, nrows);
     ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) nrows * blocks_per_row * NBINS);
