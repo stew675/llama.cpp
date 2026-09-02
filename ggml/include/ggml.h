@@ -577,6 +577,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_QSA,
         GGML_OP_INDEXER_TOPK,
         GGML_OP_HC_MIX,
+        GGML_OP_HC_COMBINE,
 
         GGML_OP_UNARY,
 
@@ -2708,6 +2709,21 @@ extern "C" {
             struct ggml_tensor  * xn,
             struct ggml_tensor  * w_down,
             struct ggml_tensor  * w_up,
+            int64_t               hc);
+
+    // hc_combine: fused hyper-connection residual combine (qwen4exp /
+    // Flash-Next decode). residual [n_embd, hc, n_tokens] -> same shape:
+    //   w[c] = 2 * sigmoid(inject[c] / hc)          (per stream)
+    //   out[r, c] = residual[r, c] + block_out[r] * w[c]
+    // which is the SCALE+SIGMOID+SCALE+REPEAT+MUL+ADD chain of
+    // build_hc_combine. The kernel keeps each op's rounding (separate MUL
+    // and ADD results, no FMA contraction) so decode stays bit-exact vs the
+    // unfused chain.
+    GGML_API struct ggml_tensor * ggml_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * inject,
             int64_t               hc);
 
     // custom operators

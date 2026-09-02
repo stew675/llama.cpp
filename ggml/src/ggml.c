@@ -1086,6 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_QSA",
     "INDEXER_TOPK",
     "HC_MIX",
+    "HC_COMBINE",
 
     "UNARY",
 
@@ -1103,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1204,6 +1205,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_qsa(q, k, v, idx, mask)",
     "indexer_topk(q, k, weights, mask)",
     "hc_mix(x, w_norm, w_down, w_up)",
+    "hc_combine(residual, x, inject)",
 
     "unary(x)",
 
@@ -1221,7 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6647,6 +6649,41 @@ struct ggml_tensor * ggml_hc_mix(
     result->src[0] = xn;
     result->src[1] = w_down;
     result->src[2] = w_up;
+
+    return result;
+}
+
+// ggml_hc_combine
+
+struct ggml_tensor * ggml_hc_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * inject,
+        int64_t               hc) {
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type == GGML_TYPE_F32);
+    GGML_ASSERT(hc > 0);
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(residual->ne[1] == hc);
+    GGML_ASSERT(block_out->ne[0] == n_embd);
+    GGML_ASSERT(block_out->ne[1] == n_tokens || block_out->ne[1] == 1);
+    GGML_ASSERT(inject->ne[0] == hc);
+    GGML_ASSERT(inject->ne[1] == n_tokens || inject->ne[1] == 1);
+    GGML_ASSERT(residual->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) hc);
+
+    result->op     = GGML_OP_HC_COMBINE;
+    result->src[0] = residual;
+    result->src[1] = block_out;
+    result->src[2] = inject;
 
     return result;
 }

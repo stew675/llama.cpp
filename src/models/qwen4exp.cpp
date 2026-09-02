@@ -285,6 +285,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
+    // decode (nt == 1): fuse the whole residual combine into one dispatch.
+    // The prefill path keeps the unfused chain (its mmq-era numerics are
+    // irrelevant here - combine is elementwise - but the chain must stay
+    // identical for the prefill gates).
+    if (nt == 1 && cparams.fused_hc_combine) {
+        ggml_tensor * cur = ggml_hc_combine(ctx0, residual, block_out, inject, hc);
+        cb(cur, "hc_combine", il);
+        return cur;
+    }
+
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
     w = ggml_scale(ctx0, w, 2.0f);

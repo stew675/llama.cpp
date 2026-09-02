@@ -12280,3 +12280,70 @@ void ggml_compute_forward_hc_mix(
             } break;
     }
 }
+
+// ggml_compute_forward_hc_combine
+
+// Fused hyper-connection residual combine: out[r, c] = residual[r, c] +
+// block_out[r] * w[c] with w[c] = 2*sigmoid(inject[c]/hc). Reference for the
+// unfused build_hc_combine chain (SCALE, SIGMOID, SCALE, REPEAT, MUL, ADD);
+// used only on the CPU backend.
+static void ggml_compute_forward_hc_combine_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * residual   = dst->src[0];
+    const ggml_tensor * block_out  = dst->src[1];
+    const ggml_tensor * inject     = dst->src[2];
+
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type    == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+
+    const int64_t hc       = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t n_tokens = residual->ne[2];
+    const int64_t bo_str   = block_out->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n_elem = n_embd * hc * n_tokens;
+    const int64_t dr     = (n_elem + nth - 1) / nth;
+    const int64_t ir0    = dr * ith;
+    const int64_t ir1    = MIN(ir0 + dr, n_elem);
+
+    const float inv_hc = 1.0f / (float) hc;
+
+    const float * residual_d = (const float *) residual->data;
+    const float * block_d    = (const float *) block_out->data;
+    const float * inject_d   = (const float *) inject->data;
+    float       * dst_d      = (float *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t r = i % n_embd;
+        const int64_t c = (i / n_embd) % hc;
+        const int64_t t = i / (n_embd * hc);
+        // 2*sigmoid(inject/hc): the 1/hc and 2.0 scales are exact in f32
+        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*hc] * inv_hc));
+        const float b = block_d[r + t*bo_str] * w;
+        dst_d[i] = residual_d[i] + b;
+    }
+}
+
+
+void ggml_compute_forward_hc_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_hc_combine_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            } break;
+    }
+}

@@ -250,6 +250,15 @@ llama_context::llama_context(
         }
     }
 
+    cparams.fused_hc_combine = true;
+    {
+        const char * LLAMA_FUSED_HC_COMBINE = getenv("LLAMA_FUSED_HC_COMBINE");
+        if (LLAMA_FUSED_HC_COMBINE) {
+            cparams.fused_hc_combine = atoi(LLAMA_FUSED_HC_COMBINE) != 0;
+            LLAMA_LOG_INFO("%s: fused hc_combine = %d (env)\n", __func__, cparams.fused_hc_combine);
+        }
+    }
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 

@@ -1065,10 +1065,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_HC_MIX: {
-                // the mix weights and the normed input are mirrored per device
-                // (verified on the qwen4exp decode graph); each device runs the
-                // full op and produces its own local mixed copy.
+            case GGML_OP_HC_MIX:
+            case GGML_OP_HC_COMBINE: {
+                // the hc weights and the per-token tensors are mirrored per
+                // device (verified on the qwen4exp decode graph); each device
+                // runs the full op and produces its own local copy.
                 GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);

@@ -49,6 +49,7 @@ struct llama_cparams {
     bool fused_dsv4_hc_post;
     bool auto_fhc;
     bool fused_hc_mix;       // use the fused hyper-connection mixer (qwen4exp decode)
+    bool fused_hc_combine;   // use the fused hyper-connection combine (qwen4exp decode)
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

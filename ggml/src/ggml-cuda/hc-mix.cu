@@ -237,3 +237,76 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 
 }
+
+// Fused hyper-connection residual combine for qwen4exp decode (nt == 1).
+// out[r, c] = residual[r, c] + block_out[r] * w[c], with
+// w[c] = 2 * sigmoid(inject[c] / hc) (the SCALE+SIGMOID+SCALE chain of
+// build_hc_combine; the 1/hc and 2.0 scalars are exact in f32 so only the
+// sigmoid rounds). The product block_out[r]*w[c] and the residual add keep
+// their own roundings because the reference runs separate MUL and ADD ops:
+// the products go to an array first so the compiler cannot contract them
+// into FMAs. One thread per row handles the hc columns, mirroring the
+// collapse kernel; w is computed once per block into smem.
+static __global__ void hc_combine_kernel(
+        const float * residual, const float * block_out, const float * inject,
+        float * dst, const int n_embd, const int hc, const int n_tokens) {
+    const float inv_hc = 1.0f / (float) hc;
+
+    __shared__ float w_s[8];
+    if (threadIdx.x < hc) {
+        const float s = inject[threadIdx.x] * inv_hc;
+        w_s[threadIdx.x] = (1.0f / (1.0f + expf(-s))) * 2.0f;
+    }
+    __syncthreads();
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const int r = blockIdx.x*blockDim.x + threadIdx.x;
+        if (r >= n_embd) {
+            return;
+        }
+        const float * res = residual + (int64_t) t*n_embd*hc + r;
+        const float   bo  = block_out[(int64_t) t*n_embd + r];
+        float       * dt  = dst + (int64_t) t*n_embd*hc + r;
+        float pp[8];
+        for (int c = 0; c < hc; ++c) {
+            pp[c] = bo * w_s[c];
+        }
+        for (int c = 0; c < hc; ++c) {
+            dt[c*n_embd] = res[c*n_embd] + pp[c];
+        }
+    }
+}
+
+void ggml_cuda_op_hc_combine(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * residual  = dst->src[0];
+    const ggml_tensor * block_out = dst->src[1];
+    const ggml_tensor * inject    = dst->src[2];
+
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type    == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+
+    const int hc = ggml_get_op_params_i32(dst, 0);
+    GGML_ASSERT(hc > 0 && hc <= 8);
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(n_tokens == 1);                 // decode-only fused op
+    GGML_ASSERT(residual->ne[1] == hc);
+    GGML_ASSERT(block_out->ne[0] == n_embd);
+    GGML_ASSERT(inject->ne[0] == hc);
+    GGML_ASSERT(residual->nb[1] == n_embd*sizeof(float));  // contiguous rows
+    GGML_ASSERT(inject->nb[1]   == hc*sizeof(float));
+
+    cudaStream_t stream = ctx.stream();
+
+    const dim3 block_nums((n_embd + 255) / 256);
+    const dim3 block_dims(256);
+    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+    ggml_cuda_kernel_launch(hc_combine_kernel, launch_params,
+            (const float *) residual->data, (const float *) block_out->data,
+            (const float *) inject->data, (float *) dst->data,
+            (int) n_embd, hc, (int) n_tokens);
+}
