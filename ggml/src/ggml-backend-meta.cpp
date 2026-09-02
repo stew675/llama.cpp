@@ -1065,7 +1065,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
-            case GGML_OP_HC_MIX:
+            case GGML_OP_HC_MIX: {
+                // the hc weights and the per-token tensors are mirrored per
+                // device (verified on the qwen4exp decode graph); each device
+                // runs the full op and produces its own local copy. The output
+                // carries both mixed and the persisted xn (the inject MUL_MAT
+                // views the tail), all mirrored.
+                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
             case GGML_OP_HC_COMBINE: {
                 // the hc weights and the per-token tensors are mirrored per
                 // device (verified on the qwen4exp decode graph); each device

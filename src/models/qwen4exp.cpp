@@ -228,25 +228,37 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
 
+    // decode (nt == 1): fuse the whole mixer - grouped RMSNorm, gamma scale,
+    // both LoRA products with the silu/sigmoid gating, the stream collapse AND
+    // the inject product - into one dispatch; the model views the mixed and
+    // inject outputs out of the one result. The prefill path keeps the
+    // unfused chain so its numerics (mmq vs mmvq accumulation) are untouched.
+    // The head call (il = -1) has no inject weight and stays unfused.
+    if (nt == 1 && cparams.fused_hc_mix && w_inject != nullptr) {
+        ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up,
+                hc, hparams.f_norm_rms_eps);
+        // mixed = the head of dst [n_embd]; xn = the tail [hc_dim] (the graph
+        // keeps the inject MUL_MAT so it consumes the same xn as the unfused
+        // chain - the F32 inject path is left untouched)
+        ggml_tensor * mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt,
+                ggml_row_size(GGML_TYPE_F32, n_embd + hc_dim), 0);
+        cb(mixed, "hc_mixed", il);
+        if (inject) {
+            ggml_tensor * xn = ggml_view_2d(ctx0, dst_t, hc_dim, nt,
+                    ggml_row_size(GGML_TYPE_F32, n_embd + hc_dim), ggml_row_size(GGML_TYPE_F32, n_embd));
+            cb(xn, "hc_norm", il);
+            *inject = build_lora_mm(w_inject, xn);
+            cb(*inject, "hc_inject", il);
+        }
+        return mixed;
+    }
+
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     xn = ggml_mul(ctx0, xn, w_norm);
     cb(xn, "hc_norm", il);
-
-    // decode (nt == 1): fuse everything after the norm into one dispatch. The
-    // prefill path keeps the unfused chain so its numerics (mmq vs mmvq
-    // accumulation) are untouched; xn above still feeds the inject MUL_MAT.
-    if (nt == 1 && cparams.fused_hc_mix) {
-        ggml_tensor * mixed = ggml_hc_mix(ctx0, xn, w_down, w_up, hc);
-        cb(mixed, "hc_mixed", il);
-        if (inject) {
-            *inject = build_lora_mm(w_inject, xn);
-            cb(*inject, "hc_inject", il);
-        }
-        return mixed;
-    }
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));

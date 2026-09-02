@@ -12166,32 +12166,38 @@ void ggml_compute_forward_lightning_indexer(
 
 // ggml_compute_forward_hc_mix
 
-// Fused hyper-connection mixer tail: two Q8_0 matrix-vector products with
-// silu/sigmoid gating plus the stream collapse. xn is the rms-normed and
-// gamma-scaled input (the graph keeps those nodes for the inject MUL_MAT).
-// Reference for the unfused chain; used only on the CPU backend (the GPU
-// fused kernel must match the GPU unfused chain, not this function).
+// Fused hyper-connection mixer: grouped RMSNorm over each stream, the gamma
+// scale, and two Q8_0 matrix-vector products with silu/sigmoid gating plus the
+// stream collapse. The dst head is mixed [n_embd] and its tail persists xn =
+// rms(x) * w_norm (the inject MUL_MAT consumes the xn view). Reference for the
+// unfused chain; used only on the CPU backend (the GPU fused kernel must match
+// the GPU unfused chain, not this function).
 static void ggml_compute_forward_hc_mix_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    const ggml_tensor * xn      = dst->src[0];
-    const ggml_tensor * w_down  = dst->src[1];
-    const ggml_tensor * w_up    = dst->src[2];
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * w_norm  = dst->src[1];
+    const ggml_tensor * w_down  = dst->src[2];
+    const ggml_tensor * w_up    = dst->src[3];
 
-    GGML_ASSERT(xn->type     == GGML_TYPE_F32);
+    GGML_ASSERT(x->type      == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
     GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
     GGML_ASSERT(dst->type    == GGML_TYPE_F32);
 
     const int64_t hc       = ggml_get_op_params_i32(dst, 0);
-    const int64_t hc_dim   = xn->ne[0];
-    const int64_t n_tokens = xn->ne[1];
-    const int64_t n_embd   = hc_dim / hc;
+    const float   eps      = ggml_get_op_params_f32(dst, 1);
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc_dim   = n_embd * hc;
+    const int64_t n_tokens = x->ne[2];
     const int64_t hc_lr    = w_down->ne[1];
 
     GGML_ASSERT(hc_lr % QK8_0 == 0 && hc_dim % QK8_0 == 0);
+    GGML_ASSERT(x->ne[1] == hc);
+    GGML_ASSERT(w_norm->ne[0] == hc_dim);
     GGML_ASSERT(w_down->ne[0] == hc_dim);
-    GGML_ASSERT(w_up->ne[0]   == hc_lr  && w_up->ne[1] == hc_dim);
+    GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -12200,14 +12206,32 @@ static void ggml_compute_forward_hc_mix_f32(
     const int64_t ir0 = dr * ith;
     const int64_t ir1 = MIN(ir0 + dr, n_tokens);
 
-    // scratch for the current token: lo [hc_lr], gate [hc_dim]
+    // scratch for the current token: lo [hc_lr], gate [hc_dim]; xn lives in
+    // the dst tail [n_embd .. n_embd + hc_dim)
     float * lo   = (float *) params->wdata + ith*(hc_lr + hc_dim);
     float * gate = lo + hc_lr;
 
     const float inv_hc = 1.0f / (float) hc;
 
     for (int64_t it = ir0; it < ir1; ++it) {
-        const float * xn_t = (const float *) xn->data + it*hc_dim;
+        const float * x_t = (const float *) x->data + it*hc_dim;
+        float * dst_t     = (float *) dst->data + it*(n_embd + hc_dim);
+        float * xn        = dst_t + n_embd;
+
+        // grouped rms over each stream, then the gamma scale (the reference
+        // rounds rms(x) per element before the gamma MUL)
+        for (int64_t c = 0; c < hc; ++c) {
+            const float * xs = x_t + c*n_embd;
+            float sum = 0.0f;
+            for (int64_t j = 0; j < n_embd; ++j) {
+                sum += xs[j]*xs[j];
+            }
+            const float scale = 1.0f / sqrtf(sum / n_embd + eps);
+            for (int64_t j = 0; j < n_embd; ++j) {
+                const float r = scale * xs[j];
+                xn[c*n_embd + j] = r * ((const float *) w_norm->data)[c*n_embd + j];
+            }
+        }
 
         // lo = w_down^T xn  (Q8_0 blocks, f32 accumulate)
         const block_q8_0 * wd = (const block_q8_0 *) w_down->data;
@@ -12217,7 +12241,7 @@ static void ggml_compute_forward_hc_mix_f32(
             for (int64_t b = 0; b < hc_dim/QK8_0; ++b) {
                 const float d = GGML_FP16_TO_FP32(wd_j[b].d);
                 const int8_t * q = wd_j[b].qs;
-                const float * xb = xn_t + b*QK8_0;
+                const float * xb = xn + b*QK8_0;
                 float acc = 0.0f;
                 for (int64_t k = 0; k < QK8_0; ++k) {
                     acc += q[k] * xb[k];
@@ -12251,12 +12275,11 @@ static void ggml_compute_forward_hc_mix_f32(
             gate[r] = 1.0f / (1.0f + expf(-sum));
         }
 
-        // collapse the gated streams to the mean
-        float * dst_t = (float *) dst->data + it*n_embd;
+        // collapse the gated streams to the mean into the dst head
         for (int64_t j = 0; j < n_embd; ++j) {
             float sum = 0.0f;
             for (int64_t c = 0; c < hc; ++c) {
-                sum += xn_t[c*n_embd + j] * gate[c*n_embd + j];
+                sum += xn[c*n_embd + j] * gate[c*n_embd + j];
             }
             dst_t[j] = sum * inv_hc;
         }

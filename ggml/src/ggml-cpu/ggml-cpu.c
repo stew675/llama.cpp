@@ -3042,8 +3042,9 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_HC_MIX:
                     {
                         // per-token scratch: lo [hc_lr] + gate [hc_dim]
-                        const int64_t hc_lr  = node->src[1]->ne[1];
-                        const int64_t hc_dim = node->src[0]->ne[0];
+                        const int64_t hc      = ggml_get_op_params_i32(node, 0);
+                        const int64_t hc_lr   = node->src[2]->ne[1];
+                        const int64_t hc_dim  = node->src[0]->ne[0] * hc;
                         const int64_t per_thread = hc_lr + hc_dim;
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;

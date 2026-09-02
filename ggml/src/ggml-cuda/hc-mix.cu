@@ -18,55 +18,76 @@
 #include "vecdotq.cuh"
 
 
-// One Q8_0 matrix-vector product against a pre-quantized Q8_1 input. Grid:
-// (ceil(nrows / RPB), 1), block: (32, nwarps), RPB rows per block. This is a
-// faithful clone of mul_mat_vec_q (ncols_dst = 1): the (row, kblock) items are
-// split across the (32, nwarps) threads and reduced with a per-warp butterfly
-// followed by a serial add of the warp results. RPB must match the dispatch's
-// rows-per-block (1 for K >= the group count, or the short-K override for
-// small K) so the sums are bit-identical to the unfused mmvq path.
-template <int nwarps, int RPB>
-static __global__ void hc_mix_row_dot(
-        const block_q8_0 * w, const block_q8_1 * y, float * dst,
-        const int nrows, const int blocks_per_row) {
-    const int row0 = RPB*blockIdx.x;
+// Grouped RMSNorm over the hc streams plus the gamma scale (w_norm). One
+// block of 1024 threads per stream row; the reduction mirrors rms_norm_f32
+// (blockDim 1024, warp shuffles then one final warp pass over the 32 warp
+// sums) and the gamma multiply keeps the rms output's separate rounding, so
+// xn is bit-identical to the unfused RMS + MUL chain.
+static __global__ void hc_mix_rms_gamma(
+        const float * x, const float * w_norm, float * xn,
+        const int n_embd, const float eps) {
+    const int c   = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float * xs = x + (int64_t) c*n_embd;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < n_embd; col += blockDim.x) {
+        const float xi = xs[col];
+        tmp += xi*xi;
+    }
+    __shared__ float s_sum[32];
+    tmp = block_reduce<block_reduce_method::SUM>(tmp, s_sum);
+
+    const float scale = rsqrtf(tmp / (float) n_embd + eps);
+    float * xo = xn + (int64_t) c*n_embd;
+    for (int col = tid; col < n_embd; col += blockDim.x) {
+        const float r = scale * xs[col];
+        xo[col] = r * w_norm[(int64_t) c*n_embd + col];
+    }
+}
+
+// One Q8_0 matrix-vector product against the pre-quantized Q8_1 input, rpb =
+// 1 (one row per block, K fills the thread groups). The grid covers the lo
+// rows (w_down, K = hc_dim) and then the inject rows (w_inject, K = hc_dim);
+// the accumulation is the mul_mat_vec_q rpb=1 clone, bit-identical to the
+// unfused mmvq path.
+static __global__ void hc_mix_down_dots(
+        const block_q8_0 * w_down, float * lo, const int nrows_down,
+        const block_q8_0 * w_inject, float * inject, const int nrows_inject,
+        const block_q8_1 * y, const int blocks_per_row) {
+    const int row = blockIdx.x;
+    const bool is_inject = row >= nrows_down;
+    const int r = is_inject ? row - nrows_down : row;
+    const block_q8_0 * w = is_inject ? w_inject : w_down;
+    float * dst = is_inject ? inject : lo;
+
     constexpr int qi  = QI8_0;             // 8
     constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
     const int tid      = 32*threadIdx.y + threadIdx.x;
-    const int n_groups = nwarps*32 / (qi/vdr);
-    const int n_items  = RPB * blocks_per_row;
+    const int n_groups = 8*32 / (qi/vdr);
+    const int n_items  = blocks_per_row;
 
-    float tmp[RPB] = {0.0f};
+    float acc = 0.0f;
     const int kqs = vdr * (tid % (qi/vdr));
     for (int it = tid / (qi/vdr); it < n_items; it += n_groups) {
-        const int i   = it / blocks_per_row;
-        const int kbx = it % blocks_per_row;
-        if (row0 + i < nrows) {
-            // the vec_dot reads the Q8_1 block from the pointer argument as-is
-            // and offsets only the weight by kbx, so pass the per-kblock y pointer
-            tmp[i] += vec_dot_q8_0_q8_1(w + (int64_t) (row0 + i) * blocks_per_row, &y[kbx], kbx, kqs);
-        }
+        acc += vec_dot_q8_0_q8_1(w + (int64_t) r*blocks_per_row, &y[it], it, kqs);
     }
 
-    __shared__ float tmp_shared[nwarps > 1 ? nwarps-1 : 1][RPB];
-    for (int i = 0; i < RPB; ++i) {
-        tmp[i] = warp_reduce_sum<32>(tmp[i]);
-        if (threadIdx.y > 0) {
-            tmp_shared[threadIdx.y-1][i] = tmp[i];
-        }
+    acc = warp_reduce_sum<32>(acc);
+    __shared__ float tmp_shared[7];
+    if (threadIdx.y > 0) {
+        tmp_shared[threadIdx.y-1] = acc;
     }
     __syncthreads();
     if (threadIdx.y > 0) {
         return;
     }
-    for (int i = 0; i < RPB; ++i) {
 #pragma unroll
-        for (int l = 0; l < nwarps-1; ++l) {
-            tmp[i] += tmp_shared[l][i];
-        }
-        if (threadIdx.x == 0 && row0 + i < nrows) {
-            dst[row0 + i] = tmp[i];
-        }
+    for (int l = 0; l < 7; ++l) {
+        acc += tmp_shared[l];
+    }
+    if (threadIdx.x == 0) {
+        dst[r] = acc;
     }
 }
 
@@ -167,31 +188,39 @@ static __global__ void hc_mix_collapse(
 }
 
 void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * xn     = dst->src[0];
-    const ggml_tensor * w_down = dst->src[1];
-    const ggml_tensor * w_up   = dst->src[2];
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * w_norm  = dst->src[1];
+    const ggml_tensor * w_down  = dst->src[2];
+    const ggml_tensor * w_up    = dst->src[3];
 
-    GGML_ASSERT(xn->type     == GGML_TYPE_F32);
+    GGML_ASSERT(x->type      == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type == GGML_TYPE_F32);
     GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(w_up->type   == GGML_TYPE_Q8_0);
     GGML_ASSERT(dst->type    == GGML_TYPE_F32);
 
-    const int hc = ggml_get_op_params_i32(dst, 0);
+    const int   hc  = ggml_get_op_params_i32(dst, 0);
+    const float eps = ggml_get_op_params_f32(dst, 1);
     GGML_ASSERT(hc > 0 && hc <= 8);
 
-    const int64_t hc_dim   = xn->ne[0];
-    const int64_t n_tokens = xn->ne[1];
-    const int64_t n_embd   = hc_dim / hc;
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc_dim   = n_embd * hc;
+    const int64_t n_tokens = x->ne[2];
     const int64_t hc_lr    = w_down->ne[1];
+    const int64_t dst_stride = n_embd + hc_dim;
 
     GGML_ASSERT(n_tokens == 1);             // decode-only fused op
     GGML_ASSERT(hc_dim % 32 == 0 && hc_lr % 32 == 0);
-    GGML_ASSERT(xn->nb[1] == hc_dim*sizeof(float)); // contiguous
-    GGML_ASSERT(w_down->ne[1] == hc_lr && w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
+    GGML_ASSERT(x->ne[1] == hc);
+    GGML_ASSERT(x->nb[2] == hc_dim*sizeof(float));  // streams contiguous
+    GGML_ASSERT(w_norm->ne[0] == hc_dim);
+    GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
+    GGML_ASSERT(dst->ne[0] == dst_stride);
 
-
-    const float * xn_d = (const float *) xn->data;
-    float * dst_d      = (float *) dst->data;
+    const float * x_d   = (const float *) x->data;
+    const float * wn_d  = (const float *) w_norm->data;
+    float * dst_d       = (float *) dst->data;
+    float * xn          = dst_d + n_embd;   // the persisted xn tail
 
     cudaStream_t stream = ctx.stream();
 
@@ -233,11 +262,20 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int rpb_down = calc_rpb(blocks_down);
     const int rpb_up   = calc_rpb(blocks_up);
 
+    // xn = rms(x) * w_norm into the dst tail: one 1024-thread block per stream
+    {
+        const dim3 block_nums(hc);
+        const dim3 block_dims(1024);
+        const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(hc_mix_rms_gamma, launch_params,
+                x_d, wn_d, xn, (int) n_embd, eps);
+    }
+
     // xn -> Q8_1 (same kernel + semantics as the mmvq quantize path)
-    quantize_row_q8_1_cuda(xn_d, nullptr, y_xn, GGML_TYPE_Q8_0,
+    quantize_row_q8_1_cuda(xn, nullptr, y_xn, GGML_TYPE_Q8_0,
             hc_dim, hc_dim, 0, 0, hc_dim, 1, 1, 1, stream);
 
-    // lo_raw = w_down^T xn: 320 rows x 10240 dots
+    // lo_raw = w_down^T xn: 320 rows x 10240 dots (rpb is always 1 here)
     if (rpb_down != 1) {
         GGML_ABORT("hc_mix: unexpected down rpb %d\n", rpb_down);
     }
@@ -245,8 +283,10 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const dim3 block_nums(hc_lr);
         const dim3 block_dims(32, 8);
         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
-        ggml_cuda_kernel_launch(hc_mix_row_dot<8, 1>, launch_params,
-                (const block_q8_0 *) w_down->data, y_xn, lo, hc_lr, blocks_down);
+        ggml_cuda_kernel_launch(hc_mix_down_dots, launch_params,
+                (const block_q8_0 *) w_down->data, lo, hc_lr,
+                nullptr, nullptr, 0,
+                y_xn, blocks_down);
     }
 
     // gate_raw = w_up^T v: 10240 rows x 320 dots (short K -> rpb override);
@@ -265,13 +305,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
-    // mixed = (1/hc) * sum_c xn * sigmoid(gate)
+    // mixed = (1/hc) * sum_c xn * sigmoid(gate) at the head of dst
     {
         const dim3 block_nums((n_embd + 255) / 256);
         const dim3 block_dims(256);
         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
         ggml_cuda_kernel_launch(hc_mix_collapse, launch_params,
-                xn_d, gate, dst_d, n_embd, hc, 1.0f / (float) hc);
+                xn, gate, dst_d, n_embd, hc, 1.0f / (float) hc);
     }
 }
 

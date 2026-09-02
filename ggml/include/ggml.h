@@ -2697,19 +2697,29 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
-    // hc_mix: fused hyper-connection mixer tail (qwen4exp / Flash-Next decode).
-    // xn [hc*hc_embd, n_tokens] F32 (rms-normed + gamma-scaled input) -> mixed [n_embd, n_tokens]
-    //   lo   = silu(w_down^T xn / hc)
-    //   gate = sigmoid(w_up^T lo)
-    //   mixed = (1/hc) * sum_c xn * gate  (collapse of the hc streams)
-    // hc goes in op_params. Bit-exactness: the CUDA kernel mirrors the mmvq
-    // Q8_0 accumulation the unfused chain uses at M=1.
+    // hc_mix: fused hyper-connection mixer (qwen4exp / Flash-Next decode).
+    // x [n_embd, hc, n_tokens] F32 (the raw hc residual) -> dst [n_embd +
+    // hc_dim, n_tokens] whose head is mixed [n_embd, n_tokens] and whose tail
+    // is xn = rms(x) * w_norm [hc_dim, n_tokens] (the model views both out of
+    // the one tensor; the inject MUL_MAT consumes the xn view). The op runs
+    // the grouped RMSNorm over each stream (eps in op_params), the gamma
+    // scale, the two Q8_0 LoRA products with silu/sigmoid gating, and the
+    // stream collapse:
+    //   xn    = rms(x) * w_norm
+    //   lo    = silu(w_down^T xn / hc)
+    //   gate  = sigmoid(w_up^T lo)
+    //   mixed = (1/hc) * sum_c xn * gate
+    // Bit-exactness: the CUDA kernels mirror the unfused ops (rms_norm_f32,
+    // the gamma MUL rounding, and the mmvq Q8_0 accumulation at M = 1), so xn
+    // and mixed are byte-identical to the RMS + MUL + fused-chain outputs.
     GGML_API struct ggml_tensor * ggml_hc_mix(
             struct ggml_context * ctx,
-            struct ggml_tensor  * xn,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_norm,
             struct ggml_tensor  * w_down,
             struct ggml_tensor  * w_up,
-            int64_t               hc);
+            int64_t               hc,
+            float                 eps);
 
     // hc_combine: fused hyper-connection residual combine (qwen4exp /
     // Flash-Next decode). residual [n_embd, hc, n_tokens] -> same shape:
