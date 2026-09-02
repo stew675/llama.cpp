@@ -258,7 +258,7 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
     GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
     GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
-    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_inject == nullptr || w_inject->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type      == GGML_TYPE_F32);
 
     const int   hc  = ggml_get_op_params_i32(dst, 0);
@@ -276,13 +276,13 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(x->nb[2] == hc_dim*sizeof(float));  // streams contiguous
     GGML_ASSERT(w_norm->ne[0] == hc_dim);
     GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
-    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
-    GGML_ASSERT(dst->ne[0] == n_embd + hc);
+    GGML_ASSERT(w_inject == nullptr || (w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc));
+    GGML_ASSERT(dst->ne[0] == n_embd + (w_inject ? hc : 0));
 
     const float * x_d   = (const float *) x->data;
     const float * wn_d  = (const float *) w_norm->data;
     float * dst_d       = (float *) dst->data;
-    float * inject      = dst_d + n_embd;   // the inject tail
+    float * inject      = w_inject ? dst_d + n_embd : nullptr;  // the inject tail
 
     cudaStream_t stream = ctx.stream();
 
@@ -369,13 +369,14 @@ void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // collapse blocks (n_embd/256) and the hc inject rows share the grid
     {
         const int n_collapse_blocks = (int) ((n_embd + 255) / 256);
-        const dim3 block_nums(n_collapse_blocks + hc);
+        const int n_inject_blocks   = w_inject ? hc : 0;
+        const dim3 block_nums(n_collapse_blocks + n_inject_blocks);
         const dim3 block_dims(256);
         const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
         ggml_cuda_kernel_launch(hc_mix_collapse_inject, launch_params,
                 xn, gate, dst_d, n_embd, hc, 1.0f / (float) hc,
-                (const float *) w_inject->data, inject, (int) (hc_dim / 2),
-                n_collapse_blocks);
+                w_inject ? (const float *) w_inject->data : nullptr, inject,
+                (int) (hc_dim / 2), n_collapse_blocks);
     }
 }
 

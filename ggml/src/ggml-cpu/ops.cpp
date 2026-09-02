@@ -12185,7 +12185,7 @@ static void ggml_compute_forward_hc_mix_f32(
     GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
     GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
     GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
-    GGML_ASSERT(w_inject->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_inject == nullptr || w_inject->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type      == GGML_TYPE_F32);
 
     const int64_t hc       = ggml_get_op_params_i32(dst, 0);
@@ -12200,7 +12200,7 @@ static void ggml_compute_forward_hc_mix_f32(
     GGML_ASSERT(w_norm->ne[0] == hc_dim);
     GGML_ASSERT(w_down->ne[0] == hc_dim);
     GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
-    GGML_ASSERT(w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc);
+    GGML_ASSERT(w_inject == nullptr || (w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc));
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -12286,14 +12286,16 @@ static void ggml_compute_forward_hc_mix_f32(
             dst_t[j] = sum * inv_hc;
         }
 
-        // inject = w_inject^T xn into the dst tail [hc]
-        const float * wi = (const float *) w_inject->data;
-        for (int64_t r = 0; r < hc; ++r) {
-            float sum = 0.0f;
-            for (int64_t k = 0; k < hc_dim; ++k) {
-                sum += wi[(int64_t) r*hc_dim + k] * xn[k];
+        // inject = w_inject^T xn into the dst tail [hc] (none at the head)
+        if (w_inject) {
+            const float * wi = (const float *) w_inject->data;
+            for (int64_t r = 0; r < hc; ++r) {
+                float sum = 0.0f;
+                for (int64_t k = 0; k < hc_dim; ++k) {
+                    sum += wi[(int64_t) r*hc_dim + k] * xn[k];
+                }
+                dst_t[n_embd + r] = sum;
             }
-            dst_t[n_embd + r] = sum;
         }
     }
 }

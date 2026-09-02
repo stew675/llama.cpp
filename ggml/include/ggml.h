@@ -2709,7 +2709,7 @@ extern "C" {
     //   lo     = silu(w_down^T xn / hc)
     //   gate   = sigmoid(w_up^T lo)
     //   mixed  = (1/hc) * sum_c xn * gate
-    //   inject = w_inject^T xn
+    //   inject = w_inject^T xn (w_inject may be null: no tail, no inject)
     // Bit-exactness: the CUDA kernels mirror the unfused ops (rms_norm_f32,
     // the gamma MUL rounding, the mmvq Q8_0 accumulation at M = 1, and the
     // mmvf float2-pair FMA accumulation for the F32 inject), so mixed and

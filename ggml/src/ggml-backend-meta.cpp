@@ -1070,12 +1070,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 // device (verified on the qwen4exp decode graph); each device
                 // runs the full op and produces its own local copy. The output
                 // carries both mixed and the inject scatter (the combine views
-                // the tail), all mirrored.
+                // the tail), all mirrored. src[4] (w_inject) is null at the
+                // head call (il = -1), which the splitter marks UNKNOWN.
                 GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-                GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
                 split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
             case GGML_OP_HC_COMBINE: {
