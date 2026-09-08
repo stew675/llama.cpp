@@ -1185,6 +1185,15 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_PLAMO2:
         case LLM_ARCH_MINICPM3:
         case LLM_ARCH_GEMMA3N:
+        // gemma4 (target) is allowed under tensor split when the model is fully GPU-resident or
+        // layer-offloaded: upstream #28965/#29294 fixed the fused-QKV split, and a fully resident
+        // 3x R9700 run is byte-identical to `-sm layer`.  The one config that still cannot split is
+        // a host-resident expert table (the segmented `ffn_gate_up_exps` upload) -- that is rejected
+        // at the params level in llama-model.cpp, not here, so the arch itself stays allowed.  The
+        // MTP draft head (`gemma4-assistant`) is a single layer pinned to rotation 0 while it reads
+        // the target's rotating KV caches, so its meta ratio check asserts; reject it explicitly so
+        // an MTP load fails cleanly and a non-MTP load proceeds (issue #99).
+        case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_MAMBA:
         case LLM_ARCH_MAMBA2:
         case LLM_ARCH_JAMBA:
@@ -1211,6 +1220,19 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_QWEN3TTS:
             return false;
+        case LLM_ARCH_QWEN4EXP:
+            // qwen4exp (Flash-Next) tensor split runs the fused QSA/HC/WS4
+            // ops through the meta backend and is validated on ROCm/HIP only
+            // (3x R9700, byte-identical to CPU).  On backends that cannot run
+            // those fused ops on-device (Vulkan, Metal, SYCL, CPU) the graph
+            // portions fall back to CPU and the meta splitter cannot reconcile
+            // the mirrored-vs-split operand states (abort at graph reserve), and
+            // CUDA (NVIDIA) is untested, so keep upstream's unsupported there.
+#ifdef GGML_USE_HIP
+            return true;
+#else
+            return false;   // TODO: validate NVIDIA CUDA tensor split, then allow GGML_USE_CUDA too
+#endif
         default:
             return true;
     }

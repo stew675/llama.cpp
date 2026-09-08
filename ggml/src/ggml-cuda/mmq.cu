@@ -245,7 +245,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                 src0_i->ne[0], src0_i->ne[1], dst_i->ne[1], s01, ne11, s1,
                 src0_i->ne[2], ne12, s02, s12_q, s2,
                 src0_i->ne[3], ne13, s03, s13_q, s3,
-                dst_i->ne[1]};
+                dst_i->ne[1], dst_i->ne[1]};
             const ggml_prec prec_i = ggml_cuda_mmq_get_prec_src1(src0_i, dst_i, cc);
             ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_i);
         }
@@ -311,13 +311,21 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int64_t s1 = dst_i->nb[1] / sizeof(float);
         const int64_t s2 = dst_i->nb[2] / sizeof(float);
         const int64_t s3 = dst_i->nb[3] / sizeof(float);
+        // ncols_opt drives the MMQ tile-size heuristic (smaller ntiles_x wins, the loop stops at
+        // the first J that covers the row).  It must be set like ggml_cuda_mul_mat_q does; leaving
+        // it 0 made every J give ntiles_x == 0, so the loop picked J=8 (the slowest tile).
+        int64_t ncols_opt = ne12;
+        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // each expert only sees ne12*n_expert_used/ne02 tokens on average
+            ncols_opt = (ne12*dst_i->ne[1] + src0_i->ne[2] - 1) / src0_i->ne[2];
+        }
         const mmq_args args = {
             (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), (float *) dst_i->data,
             nullptr,
             src0_i->ne[0], src0_i->ne[1], ne_get_rows, s01, ne_get_rows, s1,
             src0_i->ne[2], src0_i->ne[2], s02, s12_q, s2,
             src0_i->ne[3], ne13, s03, s13_q, s3,
-            ne12};
+            ne12, ncols_opt};
         const ggml_prec prec_i = ggml_cuda_mmq_get_prec_src1(src0_i, dst_i, cc);
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_i);
     }
