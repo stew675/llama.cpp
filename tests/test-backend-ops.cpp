@@ -8225,6 +8225,96 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// GGML_OP_FLASH_ATTN_QSA
+struct test_flash_attn_qsa : public test_case {
+    const int64_t hsk; // head size (== D, one of 64/128/256)
+    const int64_t nh; // num heads (Q)
+    const int64_t nh_kv; // num heads (K/V) -> grouped-query attention
+    const int64_t n_kv; // number of KV cache cells
+    const int64_t n_tps; // query tokens (the decode/verify width)
+    const int64_t n_top_k; // cells the indexer selects (the top-k list length)
+    const ggml_type type_KV; // K and V share the cache type
+
+    std::string vars() override {
+        return VARS_TO_STR7(hsk, nh, nh_kv, n_kv, n_tps, n_top_k, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // Q*K^T and P*V, each over the selected n_top_k cells only
+        return 4 * nh * n_tps * (int64_t) hsk * n_top_k;
+    }
+
+    test_flash_attn_qsa(int64_t hsk = 128, int64_t nh = 16, int64_t nh_kv = 2, int64_t n_kv = 512, int64_t n_tps = 1,
+                        int64_t n_top_k = 64, ggml_type type_KV = GGML_TYPE_F16)
+        : hsk(hsk), nh(nh), nh_kv(nh_kv), n_kv(n_kv), n_tps(n_tps), n_top_k(n_top_k), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_KV));
+
+        // the same layouts the model builds (see fattn-qsa.cuh)
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk_padded, n_tps, nh,    1);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, hsk_padded, n_kv, nh_kv, 1);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, hsk_padded, n_kv, nh_kv, 1);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, n_tps, 1, 1);
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, 1);
+        ggml_set_name(m, "m");
+
+        // softcap must be 0: the kernel's softcap arm is not implemented
+        ggml_tensor * out = ggml_flash_attn_qsa(ctx, q, k, v, idx, m, 1.0f/sqrtf((float) hsk), 0.0f);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                // the kernel and the reference both index the mask/K/V through this list, so every
+                // entry must be a valid cell; a cyclic walk with a per-column offset repeats cells
+                // (a real indexer's top-k list is not a permutation) and, being consecutive over
+                // the list, it hits every residue class of the mask pattern below
+                int32_t * data = (int32_t *) t->data;
+                for (int64_t c = 0; c < t->ne[0]; ++c) {
+                    for (int64_t i = 0; i < t->ne[1]; ++i) {
+                        data[c + i*t->ne[0]] = (int32_t) ((37*i + c) % n_kv);
+                    }
+                }
+            } else if (strcmp(t->name, "m") == 0) {
+                // 0 for a visible cell, -INF for a masked one.  Every (token, column) list walks
+                // >= 16 consecutive cells, so it always contains a visible one, while 1 in 5 cells
+                // is masked so the masked path is exercised as well.
+                ggml_fp16_t * data = (ggml_fp16_t *) t->data;
+                for (int64_t c = 0; c < t->ne[0]; ++c) {
+                    const ggml_fp16_t v = ggml_fp32_to_fp16(c % 5 == 4 ? -INFINITY : 0.0f);
+                    for (int64_t i = 0; i < t->ne[1]; ++i) {
+                        data[c + i*t->ne[0]] = v;
+                    }
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    bool grad_precise() override {
+        return true;
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -11556,6 +11646,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_falcon(1));
     test_cases.emplace_back(new test_falcon(2));
 #endif
+
+    // FLASH_ATTN_QSA (qwen4exp): the fused sparse attention reads only the indexer-selected
+    // cells.  Every supported K/V type (i.e. every load path, the quantized ones dequantizing
+    // while a tile is staged), the decode width and the speculative verify width, the three
+    // head sizes, the grouped-query mapping, and the sliced+combined top-k walk.
+    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                               GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL }) {
+        test_cases.emplace_back(new test_flash_attn_qsa(128, 16, 2, 512, 1,  64, type_kv));
+        test_cases.emplace_back(new test_flash_attn_qsa(128, 16, 2, 512, 4, 100, type_kv));
+    }
+    test_cases.emplace_back(new test_flash_attn_qsa( 64, 16, 2, 512, 1,  32, GGML_TYPE_Q4_1));
+    test_cases.emplace_back(new test_flash_attn_qsa(256,  4, 1, 256, 2,  96, GGML_TYPE_Q4_1));
+    test_cases.emplace_back(new test_flash_attn_qsa(128,  1, 1, 128, 1,  16, GGML_TYPE_Q5_1));
+    test_cases.emplace_back(new test_flash_attn_qsa(128, 32, 4, 512, 1,  64, GGML_TYPE_Q8_0));
+    // iq4_nl at the shapes qwen4exp actually runs: D = 256, and a GQA ratio of 12
+    // (24 q-heads / 2 kv-heads), which is what sets the K/V-head chunking of the
+    // shared staging tile (min(QSA_MAX_HEADS, gqa_ratio)); the loop above only
+    // covers D = 128 with gqa 8.
+    test_cases.emplace_back(new test_flash_attn_qsa(256, 24, 2, 512, 1, 128, GGML_TYPE_IQ4_NL));
+    test_cases.emplace_back(new test_flash_attn_qsa(256,  4, 1, 256, 2,  96, GGML_TYPE_IQ4_NL));
 
     // lightning_indexer
     for (int kv : { 256 }) {

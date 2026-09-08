@@ -1,6 +1,12 @@
 #include "common.cuh"
 
 #define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
+// The QSA indexer score flattens its indexer heads into the matmul's N dimension, so the
+// decode/verify band (n_tokens <= MMVF_MAX_BATCH_SIZE) spans n_idx_h * n_tokens columns.
+// That whole band must stay on the decode family or a verify batch falls through to MMF,
+// whose different accumulation flips a top-k near-tie (the forced-sparse q8_0 residual).
+// n_idx_h = 4 for qwen4exp, so the flattened band is <= 32.
+#define MMVF_MAX_BATCH_SIZE_FLAT (MMVF_MAX_BATCH_SIZE * 4)
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);

@@ -315,12 +315,21 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // 1-token decode and an (n_draft + 1)-token speculative verify batch of the same MoE matmul to be
 // bit-identical, and MUL_MAT_ID mmvq (mul_mat_vec_q_moe, one warp per token) and MMQ reduce in
 // different orders, so no cap may split the band.  The cap still applies above the band.
-static constexpr __host__ __device__ int mmvq_mmid_max_batch_band(int cap) {
-    return cap > MMVQ_MAX_BATCH_SIZE ? cap : MMVQ_MAX_BATCH_SIZE;
+//
+// The extended (16-wide) band is an RDNA4 win only.  On RDNA3_5 (gfx1151) the gfx1151-tuned
+// routed-compact MMQ (mmq_rdna3_5_id_get_J) beats the one-warp-per-token MoE MMVQ kernel for
+// n_tokens 9..16 on every routed type measured (Q3_K/Q4_K/Q4_1/Q5_K/IQ4_NL/IQ4_XS, -2..-8 % at
+// B = 9..12).  On RDNA3_0 (gfx1100) the extended band is not merely untuned but incorrect:
+// test-backend-ops -o MUL_MAT_ID fails 23/929 cases (all n_tokens = 16, every routed type, any
+// weight K) on gfx1100 with the band on, and passes 929/929 once it is floored back to 8.  Both
+// RDNA3 parts therefore keep the pre-extension 8-wide band and routed MoE returns to MMQ above it;
+// `floor_band` carries the arch decision at the call site.
+static constexpr __host__ __device__ int mmvq_mmid_max_batch_band(int cap, int floor_band) {
+    return cap > floor_band ? cap : floor_band;
 }
 
 // Host function: returns the max batch size for the current arch+type at runtime.
-int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+static int get_mmvq_mmid_max_batch_impl(ggml_type type, int cc) {
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -335,22 +344,33 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // AMD
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type), MMVQ_MOE_MAX_BATCH_SIZE);
         }
         if (GGML_CUDA_CC_IS_RDNA3(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
+            // gfx1100 (RDNA3_0) and gfx1151 (RDNA3_5): the routed-expert 16-wide band is not used.
+            const int floor_band = MMVQ_MAX_BATCH_SIZE;
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), floor_band);
         }
         if (GGML_CUDA_CC_IS_RDNA1(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type));
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type), MMVQ_MOE_MAX_BATCH_SIZE);
         }
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type));
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type), MMVQ_MOE_MAX_BATCH_SIZE);
         }
         if (GGML_CUDA_CC_IS_GCN(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type));
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type), MMVQ_MOE_MAX_BATCH_SIZE);
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+// Kill-switch for the extended routed-expert band (bisect / A-B only; the extended band is the
+// default).  Setting it clamps every MUL_MAT_ID mmvq cap back to the dense MMVQ band, i.e. the
+// pre-extension behaviour (routed MoE falls back to MMQ above 8 columns).
+int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    const int cap = get_mmvq_mmid_max_batch_impl(type, cc);
+    static const bool legacy_band = getenv("GGML_CUDA_DISABLE_MMVQ_MOE_BAND") != nullptr;
+    return (legacy_band && cap > MMVQ_MAX_BATCH_SIZE) ? MMVQ_MAX_BATCH_SIZE : cap;
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
@@ -469,15 +489,17 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
 template <ggml_type type>
 static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #if defined(RDNA4)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type), MMVQ_MOE_MAX_BATCH_SIZE);
+#elif defined(RDNA3_5)
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), MMVQ_MAX_BATCH_SIZE);
 #elif defined(RDNA3)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), MMVQ_MAX_BATCH_SIZE);
 #elif defined(RDNA2) || defined(RDNA1)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type), MMVQ_MOE_MAX_BATCH_SIZE);
 #elif defined(CDNA)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type), MMVQ_MOE_MAX_BATCH_SIZE);
 #elif defined(GCN)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type), MMVQ_MOE_MAX_BATCH_SIZE);
 #elif !defined(GGML_USE_MUSA) && (__CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
     return MMVQ_MAX_BATCH_SIZE;
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
@@ -1295,7 +1317,7 @@ static __global__ void mul_mat_vec_q_ksplit(
 // mul_mat_vec_q_switch_ncols_dst), so its launch bound must cover the band rather than the per-type
 // cap -- otherwise a launch with ncols_dst > cap fails outright.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
-__launch_bounds__(MMVQ_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(MMVQ_MOE_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_ptr,
@@ -1669,7 +1691,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    // The MUL_MAT_ID routed-expert kernel is token-generic and covers the whole verify range; the
+    // RDNA4 dense fallback-row band is extended to the same width (see ggml_cuda_mul_mat).
+    GGML_ASSERT(ncols_dst <= MMVQ_MOE_MAX_BATCH_SIZE);
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
@@ -1766,7 +1790,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
     }
 
     switch (ncols_dst) {
-        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: {
+        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
+        case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16: {
             // dispatch per ncols with a compile-time tag
             const auto dispatch = [&](auto ncols_tag) {
                 constexpr int c_ncols_dst = decltype(ncols_tag)::value;
@@ -1964,6 +1989,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
             // item-split accumulator layout is register-bound at ncols_dst > 1.
             launch_ksplit(std::integral_constant<int, 8>{});
         } break;
+        // Dense rows at ncols_dst 9..16 keep the same ksplit kernel as the 2..8 band.  The RDNA4
+        // dense dispatch only reaches these when the MMQ path would take its slow non-128-row
+        // "fallback" config (see ggml_cuda_mul_mat), so the reduction-order band 2..16 matches.
+        case 9:  launch_ksplit(std::integral_constant<int, 9>{});  break;
+        case 10: launch_ksplit(std::integral_constant<int, 10>{}); break;
+        case 11: launch_ksplit(std::integral_constant<int, 11>{}); break;
+        case 12: launch_ksplit(std::integral_constant<int, 12>{}); break;
+        case 13: launch_ksplit(std::integral_constant<int, 13>{}); break;
+        case 14: launch_ksplit(std::integral_constant<int, 14>{}); break;
+        case 15: launch_ksplit(std::integral_constant<int, 15>{}); break;
+        case 16: launch_ksplit(std::integral_constant<int, 16>{}); break;
                 default: GGML_ABORT("fatal error"); break;
             }
         } break;
@@ -2145,7 +2181,9 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    // Dense ncols_dst is ne1, MUL_MAT_ID ncols_dst is ne2 (== ne12); both now cover the full
+    // verify band (MMVQ_MOE_MAX_BATCH_SIZE), so assert on whichever one is the column count.
+    GGML_ASSERT((ids ? ne12 : ne1) <= MMVQ_MOE_MAX_BATCH_SIZE);
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;

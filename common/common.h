@@ -503,6 +503,8 @@ struct common_params {
     // how host-resident expert weights (`-ncmoe`/`-cmoe`) are backed when the model is mmap'd
     enum llama_host_experts_mode host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
 
+    size_t lazy_buf_size = 0; // managed buffer size in bytes for on-demand tensors; 0 = mmap-based lazy loading
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

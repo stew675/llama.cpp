@@ -1,6 +1,11 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+// Dedicated MUL_MAT_ID MoE kernel band (mul_mat_vec_q_moe).  That kernel is one warp per token and
+// its per-token reduction does not depend on the column count, so it covers the whole speculative
+// verify range (--spec-draft-n-max <= 15 -> n_tokens <= 16) on a single accumulation order.  The
+// dense MMVQ band above stays at 8; only the MUL_MAT_ID (routed expert) path uses this one.
+#define MMVQ_MOE_MAX_BATCH_SIZE 16
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
