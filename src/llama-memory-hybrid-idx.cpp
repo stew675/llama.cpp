@@ -61,7 +61,164 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    // incremental block-vector cache (env-gated, default OFF; decode waste fix)
+    const char * env_cache = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
+    derived_enabled = env_cache != nullptr && std::atoi(env_cache) != 0;
+
+    if (mem_idx) {
+        pool_create(model, filter_idx);
+    }
+}
+
+void llama_memory_hybrid_idx::pool_create(
+        const llama_model & model,
+        const layer_filter_cb & filter_idx) {
+    const llama_hparams & hparams = model.hparams;
+
+    if (hparams.indexer_head_size == 0) {
+        // no QSA geometry (should not happen when the indexer cache exists)
+        return;
+    }
+
+    // the pool backs the fused INDEXER_FILL -> INDEXER_SCORE derived decode path only, and
+    // only when that path can actually run:
+    //  - the fused ops read the raw indexer keys natively (F32/BF16/F16 only - quantized
+    //    indexer-key caches, e.g. --cache-type-k q8_0, always take the per-op chain), and
+    //  - the memory-layer derived cache is engaged (GGML_CUDA_QSA_INDEXER_CACHE=1/2):
+    //    otherwise qsa_derived_limits emits an empty fill range every step and the pool is
+    //    never written or read (each decode step would launch an empty fill for nothing).
+    // Skip the allocation otherwise - get_pool() then returns nullptr and build_qsa_top_k
+    // runs the fused score with no pool (pools the raw cache: the same F32 arithmetic and
+    // byte-identical output, minus the dead buffer) or the per-op chain for quantized keys.
+    if (!derived_enabled || (mem_idx->type_k() != GGML_TYPE_F32 &&
+                             mem_idx->type_k() != GGML_TYPE_BF16 &&
+                             mem_idx->type_k() != GGML_TYPE_F16)) {
+        LLAMA_LOG_INFO("%s: derived indexer cache pool skipped (%s keys, derived cache %s)\n", __func__,
+                ggml_type_name(mem_idx->type_k()), derived_enabled ? "enabled" : "disabled");
+        return;
+    }
+
+    // guard on ANY indexer layer carrying a ratio: the QSA ratio starts above layer 0
+    bool any_ratio = false;
+    for (uint32_t il = 0; il < hparams.n_layer_all && !any_ratio; ++il) {
+        if (filter_idx && filter_idx(il) && hparams.dsv4_compress_ratios[il] > 0) {
+            any_ratio = true;
+        }
+    }
+    if (!any_ratio) {
+        return;
+    }
+
+    const uint32_t idx_dim  = hparams.indexer_head_size;
+    const uint32_t kv_size  = mem_idx->get_size();
+    const uint32_t n_stream = mem_idx->get_n_stream();
+    const uint32_t n_layer  = hparams.n_layer_all;
+
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (ctx == nullptr) {
+                throw std::runtime_error("failed to create ggml context for the derived indexer cache");
+            }
+            ctx_map.emplace(buft, ggml_context_ptr(ctx));
+            return ctx;
+        }
+        return it->second.get();
+    };
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (!filter_idx || !filter_idx(il)) {
+            continue;
+        }
+
+        const uint32_t ratio = hparams.dsv4_compress_ratios[il];
+        if (ratio == 0) {
+            continue;
+        }
+
+        ggml_backend_dev_t dev = model.dev_layer((int) il);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+        ggml_context * ctx = ctx_for_buft(buft);
+
+        const uint32_t n_blocks = (kv_size + ratio - 1)/ratio;
+        ggml_tensor * pool = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, idx_dim, n_blocks, n_stream);
+        ggml_format_name(pool, "cache_idx_pool_l%u", il);
+
+        pool_layers.push_back({ il, ratio, pool });
+    }
+
+    // allocate the per-buft contexts and clear the buffers (no NaNs in the padding)
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            throw std::runtime_error("failed to allocate buffer for the derived indexer cache");
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        pool_ctxs.push_back(std::move(ctx));
+        pool_bufs.emplace_back(buf);
+    }
+
+    // one watermark per (pool layer, stream); layers sharing a ratio share the cell occupancy so
+    // their watermarks advance together (qsa_derived_limits writes the whole ratio group)
+    pool_wm.assign(pool_layers.size() * n_stream, 0);
+
+    LLAMA_LOG_INFO("%s: derived indexer cache (pool) = %zu layers x %u dims x %u streams, %s\n", __func__,
+            pool_layers.size(), idx_dim, n_stream, derived_enabled ? "ENABLED" : "disabled");
+}
+
+void llama_memory_hybrid_idx::pool_invalidate_all() {
+    // rows above the watermark are never read, so dropping it to zero IS the invalidation
+    std::fill(pool_wm.begin(), pool_wm.end(), 0);
+}
+
+ggml_tensor * llama_memory_hybrid_idx::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {
+    for (const auto & pl : pool_layers) {
+        if ((int32_t) pl.il == il) {
+            GGML_ASSERT(n_blocks <= pl.pool->ne[1]);
+            return ggml_view_3d(ctx, pl.pool,
+                    pl.pool->ne[0], n_blocks, pl.pool->ne[2],
+                    pl.pool->nb[1], pl.pool->nb[2], 0);
+        }
+    }
+    return nullptr;
+}
+
+void llama_memory_hybrid_idx::qsa_derived_limits(
+        int32_t * dst_fill_from, int32_t * dst_limit, int n_stream, uint32_t ratio,
+        const uint32_t * n_bid, bool advance) const {
+    // the indexer cells are shared across the layers, so n_bid per stream is the same for every
+    // pool layer of this ratio group; write + advance the whole group's watermarks together
+    for (size_t i = 0; i < pool_layers.size(); ++i) {
+        if (pool_layers[i].ratio != ratio) {
+            continue;
+        }
+        for (int s = 0; s < n_stream; ++s) {
+            // without advance the fill op does not run, so the score must not read the pool
+            const uint32_t lim = advance ? n_bid[s] : 0;  // full blocks this step (host grouping)
+            const uint32_t from = advance ? pool_wm[i*n_stream + s] : 0;
+            dst_fill_from[s] = (int32_t) std::min(from, lim);
+            dst_limit[s]     = (int32_t) lim;
+            if (advance) {
+                // the fill op of this step writes [from, lim), so the watermark follows to lim
+                pool_wm[i*n_stream + s] = lim;
+            }
+        }
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -142,6 +299,9 @@ void llama_memory_hybrid_idx::clear(bool data) {
     if (mem_idx) {
         mem_idx->clear(data);
     }
+
+    // the derived vectors derive from the raw cells, so any cache mutation invalidates them
+    pool_invalidate_all();
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -154,6 +314,9 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
         mem_idx->seq_rm(seq_id, p0, p1);
     }
 
+    // the raw cells of the removed range are gone, so the derived rows over them are stale
+    pool_invalidate_all();
+
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
 }
 
@@ -163,6 +326,8 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     }
+
+    pool_invalidate_all();
 }
 
 void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
@@ -171,6 +336,8 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
     }
+
+    pool_invalidate_all();
 }
 
 void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -179,6 +346,8 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_add(seq_id, p0, p1, shift);
     }
+
+    pool_invalidate_all();
 }
 
 void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
@@ -187,6 +356,8 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     if (mem_idx) {
         mem_idx->seq_div(seq_id, p0, p1, d);
     }
+
+    pool_invalidate_all();
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
@@ -260,6 +431,8 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     if (mem_idx) {
         mem_idx->seq_rm(seq_id, -1, -1);
     }
+
+    pool_invalidate_all();
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
@@ -273,7 +446,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        int32_t * dst_derived_from,
+        int32_t * dst_derived_lim) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -302,6 +477,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
     //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
     std::vector<int32_t>  blk_of(n_kv);
     std::vector<int32_t>  cell_grp(n_kv);
+    std::vector<uint32_t> n_bid_s(n_ns);
     std::vector<int32_t>  grp_head(n_blocks);
     std::vector<int32_t>  grp_next;
     std::vector<int32_t>  grp_first;
@@ -468,6 +644,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         }
 
         GGML_ASSERT(n_bid <= n_blocks);
+        n_bid_s[s] = (uint32_t) n_bid;
 
         for (int32_t b = 0; b < n_bid; ++b) {
             int32_t sec_pos[4] = { bid_idx[b], bid_idx[b], bid_idx[b], bid_idx[b] };
@@ -582,6 +759,14 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
     }
+
+    // decode-only derived-cache limits: on the single-token append path the fill op of this step
+    // writes [wm, n_bid) into the pool rows, so emit the range leaves and advance the watermarks.
+    // Any other step emits an empty range (the score then pools raw, as without the derived cache).
+    if (dst_derived_from != nullptr && dst_derived_lim != nullptr) {
+        const bool advance = derived_enabled && ubatch->n_tokens == 1;
+        qsa_derived_limits(dst_derived_from, dst_derived_lim, (int) n_ns, ratio, n_bid_s.data(), advance);
+    }
 }
 
 //
@@ -672,8 +857,17 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        int32_t * dst_derived_from,
+        int32_t * dst_derived_lim) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias,
+                       dst_derived_from, dst_derived_lim);
+}
+
+ggml_tensor * llama_memory_hybrid_idx_context::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {
+    GGML_ASSERT(mem != nullptr);
+
+    return mem->get_pool(ctx, il, n_blocks);
 }

@@ -2026,6 +2026,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
+        case GGML_OP_FLASH_ATTN_QSA:
+            {
+                ggml_compute_forward_flash_attn_qsa(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2101,6 +2105,26 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_HC_MIX:
+            {
+                ggml_compute_forward_hc_mix(params, tensor);
+            } break;
+        case GGML_OP_HC_COMBINE:
+            {
+                ggml_compute_forward_hc_combine(params, tensor);
+            } break;
+        case GGML_OP_INDEXER_TOPK:
+            {
+                ggml_compute_forward_indexer_topk(params, tensor);
+            } break;
+        case GGML_OP_INDEXER_SCORE:
+        case GGML_OP_INDEXER_FILL:
+            {
+                // GPU-only fused indexer ops (no CPU forward): the CPU plan
+                // phase above already aborts on them ("op not implemented")
+                // before compute is ever reached.
+                GGML_ABORT("fatal error");
+            }
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2284,6 +2308,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_HC_MIX:
+        case GGML_OP_HC_COMBINE:
+        case GGML_OP_INDEXER_TOPK:
             {
                 n_tasks = n_threads;
             } break;
@@ -2423,6 +2450,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_BACK:
+        case GGML_OP_FLASH_ATTN_QSA:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
@@ -3027,6 +3055,15 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+                        cur = per_thread * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_HC_MIX:
+                    {
+                        // per-token scratch: xn [hc_dim] + lo [hc_lr] + gate [hc_dim]
+                        const int64_t hc      = ggml_get_op_params_i32(node, 0);
+                        const int64_t hc_lr   = node->src[2]->ne[1];
+                        const int64_t hc_dim  = node->src[0]->ne[0] * hc;
+                        const int64_t per_thread = 2*hc_dim + hc_lr;
                         cur = per_thread * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_COUNT:

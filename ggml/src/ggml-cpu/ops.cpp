@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
+#include "quants.h"
 #include "simd-gemm.h"
 #include "ggml.h"
 #include "unary-ops.h"
@@ -9362,6 +9363,140 @@ void ggml_compute_forward_flash_attn_ext(
     }
 }
 
+// ggml_compute_forward_flash_attn_qsa
+// qwen4exp sparse attention over the indexer-selected cells (CPU reference).
+// Same contract as the CUDA kernel: q [D, n_tps, n_head, n_stream] F32,
+// k/v [D, n_kv, n_head_kv, n_stream] F16/BF16/Q8_0, idx [n_top_k, n_tps,
+// 1, n_stream] I32, mask [n_kv, n_tps, 1, n_stream] F16; the mask is
+// gathered at the idx cell positions and added to each score; softmax runs
+// over the top-k cells only.
+static void ggml_compute_forward_flash_attn_qsa_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * idx  = dst->src[3];
+    const ggml_tensor * mask = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nei, idx, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbi, idx, nb)
+    GGML_TENSOR_LOCALS(int64_t, nem, mask, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbm, mask, nb)
+
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t D       = neq0;
+    const int64_t n_tps   = neq1;
+    const int64_t n_head  = neq2;
+    const int64_t n_strm  = neq3;
+    const int64_t n_kv    = nek1;
+    const int64_t n_head_kv = nek2;
+    const int64_t n_top_k = nei0;
+
+    GGML_ASSERT(neq3 == nek3 && nek3 == nev3);
+    GGML_ASSERT(nem0 == n_kv);
+    GGML_ASSERT(idx->type == GGML_TYPE_I32);
+
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    const int64_t gqa = n_head / n_head_kv;
+    const int64_t n_items = n_tps * n_head * n_strm;
+
+    constexpr int64_t D_MAX = 1024; // head sizes are 64/128/256
+
+    auto read_kv = [&](const ggml_tensor * t, const char * row, const int64_t d) -> float {
+        switch (t->type) {
+            case GGML_TYPE_F32:
+                return *(const float *) (row + d*4);
+            case GGML_TYPE_F16:
+                return ggml_fp16_to_fp32(*(const ggml_fp16_t *) (row + d*2));
+            case GGML_TYPE_BF16:
+                return ggml_bf16_to_fp32(*(const ggml_bf16_t *) (row + d*2));
+            case GGML_TYPE_Q8_0: {
+                const block_q8_0 * blk = (const block_q8_0 *) (row + (d/QK8_0)*sizeof(block_q8_0));
+                return ggml_fp16_to_fp32(blk->d) * blk->qs[d%QK8_0];
+            }
+            default:
+                GGML_ABORT("unsupported K/V type for flash_attn_qsa");
+        }
+    };
+
+    for (int64_t ii = ith; ii < n_items; ii += nth) {
+        const int64_t col    = ii % n_tps;
+        const int64_t head   = (ii / n_tps) % n_head;
+        const int64_t strm   = ii / (n_tps*n_head);
+        const int64_t head_kv = head / gqa;
+
+        const char * q_row = (const char *) q->data + nbq3*strm + nbq2*head + nbq1*col;
+        const char * k_base = (const char *) k->data + nbk3*strm + nbk2*head_kv;
+        const char * v_base = (const char *) v->data + nbv3*strm + nbv2*head_kv;
+        const char * idx_row = (const char *) idx->data + nbi3*strm + nbi1*col;
+        const char * mask_row = (const char *) mask->data + nbm3*(strm % nem3) + nbm1*col;
+
+        float * dst_col = (float *) dst->data + ((strm*n_tps + col)*n_head + head)*D;
+
+        // pass 1: max score over the top-k cells (mask gathered at idx)
+        float max_s = -INFINITY;
+        for (int64_t c = 0; c < n_top_k; c++) {
+            const int32_t cell = ((const int32_t *) idx_row)[c];
+            GGML_ASSERT(cell >= 0 && cell < n_kv);
+            const char * k_row = k_base + cell*nbk1;
+            const float mv = ggml_fp16_to_fp32(*(const ggml_fp16_t *) (mask_row + cell*nbm0));
+            float s = mv;
+            for (int64_t d = 0; d < D; d++) {
+                const float qv = *(const float *) (q_row + d*nbq0);
+                s += scale*qv*read_kv(k, k_row, d);
+            }
+            max_s = fmaxf(max_s, s);
+        }
+
+        // pass 2: softmax weights and the weighted V sum
+        float sum = 0.0f;
+        float out[D_MAX];
+        GGML_ASSERT(D <= D_MAX);
+        for (int64_t d = 0; d < D; d++) {
+            out[d] = 0.0f;
+        }
+        for (int64_t c = 0; c < n_top_k; c++) {
+            const int32_t cell = ((const int32_t *) idx_row)[c];
+            const char * k_row = k_base + cell*nbk1;
+            const float mv = ggml_fp16_to_fp32(*(const ggml_fp16_t *) (mask_row + cell*nbm0));
+            float s = mv;
+            for (int64_t d = 0; d < D; d++) {
+                const float qv = *(const float *) (q_row + d*nbq0);
+                s += scale*qv*read_kv(k, k_row, d);
+            }
+            const float w = expf(s - max_s);
+            sum += w;
+            const char * v_row = v_base + cell*nbv1;
+            for (int64_t d = 0; d < D; d++) {
+                out[d] += w*read_kv(v, v_row, d);
+            }
+        }
+        const float inv = 1.0f/sum;
+        for (int64_t d = 0; d < D; d++) {
+            dst_col[d] = out[d]*inv;
+        }
+    }
+}
+
+void ggml_compute_forward_flash_attn_qsa(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    ggml_compute_forward_flash_attn_qsa_f32(params, dst);
+}
+
 // ggml_compute_forward_flash_attn_back
 
 static void ggml_compute_forward_flash_attn_back_f32(
@@ -12161,4 +12296,329 @@ void ggml_compute_forward_lightning_indexer(
             }
         }
     }
+}
+
+// ggml_compute_forward_hc_mix
+
+// Fused hyper-connection mixer: grouped RMSNorm over each stream, the gamma
+// scale, and two Q8_0 matrix-vector products with silu/sigmoid gating plus the
+// stream collapse. The dst head is mixed [n_embd] and its tail persists xn =
+// rms(x) * w_norm (the inject MUL_MAT consumes the xn view). Reference for the
+// unfused chain; used only on the CPU backend (the GPU fused kernel must match
+// the GPU unfused chain, not this function).
+static void ggml_compute_forward_hc_mix_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x         = dst->src[0];
+    const ggml_tensor * w_norm    = dst->src[1];
+    const ggml_tensor * w_down    = dst->src[2];
+    const ggml_tensor * w_up      = dst->src[3];
+    const ggml_tensor * w_inject  = dst->src[4];
+
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(dst->type      == GGML_TYPE_F32);
+
+    const int64_t hc       = ggml_get_op_params_i32(dst, 0);
+    const float   eps      = ggml_get_op_params_f32(dst, 1);
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc_dim   = n_embd * hc;
+    const int64_t n_tokens = x->ne[2];
+    const int64_t hc_lr    = w_down->ne[1];
+
+    GGML_ASSERT(hc_lr % QK8_0 == 0 && hc_dim % QK8_0 == 0);
+    GGML_ASSERT(x->ne[1] == hc);
+    GGML_ASSERT(w_norm->ne[0] == hc_dim);
+    GGML_ASSERT(w_down->ne[0] == hc_dim);
+    GGML_ASSERT(w_up->ne[0] == hc_lr && w_up->ne[1] == hc_dim);
+    GGML_ASSERT(w_inject == nullptr || (w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (n_tokens + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, n_tokens);
+
+    // scratch for the current token: xn [hc_dim], lo [hc_lr], gate [hc_dim]
+    float * xn   = (float *) params->wdata + ith*(2*hc_dim + hc_lr);
+    float * lo   = xn + hc_dim;
+    float * gate = lo + hc_lr;
+
+    const float inv_hc = 1.0f / (float) hc;
+
+    for (int64_t it = ir0; it < ir1; ++it) {
+        const float * x_t = (const float *) x->data + it*hc_dim;
+        float * dst_t     = (float *) dst->data + it*(n_embd + hc);
+
+        // grouped rms over each stream, then the gamma scale (the reference
+        // rounds rms(x) per element before the gamma MUL)
+        for (int64_t c = 0; c < hc; ++c) {
+            const float * xs = x_t + c*n_embd;
+            float sum = 0.0f;
+            for (int64_t j = 0; j < n_embd; ++j) {
+                sum += xs[j]*xs[j];
+            }
+            const float scale = 1.0f / sqrtf(sum / n_embd + eps);
+            for (int64_t j = 0; j < n_embd; ++j) {
+                const float r = scale * xs[j];
+                xn[c*n_embd + j] = r * ((const float *) w_norm->data)[c*n_embd + j];
+            }
+        }
+
+        // lo = w_down^T xn  (Q8_0 blocks, f32 accumulate)
+        const block_q8_0 * wd = (const block_q8_0 *) w_down->data;
+        for (int64_t j = 0; j < hc_lr; ++j) {
+            const block_q8_0 * wd_j = wd + j*(hc_dim/QK8_0);
+            float sum = 0.0f;
+            for (int64_t b = 0; b < hc_dim/QK8_0; ++b) {
+                const float d = GGML_FP16_TO_FP32(wd_j[b].d);
+                const int8_t * q = wd_j[b].qs;
+                const float * xb = xn + b*QK8_0;
+                float acc = 0.0f;
+                for (int64_t k = 0; k < QK8_0; ++k) {
+                    acc += q[k] * xb[k];
+                }
+                sum += d * acc;
+            }
+            lo[j] = sum;
+        }
+
+        // silu(lo / hc)
+        for (int64_t j = 0; j < hc_lr; ++j) {
+            const float v = lo[j] * inv_hc;
+            lo[j] = v / (1.0f + expf(-v));
+        }
+
+        // gate = sigmoid(w_up^T lo)
+        const block_q8_0 * wu = (const block_q8_0 *) w_up->data;
+        for (int64_t r = 0; r < hc_dim; ++r) {
+            const block_q8_0 * wu_r = wu + r*(hc_lr/QK8_0);
+            float sum = 0.0f;
+            for (int64_t b = 0; b < hc_lr/QK8_0; ++b) {
+                const float d = GGML_FP16_TO_FP32(wu_r[b].d);
+                const int8_t * q = wu_r[b].qs;
+                const float * lb = lo + b*QK8_0;
+                float acc = 0.0f;
+                for (int64_t k = 0; k < QK8_0; ++k) {
+                    acc += q[k] * lb[k];
+                }
+                sum += d * acc;
+            }
+            gate[r] = 1.0f / (1.0f + expf(-sum));
+        }
+
+        // collapse the gated streams to the mean into the dst head
+        for (int64_t j = 0; j < n_embd; ++j) {
+            float sum = 0.0f;
+            for (int64_t c = 0; c < hc; ++c) {
+                sum += xn[c*n_embd + j] * gate[c*n_embd + j];
+            }
+            dst_t[j] = sum * inv_hc;
+        }
+
+        // inject = w_inject^T xn into the dst tail [hc] (none at the head)
+        if (w_inject) {
+            if (w_inject->type == GGML_TYPE_Q8_0) {
+                // Q8_0 blocks with f32 accumulate, same numerics as the lo dots
+                const block_q8_0 * wi = (const block_q8_0 *) w_inject->data;
+                for (int64_t r = 0; r < hc; ++r) {
+                    const block_q8_0 * wi_r = wi + r*(hc_dim/QK8_0);
+                    float sum = 0.0f;
+                    for (int64_t b = 0; b < hc_dim/QK8_0; ++b) {
+                        const float d = GGML_FP16_TO_FP32(wi_r[b].d);
+                        const int8_t * q = wi_r[b].qs;
+                        const float * xb = xn + b*QK8_0;
+                        float acc = 0.0f;
+                        for (int64_t k = 0; k < QK8_0; ++k) {
+                            acc += q[k] * xb[k];
+                        }
+                        sum += d * acc;
+                    }
+                    dst_t[n_embd + r] = sum;
+                }
+            } else {
+                const float * wi = (const float *) w_inject->data;
+                for (int64_t r = 0; r < hc; ++r) {
+                    float sum = 0.0f;
+                    for (int64_t k = 0; k < hc_dim; ++k) {
+                        sum += wi[(int64_t) r*hc_dim + k] * xn[k];
+                    }
+                    dst_t[n_embd + r] = sum;
+                }
+            }
+        }
+    }
+}
+
+
+void ggml_compute_forward_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_hc_mix_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_hc_combine
+
+// Fused hyper-connection residual combine: out[r, c] = residual[r, c] +
+// block_out[r] * w[c] with w[c] = 2*sigmoid(inject[c]/hc). Reference for the
+// unfused build_hc_combine chain (SCALE, SIGMOID, SCALE, REPEAT, MUL, ADD);
+// used only on the CPU backend.
+static void ggml_compute_forward_hc_combine_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * residual   = dst->src[0];
+    const ggml_tensor * block_out  = dst->src[1];
+    const ggml_tensor * inject     = dst->src[2];
+
+    GGML_ASSERT(residual->type  == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type    == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type       == GGML_TYPE_F32);
+
+    const int64_t hc       = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t n_tokens = residual->ne[2];
+    const int64_t bo_str   = block_out->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n_elem = n_embd * hc * n_tokens;
+    const int64_t dr     = (n_elem + nth - 1) / nth;
+    const int64_t ir0    = dr * ith;
+    const int64_t ir1    = MIN(ir0 + dr, n_elem);
+
+    const float inv_hc = 1.0f / (float) hc;
+
+    const float * residual_d = (const float *) residual->data;
+    const float * block_d    = (const float *) block_out->data;
+    const float * inject_d   = (const float *) inject->data;
+    float       * dst_d      = (float *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t r = i % n_embd;
+        const int64_t c = (i / n_embd) % hc;
+        const int64_t t = i / (n_embd * hc);
+        // 2*sigmoid(inject/hc): the 1/hc and 2.0 scales are exact in f32
+        const float w = 2.0f / (1.0f + expf(-inject_d[c + t*hc] * inv_hc));
+        const float b = block_d[r + t*bo_str] * w;
+        dst_d[i] = residual_d[i] + b;
+    }
+}
+
+
+void ggml_compute_forward_hc_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_hc_combine_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_indexer_topk
+
+// Fused indexer expand + mask + top-k reference. value(c) = score[cell_blk(c)]
+// + additive(c); each (tps, stream) row selects the k cells with the largest
+// value. The order within the top-k matches the GPU radix kernel: the cells
+// with a value above the k-th largest threshold first, then the boundary
+// ties, each in cell order. The consumer treats the cells as a set, so the
+// order only matters for byte-identical CPU-vs-GPU top-k output.
+static void ggml_compute_forward_indexer_topk_impl(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * score    = dst->src[0];
+    const ggml_tensor * cell_blk = dst->src[1];
+    const ggml_tensor * additive = dst->src[2];
+
+    GGML_ASSERT(score->type    == GGML_TYPE_F32);
+    GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type      == GGML_TYPE_I32);
+
+    const int k = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t n_blocks = score->ne[0];
+    const int64_t n_tps    = score->ne[1];
+    const int64_t n_stream = score->ne[2];
+    const int64_t n_kv     = cell_blk->ne[0];
+
+    const float  * score_d   = (const float  *) score->data;
+    const int    * cell_d    = (const int    *) cell_blk->data;
+    int          * dst_d     = (int          *) dst->data;
+
+    std::vector<float> vals(n_kv);
+
+    // cell_blk is [n_kv, n_stream]: stream s rows at c + s*n_kv, s = row/n_tps
+    const int64_t s0 = 0;
+    GGML_UNUSED(s0);
+    const auto cell_value = [&](int64_t c, int64_t row) -> float {
+        const int b = cell_d[c + (row / n_tps)*n_kv];
+        const float sc = score_d[b + row*n_blocks];
+        if (additive->type == GGML_TYPE_F32) {
+            const float * add_d = (const float *) additive->data;
+            return sc + add_d[c + row*n_kv];
+        }
+        const ggml_fp16_t * add_d = (const ggml_fp16_t *) additive->data;
+        return sc + GGML_FP16_TO_FP32(add_d[c + row*n_kv]);
+    };
+
+    // dst is [k, n_tps, 1, n_stream]; cell_blk is [n_kv, n_stream], so the
+    // stream stride of cell_blk matches a dst row stride of k cells
+    for (int64_t row = 0; row < n_tps*n_stream; ++row) {
+        for (int64_t c = 0; c < n_kv; ++c) {
+            vals[c] = cell_value(c, row);
+        }
+
+        // the k-th largest value is the selection threshold
+        const int64_t kn = std::min<int64_t>(k, n_kv);
+        std::nth_element(vals.begin(), vals.begin() + kn - 1, vals.end(),
+                [](float a, float b) { return a > b; });
+        const float thr = vals[kn - 1];
+
+        int * row_dst = dst_d + row*k;
+        int pos = 0;
+        for (int64_t c = 0; c < n_kv && pos < kn; ++c) {
+            if (cell_value(c, row) > thr) {
+                row_dst[pos++] = (int) c;
+            }
+        }
+        for (int64_t c = 0; c < n_kv && pos < kn; ++c) {
+            if (cell_value(c, row) == thr) {
+                row_dst[pos++] = (int) c;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_indexer_topk(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    ggml_compute_forward_indexer_topk_impl(params, dst);
 }

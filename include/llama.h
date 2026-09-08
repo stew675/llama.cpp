@@ -323,6 +323,10 @@ extern "C" {
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
+        size_t n_lazy_buf_size; // managed buffer size in bytes for on-demand tensors
+                               // (qwen4exp PLE n-gram table); 0 = mmap-based lazy
+                               // loading (default)
+
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 

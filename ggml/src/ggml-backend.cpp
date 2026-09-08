@@ -958,6 +958,15 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
     allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
 
+    // skip FLASH_ATTN_QSA since the idx/mask tensors are too small to choose a backend based on them
+    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_QSA;
+
+    // skip INDEXER_TOPK since the cell map / mask tensors are too small to choose a backend based on them
+    allow = allow && tensor->op != GGML_OP_INDEXER_TOPK;
+
+    allow = allow && tensor->op != GGML_OP_INDEXER_SCORE;
+    allow = allow && tensor->op != GGML_OP_INDEXER_FILL;
+
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             const struct ggml_tensor * src = tensor->src[i];
@@ -1624,13 +1633,41 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
-        // the re-allocation may cause the split inputs to be moved to a different address
-        // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        // Reserve the graph and check whether this requires growing (reallocating) one of the buffers.
+        // The buffers are grow-only, so when the graph fits within the already-reserved space (e.g.
+        // alternating dense/sparse ubatches of the same prompt) the reserve only recomputes the tensor
+        // layout and re-points the tensors of this graph.  Skipping the synchronization is only safe
+        // when a single device stream fully orders the compute: the probe/no-sync path is validated
+        // for single-GPU inference (gfx1151 / gfx1100).  With more than one device (tensor/layer
+        // split) a previous graph's kernels may still be in flight on other devices when the
+        // re-point happens, which races cross-device (in-kernel spin / memory faults at multi-ubatch
+        // prefill, reproduced on 3x R9700 gfx1201) - so the multi-device path keeps the full
+        // synchronization (upstream behavior).  Count the non-CPU (async-capable) devices rather than
+        // the raw backend count, so a single GPU plus a CPU backend keeps the fast path.
+        int n_async_devices = 0;
         for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+            const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[i]));
+            if (dev_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                n_async_devices++;
+            }
         }
+        // Only when a buffer must actually be grown is a full synchronization needed regardless,
+        // because the re-allocation moves the addresses of tensors that an in-flight graph may still
+        // be using.
+        const bool buffers_grown = ggml_gallocr_reserve_n_probe(
+                sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (buffers_grown || n_async_devices > 1) {
+            // the re-allocation may cause the split inputs to be moved to a different address
+            // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+            if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+                GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                return false;
+            }
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -2101,6 +2138,8 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
 bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
     switch (op) {
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_QSA:
+        case GGML_OP_INDEXER_TOPK:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_CUMSUM:

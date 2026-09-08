@@ -495,6 +495,8 @@ struct common_params {
 
     enum llama_lazy_mode lazy_mode = LLAMA_LAZY_MODE_AUTO; // on-demand reading of tensors marked by the arch
 
+    size_t lazy_buf_size = 0; // managed buffer size in bytes for on-demand tensors; 0 = mmap-based lazy loading
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

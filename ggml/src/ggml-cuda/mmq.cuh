@@ -1468,7 +1468,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
-// ---- RDNA3.5 routed-compact MoE MMQ (port of halo-box/strix-llama.cpp) ----
+// ---- RDNA3.5/RDNA4 routed-compact MoE MMQ (port of halo-box/strix-llama.cpp) ----
 // mul_mat_id tiles are enumerated per real (expert, J-tile) pair via a descriptor list built by a
 // single block (one thread per expert), instead of a (x-tile, expert) block grid whose J-tiling is
 // sized to the total row count: for MoE every block used to enumerate ceil(ncols_max/J) mostly-empty
@@ -1476,8 +1476,13 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
 // rows-per-expert range (mmq_rdna3_5_id_get_J), measured on gfx1151 for the 2048x512 and 3072x1024
 // expert shapes. Numerics are bit-identical to the plain mul_mat_q path (same mul_mat_q_process_tile,
 // same per-tile accumulation order; only the tile enumeration differs). Gate: RDNA3_5 only, matching
-// the source-of-record B; gfx1201 (RDNA4) stays off until validated on the gfx1201 box in the
-// delivery flow. Opt-out for A/B validation: GGML_CUDA_DISABLE_MMQ_ROUTED=1.
+// the source-of-record B; enabled on RDNA4 after the 2026-09-06 gfx1201 validation (delivery flow,
+// wip/archive/qwen4exp/discovery/2026-09-06-gfx1201-rdna4-routed-moe-mmq.md): ub2048 tensor-split
+// prefill +4-8% (pp512 +8% / pp2048 +5.7% / pp8192 +5% / pp16384 +5%), tg unchanged, same-seed text
+// byte-identical compact vs plain, 846 compact launches/pp2048-ubatch on the IQ4_XS experts; the
+// gfx1151 J bands transfer (40-rpe: J48 == J64, J128 marginally behind, plain-at-J32 behind; the
+// >64-rpe band is unreachable at ub2048 for this model and keeps J=128). Opt-out for A/B
+// validation: GGML_CUDA_DISABLE_MMQ_ROUTED=1.
 #define MMQ_ROUTED_MAX_EXPERTS 1024
 #ifndef MMQ_IQ_ID_J_MID
 #define MMQ_IQ_ID_J_MID 64
@@ -1485,6 +1490,13 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
 
 static constexpr bool mmq_rdna3_5_id_n_experts_ok(const int64_t n_experts) {
     return n_experts >= 8 && n_experts <= MMQ_ROUTED_MAX_EXPERTS;
+}
+
+// Routed-compact arch set: RDNA3_5 (source-of-record B) + RDNA4 (2026-09-06 gfx1201 validation,
+// see the section comment above for numbers/coherence).  Arch-gated per-kernel; other archs keep
+// the plain path.
+static inline bool mmq_routed_compact_arch_ok(const int cc) {
+    return GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc);
 }
 
 static constexpr int mmq_rdna3_5_id_get_J(const ggml_type type, const int64_t rows_per_expert) {
@@ -1668,13 +1680,13 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
-    // RDNA3.5 routed-compact MoE MMQ (port of halo-box/strix-llama.cpp): replaces the mostly-empty
+    // RDNA3.5/RDNA4 routed-compact MoE MMQ (port of halo-box/strix-llama.cpp): replaces the mostly-empty
     // (x-tile, expert) block grid with one descriptor per real (expert, J-tile) pair. Bit-identical to
     // the plain path below (same process_tile). has_gate is excluded (the fused gate+up op keeps its
-    // own epilogue path); off on all other archs until validated there.
+    // own epilogue path); gfx1201 (RDNA4) validated 2026-09-06 (see the section comment above).
     // GGML_CUDA_DISABLE_MMQ_ROUTED=1 disables ONLY this compact dispatch (the per-expert J selection
     // in mul_mat_q_switch_J stays; both are part of the same port).
-    const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+    const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && mmq_routed_compact_arch_ok(cc) &&
         !has_gate && !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc) && mmq_rdna3_5_id_use_compact(type, J) &&
         getenv("GGML_CUDA_DISABLE_MMQ_ROUTED") == nullptr;
     if (use_compact_routed) {
@@ -1755,7 +1767,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         // RDNA3.5 mul_mat_id: pick the J width from the rows-per-expert range instead of the generic
         // tile-count loop (which sizes J to the flattened row count and leaves every per-expert tile
         // mostly empty). Mirrors halo-box/strix-llama.cpp mmq_rdna3_5_id_get_J (gfx1151-measured).
-        if (mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && args.ids_dst != nullptr && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback &&
+        if (mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && args.ids_dst != nullptr && mmq_routed_compact_arch_ok(cc) && !fallback &&
                 (type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS) &&
                 (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y == 48) {
             constexpr int J_rdna3_5 = 48;
@@ -1764,7 +1776,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
                 J_best = J_rdna3_5;
                 ntiles_J_best = 1;
             }
-        } else if (args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && GGML_CUDA_CC_IS_RDNA3_5(cc) && !fallback) {
+        } else if (args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && mmq_routed_compact_arch_ok(cc) && !fallback) {
             const int64_t rows_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
             const bool use_j48_128e = mmq_rdna3_5_id_use_j48_128e(type, args.nchannels_y, rows_per_expert);
             int J_rdna3_5 = use_j48_128e ? 48 : mmq_rdna3_5_id_get_J(type, rows_per_expert);

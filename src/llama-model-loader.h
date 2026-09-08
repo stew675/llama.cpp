@@ -70,6 +70,7 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_SKIP_MANAGED    = 1 << 6; // like TENSOR_SKIP, but for a tensor whose data is read on demand elsewhere (managed lazy reader); no "unused tensor" warning
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -90,9 +91,20 @@ struct llama_model_loader {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
 
+        // managed buffer size in bytes for on-demand tensors; 0 = mmap-based lazy
+        // loading (set by the caller before the create_tensor() calls)
+        size_t buf_size = 0;
+
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+
+        // record the on-disk range of a tensor whose data is loaded on demand by
+        // other means (the managed lazy reader). Unlike add(), this does not
+        // consult the lazy mode or the tensor size: the range must be excluded
+        // from the load-time WILLNEED prefetch either way, or the kernel would
+        // fault the whole table in
+        void add_range(const std::string & name, const llama_tensor_weight & w);
 
         bool any() const {
             return !ranges.empty();

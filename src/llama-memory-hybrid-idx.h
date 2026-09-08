@@ -75,6 +75,17 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // incremental block-vector cache access: the F32 pool tensor of indexer layer `il`
+    // (nullptr when the model has no indexer); view [idx_dim x n_blocks x n_stream],
+    // n_blocks = ceil(n_kv/ratio), rows [0, watermark) valid
+    ggml_tensor * get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const;
+
+    // fill the per-step derived-cache host leaves: fill range [from, to) with the score limit == to.
+    // n_bid = count of full blocks per stream (from set_input_qsa's grouping).  Called by the const
+    // set_input_qsa on the decode append path (advance = the derived path is live this step).
+    void qsa_derived_limits(int32_t * dst_fill_from, int32_t * dst_limit, int n_stream, uint32_t ratio,
+                            const uint32_t * n_bid, bool advance) const;
+
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
@@ -85,7 +96,9 @@ public:
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias,
+                       int32_t * dst_derived_from = nullptr,
+                       int32_t * dst_derived_lim  = nullptr) const;
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -97,6 +110,37 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    //
+    // incremental block-vector cache ("derived cache", qwen4exp QSA decode waste fix)
+    //
+    // One F32 [indexer_head_size x ceil(kv_size/ratio) x n_stream] tensor per indexer layer
+    // holding the pooled + rms-normed + ROTATED vector of each FULL block, computed once when
+    // the block completes instead of re-pooling the raw cache every decode token.  Lifecycle =
+    // a per-layer host watermark: rows [0, watermark) are valid; any sequence mutation drops the
+    // watermarks (the rows are never read above the watermark, so nothing needs memsetting).
+    // The graph ops (fill + the derived score path) receive the range via per-step host leaves;
+    // set_input_qsa fills them and advances the watermarks (decode-only, env-gated).
+    struct llama_mem_pool_layer {
+        uint32_t il;                  // model layer id (dense-attention, indexer-carrying)
+        uint32_t ratio;               // compress ratio of this layer (blocks = ceil(kv_size/ratio))
+        ggml_tensor * pool = nullptr; // F32 [idx_dim, n_blocks, n_stream]
+    };
+
+    // per-layer derived tensors + the contexts/buffers owning their memory
+    std::vector<llama_mem_pool_layer> pool_layers;
+    std::vector<ggml_context_ptr>      pool_ctxs;
+    std::vector<ggml_backend_buffer_ptr> pool_bufs;
+
+    // watermark per pool layer (rows [0, wm) are valid); decode advances it, seq ops drop it
+    // mutable: set_input_qsa (const) advances it on the decode append path
+    mutable std::vector<uint32_t> pool_wm;
+
+    // the derived path is decode-only + env-gated (GGML_CUDA_QSA_INDEXER_CACHE)
+    bool derived_enabled = false;
+
+    void pool_invalidate_all();
+    void pool_create(const llama_model & model, const layer_filter_cb & filter_idx);
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -143,7 +187,13 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias,
+                       int32_t * dst_derived_from = nullptr,
+                       int32_t * dst_derived_lim  = nullptr) const;
+
+    // F32 derived-cache view of indexer layer `il` ([idx_dim x n_blocks x n_stream]); nullptr
+    // when the model carries no indexer or the layer is not a pool layer
+    ggml_tensor * get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;

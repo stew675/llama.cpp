@@ -1106,6 +1106,14 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+void llama_model_loader::lazy_read::add_range(const std::string & name, const llama_tensor_weight & w) {
+    ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(w.tensor));
+    tensors.insert(name);
+
+    LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) excluded from the load-time prefetch\n",
+            __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1168,9 +1176,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // skip unused tensors
-        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP) || (flags & TENSOR_SKIP_MANAGED)) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            if (!(flags & TENSOR_SKIP_MANAGED)) {
+                LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            }
 
             size_data -= nbytes;
             n_created++;
@@ -1319,7 +1329,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(&t_meta, tn.str().c_str());
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
-        GGML_ASSERT(buft != nullptr);
+        if (buft == nullptr) { // e.g. TENSOR_SKIP
+            return nullptr;
+        }
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
@@ -1332,8 +1344,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    if (flags & TENSOR_READ_LAZY && !files.empty()) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
+        // note: the user path (llama_model_init_from_user) has no files to lazy-read from, so the
+        //   tensor is created normally there and filled via set_tensor_data
         is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
 

@@ -152,7 +152,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -240,6 +240,24 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+
+    cparams.fused_hc_mix = true;
+    {
+        const char * LLAMA_FUSED_HC_MIX = getenv("LLAMA_FUSED_HC_MIX");
+        if (LLAMA_FUSED_HC_MIX) {
+            cparams.fused_hc_mix = atoi(LLAMA_FUSED_HC_MIX) != 0;
+            LLAMA_LOG_INFO("%s: fused hc_mix = %d (env)\n", __func__, cparams.fused_hc_mix);
+        }
+    }
+
+    cparams.fused_hc_combine = true;
+    {
+        const char * LLAMA_FUSED_HC_COMBINE = getenv("LLAMA_FUSED_HC_COMBINE");
+        if (LLAMA_FUSED_HC_COMBINE) {
+            cparams.fused_hc_combine = atoi(LLAMA_FUSED_HC_COMBINE) != 0;
+            LLAMA_LOG_INFO("%s: fused hc_combine = %d (env)\n", __func__, cparams.fused_hc_combine);
+        }
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -3691,6 +3709,35 @@ llama_context * llama_init_from_model(
         }
         if (model->get_split_state_ud.n_devices == 1) {
             LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
+        }
+
+        // SPLIT_MODE_TENSOR runs the attention through the flash-attention kernels split across
+        // the tensor-parallel devices. Those kernels read the quantized K/V cache natively only
+        // for a subset of quantized types (q4_0/q8_0); for the rest (q4_1 family, iq4_nl, ...)
+        // the graph cannot express a splittable attention and the meta splitter aborts during
+        // reserve. This is only a problem when the Meta device is actually used (tensor split
+        // over >= 2 GPUs; a single-device "tensor" mode skips the Meta wrapper and is fine).
+        const bool use_meta_device =
+            [&]() {
+                for (const auto & dev : model->devices) {
+                    if (dev.is_meta) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+        if (use_meta_device) {
+            for (ggml_type type_kv : { params.type_k, params.type_v }) {
+                if (ggml_is_quantized(type_kv) &&
+                        type_kv != GGML_TYPE_Q4_0 && type_kv != GGML_TYPE_Q8_0) {
+                    LLAMA_LOG_ERROR("%s: KV cache type %s is not supported with tensor parallelism "
+                            "(SPLIT_MODE_TENSOR, %zu GPUs): flash attention cannot read this type from a "
+                            "split KV cache\n", __func__, ggml_type_name(type_kv), model->get_split_state_ud.n_devices);
+                    LLAMA_LOG_ERROR("%s: use f32/f16/bf16/q8_0/q4_0 KV cache types, or switch to "
+                            "SPLIT_MODE_LAYER which supports every KV cache type\n", __func__);
+                    return nullptr;
+                }
+            }
         }
     }
 

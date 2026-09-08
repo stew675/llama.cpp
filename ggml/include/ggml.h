@@ -585,6 +585,12 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_FLASH_ATTN_QSA,
+        GGML_OP_INDEXER_TOPK,
+        GGML_OP_INDEXER_SCORE,
+        GGML_OP_INDEXER_FILL,
+        GGML_OP_HC_MIX,
+        GGML_OP_HC_COMBINE,
 
         GGML_OP_UNARY,
 
@@ -2512,6 +2518,111 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // qwen4exp QSA sparse attention: attend only over the cells that the
+    // indexer's top-k names, instead of the whole KV cache.  The mask is the
+    // base kq_mask and is gathered in-kernel at the idx positions.
+    GGML_API struct ggml_tensor * ggml_flash_attn_qsa(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * idx,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 logit_softcap);
+
+    GGML_API void ggml_flash_attn_qsa_set_prec(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    GGML_API enum ggml_prec ggml_flash_attn_qsa_get_prec(
+            const struct ggml_tensor * a);
+
+    // fused expand + mask + top-k for the indexer: value[c] = score[cell_blk[c]] + additive[c]
+    // src0: block scores [n_blocks, n_tps, n_stream] F32
+    // src1: cell -> block map [n_kv, n_stream] I32
+    // src2: per-cell additive [n_kv, n_tps, n_stream] F16 or F32 (attention mask or bias)
+    // k:   number of top cells to return
+    GGML_API struct ggml_tensor * ggml_indexer_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * cell_blk,
+            struct ggml_tensor  * additive,
+            int                   k);
+
+    // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain
+    // get_rows(blk_cells) -> r-slice sum -> scale(1/r) -> rms_norm for the per-token
+    // decode indexer path.  src0 = raw indexer cache [idx_dim, n_kv, n_stream],
+    // src1 = blk_cells [r*n_blocks, n_stream], src2 = rms-norm weights [idx_dim];
+    // dst = [idx_dim, n_blocks*n_stream, 1], byte-identical to the per-op chain.
+
+
+    // Fused indexer block pool -> norm -> rope -> score (qwen4exp QSA decode): ONE op
+    // replaces the per-token chain get_rows -> pool -> scale -> rms_norm -> rope_multi
+    // -> score mul_mat -> relu -> head-sum -> bias add.  src0 = raw indexer cache view
+    // [idx_dim, n_kv, n_stream], src1 = blk_cells [r*n_blocks, n_stream],
+    // src2 = blk_pos [4*n_blocks*n_stream], src3 = rotated/normed indexer query
+    // [idx_dim, n_idx_h*n_tps, n_stream], src4 = norm weights [idx_dim],
+    // src5 = per-block bias [n_blocks, n_tps, n_stream]; the remaining args replicate
+    // the ggml rope call's parameters.  dst = [n_blocks, n_tps, n_stream],
+    // byte-identical to the per-op chain's post-bias score.
+    GGML_API struct ggml_tensor * ggml_indexer_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * blk_cells,
+            struct ggml_tensor  * blk_pos,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * bias,
+            int                   r,
+            float                 eps,
+            int                   n_dims,
+            const int           * sections,
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow,
+            // derived-cache path (optional, pass NULL for both): src6 = the incremental
+            // block-vector pool view [idx_dim, n_blocks, n_stream] (rows < the limit
+            // hold pre-normed+rotated vectors and are dotted directly instead of being
+            // pooled from the raw cache), src7 = I32 [2*n_stream] host range leaf with
+            // the per-stream derived limit in rows [n_stream, 2*n_stream).
+            struct ggml_tensor  * pool,
+            struct ggml_tensor  * rng);
+
+    // Incremental derived-cache fill (qwen4exp QSA decode waste fix): ONE op computes the
+    // pooled + rms-normed + ROTATED vector of the blocks in the per-step range [from, lim)
+    // (src5 = I32 [2*n_stream] host leaf, from in rows [0, n_stream), lim in
+    // [n_stream, 2*n_stream)) and writes them into the pool view `dst` (src6).  The kernel
+    // replicates ggml_indexer_score's pool/norm/rope F32 arithmetic byte-exactly, so a pool
+    // row equals what the score would pool from the raw cache - the byte-toggle contract.
+    // src0 = raw indexer cache view, src1 = blk_cells, src2 = blk_pos, src3 = norm weights,
+    // src4 = the range leaf; the rope parameters follow ggml_indexer_score.
+    GGML_API struct ggml_tensor * ggml_indexer_fill(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * blk_cells,
+            struct ggml_tensor  * blk_pos,
+            struct ggml_tensor  * w,
+            struct ggml_tensor  * rng,
+            struct ggml_tensor  * pool,
+            int                   r,
+            float                 eps,
+            int                   n_dims,
+            const int           * sections,
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,
@@ -2715,6 +2826,48 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix: fused hyper-connection mixer (qwen4exp / Flash-Next decode).
+    // x [n_embd, hc, n_tokens] F32 (the raw hc residual) -> dst [n_embd + hc,
+    // n_tokens] whose head is mixed [n_embd, n_tokens] and whose tail is the
+    // inject scatter [hc, n_tokens] (the model views both out of the one
+    // tensor; the combine consumes the inject view). The op runs the grouped
+    // RMSNorm over each stream (eps in op_params), the gamma scale (w_norm),
+    // the two Q8_0 LoRA products with silu/sigmoid gating, the stream
+    // collapse, and the F32 inject product:
+    //   xn     = rms(x) * w_norm
+    //   lo     = silu(w_down^T xn / hc)
+    //   gate   = sigmoid(w_up^T lo)
+    //   mixed  = (1/hc) * sum_c xn * gate
+    //   inject = w_inject^T xn (w_inject may be null: no tail, no inject)
+    // Bit-exactness: the CUDA kernels mirror the unfused ops (rms_norm_f32,
+    // the gamma MUL rounding, the mmvq Q8_0 accumulation at M = 1, and the
+    // mmvf float2-pair FMA accumulation for the F32 inject), so mixed and
+    // inject are byte-identical to the unfused chain outputs.
+    GGML_API struct ggml_tensor * ggml_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_norm,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_up,
+            struct ggml_tensor  * w_inject,
+            int64_t               hc,
+            float                 eps);
+
+    // hc_combine: fused hyper-connection residual combine (qwen4exp /
+    // Flash-Next decode). residual [n_embd, hc, n_tokens] -> same shape:
+    //   w[c] = 2 * sigmoid(inject[c] / hc)          (per stream)
+    //   out[r, c] = residual[r, c] + block_out[r] * w[c]
+    // which is the SCALE+SIGMOID+SCALE+REPEAT+MUL+ADD chain of
+    // build_hc_combine. The kernel keeps each op's rounding (separate MUL
+    // and ADD results, no FMA contraction) so decode stays bit-exact vs the
+    // unfused chain.
+    GGML_API struct ggml_tensor * ggml_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * block_out,
+            struct ggml_tensor  * inject,
+            int64_t               hc);
 
     // custom operators
 
