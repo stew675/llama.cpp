@@ -20,6 +20,33 @@
 // llama_memory_hybrid_idx
 //
 
+// The QSA indexer scores blocks of keys and never reads a stored value, so its cache is created
+// keys-only by default: no V tensor exists, no V-side op may be issued against it.  That saves
+// -637 MiB of VRAM at ctx 204800 (the store is triplicated across the three GPUs);
+// LLAMA_QSA_KEYS_ONLY=0 restores the (dead) V buffer for A/B.
+static bool qwen4exp_keys_only_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_QSA_KEYS_ONLY");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// A qwen4exp MTP context is built with a recurrent filter that matches nothing (the nextn layer is
+// not recurrent): it carries the indexer cache for sparse draft attention but has no recurrent
+// layers.  An empty recurrent cache still refuses a partial seq_rm (llama_memory_recurrent::seq_rm's
+// per-token rollback path needs a state snapshot that was never written), which would abort the
+// server on the first speculative cache trim, so the recurrent child is skipped whenever no layer
+// bound a state tensor.
+static bool hybrid_idx_no_recr(const llama_memory_recurrent * r) {
+    if (!r) {
+        return true;
+    }
+    for (ggml_tensor * t : r->r_l) { if (t) { return false; } }
+    for (ggml_tensor * t : r->s_l) { if (t) { return false; } }
+    return true;
+}
+
 llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const llama_model & model,
                             /* attn */
@@ -68,14 +95,23 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // the QSA indexer scores blocks of keys and never reads a stored value, so its cache is
+        // created keys-only (LLAMA_QSA_KEYS_ONLY=0 restores the dead V buffer for A/B)
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr, "idx_");
+            nullptr, filter_idx, nullptr, nullptr, "idx_", /* v_enabled */ !qwen4exp_keys_only_enabled());
     }()) {
-    // incremental block-vector cache (env-gated, default OFF; decode waste fix)
+    // incremental block-vector cache (default ON; GGML_CUDA_QSA_INDEXER_CACHE=0 disables)
+    //
+    // The graph side (build_qsa_top_k) has always defaulted its idx_cache to ON, so the pool is the
+    // only piece that was off - and with it off the fused decode score re-pools/rotates/scores the
+    // WHOLE raw indexer cache every step.  Measured on gfx1151 qwen4exp IQ4_NL f16, plain (non-MTP)
+    // decode with the pool ON vs OFF: pp80K **24.3 -> 26.5 t/s (+9.1 %)** and pp150K **20.6 ->
+    // 23.6 t/s (+14.6 %)**, byte-identical text at both (6e1e56284fc9 / 1e871dd70a62).  The pool is
+    // only allocated for the fused decode path (F32/BF16/F16 indexer keys) - see pool_create.
     const char * env_cache = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
-    derived_enabled = env_cache != nullptr && std::atoi(env_cache) != 0;
+    derived_enabled = env_cache == nullptr || std::atoi(env_cache) != 0;
 
     if (mem_idx) {
         pool_create(model, filter_idx);
@@ -96,9 +132,10 @@ void llama_memory_hybrid_idx::pool_create(
     // only when that path can actually run:
     //  - the fused ops read the raw indexer keys natively (F32/BF16/F16 only - quantized
     //    indexer-key caches, e.g. --cache-type-k q8_0, always take the per-op chain), and
-    //  - the memory-layer derived cache is engaged (GGML_CUDA_QSA_INDEXER_CACHE=1/2):
-    //    otherwise qsa_derived_limits emits an empty fill range every step and the pool is
-    //    never written or read (each decode step would launch an empty fill for nothing).
+    //  - the memory-layer derived cache is engaged (GGML_CUDA_QSA_INDEXER_CACHE, default ON;
+    //    =0 restores the raw-cache re-pool).  With it off, qsa_derived_limits emits an empty fill
+    //    range every step and the pool is never written or read (each decode step would launch an
+    //    empty fill for nothing).
     // Skip the allocation otherwise - get_pool() then returns nullptr and build_qsa_top_k
     // runs the fused score with no pool (pools the raw cache: the same F32 arithmetic and
     // byte-identical output, minus the dead buffer) or the per-op chain for quantized keys.
@@ -270,7 +307,7 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
         }
 
         // prepare the recurrent batches first
-        if (!get_mem_recr()->prepare(ubatches)) {
+        if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -345,7 +382,7 @@ llama_pos llama_memory_hybrid_idx::mem_idx_stale_pos(llama_seq_id seq_id, llama_
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
-    if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
+    if (!hybrid_idx_no_recr(get_mem_recr()) && !get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
     }
 
@@ -429,7 +466,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    llama_memory_hybrid::state_write(io, seq_id, flags);
+    // mirrors llama_memory_hybrid::state_write with the recurrent child skipped when it is empty
+    // (the MTP context's recurrent filter matches nothing - see hybrid_idx_no_recr)
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        get_mem_attn()->state_write(io, seq_id, flags);
+    }
+    if (!hybrid_idx_no_recr(get_mem_recr())) {
+        get_mem_recr()->state_write(io, seq_id, flags);
+    }
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
@@ -455,7 +499,9 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
             get_mem_attn()->state_read_sinfo(io, seq_id, flags, mem_idx ? &sinfos_attn : nullptr, nullptr);
         }
 
-        get_mem_recr()->state_read(io, seq_id, flags);
+        if (!hybrid_idx_no_recr(get_mem_recr())) {
+            get_mem_recr()->state_read(io, seq_id, flags);
+        }
 
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
@@ -488,7 +534,9 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     }
 
     get_mem_attn()->state_clear(seq_id);
-    get_mem_recr()->seq_rm(seq_id, -1, -1);
+    if (!hybrid_idx_no_recr(get_mem_recr())) {
+        get_mem_recr()->seq_rm(seq_id, -1, -1);
+    }
 
     if (mem_idx) {
         mem_idx->state_clear(seq_id);
@@ -511,6 +559,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
+        ggml_tensor * blk_idx,
+        ggml_tensor * blk_tail,
+        ggml_tensor * cell_vis,
+        ggml_tensor * q_vis,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
@@ -533,7 +585,32 @@ void llama_memory_hybrid_idx::set_input_qsa(
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
-    float   * dst_bias      = (float   *) bias->data;
+    float   * dst_bias      = bias     != nullptr ? (float   *) bias->data     : nullptr;
+    int32_t * dst_blk_idx   = blk_idx  != nullptr ? (int32_t *) blk_idx->data  : nullptr;
+    int32_t * dst_blk_tail  = blk_tail != nullptr ? (int32_t *) blk_tail->data : nullptr;
+    int32_t * dst_cell_vis  = cell_vis != nullptr ? (int32_t *) cell_vis->data : nullptr;
+    int32_t * dst_q_vis     = q_vis    != nullptr ? (int32_t *) q_vis->data    : nullptr;
+
+    // exactly one form of the per-block bias is asked for: the uploaded tensor, or the compact
+    // pair the top-k derives it from
+    GGML_ASSERT((dst_blk_idx != nullptr) == (dst_blk_tail != nullptr));
+    GGML_ASSERT(dst_blk_idx == nullptr || blk_bias);
+    GGML_ASSERT(dst_bias != nullptr || dst_blk_idx != nullptr);
+    GGML_ASSERT(dst_bias == nullptr || dst_blk_idx == nullptr);
+
+    // the derived visibility travels with blk_bias (it is the per-cell half of the same bias)
+    GGML_ASSERT((dst_cell_vis != nullptr) == (dst_q_vis != nullptr));
+    GGML_ASSERT(dst_cell_vis == nullptr || blk_bias);
+
+    if (dst_blk_idx != nullptr) {
+        GGML_ASSERT(blk_idx->type  == GGML_TYPE_I32 && blk_idx->ne[0]  == n_blocks && blk_idx->ne[1]  == n_ns);
+        GGML_ASSERT(blk_tail->type == GGML_TYPE_I32 && blk_tail->ne[0] == n_tps    && blk_tail->ne[1] == n_ns);
+    }
+
+    if (dst_cell_vis != nullptr) {
+        GGML_ASSERT(cell_vis->type == GGML_TYPE_I32 && cell_vis->ne[0] == n_kv && cell_vis->ne[1] == n_ns);
+        GGML_ASSERT(q_vis->type    == GGML_TYPE_I32 && q_vis->ne[0]    == n_tps && q_vis->ne[1]    == n_ns);
+    }
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
@@ -692,6 +769,20 @@ void llama_memory_hybrid_idx::set_input_qsa(
             group_cells();
         }
 
+        // the per-cell half of the visibility as state: the compaction key of every cell of
+        // this stream's cache, -1 for a cell that is empty or owned by another sequence.
+        // a query token with key q_vis sees exactly the cells with 0 <= key <= q_vis, which is
+        // set_input_kq_mask_impl's predicate without its causal part - the same comparison the
+        // per-cell bias above already makes (idx = ranked ? rank[j] : pos_get(j) against q).
+        if (dst_cell_vis != nullptr) {
+            int32_t * cur_cell_vis = dst_cell_vis + s*n_kv;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                cur_cell_vis[j] = cells.is_empty(j) || !cells.seq_has((uint32_t) j, seq_of_stream)
+                        ? -1 : (int32_t) (ranked ? rank[j] : cells.pos_get(j));
+            }
+        }
+
         GGML_ASSERT((!blk_bias || !oor) && "qsa: cell position runs past the cell window");
 
         int32_t n_bid = 0;
@@ -751,6 +842,21 @@ void llama_memory_hybrid_idx::set_input_qsa(
             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
         }
 
+        if (dst_blk_idx != nullptr) {
+            // the per-block half of the bias as state: the top-k derives the -inf / 0 / 1e9
+            // value from this against the per-token tail start.  the per-sequence half of the
+            // original test is deliberately absent - the attention mask (or the derived cell
+            // positions) already drops every cell of a foreign block, and -inf + -inf is
+            // still -inf, so the values and the selection are identical.
+            int32_t * cur_blk_idx = dst_blk_idx + s*n_blocks;
+
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                cur_blk_idx[b] = have_dead && b == dead_bid ? INT32_MAX
+                               : b >= n_bid                 ? -1
+                               :                              bid_idx[b];
+            }
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -783,7 +889,18 @@ void llama_memory_hybrid_idx::set_input_qsa(
             // the tail is an incomplete block and is always visible, as in the reference
             const int64_t tail_start = (q + 1)/r*r;
 
+            if (dst_q_vis != nullptr) {
+                dst_q_vis[s*n_tps + ii] = (int32_t) q;
+            }
+
             if (blk_bias) {
+                if (dst_blk_tail != nullptr) {
+                    // compact form: the tail start is the only per-token part of the block bias
+                    dst_blk_tail[i] = (int32_t) tail_start;
+
+                    continue;
+                }
+
                 // a block sits wholly inside or outside the tail, so one value covers it
                 // the caller adds the attention mask, which drops empty, foreign and future cells
                 float * cur_blk_bias = dst_bias + i*n_blocks;
@@ -1545,11 +1662,147 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
 }
 
+uint32_t llama_memory_hybrid_idx_context::qsa_n_kv_window() const {
+    const uint32_t n_kv = get_idx() ? get_idx()->get_n_kv() : 0;
+    const llama_kv_cache * idx = mem ? mem->get_mem_idx() : nullptr;
+    if (idx == nullptr) {
+        return n_kv;
+    }
+    // seq_to_stream is LLAMA_MAX_SEQ-sized in the unified (n_stream == 1) case and n_stream-sized
+    // otherwise, and get_cells() asserts, so bound the seq sweep to what that vector holds.
+    const uint32_t n_stream = idx->get_n_stream();
+    const llama_seq_id n_seq = n_stream > 1 ? (llama_seq_id) n_stream : (llama_seq_id) LLAMA_MAX_SEQ;
+    llama_pos pos_max = -1;
+    for (llama_seq_id s = 0; s < n_seq; ++s) {
+        pos_max = std::max(pos_max, idx->get_cells(s).seq_pos_max(s));
+    }
+    if (pos_max < 0) {
+        return n_kv;
+    }
+    const uint32_t window = ((uint32_t) pos_max + 1 + 255) / 256 * 256;
+    return std::max(n_kv, window);
+}
+
+// [QSA_SCORE_BOUNDS] true when the occupied cells of `seq` hold a unique set of non-negative
+// positions, one sequence only.  Complete blocks are enumerated in ascending logical block order
+// (see set_input_qsa's grouping), so under this precondition a complete block's ordinal cannot
+// exceed its logical block number and the scorer can be trimmed to a strip's visible prefix.
+static bool qsa_single_sequence_prefix(const llama_kv_cells & cells, uint32_t count, llama_seq_id seq) {
+    if (count > cells.size()) {
+        return false;
+    }
+
+    std::vector<llama_pos> positions;
+    positions.reserve(count);
+
+    for (uint32_t i = 0; i < count; ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        // the scorer trim is by cell index, so the cell index must equal the position (no
+        // permutation); a hole keeps the check valid, an empty cell contributes nothing
+        if (cells.seq_get_all(i).count() != 1 || !cells.seq_has(i, seq) || cells.pos_get(i) != (llama_pos) i) {
+            return false;
+        }
+        positions.push_back(cells.pos_get(i));
+    }
+
+    std::sort(positions.begin(), positions.end());
+    return std::adjacent_find(positions.begin(), positions.end()) == positions.end();
+}
+
+bool llama_memory_hybrid_idx_context::qsa_position_prefix(const llama_ubatch & ubatch) const {
+    if (get_n_stream() != 1 || !get_idx() || mem == nullptr) {
+        return false;
+    }
+    if (!ubatch.token || !ubatch.pos || !ubatch.n_tokens || !ubatch.n_pos ||
+        !ubatch.seq_id || !ubatch.n_seq_id) {
+        return false;
+    }
+    if (ubatch.n_seq_id[0] < 1 || !ubatch.seq_id[0]) {
+        return false;
+    }
+
+    const llama_seq_id seq = ubatch.seq_id[0][0];
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] < 1 || !ubatch.seq_id[i] || ubatch.seq_id[i][0] != seq ||
+            ubatch.pos[i] < 0 || ubatch.pos[i] >= 16777216) {
+            return false;
+        }
+        // M-RoPE repeats a position across an image, which breaks the unique-position ordering
+        for (uint32_t axis = 1; axis < ubatch.n_pos; ++axis) {
+            if (ubatch.pos[i + axis*ubatch.n_tokens] != ubatch.pos[i]) {
+                return false;
+            }
+        }
+    }
+
+    const llama_kv_cache * idx = mem->get_mem_idx();
+    if (idx == nullptr) {
+        return false;
+    }
+
+    return qsa_single_sequence_prefix(idx->get_cells(seq), get_idx()->get_n_kv(), seq);
+}
+
+std::vector<int64_t> llama_memory_hybrid_idx_context::qsa_score_key_limits(
+        const llama_ubatch & ubatch, int64_t n_blocks, int64_t strip, uint32_t ratio, int64_t budget) const {
+    const int64_t n_tokens = ubatch.n_tokens;
+
+    if (!ubatch.pos || n_tokens <= 0 || strip <= 0 || ratio == 0 || budget <= 0 || n_blocks < budget) {
+        return {};
+    }
+
+    // llama_context::graph_reserve builds a worst-case graph from a synthetic ubatch whose positions
+    // are all 0.  Bounding that graph would reserve compute buffers for a 4%-wide scorer and then
+    // execute full-width ones, so a many-token ubatch whose positions are all identical is treated
+    // as synthetic and left unbounded.
+    bool degenerate_pos = n_tokens > 1;
+    for (int64_t i = 1; degenerate_pos && i < n_tokens; ++i) {
+        if (ubatch.pos[i] != ubatch.pos[0]) {
+            degenerate_pos = false;
+        }
+    }
+    if (degenerate_pos || !qsa_position_prefix(ubatch)) {
+        return {};
+    }
+
+    std::vector<int64_t> limits;
+    limits.reserve((n_tokens + strip - 1)/strip);
+
+    for (int64_t first = 0; first < n_tokens; first += strip) {
+        int64_t maximum = -1;
+        for (int64_t i = first; i < std::min(n_tokens, first + strip); ++i) {
+            if (ubatch.pos[i] < 0 || ubatch.pos[i] >= 16777216) {
+                return {};
+            }
+            maximum = std::max(maximum, (int64_t) ubatch.pos[i]);
+        }
+        // (maximum+1)/ratio complete blocks lie fully inside the strip's causal prefix.  The +1
+        // keeps the incomplete tail block - the fused top-k carries it as ordinary cells, whereas
+        // the reference appends it separately - inside the scored prefix.
+        limits.push_back(std::min(n_blocks, std::max(budget, (maximum + 1)/ratio) + 1));
+    }
+
+    if (getenv("LLAMA_QSA_SCORE_STRIP_DEBUG") != nullptr) {
+        fprintf(stderr, "QSA score bounds: n_tokens=%lld n_blocks=%lld strip=%lld ratio=%u budget=%lld limits=[%lld, %lld]\n",
+                (long long) n_tokens, (long long) n_blocks, (long long) strip, ratio, (long long) budget,
+                (long long) limits.front(), (long long) limits.back());
+    }
+
+    return limits;
+}
+
 void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
+        ggml_tensor * blk_idx,
+        ggml_tensor * blk_tail,
+        ggml_tensor * cell_vis,
+        ggml_tensor * q_vis,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
@@ -1557,8 +1810,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         int32_t * dst_derived_lim) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias,
-                       dst_derived_from, dst_derived_lim);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, cell_vis, q_vis,
+                       ubatch, ratio, blk_bias, dst_derived_from, dst_derived_lim);
 }
 
 ggml_tensor * llama_memory_hybrid_idx_context::get_pool(ggml_context * ctx, int32_t il, uint32_t n_blocks) const {

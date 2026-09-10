@@ -348,6 +348,11 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
+    // WIP r42 (TODO #42): free the compute buffers so the next alloc_graph sizes them from that graph
+    // instead of the (grow-only) previous peak.  Used to release a wide-prefill compute layout before
+    // the MoE expert cache arena is sized, so a big -ub and a big arena can coexist.
+    GGML_API void                 ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched);
+
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
 

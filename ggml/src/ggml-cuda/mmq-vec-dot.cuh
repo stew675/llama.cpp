@@ -341,6 +341,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+#pragma unroll 1 // the default fully unrolls at J <= 64 on gfx12 (Q5_K J=64: 256 VGPRs + scratch)
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
         const int k0 = k00 + k01;
 
@@ -514,6 +515,7 @@ template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+#pragma unroll 1 // the default fully unrolls at J=16 on gfx12 and spills (256 VGPRs + scratch)
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
         const int k0 = k00 + k01;
 

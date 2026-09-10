@@ -143,6 +143,23 @@ extern "C" {
         // can be called multiple times for the same tensor: the longest lifetime applies
         void (*add_alloc_dep)(void * user_data, struct ggml_tensor * tensor, struct ggml_tensor * until);
         void * user_data;
+        // the scheduler will run the graph in sub-graphs split at every eval-callback node, so a
+        // backend optimisation that relies on state living for one whole compute (e.g. eliding a
+        // producer's F32 output and re-reading it from a per-graph cache) must stand down
+        bool has_eval_callback;
+        // the *whole* scheduled graph.  graph_optimize is called per split, but a consumer of a
+        // tensor may live in another split (the per-compute activation cache does not span splits),
+        // so a backend optimisation that elides a producer's output must consult the whole graph to
+        // find every consumer.  NULL means the graph is not split (full_graph == the split graph).
+        const struct ggml_cgraph * full_graph;
+        // Two-pass mode used by the meta (tensor-split) backend.  The meta owns the whole graph, so
+        // the scheduler never calls a child backend's graph_optimize; the meta forwards it twice
+        // instead -- once over the whole graph before allocation (alloc-deps only) and once per
+        // per-device subgraph of simple tensors after allocation (markings only), because the marks
+        // must be keyed by the tensor pointers the child's compute actually sees.  Both default to
+        // false (the single-backend scheduler runs the complete pass in one call).
+        bool marks_only;
+        bool allocs_only;
     };
 
     struct ggml_backend_i {
@@ -187,6 +204,15 @@ extern "C" {
         // implement these leaves all four NULL and the scheduler keeps the in-order copy path.
         void * (*stage_buffer)(ggml_backend_t backend, int slot, size_t size);
         void   (*stage_upload)(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev);
+        // (optional) like `stage_upload`, but for a split upload whose device slice is strided in the
+        // source weight: the device owns `n_copies` blocks of `width` bytes, `stride_src` apart, starting
+        // `offset` bytes into the contiguous host source `src`.  The implementation assembles the compacted
+        // slice into ring `slot` (a host gather for a small `n_copies`, else a whole-range H2D plus a device
+        // 2-D compaction) and records `ev` on the copy stream.  Returns false if it cannot stage.
+        // `src_pinned` is true when `src` is device-accessible pinned host memory (a GPU host buffer, not
+        // the pageable model mmap), which lets a backend copy the strided slice directly with a 2-D H2D
+        // instead of staging the whole contiguous range.
+        bool   (*stage_gather)(ggml_backend_t backend, int slot, const void * src, size_t offset, size_t width, size_t stride_src, size_t n_copies, ggml_backend_event_t ev, bool src_pinned);
         void   (*stage_wait)  (ggml_backend_t backend, ggml_backend_event_t ev);
         void   (*stage_d2d)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
         // (optional) measured H2D bandwidth in GB/s (one-off calibration, cached); 0 if unknown.  The

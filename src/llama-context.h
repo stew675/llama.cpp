@@ -246,6 +246,24 @@ private:
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+public:
+    // Llama-Frankenstein F1: device-resident layer inputs (target) and device feature injection (draft)
+    void          set_lf_layer_inp_dev(bool enable);
+    ggml_tensor * get_lf_layer_inp_dev(uint32_t lid) const;
+    void          set_lf_dev_inject(bool enable);
+    // draft context: mark the target's device layer inputs as read (GPU-side event, no host wait)
+    void          lf_signal_features_consumed();
+    // target context: event the next extraction must wait for before overwriting the buffers
+    void          lf_set_consumed_event(ggml_backend_t backend_reader);
+    ggml_backend_t lf_backend_for(ggml_backend_dev_t dev) const;
+
+private:
+    std::vector<ggml_tensor *> lf_layer_dev;   // [n_layer()+1] F32 [n_embd, n_batch], nullptr if not extracted
+    ggml_context_ptr           lf_layer_ctx;
+    ggml_backend_buffer_ptr    lf_layer_buf;
+    ggml_backend_event_t       lf_consumed_ev      = nullptr;
+    bool                       lf_consumed_pending = false;
+
     //
     // graph
     //
@@ -260,8 +278,17 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // packed_kq_mask: build the measure graph with the packed kq mask even when the derived form is
+    //   enabled, so the reserved buffers cover a batch the derived form cannot serve (see the note in
+    //   graph_reserve).  Pass kq_mask_packed_reachable() for a worst-case reserve; the fused-op
+    //   support probes must NOT set it - they verify the derived form is present in the graph.
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool packed_kq_mask = false);
+
+    // true when a batch the derived kq mask cannot serve is reachable at runtime, i.e. when the
+    // compute reserve must be sized for the packed mask - see the definition for the full reasoning
+    bool kq_mask_packed_reachable() const;
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -347,6 +374,10 @@ private:
 
     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+
+    // WIP r42 (TODO #42): previous ubatch size, used to detect the prefill -> decode transition and
+    // release the wide-prefill compute buffer before the MoE expert cache arena is sized.
+    uint32_t n_tokens_prev = 0;
 
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
 

@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "lightning-indexer.cuh"
+#include "mma.cuh"
 #include "fattn-common.cuh"
 #include "convert.cuh"
 
@@ -397,7 +398,7 @@ static __global__ void lightning_indexer_kernel_vec(
         );                                                                                  \
     } else
 
-void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_lightning_indexer_generic(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * w = dst->src[2]; // weights
@@ -529,30 +530,33 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             GGML_ABORT("fatal error");
         }
     } else if (n_embd == 128 && n_head == 4) {
-        // too few heads for a wmma tile, use vector kernel
-        constexpr int K_VECS_PER_WARP = 8;
-        constexpr int WARPS_PER_BLOCK = 8;
-        constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
+        // qwen4exp's QSA indexer scorer shape.  The RDNA3_5 WMMA kernel (supports_indexer4) is the
+        // fast path; this vec fallback keeps the op legal on every other backend/arch.
+        {
+            constexpr int K_VECS_PER_WARP = 8;
+            constexpr int WARPS_PER_BLOCK = 8;
+            constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
 
-        dim3 block(32, WARPS_PER_BLOCK);
-        int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
-        dim3 grid(num_kv_blocks, n_batch, n_stream);
+            dim3 block(32, WARPS_PER_BLOCK);
+            int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+            dim3 grid(num_kv_blocks, n_batch, n_stream);
 
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
-        LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
-        GGML_ABORT("fatal error");
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F16)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_0)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q4_1)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_0)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q5_1)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_Q8_0)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_BF16)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
+            GGML_ABORT("fatal error");
+        }
     } else {
         GGML_ABORT("fatal error");
     }
 }
 
-bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) {
+static bool ggml_cuda_lightning_indexer_generic_supported(int device, const ggml_tensor * dst) {
     GGML_UNUSED(device);
 
     const ggml_tensor * q = dst->src[0];
@@ -604,4 +608,158 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
         default:
             return false;
     }
+}
+
+// AMD (gfx1151, RDNA3_5) fused lightning-indexer kernel for the 4-head / 128-dim case.  The generic
+// path above only instantiates n_head 32/64, but qwen4exp's QSA indexer scores with 4 heads, so the
+// prefill score chain would otherwise run as mul_mat + relu + head-sum.  This kernel computes
+// sum_h relu(q_h . k) * w_h + mask in one WMMA pass (weights all-ones / mask zero reproduces the
+// chain), which is the fused op the QSA prefill scorer wants.
+struct indexer_layout {
+    size_t q1, q2, q3, k2, k3, w1, w3, m1, m3, d1, d3;
+    int nq, nk, nm;
+};
+
+template <typename K>
+__global__ __launch_bounds__(128) void qsa_indexer_wmma16_keyreg(
+        const char * q, const char * k, const char * w, const char * mask,
+        char * dst, indexer_layout s) {
+#if defined(AMD_WMMA_AVAILABLE) && (defined(RDNA3) || defined(RDNA4))
+    using namespace ggml_cuda_mma;
+#if defined(RDNA3)
+    using AB=tile<16,8,half2,DATA_LAYOUT_I_MAJOR_MIRRORED>;
+#else
+    // RDNA4 (gfx12): A/B use the plain I_MAJOR layout ("two runs of four" per lane); the
+    // MIRRORED layout is a gfx11 builtin only and has no RDNA4 device code.
+    using AB=tile<16,8,half2,DATA_LAYOUT_I_MAJOR>;
+#endif
+    using C=tile<16,16,float,DATA_LAYOUT_J_MAJOR>;
+    const int warp=threadIdx.y,lane=threadIdx.x,tid=warp*32+lane;
+    const int qfirst=int(blockIdx.y)*16,kfirst=int(blockIdx.x)*64,stream=blockIdx.z;
+    __shared__ half2 query_tile[16][260];
+#pragma unroll 1
+    for(int i=tid;i<16*128;i+=128) {
+        const int row=i/128,col=4*(i%128),token=qfirst+row;
+        float4 value=make_float4(0,0,0,0);
+        if(token<s.nq) {
+            const float * src=(const float *)(q+size_t(stream)*s.q3+size_t(token)*s.q2+size_t(col/128)*s.q1);
+            const int d=col%128;
+            value=make_float4(src[d],src[d+1],src[d+2],src[d+3]);
+        }
+        query_tile[row][col/2]=__float22half2_rn(make_float2(value.x,value.y));
+        query_tile[row][col/2+1]=__float22half2_rn(make_float2(value.z,value.w));
+    }
+    AB keys[8];
+#pragma unroll
+    for(int part=0;part<8;++part) {
+#pragma unroll
+        for(int l=0;l<AB::ne;++l) {
+            const int key=kfirst+warp*16+AB::get_i(l),d=part*16+2*AB::get_j(l);
+            float2 value=make_float2(0,0);
+            if(key<s.nk) {
+                const K * src=(const K *)(k+size_t(stream)*s.k3+size_t(key)*s.k2);
+                value=make_float2(float(src[d]),float(src[d+1]));
+            }
+            keys[part].x[l]=__float22half2_rn(value);
+        }
+    }
+    __syncthreads();
+    C acc[4];
+#pragma unroll
+    for(int head=0;head<4;++head) {
+#pragma unroll
+        for(int l=0;l<C::ne;++l) acc[head].x[l]=0.0f;
+    }
+#pragma unroll
+    for(int part=0;part<8;++part) {
+#pragma unroll
+        for(int head=0;head<4;++head) {
+            AB query;
+#pragma unroll
+            for(int l=0;l<AB::ne;++l) query.x[l]=query_tile[AB::get_i(l)][head*64+part*8+AB::get_j(l)];
+            mma(acc[head],query,keys[part]);
+        }
+    }
+#pragma unroll
+    for(int l=0;l<C::ne;++l) {
+        const int token=qfirst+C::get_i(l),key=kfirst+warp*16+C::get_j(l);
+        if(token<s.nq && key<s.nk) {
+            const float * wr=(const float *)(w+size_t(stream)*s.w3+size_t(token)*s.w1);
+            float value=0.0f;
+#pragma unroll
+            for(int head=0;head<4;++head) value+=fmaxf(acc[head].x[l],0.0f)*wr[head];
+            const half * mr=(const half *)(mask+size_t(stream%s.nm)*s.m3+size_t(token)*s.m1);
+            float * out=(float *)(dst+size_t(stream)*s.d3+size_t(token)*s.d1);
+            out[key]=value+float(mr[key]);
+        }
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+// The 4-head WMMA kernel is the RDNA3_5 (gfx1151) shipped arm.  RDNA3_0 (gfx1100) shares the gfx11
+// WMMA builtin, so the kernel compiles there; it is gated OPT-IN via
+// GGML_CUDA_LIGHTNING_INDEXER4_GFX1100 until a gfx1151 session A/Bs qwen4exp prefill end-to-end.
+// RDNA4 (gfx1201) uses the same ggml_cuda_mma tile abstraction but the gfx12 fragment layout
+// (DATA_LAYOUT_I_MAJOR A/B instead of the gfx11 MIRRORED one) -- ported 2026-09-23, default ON;
+// GGML_CUDA_LIGHTNING_INDEXER4_GFX1201=0 forces the generic vec fallback for an A/B.
+static bool indexer4_arch_enabled(int cc) {
+    if (GGML_CUDA_CC_IS_RDNA3_5(cc)) { return true; }
+    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+        static const int v = getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")
+            ? atoi(getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1100")) : 0;
+        return v != 0;
+    }
+    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        static const int v = getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1201")
+            ? atoi(getenv("GGML_CUDA_LIGHTNING_INDEXER4_GFX1201")) : 1;
+        return v != 0;
+    }
+    return false;
+}
+
+static bool supports_indexer4(int device, const ggml_tensor * dst) {
+    const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
+    if (!q || !k || !w || !m || !indexer4_arch_enabled(ggml_cuda_info().devices[device].cc)) { return false; }
+    if (q->type != GGML_TYPE_F32 || (k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_F16) ||
+            w->type != GGML_TYPE_F32 || m->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
+            q->ne[0] != 128 || q->ne[1] != 4 || k->ne[0] != 128 || k->ne[1] != 1 ||
+            q->ne[2] < 1 || q->ne[2] > 262140 || q->ne[3] > 65535 || k->ne[2] > INT_MAX ||
+            q->ne[3] != k->ne[3] || w->ne[0] != 4 || w->ne[1] != q->ne[2] ||
+            w->ne[2] != 1 || w->ne[3] != q->ne[3] || m->ne[0] != k->ne[2] ||
+            m->ne[1] != q->ne[2] || m->ne[2] != 1 || m->ne[3] < 1 || q->ne[3] % m->ne[3] != 0) { return false; }
+    for (const auto * t : {q, k, w, m, dst}) {
+        const size_t ts=ggml_type_size(t->type);
+        if (t->nb[0] != ts) { return false; }
+        for (int j=1;j<4;++j) { if (t->nb[j]%ts != 0) { return false; } }
+    }
+    return dst->ne[0]==k->ne[2] && dst->ne[1]==q->ne[2] && dst->ne[2]==1 && dst->ne[3]==q->ne[3];
+}
+
+void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!supports_indexer4(ctx.device, dst)) {
+        ggml_cuda_lightning_indexer_generic(ctx, dst);
+        return;
+    }
+    const auto * q=dst->src[0], * k=dst->src[1], * w=dst->src[2], * m=dst->src[3];
+    indexer_layout s{q->nb[1],q->nb[2],q->nb[3],k->nb[2],k->nb[3],w->nb[1],w->nb[3],
+        m->nb[1],m->nb[3],dst->nb[1],dst->nb[3],int(q->ne[2]),int(k->ne[2]),int(m->ne[3])};
+    const dim3 grid((s.nk+63)/64,(s.nq+15)/16,q->ne[3]), block(32,4);
+    ggml_cuda_kernel_launch_params launch(grid,block,0,ctx.stream());
+    if (k->type==GGML_TYPE_F32) {
+        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<float>,launch,(const char*)q->data,(const char*)k->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
+    } else {
+        ggml_cuda_kernel_launch(qsa_indexer_wmma16_keyreg<half>,launch,(const char*)q->data,(const char*)k->data,(const char*)w->data,(const char*)m->data,(char*)dst->data,s);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) {
+    // The op always has a generic per-backend fallback, so support is the WMMA4 arm where it is
+    // enabled or the generic predicate everywhere else.  The *policy* of whether the model should
+    // prefer this fused op over the unfused mul_mat+relu+head_sum chain (issue #59/#60) lives in
+    // the model's use_wmma, not here: RDNA3_0's WMMA4 arm is opt-in (indexer4_arch_enabled) and its
+    // generic vec fallback is slower than the chain at shallow/medium prefill but is what keeps a
+    // deep prefill inside the compute-graph reserve, so the caller decides by geometry.
+    return supports_indexer4(device, dst) || ggml_cuda_lightning_indexer_generic_supported(device, dst);
 }

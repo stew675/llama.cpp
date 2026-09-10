@@ -14,6 +14,16 @@
 #include <unistd.h> // dup
 #endif
 
+// qsa3 (the packed-block WMMA QSA prefill path) is gated at COMPILE TIME, not by an environment
+// variable, on purpose.  The rocprofiler-register shipped with ROCm 7.14 calls setenv() during
+// early init (publishing GLOG_* vars), which can reallocate the process environment under a
+// concurrent getenv() in the target application and intermittently make an env gate read as unset
+// (ROCm issue #10196; fixed upstream 2026-09-15 in rocm-systems PR #11620).  An env gate therefore
+// makes qsa3 profiling non-reproducible.  Build with -DLLAMA_QSA3_ENABLE=0 to compile it out.
+#ifndef LLAMA_QSA3_ENABLE
+#define LLAMA_QSA3_ENABLE 1
+#endif
+
 // Upper bound of the decode/verify band served by the fused hyper-connection ops
 // (ggml_cuda_op_hc_mix / _hc_combine, which assert the same bound - HC_FUSED_MAX_TOKENS
 // in ggml-cuda/hc-mix.cu). A verify batch is --spec-draft-n-max + 1 tokens and the
@@ -80,6 +90,78 @@ static int qsa_arch_gfx() {
     return gfx;
 }
 
+// The qwen4exp MTP draft can attend sparsely (QSA) like the trunk.  The memory type
+// (create_memory) and the graph routing (graph_mtp) must agree, so both read this one switch.
+//
+// **ON by default**: the MTP draft uses the trunk's hybrid-idx memory and attends its prefill
+// sparsely (QSA) above the depth gate (LLAMA_MTP_SPARSE_MIN_KV, default 32768).  Measured on
+// gfx1151 (qwen4exp IQ4_NL, f16 KV, MTP n3, -b/-ub 2048 unless noted): pp150K 937.1 -> 1007.9 t/s
+// (+7.6 %), pp16K -0.3 %, 8K decode parity (56.5 -> 56.4 t/s), 40K text byte-identical with
+// -b/-ub 4096.  The old default-OFF reason -- the HC16 F32-elision making the sparse draft's
+// depth text diverge -- was fixed by the per-context HC16 state + whole-graph consumer scan
+// (patches/0023), so the feature is pure with HC16 on.  LLAMA_MTP_SPARSE=0 disables it (plain KV
+// cache + dense draft attention); the decode/verify arm stays opt-in (LLAMA_MTP_SPARSE_DECODE=1).
+static bool qwen4exp_mtp_sparse_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_MTP_SPARSE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// LLAMA_QSA_OFF=1 forces the dense no-indexer regime everywhere (a plain-dense reference: no
+// indexer store, scoring or sparse selection at any layer).  graph_mtp consults it so the draft
+// matches the trunk's arm.
+static bool qwen4exp_qsa_off() {
+    static const bool off = [] {
+        const char * env = getenv("LLAMA_QSA_OFF");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return off;
+}
+
+static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams, int64_t n_tokens);
+
+// Sparse-draft attention arm.  The draft's dense attention is O(n_q*n_kv) while the sparse cap is
+// top_k + r - 1, but the indexer score + top-k cost is fixed per query, so the sparse arm only
+// pays once the cache is much deeper than the selection budget.  Measured on gfx1151 (qwen4exp
+// IQ4_NL, f16 KV, MTP n3, -b/-ub 2048, this campaign):
+//   prefill  5K -0.9 %, 16K -0.2 %, 40K +1.6 %, 150K +6.9 %  -> sparse above ~32K tokens
+//   decode   16K -13 %, 40K -15 %, 150K -16 %                -> OFF (opt-in for A/B)
+// Both arms still store the indexer keys when they attend dense, so the cache stays complete.
+// LLAMA_MTP_SPARSE_MIN_KV overrides the prefill depth; LLAMA_MTP_SPARSE_DECODE=1 opts the decode/
+// verify band back in (LLAMA_MTP_SPARSE_DECODE_UNTIL then gates it on depth, 0 = whole band).
+static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
+        const llama_memory_hybrid_idx_context * mctx,
+        const llama_cparams & cparams, const llama_hparams & hparams) {
+    if (!cparams.flash_attn) {
+        return false;   // the sparse FA op is the whole point; without it this is wasted indexer work
+    }
+    if (n_tokens >= 128) {
+        static const int64_t min_kv = []() -> int64_t {
+            const int64_t env = qsa_env_tokens("LLAMA_MTP_SPARSE_MIN_KV");
+            return env >= 0 ? env : 32768;
+        }();
+        return n_kv >= min_kv;
+    }
+    // decode/verify: the reference's <= 8-token guard, off by default because every measured depth
+    // lost (the SIMT selected-cell decode plus the per-step indexer costs more than the dense
+    // attention it replaces at this geometry).
+    static const bool decode = [] {
+        const char * env = getenv("LLAMA_MTP_SPARSE_DECODE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (!decode) {
+        return false;
+    }
+    if (n_tokens <= QSA_DECODE_BAND && mctx->get_n_stream() == 1 &&
+            cparams.offload_kqv && hparams.f_max_alibi_bias == 0.0f && !hparams.attn_soft_cap) {
+        const int64_t until = qsa_env_tokens("LLAMA_MTP_SPARSE_DECODE_UNTIL");
+        return until < 0 || until == 0 || n_kv >= until;
+    }
+    return false;
+}
+
 // The prefill half of the QSA arm policy is the static lambda next to the decode gate in
 // build_layer_attn (default 0 = QSA prefill always, per the documented 2026-09-07 arch policy;
 // LLAMA_QSA_DENSE_PREFILL_UNTIL is the opt-in A/B).
@@ -117,7 +199,92 @@ static bool qsa_op_supported(const llama_model & model, const llama_hparams & hp
     ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1,       1, 1, 1);
     ggml_tensor * msk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1,       1, 1, 1);
 
-    const bool ok = ggml_backend_dev_supports_op(dev, ggml_flash_attn_qsa(ctx, q, k, v, idx, msk, 1.0f, 0.0f));
+    // mask form (cell_vis/q_vis are the derived-visibility alternative, not needed for a probe)
+    const bool ok = ggml_backend_dev_supports_op(dev,
+            ggml_flash_attn_qsa(ctx, q, k, v, idx, msk, 1.0f, 0.0f, nullptr, nullptr));
+    ggml_free(ctx);
+    return ok;
+}
+
+// True when the acting device accepts the *packed* (qsa3) QSA op for this layer's cache type.
+// The packed form is only taken when the packed WMMA kernel is available (the arch policy lives
+// inside ggml_cuda_flash_attn_qsa3_supported, reached here through ggml_backend_dev_supports_op
+// when src[7]/src[8] are set).  This matters for memory: the natural F16 K/V packs the graph
+// materialises are two full F16 copies of the cache, and building them on a device whose kernel
+// will not read them is pure waste (issue #60's r17+qsa3-off headroom).  Under -sm tensor
+// model.dev_layer() is the Meta device, whose supports_op() requires EVERY child to accept, so
+// the probe is also the tensor-parallel safety condition.
+static bool qsa3_op_supported(const llama_model & model, const llama_hparams & hparams, int il, ggml_type type_kv) {
+    ggml_backend_dev_t dev = model.dev_layer(il);
+    if (dev == nullptr) {
+        return false;
+    }
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 16*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    // Minimal shapes that satisfy the packed predicate: D = 256, the layer's GQA ratio, a prefill
+    // width of 128 and an FATTN_KQ_STRIDE-aligned n_kv.  The predicate is a pure field check, so
+    // these shapes exercise it without touching memory (no_alloc).
+    const int64_t D    = hparams.n_embd_head_k(il);
+    const int64_t gqa  = hparams.n_head_kv(il) != 0 ? (int64_t) hparams.n_head(il) / hparams.n_head_kv(il) : 0;
+    const int64_t n_kv = 4;
+    ggml_tensor * q   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D,       128, gqa, 1);
+    ggml_tensor * k   = ggml_new_tensor_4d(ctx, type_kv,       D,       n_kv, 1,  1);
+    ggml_tensor * v   = ggml_new_tensor_4d(ctx, type_kv,       D,       n_kv, 1,  1);
+    ggml_tensor * idx = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 1,       128, 1,  1);
+    ggml_tensor * msk = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv,    128, 1,  1);
+    ggml_tensor * pk  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D,       1,   n_kv, 1);
+    ggml_tensor * pv  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D,       1,   n_kv, 1);
+
+    ggml_tensor * op = ggml_flash_attn_qsa(ctx, q, k, v, idx, msk, 1.0f, 0.0f, nullptr, nullptr);
+    ggml_flash_attn_qsa_set_packed(op, pk, pv);
+
+    const bool ok = ggml_backend_dev_supports_op(dev, op);
+    ggml_free(ctx);
+    return ok;
+}
+
+// True when the acting device accepts the fused 4-head lightning-indexer op (the qwen4exp QSA
+// prefill score).  The probe is a pure capability query: the op has a generic fallback on every
+// backend, so this is true wherever the backend implements LIGHTNING_INDEXER.  Whether the model
+// should *use* the fused op over the unfused mul_mat+relu+head_sum chain is a separate policy
+// (issue #59/#60) decided by use_wmma below, because on RDNA3_0 the generic vec fallback is
+// slower than the chain at shallow/medium prefill yet is what keeps a deep prefill inside the
+// compute-graph reserve.  The probe still guards a truly unsupported backend (and, under
+// -sm tensor, the Meta device's all_of() is the split-safety condition).
+static bool lightning_indexer_op_supported(const llama_model & model, int il, int64_t n_tps) {
+    ggml_backend_dev_t dev = model.dev_layer(il);
+    if (dev == nullptr) {
+        return false;
+    }
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 8*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    const int64_t D    = 128;
+    const int64_t H    = 4;
+    const int64_t n_kv = 512;
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H,    n_tps, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, D, 1,    n_kv,  1);
+    ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, H, n_tps, 1,    1);
+    ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, 1);
+
+    const bool ok = ggml_backend_dev_supports_op(dev, ggml_lightning_indexer(ctx, q, k, w, m));
     ggml_free(ctx);
     return ok;
 }
@@ -195,6 +362,24 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
+
+    {   // The converted GGUF leaves the nextn/MTP layer's compress ratio at 0, but the MTP sidecar
+        // ships blk.N.indexer.* and runs that layer with the same sparse attention as the trunk, so
+        // inherit the trunk's ratio.  With the sparse draft off (the default) the layer stays dense
+        // (no ratio), matching the pre-change behaviour.
+        if (qwen4exp_mtp_sparse_enabled() && hparams.n_layer_nextn > 0 && hparams.indexer_head_size > 0) {
+            int32_t trunk_r = 0;
+            for (uint32_t j = 0; j < hparams.n_layer(); ++j) {
+                if (hparams.dsv4_compress_ratios[j] > 0) { trunk_r = hparams.dsv4_compress_ratios[j]; }
+            }
+            for (uint32_t j = hparams.n_layer(); j < hparams.n_layer_all && trunk_r > 0; ++j) {
+                if (hparams.dsv4_compress_ratios[j] == 0) {
+                    hparams.dsv4_compress_ratios[j] = trunk_r;
+                    LLAMA_LOG_INFO("%s: nextn layer %u compress ratio 0 -> %d\n", __func__, j, trunk_r);
+                }
+            }
+        }
+    }
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
     hparams.is_ple_impl.reset();
@@ -326,7 +511,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
 #if LLAMA_LAZY_READER_POSIX
-        if (ml.lazy.buf_size > 0 && ple_w != nullptr) {
+        if (ml.lazy.managed_budget > 0 && ple_w != nullptr) {
             // managed path: cache the rows on demand in a fixed-size host buffer.
             // the tensor itself is never materialized; the reader reads straight
             // from the file with pread()
@@ -341,7 +526,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
                 /*n_rows*/     (uint64_t) ple_rows,
                 /*type*/       ple_w->tensor->type,
                 /*row_nelems*/ row_nelems,
-                /*budget*/     ml.lazy.buf_size,
+                /*budget*/     ml.lazy.managed_budget,
             });
             // keep the ggml tensor for metadata/counts only; its data is never loaded.
             // the range must also stay out of the load-time WILLNEED prefetch (the
@@ -492,8 +677,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // The fused op is Q8_0-specific, so other weight types (synthetic/test
     // models) fall back to the generic chain. Inject may be F32 (the mmvf
     // tail of the collapse launch) or Q8_0 (mmvq rows on the down grid).
-    const bool fused_ok = w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
-                          (w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0);
+    // BF16 hc weights (Flash-Next GSQ-RCO): the BF16 variant of the op replays the BF16 chain bit for bit
+    // (LLAMA_HC_MIX_BF16=0 keeps the unfused chain)
+    static const bool hc_mix_bf16 = !getenv("LLAMA_HC_MIX_BF16") || atoi(getenv("LLAMA_HC_MIX_BF16")) != 0;
+    // only the GPU backend implements the BF16 variant: hc weights in a host buffer (CPU-only, -ot) keep the chain
+    const bool fused_bf16 = hc_mix_bf16 && hc == 4 && w_down->ne[1] == 320 && w_down->type == GGML_TYPE_BF16 && w_up->type == GGML_TYPE_BF16 &&
+                            (w_inject == nullptr || w_inject->type == GGML_TYPE_BF16) &&
+                            w_down->buffer != nullptr && !ggml_backend_buffer_is_host(w_down->buffer);
+    const bool fused_ok = fused_bf16 || (w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
+                          (w_inject == nullptr || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0));
     // nt == 0 appears in the reservation-only graphs (the old nt == 1 gate excluded them).
     // The band covers decode AND short prefill chunks: a <= HC_FUSED_MAX_TOKENS-token batch
     // cannot be told apart from a verify batch, and both must use the decode arithmetic.
@@ -502,8 +694,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor * dst_t = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up, w_inject,
                 hc, hparams.f_norm_rms_eps);
         const int64_t out_n = n_embd + (w_inject ? hc : 0);
+        // planar output (BF16 path): mixed [n_embd, nt] then inject [hc, nt], both contiguous, so the verify band
+        // needs no ggml_cont of the mixed head; byte-identical at nt == 1.  LLAMA_HC_MIX_PLANAR=0 disables it.
+        static const bool planar_env = !getenv("LLAMA_HC_MIX_PLANAR") || atoi(getenv("LLAMA_HC_MIX_PLANAR")) != 0;
+        const bool planar = planar_env && fused_bf16 && w_inject != nullptr;
+        if (planar) {
+            ggml_hc_mix_set_planar(dst_t);
+        }
         ggml_tensor * mixed;
-        if (w_inject) {
+        if (planar) {
+            mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt, ggml_row_size(GGML_TYPE_F32, n_embd), 0);
+        } else if (w_inject) {
             // mixed = the head of dst [n_embd]; inject = the tail [hc]
             mixed = ggml_view_2d(ctx0, dst_t, n_embd, nt,
                     ggml_row_size(GGML_TYPE_F32, out_n), 0);
@@ -520,7 +721,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         }
         cb(mixed, "hc_mixed", il);
         if (inject && w_inject) {
-            *inject = ggml_view_2d(ctx0, dst_t, hc, nt,
+            *inject = planar
+                ? ggml_view_2d(ctx0, dst_t, hc, nt, ggml_row_size(GGML_TYPE_F32, hc), ggml_row_size(GGML_TYPE_F32, n_embd*nt))
+                : ggml_view_2d(ctx0, dst_t, hc, nt,
                     ggml_row_size(GGML_TYPE_F32, out_n), ggml_row_size(GGML_TYPE_F32, n_embd));
             cb(*inject, "hc_inject", il);
         } else if (inject) {
@@ -601,7 +804,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     // kernel can read the NARROW block_out base directly (block_out_hc=false) and the standalone
     // hc-wide REPEAT materialization (a ~80MB tensor per combine at pp2048) is absorbed into the
     // fusion window instead of dispatching.
-    ggml_set_output(block_out);
+    // Pinning block_out as a graph output keeps every layer's block output allocated until the end
+    // of the graph (~20 MiB per layer at -ub 2048, ~1.9 GiB in all), which is what limited -ub at
+    // 256K.  The CUDA combine+norm matcher checks the fused outputs against block_out at run time
+    // and reads block_out from a copy when one of them reuses its buffer, so the pin is not needed.
+    // LLAMA_HC_PIN_BLOCK_OUT=1 restores it for A/B.  inject is tiny and stays pinned.
+    static const bool pin_block_out = getenv("LLAMA_HC_PIN_BLOCK_OUT") != nullptr && atoi(getenv("LLAMA_HC_PIN_BLOCK_OUT")) != 0;
+    if (pin_block_out) {
+        ggml_set_output(block_out);
+    }
     ggml_set_output(inject);
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
@@ -621,6 +832,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
         res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
     } else {
         w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
+        // Emit the scatter-weight VIEW before the block_out REPEAT so the fusion window
+        // repeat -> mul -> add -> rms -> mul(gamma) is contiguous.  Otherwise the w view lands
+        // between the repeat and the mul (mul expands src[0]=repeat before src[1]=w) and
+        // ggml_can_fuse_subgraph_ext rejects the window on its external view_src, so the
+        // hc_combine_norm matcher never fires.
+        ggml_build_forward_expand(gf, w);
 
         ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
         b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
@@ -858,7 +1075,27 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // The MTP context is a hybrid-idx memory when the sparse draft is on (create_memory reads the
+    // same switch), so the draft head can use the same sparse attention path as the trunk - one QSA
+    // call per target chunk, as the reference does.  Otherwise it stays a plain KV cache.
+    llm_graph_input_attn_kv * inp_attn = nullptr;
+    const llama_memory_hybrid_idx_context * mctx_hyb = nullptr;
+    if (qwen4exp_mtp_sparse_enabled() && hparams.indexer_head_size > 0) {
+        auto * inp_hyb = build_inp_mem_hybrid();
+        const auto * m = static_cast<const llama_memory_hybrid_idx_context *>(inp_hyb->mctx);
+        if (m->get_idx() != nullptr) {
+            mctx_hyb = m;
+            inp_attn = inp_hyb->get_attn();
+            // the MTP graph has no recurrent layers, so the hybrid input's recurrent tensors are
+            // never used and the allocator skips them - set_input would then hit a null buffer.
+            // Give them a trivial use.
+            auto * rs = inp_hyb->get_recr();
+            for (ggml_tensor * t : { rs->s_copy, rs->s_copy_main, rs->s_copy_tail }) {
+                if (t) { ggml_build_forward_expand(gf, ggml_scale(ctx0, ggml_cast(ctx0, t, GGML_TYPE_F32), 0.0f)); }
+            }
+        }
+    }
+    if (!inp_attn) { inp_attn = build_attn_inp_kv(); }
 
     // grouped RMSNorm over the wide stream: normalise each hc stream, then scale the flattened
     // [hc_dim] vector with the head's gamma, exactly as build_hc_mix does
@@ -933,9 +1170,33 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    if (mctx_hyb) {
+        const int64_t r        = hparams.dsv4_compress_ratios[il];
+        const int64_t n_kv_idx = mctx_hyb->get_idx()->get_n_kv();
+        const int64_t width    = (int64_t) hparams.indexer_top_k + r - 1;
+        ggml_tensor * top_k = nullptr;
+        if (!qwen4exp_qsa_off() && r > 0 && n_kv_idx > width &&
+                qwen4exp_mtp_sparse_arm(n_tokens, n_kv_idx, mctx_hyb, cparams, hparams)) {
+            // the mask may be dropped when the sparse FA derives the cell visibility (the same
+            // n_ubatch*n_ctx*2 win the trunk takes); build_qsa_top_k expects nullptr exactly there
+            const bool want_derived_vis = qwen4exp_want_derived_vis(model, hparams, il, cparams, n_tokens);
+            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos,
+                    want_derived_vis ? nullptr : inp_attn->get_kq_mask(), sections, il);
+        } else if (!qwen4exp_qsa_off() && r > 0) {
+            // keep the indexer cache complete for the first selective ubatch
+            build_qsa_store_k(mctx_hyb, cur, il);
+        }
+        if (top_k) {
+            cur = build_attn_qsa(inp_attn, Qcur, Kcur, Vcur, top_k, kq_scale, il);
+        } else {
+            cur = build_attn(inp_attn, nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        }
+    } else {
+        cur = build_attn(inp_attn,
+                nullptr, nullptr, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "mtp_attn_pregate", il);
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
@@ -1078,20 +1339,147 @@ void llama_model_qwen4exp::graph::build_qsa_store_k(
 
 // QSA attends to a budget of whole blocks of compress_ratio tokens, plus the incomplete tail
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
+//
+// The per-block half of the bias is derived in-kernel from blk_idx/blk_tail by default (see
+// build_qsa_top_k); GGML_QSA_DERIVED_BIAS=0 restores the uploaded tensor for A/B validation.
+static int qwen4exp_derived_bias_mode() {
+    static const int mode = [] {
+        const char * env = getenv("GGML_QSA_DERIVED_BIAS");
+        return env == nullptr ? 1 : std::atoi(env);
+    }();
+    return mode;
+}
+
+// The QSA indexer score chain materialises an [n_blocks * n_idx_h, n_tps, n_stream] F32 tensor,
+// which at ctx 204800 / ub 2048 is 1.6 GB per layer - the largest single allocation in the graph.
+// build_qsa_top_k keeps the relu before the 4-D reshape and assembles the block dimension in
+// chunks by default; GGML_QSA_SCORE_MEM=0 restores the plain chain for A/B.
+static bool qwen4exp_score_mem_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_QSA_SCORE_MEM");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// The per-cell half of the same bias (the attention mask) is derived from two compact keys as
+// well: cell_vis is a cell's compaction key (-1 for an empty or foreign cell) and q_vis is the
+// query's key, and a cell is visible iff 0 <= cell_vis <= q_vis.  GGML_QSA_DERIVED_VIS=0 keeps
+// the uploaded mask as the additive for A/B.  The mask tensor stays allocated until the flash
+// attention derives the same value, so this is a drop-in equivalent on its own.
+static bool qwen4exp_derived_vis_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_QSA_DERIVED_VIS");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// The prefill derived-visibility gate, expressed WITHOUT the mask tensor, because the derived
+// path must not create the mask at all (that is the -800 MiB win: an unreachable mask is left
+// unallocated by the gallocr and then aborted on by a buffer query elsewhere).  It is exactly
+// the predicate blk_bias checks against the mask's shape - the mask is always
+// [n_kv, n_tps, 1, n_stream] for this model - so both paths agree by construction.
+// the QSA sparse (fused, top-k only) flash attention is the DEFAULT path; LLAMA_QSA_SPARSE_FA=0
+// selects the dense masked path, which still reads the kq mask through build_attn_mha and must
+// therefore keep it alive.  Both paths need flash attention enabled.
+static bool qwen4exp_qsa_sparse(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams) {
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
+    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  Whether the
+    // acting device accepts the op is asked of the back-end itself (qsa_op_supported, which
+    // reaches ggml_cuda_flash_attn_qsa_supported through ggml_backend_dev_supports_op) rather
+    // than mirrored here: a stale mirror is not a fallback but an abort, because an unsupported
+    // qsa op is not split across the tensor-parallel devices, so its output stays mirrored while
+    // the attention gate remains hidden-split and the meta splitter aborts on the attn_gated MUL
+    // (observed with qwen4exp + --cache-type-k q4_0/q4_1 + -sm tensor before the query replaced
+    // the hand-maintained list).  Under -sm tensor model.dev_layer(il) is the Meta device, whose
+    // supports_op requires EVERY tensor-parallel device to accept the op, so the query covers
+    // the meta split as well.  Any cache type it rejects takes the dense masked path instead
+    // (the same path as LLAMA_QSA_SPARSE_FA=0): that path reads the kq mask, so the
+    // derived-visibility/mask-elision arm is off with it (qwen4exp_want_derived_vis below).
+    const bool kv_native = qsa_op_supported(model, hparams, il, cparams.type_k);
+    return enabled && cparams.flash_attn && kv_native;
+}
+
+// the mask may be dropped (never created, hence never allocated) only when nothing in the graph
+// reads it: the derived-visibility path plus the sparse FA that derives the cell visibility in
+// its kernel.  This is the -800 MiB win; the predicate is exactly the one blk_bias would have
+// checked against the mask's own shape (the mask is always [n_kv, n_tps, 1, n_stream] here).
+static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams, int64_t n_tokens) {
+    return qwen4exp_derived_bias_mode() != 0 && qwen4exp_derived_vis_enabled() &&
+            qwen4exp_qsa_sparse(model, hparams, il, cparams) &&
+            n_tokens > 1 && cparams.causal_attn && !hparams.use_alibi;
+}
+
+// [QSA_SCORE_BOUNDS] prefill queries are scored in strips of at most this many tokens; each strip is
+// then trimmed to the blocks it can actually see (qsa_score_key_limits), so the indexer scorer runs
+// on roughly half its columns.  Only the single-sequence prefill case is stripped; anything else
+// (decode, verify, multi-stream, M-RoPE images) keeps the whole batch and stays bit-identical.
+// LLAMA_QSA_SCORE_STRIP=0 disables the strip + bound for A/B.
+static int64_t qwen4exp_query_strip(int64_t n_tokens, int64_t n_stream) {
+    static const int64_t env_strip = []() -> int64_t {
+        const char * env = getenv("LLAMA_QSA_SCORE_STRIP");
+        // 1024 measured best on gfx1151 at -b/-ub 8192 (pp8192 +0.7 %, pp32768 neutral):
+        // smaller strips multiply the per-strip matmul/top-k launches, larger ones trim less
+        return env == nullptr ? 1024 : atoll(env);
+    }();
+    if (env_strip <= 0) {
+        return n_tokens;
+    }
+    return n_stream == 1 ? std::min<int64_t>(n_tokens, env_strip) : n_tokens;
+}
+
+// The bound is only meaningful where the score columns are complete-block ordinals and the tail is
+// carried as cells - the derived-bias path.  n_tokens < 128 keeps the whole decode/verify band on
+// the unbounded graph, so W = 1..8 stays byte-identical by construction.
+// LLAMA_QSA_SCORE_BOUNDS=0 keeps the strips but scores every strip at full width (isolates the
+// strip/launch overhead from the trim savings in an A/B).
+static std::vector<int64_t> qwen4exp_score_key_limits(const llama_memory_hybrid_idx_context * mctx,
+        const llama_ubatch & ubatch, bool derived_bias, bool derived_vis, int64_t n_blocks,
+        int64_t strip, uint32_t ratio, int64_t budget) {
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_QSA_SCORE_STRIP");
+        if (env != nullptr && atoll(env) <= 0) {
+            return false;
+        }
+        const char * bounds = getenv("LLAMA_QSA_SCORE_BOUNDS");
+        return bounds == nullptr || atoi(bounds) != 0;
+    }();
+    // the fused top-k skips trimmed blocks by cell index, which needs the derived-visibility
+    // cell-clamped kernel path - keep the bound there only
+    if (!enabled || !derived_bias || !derived_vis || ubatch.n_tokens < 128 || strip <= 0) {
+        return {};
+    }
+    return mctx->qsa_score_key_limits(ubatch, n_blocks, strip, ratio, budget);
+}
+
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, bool derived_bias, bool derived_vis) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), derived_bias(derived_bias), derived_vis(derived_vis) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+
+        // the QSA mapping tensors (cell_blk/blk_cells/blk_pos + the per-block and per-cell bias
+        // forms) are reachable only from the indexer top-k node.  The policies that store K only
+        // (decode and short-context graphs) do not build it, so the allocator leaves these
+        // unallocated - and there is nothing to fill for a tensor no node reads.
+        if (cell_blk == nullptr || cell_blk->buffer == nullptr) {
+            return;
+        }
+
         if (rng != nullptr) {
             // derived-cache decode: emit the per-step fill range [from, lim) into the leaf
             int32_t * d = (int32_t *) rng->data;
-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, d, d + 1);
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, cell_vis, q_vis, ubatch, ratio, blk_bias, d, d + 1);
         } else {
-            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, blk_idx, blk_tail, cell_vis, q_vis, ubatch, ratio, blk_bias);
         }
     }
 
@@ -1105,19 +1493,49 @@ public:
 
         const int64_t n_kv     = idx->get_n_kv();
         const int64_t n_stream = mctx->get_n_stream();
-        const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+        // blocks are keyed by position, which can run ahead of the occupied cells (M-RoPE image + MTP)
+        const int64_t n_blocks = ((int64_t) mctx->qsa_n_kv_window() + ratio - 1)/ratio;
 
         bool res = true;
 
         res &= params.ubatch.n_tokens % n_stream == 0;
+
+        // a graph built for one form of the per-block bias cannot serve the other
+        const int  dbias_mode   = qwen4exp_derived_bias_mode();
+        const bool want_derived = dbias_mode != 0 && blk_bias && params.ubatch.n_tokens > 1;
+        const bool want_vis     = want_derived && qwen4exp_derived_vis_enabled();
+        res &= derived_bias == want_derived;
+        res &= derived_vis  == want_vis;
 
         res &= k_idxs->ne[0]    == params.ubatch.n_tokens;
         res &= cell_blk->ne[0]  == n_kv;
         res &= cell_blk->ne[1]  == n_stream;
         res &= blk_cells->ne[0] == (int64_t) ratio*n_blocks;
         res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
-        res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
-        res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
+        if (derived_bias) {
+            res &= blk_idx->ne[0]  == n_blocks;
+            res &= blk_idx->ne[1]  == n_stream;
+            res &= blk_tail->ne[0] == params.ubatch.n_tokens/n_stream;
+            res &= blk_tail->ne[1] == n_stream;
+        }
+        if (derived_vis) {
+            res &= cell_vis->ne[0] == n_kv;
+            res &= cell_vis->ne[1] == n_stream;
+            res &= q_vis->ne[0]    == params.ubatch.n_tokens/n_stream;
+            res &= q_vis->ne[1]    == n_stream;
+        }
+        if (!derived_bias) {
+            res &= bias->ne[0] == (blk_bias ? n_blocks : n_kv);
+            res &= bias->ne[1] == params.ubatch.n_tokens/n_stream;
+        }
+
+        // [QSA_SCORE_BOUNDS] the trimmed scorer widths are baked into the graph, so a reused graph
+        // must agree on the strip size and the per-strip column limits.
+        const int64_t next_strip  = qwen4exp_query_strip(params.ubatch.n_tokens/n_stream, n_stream);
+        const auto    next_limits = qwen4exp_score_key_limits(mctx, params.ubatch, derived_bias, derived_vis, n_blocks,
+                next_strip, ratio, (int64_t) params.hparams.indexer_top_k/ratio);
+        res &= score_strip == next_strip;
+        res &= score_key_limits == next_limits;
 
         return res;
     }
@@ -1130,11 +1548,32 @@ public:
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
     ggml_tensor * rng       = nullptr;   // I32 [2*n_stream] derived-cache range leaf (decode only)
 
+    // derived_bias: the per-block half of the bias is not uploaded at all - the top-k derives
+    // it in-kernel from this compact pair (4 bytes per block instead of n_tokens/n_stream)
+    ggml_tensor * blk_idx   = nullptr;   // I32 [n_blocks, n_stream]
+    ggml_tensor * blk_tail  = nullptr;   // I32 [n_tokens/n_stream, n_stream]
+
+    // derived_vis: the per-cell half (the attention mask) is not uploaded either - a cell carries
+    // a compaction key and a token a query key, and the cell is visible iff 0 <= cell_vis <= q_vis
+    ggml_tensor * cell_vis  = nullptr;   // I32 [n_kv, n_stream]
+    ggml_tensor * q_vis     = nullptr;   // I32 [n_tokens/n_stream, n_stream]
+
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
+
+    // ... unless it is derived from blk_idx/blk_tail (prefill only: the fused decode score op
+    // applies the bias itself, and 2d positions select the ranked tail metric)
+    const bool derived_bias;
+
+    // ... and the per-cell half is derived from the visibility keys
+    const bool derived_vis;
+
+    // [QSA_SCORE_BOUNDS] strip size and per-strip score column limits baked into this graph
+    int64_t score_strip = 0;
+    std::vector<int64_t> score_key_limits;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -1153,7 +1592,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     GGML_ASSERT(r > 0);
 
-    const int64_t n_blocks = (n_kv + r - 1)/r;
+    // blocks are keyed by position, which can run ahead of the occupied cells (see qsa_n_kv_window)
+    const int64_t n_blocks = ((int64_t) mctx_hyb->qsa_n_kv_window() + r - 1)/r;
     // build_attn_qsa and the KQ mask need the tokens to divide evenly across the streams
     const int64_t n_stream = mctx_hyb->get_n_stream();
     GGML_ASSERT(n_tokens % n_stream == 0);
@@ -1163,9 +1603,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // the rest is the visible/not test the attention mask already carries, so upload the per-block half only: 1/ratio of the cells
     // alibi writes distances instead of a mask and non-causal keeps future cells, so both opt out
     // the mask also holds an mrope rule for the query's own position, but only 2d image positions can differ there
-    const bool blk_bias = kq_mask != nullptr &&
-        kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
-        cparams.causal_attn && !hparams.use_alibi;
+    // kq_mask is null on the derived-visibility path (the mask is never created there); the
+    // derived gate is the same predicate the mask's own shape would have satisfied
+    const bool blk_bias = kq_mask != nullptr
+            ? (kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream &&
+               cparams.causal_attn && !hparams.use_alibi)
+            : qwen4exp_want_derived_vis(model, hparams, il, cparams, n_tokens);
+
+    // The per-block half of the bias is a pure function of the block bookkeeping (blk_idx) and
+    // the token's tail start (blk_tail), so the prefill graph has the top-k derive it in-kernel
+    // instead of uploading an [n_blocks, n_tps] F32 tensor (400 MiB at ctx 204800 / ub 2048).
+    // Decode keeps the tensor: the fused INDEXER_SCORE op applies the bias internally and its
+    // rows are one token wide anyway.
+    //
+    // Note: not gated on !ubatch.is_pos_2d().  This model is IMROPE, so n_pos_per_embd() is 4 and
+    // is_pos_2d() is always true, but that only describes the position *tensor*, not the data.
+    // Both sides of the bias test come from the same code path - the memory layer computes
+    // bid_idx and the query's tail start in rank units when it ranked the cells (mrope repeats a
+    // position across an image) and in position units otherwise - so the comparison is exact
+    // either way and the per-sequence half is redundant with the visibility.
+    const int  dbias_mode   = qwen4exp_derived_bias_mode();
+    const bool derived_bias = dbias_mode != 0 && blk_bias && n_tokens > 1;
+    // the per-cell half of the same bias (the attention mask) is derived from the visibility
+    // keys too; the mask tensor stays until the flash attention reads the keys as well
+    const bool derived_vis  = derived_bias && qwen4exp_derived_vis_enabled();
 
     // env gates (per-process, read once): the fused INDEXER_SCORE op + the incremental derived
     // cache are the DEFAULT decode path (parity-verified byte-identical to the per-op chain);
@@ -1180,6 +1641,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const char * env = getenv("GGML_CUDA_QSA_INDEXER_CACHE");
         return env == nullptr ? 1 : std::atoi(env);
     }();
+    // [QSA_SCORE_WMMA] prefill indexer score -> one fused lightning-indexer op (all-ones weights,
+    // zero mask) instead of the mul_mat + relu + head-sum chain.  RDNA3_5/RDNA4's 4-head WMMA
+    // kernel is the fast path; elsewhere the generic vec kernel backs it.  The fused op casts q/k
+    // to F16, so this is a *prefill re-baseline* (decode/verify width purity is untouched: the band
+    // is n_tps >= 128).  Tri-state: unset = auto (see use_wmma; on RDNA3_0 auto picks the fused op
+    // once the unfused score would exceed the threshold below, so the deep-prefill reserve stays
+    // inside the device while shallow/medium prefill keeps the faster chain); =0 forces the per-op
+    // chain; =1 forces the fused op.  (Issue #59/#60.)
+    static const int idx_score_wmma = [] {
+        const char * env = getenv("LLAMA_QSA_SCORE_WMMA");
+        return env == nullptr ? -1 : (std::atoi(env) != 0 ? 1 : 0);
+    }();
+    // [issue #60] Auto's fused-vs-chain score-size threshold, in MiB.  The unfused chain's score
+    // buffer is `score_blocks * n_idx_h * n_query * n_stream * 4`, and below the chunked branch
+    // (also 128 MiB) it materialises the mul_mat result and its separate relu, so its reserve
+    // peaks at twice the score size just under the old 128 MiB cutoff.  The reporter's 2x7900XTX
+    // 196K profile needs the peak bounded well before that, and measures the chain as only ~7%
+    // faster than the fused vec in the affected band, so auto switches at 64 MiB by default
+    // (n_kv ~64K for their r=4 geometry).  LLAMA_QSA_SCORE_WMMA_MB=N overrides it, 0 = always fused.
+    static const int64_t idx_score_wmma_threshold_bytes = []() -> int64_t {
+        const char * env = getenv("LLAMA_QSA_SCORE_WMMA_MB");
+        const long mb = env != nullptr ? atol(env) : 64;
+        return mb <= 0 ? 0 : (int64_t) mb * 1024 * 1024;
+    }();
 
     // nothing above depends on the layer, so the layers sharing a ratio share one input set
     llm_graph_input_qsa * inp = nullptr;
@@ -1188,13 +1673,23 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, derived_bias, derived_vis);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        if (derived_bias) {
+            qsa->blk_idx  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_blocks, n_stream);
+            qsa->blk_tail = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tps,    n_stream);
+        }
+        if (derived_vis) {
+            qsa->cell_vis = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv,  n_stream);
+            qsa->q_vis    = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_tps, n_stream);
+        }
+        if (!derived_bias) {
+            qsa->bias = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        }
         if (idx_cache && n_stream == 1) {
             // per-step derived fill range leaf: [from_s, lim_s] (one stream in decode)
             qsa->rng = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2);
@@ -1203,10 +1698,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_set_input(qsa->cell_blk);
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
-        ggml_set_input(qsa->bias);
+        if (derived_bias) {
+            ggml_set_input(qsa->blk_idx);
+            ggml_set_input(qsa->blk_tail);
+        }
+        if (derived_vis) {
+            ggml_set_input(qsa->cell_vis);
+            ggml_set_input(qsa->q_vis);
+        }
+        if (!derived_bias) {
+            ggml_set_input(qsa->bias);
+        }
         if (qsa->rng != nullptr) {
             ggml_set_input(qsa->rng);
         }
+
+        // [QSA_SCORE_BOUNDS] the prefill scorer is striped and causally trimmed; the widths are
+        // baked into this graph and re-checked by can_reuse above.
+        qsa->score_strip      = qwen4exp_query_strip(n_tps, n_stream);
+        qsa->score_key_limits = qwen4exp_score_key_limits(mctx_hyb, ubatch, derived_bias, derived_vis, n_blocks,
+                qsa->score_strip, (uint32_t) r, (int64_t) hparams.indexer_top_k/r);
 
         inp = qsa.get();
         res->add_input(std::move(qsa));
@@ -1241,6 +1752,53 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const bool idx_key_float = k_all->type == GGML_TYPE_F32 ||
                                k_all->type == GGML_TYPE_BF16 ||
                                k_all->type == GGML_TYPE_F16;
+
+    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
+    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
+    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
+
+    // fused expand + mask + top-k: value[c] = score[cell_blk[c]] + additive[c]
+    // avoids materializing the [n_kv, n_tps] F32 expanded tensor (512MB at 64K) per layer
+    // the mask is [n_kv, n_tps, 1, n_stream]; the size-1 dim is a no-op stride, so the
+    // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
+    ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
+
+    // [QSA_SCORE_BOUNDS] the query-indexed inputs (additive, q_vis, blk_tail) are sliced to the
+    // strip so each per-strip top-k sees the same shapes the whole-batch decode call does.
+    auto run_top_k = [&](ggml_tensor * sc, int64_t first, int64_t n_query, int64_t score_blocks) -> ggml_tensor * {
+        ggml_tensor * add_s = nullptr;
+        if (additive != nullptr) {
+            add_s = ggml_n_dims(additive) == 4
+                    ? ggml_view_4d(ctx0, additive, additive->ne[0], n_query, 1, n_stream,
+                            additive->nb[1], additive->nb[2], additive->nb[3], first*additive->nb[1])
+                    : ggml_view_3d(ctx0, additive, additive->ne[0], n_query, n_stream,
+                            additive->nb[1], additive->nb[2], first*additive->nb[1]);
+        }
+        ggml_tensor * qpos_s = derived_vis ? ggml_view_2d(ctx0, inp->q_vis, n_query, n_stream,
+                inp->q_vis->nb[1], first*inp->q_vis->nb[0]) : nullptr;
+        ggml_tensor * tail_s = derived_bias ? ggml_view_2d(ctx0, inp->blk_tail, n_query, n_stream,
+                inp->blk_tail->nb[1], first*inp->blk_tail->nb[0]) : nullptr;
+        // [QSA_SCORE_BOUNDS] a trimmed score holds only the visible prefix; the block fast path
+        // then skips the trimmed blocks by cell index.  The bound only applies with n_stream == 1,
+        // so these views stay contiguous even though the source's stream stride is the full width.
+        ggml_tensor * blk_idx_s = derived_bias
+                ? (score_blocks < n_blocks
+                        ? ggml_view_2d(ctx0, inp->blk_idx, score_blocks, n_stream, inp->blk_idx->nb[1], 0)
+                        : inp->blk_idx)
+                : nullptr;
+        ggml_tensor * blk_cells_s = score_blocks < n_blocks
+                ? ggml_view_2d(ctx0, inp->blk_cells, (int64_t) r*score_blocks, n_stream, inp->blk_cells->nb[1], 0)
+                : inp->blk_cells;
+        return ggml_indexer_top_k(ctx0, sc, inp->cell_blk, add_s,
+                derived_vis ? inp->cell_vis : nullptr,
+                qpos_s,
+                blk_idx_s,
+                tail_s,
+                blk_cells_s,
+                (int) width);
+    };
+
+    ggml_tensor * top_k = nullptr;
 
     ggml_tensor * score = nullptr;
     if (idx_score_fused && idx_key_float && n_tokens == 1 && blk_bias && n_idx_h <= 8 &&
@@ -1321,42 +1879,236 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
         // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
-        score = ggml_mul_mat(ctx0, pooled,
-                ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
-        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-        score = ggml_relu(ctx0, score);
+        ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream);
 
-        // the heads sit side by side on ne[1] and there are only a few of them
-        ggml_tensor * summed = nullptr;
-        for (int64_t h = 0; h < n_idx_h; ++h) {
-            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
-                    score->nb[2], score->nb[3], h*score->nb[1]);
-            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        // The score chain is the largest F32 tensor in the graph, so it carries two memory fixes
+        // that together are the L2 win (GGML_QSA_SCORE_MEM, default on - =0 restores the plain
+        // reference chain for A/B):
+        //
+        //   L2a: relu BEFORE the 4-D reshape.  relu is elementwise, so this is bit-identical, but
+        //        it makes the relu's parent the mul_mat result instead of a reshape view.  The
+        //        allocator cannot reuse a view parent in place (a view's data is NULL at planning
+        //        time, so it is treated as external), which otherwise keeps the
+        //        [n_blocks, n_idx_h, n_tps] F32 result and its relu alive simultaneously
+        //        (2 x 1600 MB at ctx 204800 / ub 2048).
+        //   L2m: M-chunked assembly.  n_blocks is an independent output (M) dimension of the
+        //        matmul (the reduction is over idx_dim only), so slicing it leaves the per-element
+        //        arithmetic untouched; the slices are assembled with ggml_concat (a produced tensor
+        //        frees normally, unlike cpy into a view of an allocator-owned tensor, which leaks).
+        //        The threshold is internal policy, not the A/B knob.
+        //
+        // [QSA_SCORE_BOUNDS] prefill is additionally scored in `strip`-token query strips, each
+        // trimmed to the blocks it can see (qwen4exp_score_key_limits): a complete block's ordinal
+        // cannot exceed its logical block number, so columns past (max_query_pos+1)/ratio are
+        // invisible.  The trimmed score is handed straight to the fused top-k, whose cell range is
+        // clamped to n_blocks*ratio so the trimmed cells (cell_blk[c] >= n_blocks) are never read;
+        // the padded-blocks variant was measured slower because it re-materialises the full score.
+        // A strip that is not trimmed (decode/verify, no bound) builds exactly the pre-strip graph,
+        // so W = 1..8 stays byte-identical.
+        const bool    score_mem = qwen4exp_score_mem_enabled();
+        const int64_t strip     = inp->score_strip > 0 ? inp->score_strip : n_tps;
+
+        // sum the indexer heads: ne[1] holds them side by side and there are only a few
+        auto head_sum = [&](ggml_tensor * sc, int64_t nb, int64_t n_query) {
+            ggml_tensor * summed = nullptr;
+            for (int64_t h = 0; h < n_idx_h; ++h) {
+                ggml_tensor * slice = ggml_view_3d(ctx0, sc, nb, n_query, n_stream,
+                        sc->nb[2], sc->nb[3], h*sc->nb[1]);
+                summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+            }
+            return summed;
+        };
+
+        auto compute_score = [&](int64_t first, int64_t n_query, int64_t score_blocks) {
+            ggml_tensor * pooled_s = score_blocks == n_blocks ? pooled :
+                    ggml_view_3d(ctx0, pooled, idx_dim, score_blocks, n_stream,
+                            pooled->nb[1], pooled->nb[2], 0);
+            ggml_tensor * q_s = (first == 0 && n_query == n_tps) ? q3 :
+                    ggml_view_3d(ctx0, q, idx_dim, n_idx_h*n_query, n_stream,
+                            q->nb[1], q->nb[2]*n_tps, first*q->nb[2]);
+
+            // [QSA_SCORE_WMMA] the fused op needs 128 dims and exactly 4 heads (the AMD WMMA
+            // kernel's shape), and only pays in the prefill band; decode/verify keep the per-op
+            // chain so the W=1..8 reduction order is unchanged.
+            //
+            // [issue #59/#60] On RDNA3_0 the generic-vec fused op is slower than the unfused
+            // chain at shallow/medium prefill (measured ~7% in the 64K band) but its score buffer
+            // is bounded, where the unfused chain's is not: below its own 128 MiB chunked branch
+            // the chain materialises the mul_mat result and a separate relu, so its reserve peaks
+            // at twice the score size, and past that the chunked assembly still reserves more than
+            // the fused op.  The 196K prefill lives on the wrong side of that, so auto switches to
+            // the fused op once the score passes idx_score_wmma_threshold_bytes (64 MiB by default,
+            // LLAMA_QSA_SCORE_WMMA_MB overrides); the chain stays below it, and everywhere on
+            // RDNA3_5/RDNA4, whose 4-head WMMA arm is the tuned path.  LLAMA_QSA_SCORE_WMMA=0/1
+            // overrides the policy, so the knob works on gfx1100 again.
+            const int64_t score_bytes = score_blocks * n_idx_h * n_query * n_stream * (int64_t) sizeof(float);
+            const int  gfx      = qsa_arch_gfx();
+            const bool rdna3_0  = gfx >= 0x1100 && gfx < 0x1150;   // gfx1100/1101/1102/1103 (RDNA3_5 is 0x1150+)
+            const bool wmma_wanted = idx_score_wmma < 0
+                    ? (!rdna3_0 || score_bytes > idx_score_wmma_threshold_bytes)
+                    : (idx_score_wmma != 0);
+            const bool use_wmma = wmma_wanted && n_tps >= 128 && idx_dim == 128 && n_idx_h == 4 &&
+                    lightning_indexer_op_supported(model, il, n_tps);
+
+            // ones-weights / zero-mask, shared across layers by name (the graph context outlives a
+            // layer build); the mask is sized by the untrimmed block count and viewed per strip.
+            auto score_wmma_weights = [&]() -> ggml_tensor * {
+                char name[64];
+                snprintf(name, sizeof(name), "qsa_score_w_%lld_%lld_%lld",
+                        (long long) n_idx_h, (long long) strip, (long long) n_stream);
+                ggml_tensor * t = ggml_get_tensor(ctx0, name);
+                if (t == nullptr) {
+                    t = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_idx_h, strip, 1, n_stream), 1.0f);
+                    ggml_set_name(t, name);
+                }
+                return t;
+            };
+            auto score_wmma_mask = [&]() -> ggml_tensor * {
+                char name[64];
+                snprintf(name, sizeof(name), "qsa_score_m_%lld_%lld_%lld",
+                        (long long) n_blocks, (long long) strip, (long long) n_stream);
+                ggml_tensor * t = ggml_get_tensor(ctx0, name);
+                if (t == nullptr) {
+                    t = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_blocks, strip, 1, n_stream), 0.0f);
+                    ggml_set_name(t, name);
+                }
+                return t;
+            };
+
+            ggml_tensor * strip_score = nullptr;
+            if (use_wmma) {
+                ggml_tensor * w_full = score_wmma_weights();
+                ggml_tensor * m_full = score_wmma_mask();
+                ggml_tensor * query = ggml_view_4d(ctx0, q, idx_dim, n_idx_h, n_query, n_stream,
+                        q->nb[1], q->nb[2], q->nb[2]*n_tps, first*q->nb[2]);
+                ggml_tensor * key = ggml_view_4d(ctx0, pooled, idx_dim, 1, score_blocks, n_stream,
+                        pooled->nb[1], pooled->nb[1], pooled->nb[2], 0);
+                ggml_tensor * weights_v = ggml_view_4d(ctx0, w_full, n_idx_h, n_query, 1, n_stream,
+                        w_full->nb[1], w_full->nb[2], w_full->nb[3], 0);
+                // leading-rows view: the all-zero mask's ne0 is n_blocks, the op needs score_blocks
+                ggml_tensor * mask_v = ggml_view_4d(ctx0, m_full, score_blocks, n_query, 1, n_stream,
+                        m_full->nb[1], m_full->nb[2], m_full->nb[3], 0);
+                ggml_tensor * li = ggml_lightning_indexer(ctx0, query, key, weights_v, mask_v);
+                res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, li, il});
+                strip_score = ggml_reshape_3d(ctx0, li, score_blocks, n_query, n_stream);
+            } else if (score_mem && score_bytes > 128*1024*1024) {
+                const int64_t chunk = std::max<int64_t>(4096, (score_blocks + 15)/16);
+                ggml_tensor * acc = nullptr;
+                for (int64_t b0 = 0; b0 < score_blocks; b0 += chunk) {
+                    const int64_t cb = std::min<int64_t>(chunk, score_blocks - b0);
+
+                    ggml_tensor * pooled_c = ggml_view_3d(ctx0, pooled_s, idx_dim, cb, n_stream,
+                            pooled_s->nb[1], pooled_s->nb[2], b0*pooled_s->nb[1]);
+
+                    ggml_tensor * sc = ggml_mul_mat(ctx0, pooled_c, q_s);
+                    // in-place: the relu shares the mul_mat buffer, so the chunked assembly does
+                    // not hold the score and its relu at once (issue #60; bit-identical)
+                    sc = ggml_relu_inplace(ctx0, sc);
+                    sc = ggml_reshape_4d(ctx0, sc, cb, n_idx_h, n_query, n_stream);
+
+                    ggml_tensor * summed = head_sum(sc, cb, n_query);
+
+                    acc = acc ? ggml_concat(ctx0, acc, summed, 0) : summed;
+                }
+                strip_score = acc;
+            } else if (score_mem) {
+                strip_score = ggml_mul_mat(ctx0, pooled_s, q_s);
+                // in-place: below the chunked branch the score is the whole strip, so sharing the
+                // buffer with its relu halves the chain's reserve peak (issue #60; bit-identical)
+                strip_score = ggml_relu_inplace(ctx0, strip_score);
+                strip_score = ggml_reshape_4d(ctx0, strip_score, score_blocks, n_idx_h, n_query, n_stream);
+                strip_score = head_sum(strip_score, score_blocks, n_query);
+            } else {
+                strip_score = ggml_mul_mat(ctx0, pooled_s, q_s);
+                strip_score = ggml_reshape_4d(ctx0, strip_score, score_blocks, n_idx_h, n_query, n_stream);
+                strip_score = ggml_relu(ctx0, strip_score);
+                strip_score = head_sum(strip_score, score_blocks, n_query);
+            }
+
+            // one value per block, so it is cheaper to bias here than after the cells are expanded
+            // (the derived path drops this tensor and lets the top-k add the bias in-kernel instead)
+            if (blk_bias && !derived_bias) {
+                ggml_tensor * bias_s = ggml_view_3d(ctx0, inp->bias, n_blocks, n_query, n_stream,
+                        inp->bias->nb[1], inp->bias->nb[2], first*inp->bias->nb[1]);
+                strip_score = ggml_add(ctx0, strip_score, bias_s);
+            }
+
+            return strip_score;
+        };
+
+        std::vector<ggml_tensor *> strips;
+        for (int64_t first = 0; first < n_tps; first += strip) {
+            const int64_t n_query = std::min(strip, n_tps - first);
+            const int64_t score_blocks = inp->score_key_limits.empty()
+                    ? n_blocks : inp->score_key_limits[first/strip];
+            GGML_ASSERT(score_blocks > 0 && score_blocks <= n_blocks);
+
+            ggml_tensor * sc = compute_score(first, n_query, score_blocks);
+            cb(sc, "indexer_score", il);
+
+            ggml_tensor * tk = run_top_k(sc, first, n_query, score_blocks);
+            cb(tk, "indexer_top_k", il);
+            strips.push_back(tk);
         }
 
-        score = summed;
-
-        // one value per block, so it is cheaper to bias here than after the cells are expanded
-        if (blk_bias) {
-            score = ggml_add(ctx0, score, inp->bias);
+        // balanced concatenation along the query dimension keeps the strips in order
+        while (strips.size() > 1) {
+            ggml_tensor * right = strips.back(); strips.pop_back();
+            ggml_tensor * left  = strips.back(); strips.pop_back();
+            ggml_tensor * joined = ggml_concat(ctx0, left, right, 1);
+            ggml_build_forward_expand(gf, joined);
+            strips.push_back(joined);
         }
+        top_k = strips.front();
     }
-    cb(score, "indexer_score", il);
-
-    // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
-    // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
-    const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
-
-    // fused expand + mask + top-k: value[c] = score[cell_blk[c]] + additive[c]
-    // avoids materializing the [n_kv, n_tps] F32 expanded tensor (512MB at 64K) per layer
-    // the mask is [n_kv, n_tps, 1, n_stream]; the size-1 dim is a no-op stride, so the
-    // kernel reads it as [n_kv, n_tps, n_stream] and no per-layer copy is needed
-    ggml_tensor * additive = blk_bias ? kq_mask : inp->bias;
-
-    ggml_tensor * top_k = ggml_indexer_top_k(ctx0, score, inp->cell_blk, additive, (int) width);
-    cb(top_k, "indexer_top_k", il);
+    if (score != nullptr) {
+        cb(score, "indexer_score", il);
+        top_k = run_top_k(score, 0, n_tps, n_blocks);
+        cb(top_k, "indexer_top_k", il);
+    }
 
     return top_k;
+}
+
+// qsa3 packed-block layouts (the F16 layouts the WMMA prefill kernel reads, ggml/src/ggml-cuda/
+// fattn-qsa3.cu).  The pack itself is done by the launcher in one fused pass per tensor
+// (qsa3_pack_{keys,values}_kernel, session 7); the graph only materialises the natural contiguous F16
+// view [D, n_head_kv, n_kv] the launcher packs from.  Keys -> [16, 4, 16, n_kv/4*n_kvh]; Values ->
+// [4, 256, n_kv/4*n_kvh, 1].  Both are built only for the prefill band and any cache type the graph
+// can materialize as F16 (the native ones, or a quantized cache cast on the way in); anything else
+// leaves the VEC kernel in charge.
+// The cache types the qsa3 pack can consume: the native pair plus every type the VEC kernel can
+// dequantize (the cast below materializes them).  Kept in sync with the VEC kernel's type list.
+static bool qwen4exp_qsa3_kv_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// qsa3 works on F16 packs.  Materialize the cache view as F16 from its *natural* (contiguous)
+// layout before any permute: a quantized tensor cannot be permuted, and the backend dup only
+// dequantizes to F32, so those route through an F32 intermediate.  The permute/cont that follows
+// is then a plain F16 copy.
+static ggml_tensor * qsa3_f16_cast(ggml_context * ctx0, ggml_tensor * raw) {
+    if (raw->type == GGML_TYPE_F16)  { return raw; }
+    if (raw->type == GGML_TYPE_BF16) { return ggml_cast(ctx0, raw, GGML_TYPE_F16); }
+    return ggml_cast(ctx0, ggml_cast(ctx0, raw, GGML_TYPE_F32), GGML_TYPE_F16);
+}
+
+static ggml_tensor * qsa3_f16_natural(ggml_context * ctx0, ggml_tensor * raw) {
+    ggml_tensor * t = qsa3_f16_cast(ctx0, raw);
+    if (!ggml_is_contiguous(t)) { t = ggml_cont(ctx0, t); }
+    return t;
 }
 
 // Dense GQA self-attention restricted to the cells that top_k names.
@@ -1398,8 +2150,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    ggml_tensor * kq_mask = inp->get_kq_mask();
+    // Fused sparse FA (top-k cells only) vs dense masked FA: see qwen4exp_qsa_sparse().
+    const bool qsa_sparse = qwen4exp_qsa_sparse(model, hparams, il, cparams);
 
+    // the derived visibility keys live in this layer's QSA graph input set (null on the tensor
+    // path, where the kernel keeps gathering the mask); the mask src stays until the prunable form
+    ggml_tensor * qsa_cell_vis = nullptr;
+    ggml_tensor * qsa_q_vis    = nullptr;
+    {
+        const auto it_qsa = qsa_inps.find((uint32_t) hparams.dsv4_compress_ratios[il]);
+
+        if (it_qsa != qsa_inps.end()) {
+            qsa_cell_vis = it_qsa->second->cell_vis;
+            qsa_q_vis    = it_qsa->second->q_vis;
+        }
+    }
+
+    // the derived-visibility path creates no mask at all (nothing in this graph reads it: the FA
+    // derives from the keys and the dense fallback below is off) - this is the -800 MiB win
+    const bool qsa_derive_vis = qsa_sparse && qsa_cell_vis != nullptr;
+    ggml_tensor * kq_mask = qsa_derive_vis ? nullptr : inp->get_kq_mask();
+
+    ggml_tensor * kq_mask_top_k = nullptr;
+
+    if (kq_mask != nullptr) {
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
@@ -1417,7 +2191,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // modify KQ mask by unmasking elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
+    kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
 
     // reshape to restore the original shape of KQ mask:
     // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
@@ -1425,34 +2199,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // combine with the original kq mask
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
+    }
 
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-
-    // The fused sparse kernel (attend only the indexer-selected top-k cells)
-    // is the DEFAULT flash-attention path; LLAMA_QSA_SPARSE_FA=0 keeps the
-    // dense masked flash-attention path instead. Both require flash attention
-    // enabled; with FA off (-fa 0) the manual attention path below is used.
-    static const bool qsa_sparse_env = []() {
-        const char * env = getenv("LLAMA_QSA_SPARSE_FA");
-        return env == nullptr || std::atoi(env) != 0;
-    }();
-    // The fused sparse kernel reads the K/V cache rows itself - F16/BF16 natively, and
-    // Q8_0/q4_0/q4_1/q5_0/q5_1/iq4_nl by dequantizing them while a tile is staged.  Whether the
-    // acting device accepts the op is asked of the back-end itself (qsa_op_supported above,
-    // which reaches ggml_cuda_flash_attn_qsa_supported through ggml_backend_dev_supports_op)
-    // rather than mirrored here: an unsupported qsa op is not split across the tensor-parallel
-    // devices, so its output ends up mirrored while the attention gate stays hidden-split and
-    // the meta splitter aborts on the attn_gated MUL (observed on qwen4exp + --cache-type-k
-    // q4_0/q4_1 + -sm tensor before the query replaced the hand-maintained list).  Under
-    // -sm tensor model.dev_layer(il) is the Meta device, whose supports_op requires EVERY
-    // tensor-parallel device to accept the op, so the query covers the meta split as well.
-    // Every cache type the query rejects takes the dense masked path below (the same path as
-    // LLAMA_QSA_SPARSE_FA=0, which stays as the A/B knob).
-    const bool qsa_kv_native = qsa_op_supported(model, hparams, il, k->type);
-    const bool qsa_sparse = qsa_sparse_env && cparams.flash_attn && qsa_kv_native;
-
+    // the natural cache views, kept for the qsa3 packs (which must cast before permuting)
+    ggml_tensor * k_raw = k;
+    ggml_tensor * v_raw = v;
     ggml_tensor * cur;
 
     if (qsa_sparse) {
@@ -1464,7 +2218,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         k = ggml_permute(ctx0, k, 0, 2, 1, 3);
         v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
-        cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f);
+        // kq_mask is null on the derived-visibility path (the graph never creates it): the kernel
+        // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
+        cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
+                qsa_cell_vis, qsa_q_vis);
+        // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
+        // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
+        // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1) plus the
+        // backend probe: never materialise the F16 packs when the acting device's qsa3 predicate
+        // will not read them (the runtime arch/env policy lives there; issue #59/#60).
+        constexpr bool qsa3_pack = LLAMA_QSA3_ENABLE != 0;
+        if (qsa3_pack && n_stream == 1 && q_p->ne[1] >= 128 && k_raw->ne[0] == 256 && k_raw->ne[2] % 4 == 0 &&
+            qwen4exp_qsa3_kv_type(k_raw->type) && qsa3_op_supported(model, hparams, il, k_raw->type)) {
+            // The launcher packs these into the block layouts itself (one fused pass, session 7);
+            // the graph only materialises the natural contiguous F16 view [D, n_head_kv, n_kv].
+            ggml_tensor * k16 = qsa3_f16_natural(ctx0, k_raw);
+            ggml_tensor * v16 = qsa3_f16_natural(ctx0, v_raw);
+            ggml_flash_attn_qsa_set_packed(cur, k16, v16);
+        }
+
         ggml_flash_attn_qsa_set_prec(cur, GGML_PREC_F32);
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
         cb(cur, "kqv_out", il);
@@ -1498,14 +2270,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // indexer reads the same block input as q/k/v; no context (the MTP draft attends dense,
-    // see build_layer_attn's caller in graph_mtp), no cache, or no ratio means dense.
+    // indexer reads the same block input as q/k/v; no context, no cache, or no ratio means dense.
     // LLAMA_QSA_OFF=1 forces the dense no-indexer regime everywhere (a plain-dense reference:
     // no indexer store, scoring or sparse selection at any layer) - a gate knob, default OFF.
-    static const bool qsa_off = [] {
-        const char * env = getenv("LLAMA_QSA_OFF");
-        return env != nullptr && std::atoi(env) != 0;
-    }();
+    const bool qsa_off = qwen4exp_qsa_off();
     const bool qsa = !qsa_off && mctx_hyb != nullptr && mctx_hyb->get_idx() != nullptr && hparams.dsv4_compress_ratios[il] > 0;
 
     ggml_tensor * top_k = nullptr;
@@ -1517,9 +2285,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         const int64_t r     = hparams.dsv4_compress_ratios[il];
         const int64_t n_kv  = mctx_hyb->get_idx()->get_n_kv();
         const int64_t width = (int64_t) hparams.indexer_top_k + r - 1;
-        // LLAMA_QSA_DENSE_SHORTCUT: dense shortcut below the selection width, DEFAULT ON (B parity;
-        // the env name matches B for cross-testing). It was opt-in default OFF while a llama-bench-
-        // only multi-ubatch artifact (pp4096+@0 rows slower with the shortcut on) lacked a root
+        // LLAMA_QSA_DENSE_SHORTCUT: attend dense while every cell is still selected (n_kv <= the
+        // selection width).  **DEFAULT OFF as of 2026-09-19 = always QSA** (the env name matches B
+        // for cross-testing; LLAMA_QSA_DENSE_SHORTCUT=1 restores the dense shortcut).
+        //
+        // It was DEFAULT ON for B parity, on the reasoning that below the width the top-k selects
+        // every cell, so sparse attention saves no work while still paying the indexer + top-k.
+        // That stopped being true once qsa3 landed: measured at pp2048 (single ubatch, every cell
+        // selected, gfx1151) the qsa3 attention kernel is 137.8 ms vs 149.9 ms for the dense
+        // flash_attn_ext_f16 - i.e. qsa3 is already 8 % faster on the attention even when nothing
+        // is skipped.  The path only still lost because the indexer + top-k (20.9 ms) costs more
+        // than the kernel saves (12.1 ms), so the shortcut's net value had fallen to ~1 % at short
+        // prefill and ~0 at depth.  It also left a numerics discontinuity at n_kv == width and kept
+        // qsa3 out of every <= 2051-token validation (a `-c 2048` PPL exercise was silently dense).
+        // Removing the split makes the prefill attention path uniform and always exercised; the
+        // remaining gap is an indexer/top-k cost to attack, not a reason to keep two regimes.
+        //
+        // History (kept because it documents the alternative): the shortcut was once opt-in OFF
+        // while a llama-bench-only multi-ubatch artifact (pp4096+@0 slower with it on) lacked a root
         // cause. Root-caused 2026-09-08/09: llama-bench's sync-free decode pipeline x ggml-gallocr's
         // single-layout alloc-fallback doing an unconditional full-device sync on every dense/sparse
         // topology flip (record: benchmarks/2026-09-10-*-shortcut-fix.md).  NOTE (2026-09-06): the
@@ -1527,24 +2310,37 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         // must grow) was UNSAFE across backends and has been reverted: a re-reserve re-points tensor
         // addresses while the previous ubatch's kernels may still be in flight on other GPUs
         // (cross-GPU race -> in-kernel spin / memory faults at multi-ubatch prefill, reproduced on
-        // 3x R9700 gfx1201).  The per-flip full-device sync is back (upstream behavior) and the
-        // shortcut stays DEFAULT ON on top of it.  Numerics below the width == the
-        // LLAMA_QSA_SPARSE_FA=0 masked-dense path (the difference from the selection default is the
-        // known dense-vs-sparse kernel signature, an env-selectable regime). =0 forces the selection
-        // path (the pre-flip known-good numerics) either way.
+        // 3x R9700 gfx1201).  The per-flip full-device sync is back (upstream behavior).  Note the
+        // dense path's numerics below the width equal the LLAMA_QSA_SPARSE_FA=0 masked-dense path -
+        // useful as a cross-check, and still reachable with LLAMA_QSA_DENSE_SHORTCUT=1.  Decode is
+        // unaffected by this default either way: it stays dense via qsa_dense_decode_until below.
+        //
+        // ARCH POLICY (2026-09-21, gfx1201 port): the WIP's always-QSA default (shortcut OFF) was
+        // measured on gfx1151, where qsa3 makes the sparse attention competitive below the
+        // selection width.  On gfx1201 the VEC QSA path is NOT: measured 2026-09-21, 3x R9700
+        // -sm tensor, IQ4_XS, -b/-ub 2048, restoring the shortcut took pp2048 1539.6 -> 2097.4,
+        // pp8192 2169.8 -> 2429.5, pp32768 2359.4 -> 2420.5 (+36 % / +12 % / +2.6 %).  The
+        // shortcut also gates the first ~2051 tokens of EVERY prefill, so it is not a pp2048-only
+        // effect.  Default the shortcut ON on every arch not measured to prefer always-QSA;
+        // gfx1151 keeps the WIP's measured always-QSA.  Revisit per arch once qsa3 (the
+        // packed-WMMA prefill) is ported - it is what made always-QSA viable on gfx1151.
         static const bool shortcut = [] {
             const char * env = getenv("LLAMA_QSA_DENSE_SHORTCUT");
-            return env == nullptr || atoi(env) != 0;
+            if (env != nullptr) return atoi(env) != 0;
+            return qsa_arch_gfx() != 0x1151;
         }();
-        // ARCH POLICY (2026-09-07 crossover tables, pp2048/tg64 bf16 KV, discovery record):
+        // ARCH POLICY (re-measured 2026-09-22, fork `gap-closing-r13`, qwen4exp IQ4_NL f16 KV):
         // decode uses the plain dense attend while n_kv < the per-arch crossover depth and
-        // QSA (sparse) at/above it.  Measured: gfx1151 (Strix Halo, 1 GPU) - dense wins below
-        // ~64K (32K A/B: dense +2.5%, three pairs, 2026-09-07), QSA at/above (the
-        // earlier +6.6% @64K table reading sits at parity under a controlled power
-        // protocol); the threshold is set at 64K; gfx1201 (3x R9700) - dense wins at every
-        // measured depth (8K-160K, flat ~8%), so it never switches.  PREFILL has its own
-        // crossover (qsa_dense_prefill_until, below).  The indexer keys are stored as the
-        // width-shortcut does, so the sparse path takes over seamlessly above the depth.
+        // QSA (sparse) at/above it.  gfx1151 (Strix Halo, 1 GPU) - interleaved forced-dense vs
+        // forced-sparse, `-n 200 --ctx-checkpoints 0`: 16K dense 30.4 / sparse 29.4 (dense +3.4 %),
+        // 32K 28.7 / 28.6 (parity), 48K 27.4 / 27.9 (sparse +1.8 %), 64K 26.1 / 27.3 (sparse
+        // +4.6 %) -> the gfx1151 crossover is now **32K**, down from the 64K of the 2026-09-07
+        // tables.  The move is the derived indexer cache (patches/0021): with it ON the sparse
+        // decode stops re-pooling the raw indexer cache every step, which is what the old 64K
+        // threshold was sized around.  gfx1201 (3x R9700) - dense wins at every measured depth
+        // (8K-160K, flat ~8 %), so it never switches.  PREFILL has its own crossover
+        // (qsa_dense_prefill_until, below).  The indexer keys are stored as the width-shortcut
+        // does, so the sparse path takes over seamlessly above the depth.
         // LLAMA_QSA_DENSE_DECODE_UNTIL overrides the threshold in tokens (0 disables the
         // gate = QSA decode always, for A/B).
         static const int64_t qsa_dense_decode_until = []() -> int64_t {
@@ -1552,7 +2348,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
             if (env >= 0) {
                 return env;
             }
-            return qsa_arch_gfx() == 0x1151 ? 65536 : ((int64_t) 1 << 62);  // gfx1151 crossover ~64K; else dense always
+            return qsa_arch_gfx() == 0x1151 ? 32768 : ((int64_t) 1 << 62);  // gfx1151 crossover ~32K; else dense always
         }();
         // the prefill counterpart: dense below `qsa_dense_prefill_until`, sparse above.  DEFAULT 0 =
         // **QSA prefill always**, the documented ARCH POLICY (2026-09-07 crossover tables;
@@ -1599,7 +2395,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
             // cannot be distinguished from a verify batch - that is the point).
             build_qsa_store_k(mctx_hyb, cur, il);
         } else {
-            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos, inp->get_kq_mask(), sections, il);
+            // the derived path never creates the kq mask; the qsa input's can_reuse below carries
+            // the same gate, so a prefill graph (no mask) and a decode graph (mask) never mix
+            const bool want_derived_vis = qwen4exp_want_derived_vis(model, hparams, il, cparams, n_tokens);
+            top_k = build_qsa_top_k(mctx_hyb, cur, inp_pos,
+                    want_derived_vis ? nullptr : inp->get_kq_mask(), sections, il);
         }
     }
 

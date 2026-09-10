@@ -479,7 +479,14 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
-    model_params.n_lazy_buf_size = lazy_buf_size;
+    // the managed PLE reader budget is driven by LLAMA_LAZY_BUF_MB now (LAZY_MODE_AUTO); keep this
+    // parameter as an override by exporting the equivalent MiB value around the load
+    if (lazy_buf_size > 0) {
+        const size_t mb = lazy_buf_size / (1024*1024);
+        setenv("LLAMA_LAZY_BUF_MB", std::to_string(mb > 0 ? mb : 1).c_str(), 1);
+    } else {
+        unsetenv("LLAMA_LAZY_BUF_MB");
+    }
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();

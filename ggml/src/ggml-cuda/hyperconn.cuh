@@ -50,6 +50,15 @@ struct ggml_cuda_hc_combine_norm_args {
     float               eps;
     bool                single_block = false; // alias-proof variant: one block per token, all inputs read before any store (hc <= 4)
     bool                block_out_hc = false; // block_out carries hc stacked copies ([n_embd,hc,T]); else rows of n_embd per token
+    // BF16 HC streams (LLAMA_HC_BLK16 / LLAMA_HC_RES16, both default OFF).  The pointers are set by
+    // the fusion site only when the graph marked the matching tensor BF16-only, so the run-time
+    // arithmetic is unchanged when a pointer is null.  The F32 tensor metadata is kept; the kernel
+    // reads/writes the BF16 bytes in place over the same buffer.
+    uint16_t *          out_xn_bf16   = nullptr;  // separate BF16 copy of out_xn (always written when non-null)
+    bool                store_xn_f32  = true;     // false: out_xn's F32 bytes are dead (all consumers read the BF16 copy)
+    const uint16_t *    res_in_bf16   = nullptr;  // `residual` is BF16 in place (marked bf16-only)
+    uint16_t *          res_out_bf16  = nullptr;  // write out_res as BF16 in place (marked bf16-only)
+    const uint16_t *    blk_in_bf16   = nullptr;  // `block_out` is BF16 in place (marked bf16-only)
 };
 
 bool ggml_cuda_hc_combine_norm_supported(const ggml_cuda_hc_combine_norm_args & args, int warp_size);

@@ -993,6 +993,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
 
+    // Llama-Frankenstein F1 (single sequence; default on, GGML_LF_DFLASH_DEV=0 turns it off): the target keeps its extracted
+    // layer inputs on the device and the injection batch carries the target rows as token ids, so the features never leave
+    // the GPU. If the target cannot allocate its device buffers, it keeps the host path and so does the draft.
+    bool        lf_dev = false;
+    llama_batch batch_inject_tok = {};
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -1123,6 +1129,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        {
+            const char * lf_env = getenv("GGML_LF_DFLASH_DEV");
+            const bool   lf_on  = lf_env == nullptr || atoi(lf_env) != 0;
+            lf_dev = lf_on && n_seq == 1;
+            if (lf_dev) {
+                llama_lf_set_layer_inp_dev(ctx_tgt, true);
+                batch_inject_tok = llama_batch_init(llama_n_ubatch(ctx_dft), 0, n_seq);
+                if (is_mrope) {
+                    free(batch_inject_tok.pos);
+                    batch_inject_tok.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
+                }
+                LOG_INF("%s: F1: target features stay on the device (default on, GGML_LF_DFLASH_DEV=0 turns it off)\n", __func__);
+            } else if (lf_env != nullptr && atoi(lf_env) != 0) {
+                LOG_WRN("%s: F1 needs a single sequence (n_seq = %d), using the host path\n", __func__, (int) n_seq);
+            }
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1140,6 +1163,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+
+        if (lf_dev) {
+            llama_batch_free(batch_inject_tok);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1196,11 +1223,49 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // F1: the target wrote its layer inputs to device buffers on its own stream; the draft reads them on its
+        // stream, and the target must not overwrite them before the draft is done
+        // the target falls back to the host path when its device buffers could not be allocated
+        const bool use_dev = lf_dev && has_tokens && llama_lf_get_layer_inp_dev(ctx_tgt, (uint32_t) target_layer_ids[0]) != nullptr;
+        if (use_dev) {
+            llama_synchronize(ctx_tgt);
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+            if (use_dev) {
+                for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+                    const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+                    batch_inject_tok.n_tokens = n_chunk;
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const int32_t   row = i_batch_beg[seq_id] + offset + i;
+                        const llama_pos p   = batch_in.tokens[row].pos[0];
+                        batch_inject_tok.token[i] = row; // row of the target batch (see llama_lf_set_dev_inject)
+                        batch_inject_tok.pos[i]   = p;
+                        if (is_mrope) {
+                            batch_inject_tok.pos[1 * n_chunk + i] = p;
+                            batch_inject_tok.pos[2 * n_chunk + i] = p;
+                            batch_inject_tok.pos[3 * n_chunk + i] = 0;
+                        }
+                        batch_inject_tok.n_seq_id[i]  = 1;
+                        batch_inject_tok.seq_id[i][0] = seq_id;
+                        batch_inject_tok.logits[i]    = false;
+                    }
+                    llama_lf_set_dev_inject(ctx_dft, true);
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject_tok);
+                    llama_lf_set_dev_inject(ctx_dft, false);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (F1, n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                }
+                continue;
+            }
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
             // cache cannot free cells for it - skip it, the draft can jump over the gap
@@ -1240,6 +1305,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return false;
                 }
             }
+        }
+
+        if (use_dev) {
+            llama_lf_signal_features_consumed(ctx_dft);
         }
 
         return true;
@@ -2737,6 +2806,20 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+
+    // MTP draft compute-buffer cap (TODO #42 / OPEN 1): the draft's encoder injection is fed in
+    // `n_ubatch` chunks, so its compute buffer during the target's first prefill is sized for that
+    // chunk (~1.6-1.7 GiB/device at the target's full `-ub`).  The draft only drafts `n_max+1` tokens
+    // and the injection is fast in small chunks, so cap it at 512 by default; the freed VRAM goes to
+    // the MoE expert arena (the `-ub 8192` decode DoD).  `MTP_DRAFT_N_UBATCH=0` restores the target's
+    // `-ub`; a positive value overrides the 512 default.
+    if (spec_mtp) {
+        const char * e = getenv("MTP_DRAFT_N_UBATCH");
+        const int64_t draft_ub = e != nullptr ? atoll(e) : 512;   // 0 = no cap (use the target's -ub)
+        if (draft_ub > 0) {
+            cparams.n_ubatch = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(draft_ub, (int64_t) cparams.n_ubatch));
+        }
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?

@@ -30,6 +30,14 @@ static __device__ __forceinline__ float hc_sigmoid(const float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
+// BF16 <-> F32 with round-to-nearest-even, identical to mmb_cvt_f32_bf16 and the HC16 producers.
+static __device__ __forceinline__ float hc_bf2f32(const uint16_t h) { return __uint_as_float(((uint32_t) h) << 16); }
+static __device__ __forceinline__ uint16_t hc_f2bf32(const float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t) (u >> 16);
+}
+
 // mixed[e,t] = scale * ( ((xn*sig)[0] + (xn*sig)[1]) + ... ) + bias, streams summed in order 0..hc-1
 static __global__ void hc_mix_reduce_f32(
         const float * __restrict__ xn, const float * __restrict__ gate, float * __restrict__ dst,
@@ -187,6 +195,9 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
         const float * __restrict__ inject, const float * __restrict__ residual,
         const float * __restrict__ block_out, const float * __restrict__ gamma,
         float * __restrict__ out_res, float * __restrict__ out_xn,
+        uint16_t * __restrict__ out_xn_bf16, const bool store_xn_f32,
+        const uint16_t * __restrict__ res_in_bf16, uint16_t * __restrict__ res_out_bf16,
+        const uint16_t * __restrict__ blk_in_bf16,
         const int n_embd, const bool bo_hc,
         const float s1, const float b1, const float s2, const float b2, const float eps) {
     __shared__ float s_sum[32];
@@ -203,8 +214,11 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
 
     const int64_t row = (int64_t) t * hc + c;
     const float * res = residual + row * n_embd;
+    const uint16_t * res16 = res_in_bf16 ? res_in_bf16 + row * n_embd : nullptr;
     float *       dst = out_res  + row * n_embd;
+    uint16_t *    dst16 = res_out_bf16 ? res_out_bf16 + row * n_embd : nullptr;
     block_out += (bo_hc ? row : (int64_t) t) * n_embd;
+    const uint16_t * blk16 = blk_in_bf16 ? blk_in_bf16 + (bo_hc ? row : (int64_t) t) * n_embd : nullptr;
     float xs[3];
     float tmp = 0.0f;
 #pragma unroll
@@ -212,9 +226,9 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
         const int col = tid + k * HC_CN_BLOCK;
         xs[k] = 0.0f;
         if (col < n_embd) {
-            const float m  = hc_mul_rn(block_out[col], w);
-            const float xi = hc_add_rn(res[col], m);
-            dst[col] = xi;
+            const float m  = hc_mul_rn(blk16 ? hc_bf2f32(blk16[col]) : block_out[col], w);
+            const float xi = hc_add_rn(res16 ? hc_bf2f32(res16[col]) : res[col], m);
+            if (dst16) { dst16[col] = hc_f2bf32(xi); } else { dst[col] = xi; }
             xs[k]    = xi;
             tmp += xi * xi;
         }
@@ -227,11 +241,14 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
 
     const float * g  = gamma  + (int64_t) c * n_embd;
     float *       xn = out_xn + row * n_embd;
+    uint16_t *    xh = out_xn_bf16 ? out_xn_bf16 + row * n_embd : nullptr;
 #pragma unroll
     for (int k = 0; k < 3; ++k) {
         const int col = tid + k * HC_CN_BLOCK;
         if (col < n_embd) {
-            xn[col] = hc_mul_rn(hc_mul_rn(scale, xs[k]), g[col]);
+            const float v = hc_mul_rn(hc_mul_rn(scale, xs[k]), g[col]);
+            if (store_xn_f32) xn[col] = v;
+            if (xh) xh[col] = hc_f2bf32(v);
         }
     }
 }
@@ -245,6 +262,9 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_f32(
 static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_single_f32(
         const float * inject, const float * residual, const float * block_out, const float * __restrict__ gamma,
         float * out_res, float * out_xn,
+        uint16_t * __restrict__ out_xn_bf16, const bool store_xn_f32,
+        const uint16_t * __restrict__ res_in_bf16, uint16_t * __restrict__ res_out_bf16,
+        const uint16_t * __restrict__ blk_in_bf16,
         const int n_embd, const int hc, const bool bo_hc,
         const float s1, const float b1, const float s2, const float b2, const float eps) {
     __shared__ float s_sum[HC_CN_SINGLE_MAX_HC][32];
@@ -283,8 +303,11 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_single_
             if (c < hc && col < n_embd) {
                 // single-copy block_out broadcasts over c: its row is t regardless of the stream
                 const int64_t bo_off = (bo_row_base + (bo_hc ? (int64_t) c : 0)) * n_embd + col;
-                const float m  = hc_mul_rn(block_out[bo_off], w[c]);
-                const float xi = hc_add_rn(residual[((int64_t) t * hc + c) * n_embd + col], m);
+                const int64_t roff   = ((int64_t) t * hc + c) * n_embd + col;
+                const float rv = res_in_bf16 ? hc_bf2f32(res_in_bf16[roff]) : residual[roff];
+                const float bv = blk_in_bf16 ? hc_bf2f32(blk_in_bf16[bo_off]) : block_out[bo_off];
+                const float m  = hc_mul_rn(bv, w[c]);
+                const float xi = hc_add_rn(rv, m);
                 xs[c][k] = xi;
                 tmp[c] += xi * xi;
             }
@@ -324,8 +347,11 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK, 1) hc_combine_norm_single_
             for (int k = 0; k < 3; ++k) {
                 const int col = tid + k * HC_CN_BLOCK;
                 if (col < n_embd) {
-                    dst[col] = xs[c][k];
-                    xn[col]  = hc_mul_rn(hc_mul_rn(scale, xs[c][k]), g[col]);
+                    if (res_out_bf16) res_out_bf16[row * n_embd + col] = hc_f2bf32(xs[c][k]);
+                    else              dst[col] = xs[c][k];
+                    const float v = hc_mul_rn(hc_mul_rn(scale, xs[c][k]), g[col]);
+                    if (store_xn_f32) xn[col] = v;
+                    if (out_xn_bf16)  out_xn_bf16[row * n_embd + col] = hc_f2bf32(v);
                 }
             }
         }
@@ -350,7 +376,11 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
     // identically via row = (t*hc + c).
     GGML_ASSERT(a.out_xn->type == GGML_TYPE_F32 && ggml_is_contiguous(a.out_xn));
     GGML_ASSERT(ggml_nelements(a.out_xn) == ggml_nelements(a.out_res));
-    GGML_ASSERT(a.out_xn->ne[0] == n_embd * hc);
+    // out_xn is the gamma-MUL result: either [n_embd*hc, T] (2D, pre-rebase graphs) or
+    // [n_embd, hc, T] (3D, the current qwen4exp graph). Both are contiguous F32 with the same
+    // row-major layout, which is all the kernel addresses (row = t*hc + c).
+    GGML_ASSERT((a.out_xn->ne[0] == n_embd * hc) ||
+                (a.out_xn->ne[0] == n_embd && a.out_xn->ne[1] == hc));
     GGML_ASSERT(ggml_are_same_shape(a.out_res, a.residual));
     GGML_ASSERT(ggml_nelements(a.block_out) == n_embd * n_tokens || ggml_nelements(a.block_out) == n_embd * hc * n_tokens);
     GGML_ASSERT(ggml_nelements(a.gamma) == n_embd * hc && ggml_nelements(a.inject) == hc * n_tokens);
@@ -362,6 +392,7 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
             (const float *) a.inject->data, (const float *) a.residual->data,
             (const float *) a.block_out->data, (const float *) a.gamma->data,
             (float *) a.out_res->data, (float *) a.out_xn->data,
+            a.out_xn_bf16, a.store_xn_f32, a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
             (int) n_embd, (int) hc, a.block_out_hc, a.s1, a.b1, a.s2, a.b2, a.eps);
         return;
     }
@@ -371,5 +402,6 @@ void ggml_cuda_op_hc_combine_norm(ggml_backend_cuda_context & ctx, const ggml_cu
         (const float *) a.inject->data, (const float *) a.residual->data,
         (const float *) a.block_out->data, (const float *) a.gamma->data,
         (float *) a.out_res->data, (float *) a.out_xn->data,
+        a.out_xn_bf16, a.store_xn_f32, a.res_in_bf16, a.res_out_bf16, a.blk_in_bf16,
         (int) n_embd, a.block_out_hc, a.s1, a.b1, a.s2, a.b2, a.eps);
 }

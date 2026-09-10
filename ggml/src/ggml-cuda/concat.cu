@@ -86,6 +86,10 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
+// The routed-expert concat is a pure streaming transpose (each element read once, written once), so
+// its global LOADS use non-temporal hints to stop it thrashing the L2/MALL the surrounding GEMM
+// weight streams need.  LOADS ONLY: the dst stays cached for its immediate consumer, and a
+// non-temporal store here measured +41 ms (session 13/14, gfx1151, pp8192).
 template <typename T>
 static __global__ void concat_transposed_src1_dim0(
         const char * src0, const char * src1, char * dst,
@@ -108,7 +112,7 @@ static __global__ void concat_transposed_src1_dim0(
         const int64_t token = token0 + ty + j;
         const int64_t channel = channel0 + tx;
         if (token < ne10 && channel < ne11) {
-            values[ty + j][tx] = *reinterpret_cast<const T *>(src1 + i2 * nb12 + channel * nb11 + token * nb10);
+            values[ty + j][tx] = __builtin_nontemporal_load(reinterpret_cast<const T *>(src1 + i2 * nb12 + channel * nb11 + token * nb10));
         }
     }
     __syncthreads();
@@ -127,7 +131,7 @@ static __global__ void concat_transposed_src1_dim0(
             if (channel < ne11) {
                 for (int64_t state = tx; state < ne00; state += tile) {
                     *reinterpret_cast<T *>(dst + i2 * nb2 + channel * nb1 + state * nb0) =
-                        *reinterpret_cast<const T *>(src0 + i2 * nb02 + channel * nb01 + state * nb00);
+                        __builtin_nontemporal_load(reinterpret_cast<const T *>(src0 + i2 * nb02 + channel * nb01 + state * nb00));
                 }
             }
         }

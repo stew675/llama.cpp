@@ -426,7 +426,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    // The scheduler's per-split input copies are named `<backend>#<tensor name>#<copy index>`
+    // (`ggml_backend_sched_alloc_splits`).  Under `-sm tensor` that copy is the only form in which a
+    // host-resident, op-offloaded weight reaches the meta backend, so strip the wrapper to let the
+    // copy inherit the split state of the weight it duplicates -- otherwise it defaults to mirrored and
+    // the whole tensor is uploaded to every device and every device computes all experts.  Any other
+    // name (every activation copy) is left alone and falls through to the mirrored default below.
+    std::string tensor_name = tensor->name;
+    {
+        const size_t first = tensor_name.find('#');
+        const size_t last  = tensor_name.rfind('#');
+        if (first != std::string::npos && last > first + 1 && last + 1 < tensor_name.size()) {
+            bool trailing_index = true;
+            for (size_t i = last + 1; i < tensor_name.size(); i++) {
+                trailing_index = trailing_index && tensor_name[i] >= '0' && tensor_name[i] <= '9';
+            }
+            if (trailing_index) {
+                // wip/tensor-split-expert-split experiment gate:
+                //   0 = off (r12 behaviour: the copy stays mirrored)
+                //   1 = every weight copy inherits its weight's split
+                //   2 = only the axis-1 copies (gate/up: column-parallel, no reduction), leaving the
+                //       axis-0 `ffn_down_exps` copies mirrored -- the bisection for the memory fault
+                static const int split_copy = [] {
+                    const char * e = getenv("GGML_META_SPLIT_COPY");
+                    return e != nullptr ? atoi(e) : 1;
+                }();
+                if (split_copy != 0) {
+                    const std::string stripped = tensor_name.substr(first + 1, last - first - 1);
+                    const bool is_down = stripped.find("ffn_down_exps") != std::string::npos;
+                    // 2 = keep only the axis-0 down copies mirrored; 3 = the inverse bisection:
+                    // split only the axis-0 down copies, leave gate/up mirrored (tests the reduce path
+                    // in isolation).
+                    const bool axis0_only = split_copy == 2 && is_down;
+                    const bool down_only  = split_copy == 3 && !is_down;
+                    if (!axis0_only && !down_only) {
+                        tensor_name = stripped;
+                    }
+                }
+            }
+        }
+    }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -2095,6 +2134,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
     return ret;
 }
 
+size_t llama_model::max_host_weight_tensor_bytes() const {
+    size_t max_bytes = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(t);
+            if (bytes > max_bytes) {
+                max_bytes = bytes;
+            }
+        }
+    }
+    return max_bytes;
+}
+
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
@@ -2728,10 +2787,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         default:
             {
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
+                // The qwen4exp MTP draft attends sparsely (QSA) like the trunk by default, so
+                // its MTP context gets an indexer cache instead of a plain KV cache.
+                // LLAMA_MTP_SPARSE=0 restores the plain cache + dense draft attention;
+                // graph_mtp reads the same env, so the memory type and the graph routing cannot
+                // disagree.
+                static const bool mtp_sparse = [] {
+                    const char * env = getenv("LLAMA_MTP_SPARSE");
+                    return env == nullptr || std::atoi(env) != 0;
+                }();
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
+                     arch == LLM_ARCH_BAILINGMOE3 ||
+                     (arch == LLM_ARCH_QWEN4EXP && (!mtp_sparse || hparams.indexer_head_size == 0)));
+
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                        mtp_sparse && hparams.indexer_head_size > 0) {
+                    llama_memory_hybrid_idx::layer_filter_cb f_attn =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    llama_memory_hybrid_idx::layer_filter_cb f_recr =
+                        [&](uint32_t /*il*/) { return false; };          // the nextn layer is not recurrent
+                    llama_memory_hybrid_idx::layer_filter_cb f_idx =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    LLAMA_LOG_INFO("%s: MTP context uses a hybrid-idx memory (sparse draft attention)\n", __func__);
+                    return new llama_memory_hybrid_idx(
+                        /* model             */ *this,
+                        /* attn_type_k       */ params.type_k,
+                        /* attn_type_v       */ params.type_v,
+                        /* attn_v_trans      */ !cparams.flash_attn,
+                        /* attn_kv_size      */ cparams.n_ctx_seq,
+                        /* attn_n_pad        */ 1,
+                        /* attn_n_swa        */ hparams.n_swa,
+                        /* attn_swa_type     */ hparams.swa_type,
+                        /* recurrent_type_k  */ GGML_TYPE_F32,
+                        /* recurrent_type_v  */ GGML_TYPE_F32,
+                        /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                        /* n_seq_max         */ cparams.n_seq_max,
+                        /* n_rs_seq          */ cparams.n_rs_seq,
+                        /* n_rs_batch        */ cparams.n_rs_batch,
+                        /* offload           */ cparams.offload_kqv,
+                        /* unified           */ cparams.kv_unified,
+                        /* filter_attn       */ std::move(f_attn),
+                        /* filter_recr       */ std::move(f_recr),
+                        /* filter_idx        */ std::move(f_idx));
+                }
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2998,7 +3098,6 @@ llama_model_params llama_model_default_params() {
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.host_experts_mode           =*/ LLAMA_HOST_EXPERTS_MODE_AUTO,
-        /*.n_lazy_buf_size             =*/ 0,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -3467,9 +3566,6 @@ bool llama_moe_cache_stats(const llama_model * model, int64_t * hits, int64_t * 
         }
     }
     return false;
-        const size_t bytes = llama_model_moe_host_expert_bytes(model, (uint32_t) i);
-        if (bytes > 0) {
-            ggml_backend_dev_moe_cache_preflight(llama_model_get_device(model, (uint32_t) i), bytes, aux_reserve_bytes);
 }
 
 size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {

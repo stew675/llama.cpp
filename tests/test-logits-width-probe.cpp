@@ -154,13 +154,12 @@ int main(int argc, char ** argv) {
     float worst = 0.0f;
     for (int W = 1; W <= NW; ++W) {
         float wmax = 0.0f;
-        int   jmax = -1;
         for (int j = 0; j < W; ++j) {
             const std::vector<float> & a = rows[W - 1][j];
             const std::vector<float> & b = rows[NW - 1][j];
             for (size_t k = 0; k < a.size(); ++k) {
                 const float d = std::fabs(a[k] - b[k]);
-                if (d > wmax) { wmax = d; jmax = j; }
+                if (d > wmax) { wmax = d; }
             }
         }
         if (wmax != 0.0f) bad++;

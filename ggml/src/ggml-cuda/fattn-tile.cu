@@ -14,6 +14,35 @@ static void ggml_cuda_flash_attn_ext_tile_case_type(ggml_backend_cuda_context & 
         return;
     }
 
+#ifdef FAST_FP16_AVAILABLE
+    // V4 / issue #30 item 2: q8_0, q4_0, q4_1, q5_0, q5_1 and iq4_nl K/V are dequantized while staging
+    // the tiles, so no F16 copy of the cache is needed.  The predicate is shared with
+    // ggml_cuda_flash_attn_ext_get_alloc_size (which sizes the node's staging scratch) and with the
+    // launcher's kv_native_kernel argument, so the three cannot disagree.
+    switch (ggml_cuda_fattn_tile_kv_native_type(K, V)) {
+        case FATTN_KV_NATIVE_Q8_0:
+            ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_Q8_0>(ctx, dst);
+            return;
+        case FATTN_KV_NATIVE_Q4_0:
+            ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_Q4_0>(ctx, dst);
+            return;
+        case FATTN_KV_NATIVE_Q4_1:
+            ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_Q4_1>(ctx, dst);
+            return;
+        case FATTN_KV_NATIVE_Q5_0:
+            ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_Q5_0>(ctx, dst);
+            return;
+        case FATTN_KV_NATIVE_Q5_1:
+            ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_Q5_1>(ctx, dst);
+            return;
+        case FATTN_KV_NATIVE_IQ4_NL:
+            ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_IQ4_NL>(ctx, dst);
+            return;
+        default:
+            break;
+    }
+#endif // FAST_FP16_AVAILABLE
+
     // F16, F32, quantized K/V are read as F16; BF16 is converted to F16 by the launcher.
     ggml_cuda_flash_attn_ext_tile_case<DKQ, DV, GGML_TYPE_F16>(ctx, dst);
 }

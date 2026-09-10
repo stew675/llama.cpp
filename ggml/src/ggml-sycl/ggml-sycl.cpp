@@ -6361,6 +6361,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .event_wait              = */ ggml_backend_sycl_event_wait,
     /* .stage_buffer            = */ NULL,
     /* .stage_upload            = */ NULL,
+    /* .stage_gather            = */ NULL,
     /* .stage_wait              = */ NULL,
     /* .stage_d2d               = */ NULL,
     /* .stage_h2d_gbps          = */ NULL,

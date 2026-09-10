@@ -40,6 +40,8 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool kq_mask_derived;      // V3: derive the kq mask in the FA kernel instead of materializing it
+    bool auto_kq_mask_derived; // the derived kq mask still has to be confirmed by the backend probe
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;

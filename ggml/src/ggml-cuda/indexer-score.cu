@@ -559,3 +559,46 @@ bool ggml_cuda_indexer_fill_supported(int device, const ggml_tensor * dst) {
            POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32 && RNG->type == GGML_TYPE_I32 &&
            dst->type == GGML_TYPE_F32;
 }
+
+// -------------------------------------------------------------------------------------------------
+// Prefill indexer head reduction: relu each head's block score, then sum the heads in graph order.
+// Replaces the RELU (+ optional RESHAPE in our L2a layout) -> CONT -> ADD chain, reading the scores
+// once instead of H times.  `src` is the physical [n_blocks, H, nt, ns] F32 block score (the relu's
+// input, so the relu is recomputed here); `dst` is [n_blocks, nt*ns] contiguous.
+//
+// ggml_reshape_4d() reinterprets the [n_blocks, H*nt, ns] mul_mat output as [n_blocks, H, nt, ns]
+// with the head dimension fastest, so the physical head stride is n_blocks and the token stride is
+// H*n_blocks -- exactly the indexing below.  fmaxf() is the relu and the add order is graph order, so
+// the result is bitwise identical to the elementwise chain.
+static __global__ void idx_relu_sum_f32(const float * __restrict__ src, float * __restrict__ dst,
+                                        const int n_blocks, const int heads) {
+    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const int64_t tt = blockIdx.y;                        // token*stream, streams stacked
+    const float * p  = src + tt * (int64_t) heads * n_blocks + b;
+    float acc = fmaxf(p[0], 0.0f);
+    for (int h = 1; h < heads; ++h) {
+        acc = acc + fmaxf(p[(int64_t) h * n_blocks], 0.0f);
+    }
+    dst[tt * (int64_t) n_blocks + b] = acc;
+}
+
+bool ggml_cuda_idx_relu_sum_enabled() {
+    static const bool v = getenv("GGML_CUDA_DISABLE_IDX_RELU_SUM") == nullptr ||
+                          atoi(getenv("GGML_CUDA_DISABLE_IDX_RELU_SUM")) == 0;
+    return v;
+}
+
+void ggml_cuda_op_idx_relu_sum(ggml_backend_cuda_context & ctx, const ggml_cuda_idx_relu_sum_args & args) {
+    const ggml_tensor * s = args.score;
+    GGML_ASSERT(s->type == GGML_TYPE_F32 && ggml_is_contiguous(s));
+    GGML_ASSERT(args.dst->type == GGML_TYPE_F32 && ggml_is_contiguous(args.dst));
+    GGML_ASSERT(args.heads >= 2 && args.rows >= 1);
+    { static const int lg = getenv("GGML_CUDA_IDX_RELU_SUM_LOG") ? atoi(getenv("GGML_CUDA_IDX_RELU_SUM_LOG")) : 0; static unsigned cnt = 0;
+      if (lg && cnt++ < 4) fprintf(stderr, "IDX_RELU_SUM score=%s nb=%lld heads=%d rows=%lld\n", s->name, (long long) s->ne[0], args.heads, (long long) args.rows); }
+    const int n_blocks = (int) s->ne[0];
+    constexpr int threads = 256;
+    const dim3 grid((n_blocks + threads - 1) / threads, (unsigned) args.rows, 1);
+    const ggml_cuda_kernel_launch_params lp(grid, threads, 0, ctx.stream());
+    ggml_cuda_kernel_launch(idx_relu_sum_f32, lp, (const float *) s->data, (float *) args.dst->data, n_blocks, args.heads);
+}

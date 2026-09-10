@@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_QSA",
     "INDEXER_TOPK",
     "INDEXER_SCORE",
+    "INDEXER_FILL",
     "HC_MIX",
     "HC_COMBINE",
 
@@ -5598,6 +5599,34 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+// V3: kq mask derived from compact per-cell/per-token state (see ggml.h)
+void ggml_flash_attn_ext_add_kq_derived(
+        struct ggml_tensor * a,
+        struct ggml_tensor * cell_pos,
+        struct ggml_tensor * tok_lo,
+        struct ggml_tensor * tok_hi) {
+    if (!cell_pos) {
+        a->src[5] = NULL;
+        a->src[6] = NULL;
+        a->src[7] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(tok_lo != NULL && tok_hi != NULL);
+    GGML_ASSERT(cell_pos->type == GGML_TYPE_I32 && tok_lo->type == GGML_TYPE_I32 && tok_hi->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(cell_pos) && ggml_is_contiguous(tok_lo) && ggml_is_contiguous(tok_hi));
+    // cell_pos indexes the K rows (the cache cells), tok_lo/tok_hi the mask rows (the query tokens)
+    GGML_ASSERT(cell_pos->ne[0] == a->src[1]->ne[1]);
+    GGML_ASSERT(tok_lo->ne[0]   == a->src[0]->ne[1]);
+    GGML_ASSERT(tok_hi->ne[0]   == a->src[0]->ne[1]);
+
+    a->src[5] = cell_pos;
+    a->src[6] = tok_lo;
+    a->src[7] = tok_hi;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {
@@ -5626,7 +5655,9 @@ struct ggml_tensor * ggml_flash_attn_qsa(
         struct ggml_tensor  * idx,
         struct ggml_tensor  * mask,
         float                 scale,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        struct ggml_tensor  * cell_vis,
+        struct ggml_tensor  * q_vis) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
 
     GGML_ASSERT(q->ne[3] == k->ne[3]);
@@ -5636,11 +5667,24 @@ struct ggml_tensor * ggml_flash_attn_qsa(
     GGML_ASSERT(idx->ne[1] == q->ne[1]);   // n_tps
     GGML_ASSERT(idx->ne[3] == q->ne[3]);   // n_stream
 
-    GGML_ASSERT(mask->type == GGML_TYPE_F16);
-    GGML_ASSERT(ggml_is_contiguous(mask));
-    GGML_ASSERT(mask->ne[0] == k->ne[1]);  // n_kv
-    GGML_ASSERT(mask->ne[1] == q->ne[1]);
-    GGML_ASSERT(mask->ne[3] == q->ne[3]);
+    // the mask is optional: when the compact visibility keys are given, the kernel derives the
+    // per-cell value from them instead (cell_vis[cell] in [0, q_vis[token]] means visible)
+    GGML_ASSERT(mask != NULL || (cell_vis != NULL && q_vis != NULL));
+
+    if (mask != NULL) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[0] == k->ne[1]);  // n_kv
+        GGML_ASSERT(mask->ne[1] == q->ne[1]);
+        GGML_ASSERT(mask->ne[3] == q->ne[3]);
+    }
+
+    if (cell_vis != NULL) {
+        GGML_ASSERT(q_vis != NULL);
+        GGML_ASSERT(cell_vis->type == GGML_TYPE_I32 && q_vis->type == GGML_TYPE_I32);
+        GGML_ASSERT(cell_vis->ne[0] == k->ne[1] && cell_vis->ne[1] == q->ne[3]);
+        GGML_ASSERT(q_vis->ne[0]    == q->ne[1] && q_vis->ne[1]    == q->ne[3]);
+    }
 
     // permute(0, 2, 1, 3)
     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
@@ -5655,8 +5699,42 @@ struct ggml_tensor * ggml_flash_attn_qsa(
     result->src[2] = v;
     result->src[3] = idx;
     result->src[4] = mask;
+    result->src[5] = cell_vis;
+    result->src[6] = q_vis;
 
     return result;
+}
+
+// attach (or clear) the natural contiguous F16 K/V views the qsa3 prefill launcher packs into the
+// packed-block layouts it consumes (ggml/src/ggml-cuda/fattn-qsa3.cu)
+void ggml_hc_mix_set_planar(struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_HC_MIX);
+    GGML_ASSERT(a->src[4] != NULL);   // only the mixer with an inject tail has two outputs
+    ggml_set_op_params_i32(a, 2, 1);
+}
+
+void ggml_flash_attn_qsa_set_packed(
+        struct ggml_tensor * a,
+        struct ggml_tensor * packed_keys,
+        struct ggml_tensor * packed_values) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_QSA);
+
+    if (packed_keys == NULL || packed_values == NULL) {
+        a->src[7] = NULL;
+        a->src[8] = NULL;
+        return;
+    }
+
+    const struct ggml_tensor * k = a->src[1];   // permuted [D, n_kv, n_head_kv]
+    GGML_ASSERT(packed_keys->type   == GGML_TYPE_F16);
+    GGML_ASSERT(packed_values->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(packed_keys) && ggml_is_contiguous(packed_values));
+    // the natural view swaps k's dims 1 and 2: [D, n_head_kv, n_kv]
+    GGML_ASSERT(packed_keys->ne[0]   == k->ne[0] && packed_keys->ne[1]   == k->ne[2] && packed_keys->ne[2]   == k->ne[1] && packed_keys->ne[3]   == 1);
+    GGML_ASSERT(packed_values->ne[0] == k->ne[0] && packed_values->ne[1] == k->ne[2] && packed_values->ne[2] == k->ne[1] && packed_values->ne[3] == 1);
+
+    a->src[7] = packed_keys;
+    a->src[8] = packed_values;
 }
 
 void ggml_flash_attn_qsa_set_prec(
@@ -5684,20 +5762,53 @@ struct ggml_tensor * ggml_indexer_top_k(
         struct ggml_tensor  * score,
         struct ggml_tensor  * cell_blk,
         struct ggml_tensor  * additive,
+        struct ggml_tensor  * cell_pos,
+        struct ggml_tensor  * q_pos,
+        struct ggml_tensor  * blk_idx,
+        struct ggml_tensor  * blk_tail,
+        struct ggml_tensor  * blk_cells,
         int                   k) {
     GGML_ASSERT(score->type   == GGML_TYPE_F32);
     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
-    GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
     GGML_ASSERT(score->ne[0] > 0);
-    GGML_ASSERT(cell_blk->ne[0] == additive->ne[0]);
     GGML_ASSERT(cell_blk->ne[1] == score->ne[2]);
-    GGML_ASSERT(additive->ne[1] == score->ne[1]);
-    // the additive is the kq mask [n_kv, n_tps, 1, n_stream] (the size-1 dim is a
-    // no-op stride the kernel reads as 3D) or a 3D bias [n_kv, n_tps, n_stream]
-    GGML_ASSERT(additive->ne[2] == score->ne[2] ||
-            (additive->ne[2] == 1 && additive->ne[3] == score->ne[2]));
     GGML_ASSERT(k > 0);
     GGML_ASSERT(k <= (int) cell_blk->ne[0]);
+
+    // the per-cell additive is optional: the compact position srcs derive it in-kernel
+    if (additive != NULL) {
+        GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
+        GGML_ASSERT(cell_blk->ne[0] == additive->ne[0]);
+        GGML_ASSERT(additive->ne[1] == score->ne[1]);
+        // the additive is the kq mask [n_kv, n_tps, 1, n_stream] (the size-1 dim is a
+        // no-op stride the kernel reads as 3D) or a 3D bias [n_kv, n_tps, n_stream]
+        GGML_ASSERT(additive->ne[2] == score->ne[2] ||
+                (additive->ne[2] == 1 && additive->ne[3] == score->ne[2]));
+    }
+
+    if (cell_pos != NULL) {
+        GGML_ASSERT(q_pos != NULL && cell_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32);
+        GGML_ASSERT(cell_pos->ne[0] == cell_blk->ne[0]);
+        GGML_ASSERT(cell_pos->ne[1] == cell_blk->ne[1]);
+        GGML_ASSERT(q_pos->ne[0] == score->ne[1]);
+        GGML_ASSERT(q_pos->ne[1] == score->ne[2]);
+    }
+
+    if (blk_idx != NULL) {
+        GGML_ASSERT(blk_tail != NULL && blk_idx->type == GGML_TYPE_I32 && blk_tail->type == GGML_TYPE_I32);
+        GGML_ASSERT(blk_idx->ne[0] == score->ne[0]);
+        GGML_ASSERT(blk_idx->ne[1] == score->ne[2]);
+        GGML_ASSERT(blk_tail->ne[0] == score->ne[1]);
+        GGML_ASSERT(blk_tail->ne[1] == score->ne[2]);
+    }
+
+    // the block -> cell map: [ratio*n_blocks, n_stream].  optional (the block-level fast
+    // path); when present it must divide evenly into per-block slots so ratio = ne[0]/n_blocks.
+    if (blk_cells != NULL) {
+        GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
+        GGML_ASSERT(blk_cells->ne[1] == score->ne[2]);
+        GGML_ASSERT(blk_cells->ne[0] > 0 && blk_cells->ne[0] % score->ne[0] == 0);
+    }
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, score->ne[1], 1, score->ne[2]);
 
@@ -5705,6 +5816,11 @@ struct ggml_tensor * ggml_indexer_top_k(
     result->src[0] = score;
     result->src[1] = cell_blk;
     result->src[2] = additive;
+    result->src[3] = cell_pos;
+    result->src[4] = q_pos;
+    result->src[5] = blk_idx;
+    result->src[6] = blk_tail;
+    result->src[7] = blk_cells;
     ggml_set_op_params_i32(result, 0, k);
 
     return result;
@@ -6900,9 +7016,12 @@ struct ggml_tensor * ggml_hc_mix(
         float                 eps) {
     GGML_ASSERT(x->type        == GGML_TYPE_F32);
     GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
-    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0);
-    GGML_ASSERT(w_up->type     == GGML_TYPE_Q8_0);
-    GGML_ASSERT(w_inject == NULL || w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0);
+    // Q8_0 down/up (inject F32 or Q8_0), or BF16 down/up/inject (Flash-Next GSQ-RCO keeps the hc weights in BF16)
+    const bool hc_bf16 = w_down->type == GGML_TYPE_BF16;
+    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0 || hc_bf16);
+    GGML_ASSERT(w_up->type     == w_down->type);
+    GGML_ASSERT(w_inject == NULL || (hc_bf16 ? w_inject->type == GGML_TYPE_BF16 :
+                                     (w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0)));
     GGML_ASSERT(hc > 0);
 
     const int64_t n_embd    = x->ne[0];
@@ -8124,19 +8243,29 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
                                 const int *                outputs,
                                 int                        num_outputs) {
     GGML_ASSERT(outputs && num_outputs > 0);
+    // Read the diagnostic flag once: this predicate runs on every candidate fusion window (millions
+    // of calls per pass), and getenv() takes a lock and rescans the environment block on Windows.
+    static int dbg_state = -1;   // C requires a constant initializer, so cache the lookup by hand
+    if (dbg_state < 0) {
+        dbg_state = getenv("LLAMA_HC_CN_DEBUG") != NULL;
+    }
+    const bool dbg = dbg_state != 0;
 
     for (int i = 0; i < count; ++i) {
         if (node_idxs[i] >= cgraph->n_nodes) {
+            if (dbg) fprintf(stderr, "canf: i=%d idx>=n_nodes\n", i);
             return false;
         }
 
         const struct ggml_tensor * node = cgraph->nodes[node_idxs[i]];
 
         if (node->op != ops[i]) {
+            if (dbg) fprintf(stderr, "canf: i=%d op mismatch %s vs %s\n", i, ggml_op_name(node->op), ggml_op_name(ops[i]));
             return false;
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (dbg) fprintf(stderr, "canf: i=%d %s not COMPUTE\n", i, ggml_op_name(node->op));
             return false;
         }
 
@@ -8145,6 +8274,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         }
 
         if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            if (dbg) fprintf(stderr, "canf: i=%d %s is OUTPUT but not declared\n", i, ggml_op_name(node->op));
             return false;
         }
 
@@ -8159,6 +8289,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         }
 
         if (subgraph_uses != ggml_node_get_use_count(cgraph, node_idxs[i])) {
+            if (dbg) fprintf(stderr, "canf: i=%d %s uses %d != count %d\n", i, ggml_op_name(node->op), subgraph_uses, ggml_node_get_use_count(cgraph, node_idxs[i]));
             return false;
         }
 
@@ -8167,6 +8298,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         struct ggml_tensor * view_src = node->view_src;
         while (view_src) {
             if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1 && !ggml_is_constant(view_src)) {
+                if (dbg) fprintf(stderr, "canf: i=%d %s external view_src %s\n", i, ggml_op_name(node->op), view_src->name);
                 return false;
             }
             view_src = view_src->view_src;

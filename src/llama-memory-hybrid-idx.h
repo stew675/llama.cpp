@@ -126,8 +126,19 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    //
+    // blk_idx/blk_tail are the compact (derived) alternative to the bias tensor: they let the
+    // top-k derive the per-block half of the bias in-kernel from 4 bytes per block instead of
+    // n_tokens/ns.  blk_idx is -1 for a block that is not complete for this stream, INT32_MAX
+    // for the spare block holding the unpooled tail cells, else the position of the block's
+    // first cell; blk_tail holds the per-token tail start.  The per-sequence half of the bias
+    // is not folded in: the visibility (the attention mask, or the derived cell positions)
+    // already drops every cell of a foreign block, so the values stay identical.  A caller
+    // passing blk_idx must not add the bias into the block score itself.
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
+                       ggml_tensor * cell_vis, ggml_tensor * q_vis,
+                       const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias,
                        int32_t * dst_derived_from = nullptr,
                        int32_t * dst_derived_lim  = nullptr) const;
@@ -181,7 +192,8 @@ private:
     // mutable: set_input_qsa (const) advances it on the decode append path
     mutable std::vector<uint32_t> pool_wm;
 
-    // the derived path is decode-only + env-gated (GGML_CUDA_QSA_INDEXER_CACHE)
+    // the derived path is decode-only; ON by default, GGML_CUDA_QSA_INDEXER_CACHE=0 disables
+    // (the constructor overwrites this from the env)
     bool derived_enabled = false;
 
     void pool_invalidate_all();
@@ -256,8 +268,33 @@ public:
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+    // Cells the QSA block metadata must cover.  The KV view is sized by OCCUPIED cells, but blocks
+    // are keyed by POSITION, and a cache whose positions run ahead of its cells has blocks past that
+    // view: the MTP draft context never receives the cells an M-RoPE image pins to one position, so
+    // after an image its highest position leads its cell count by the image's grid size.  Sizing the
+    // block tensors from get_n_kv() then makes the fill walk past the window (assert / corrupt read);
+    // use max(get_n_kv(), highest stored position + 1), padded to 256 like get_n_kv() so graph reuse
+    // keeps its cadence.  (Ported from the other solution's b0f31f587.)
+    uint32_t qsa_n_kv_window() const;
+
+    // [QSA_SCORE_BOUNDS] precondition for trimming the indexer scorer to the columns a query strip
+    // can actually see: one sequence whose occupied cache cells carry unique non-negative positions
+    // (so the complete blocks are enumerated in ascending logical block order and a block's ordinal
+    // cannot exceed its logical block number).  M-RoPE images pin several cells to one position, so
+    // they fail the uniqueness check and stay unbounded.
+    bool qsa_position_prefix(const llama_ubatch & ubatch) const;
+
+    // [QSA_SCORE_BOUNDS] per query strip, the number of leading score columns the strip can see
+    // (the complete-block ordinals that are fully inside its causal prefix, plus the incomplete
+    // tail block the fused top-k carries as cells), or an empty vector when the bound does not
+    // apply.  `strip` is in tokens, `budget` = indexer_top_k / ratio.
+    std::vector<int64_t> qsa_score_key_limits(const llama_ubatch & ubatch, int64_t n_blocks,
+            int64_t strip, uint32_t ratio, int64_t budget) const;
+
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       ggml_tensor * bias, ggml_tensor * blk_idx, ggml_tensor * blk_tail,
+                       ggml_tensor * cell_vis, ggml_tensor * q_vis,
+                       const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias,
                        int32_t * dst_derived_from = nullptr,
                        int32_t * dst_derived_lim  = nullptr) const;

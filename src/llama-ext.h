@@ -128,6 +128,15 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// Llama-Frankenstein F1: device-resident layer inputs for draft feature injection (single sequence)
+LLAMA_API void                 llama_lf_set_layer_inp_dev(struct llama_context * ctx, bool enable);
+LLAMA_API struct ggml_tensor * llama_lf_get_layer_inp_dev(struct llama_context * ctx, uint32_t lid);
+// draft context: while enabled, a token batch is a KV injection whose token ids are the rows of the target's
+// last batch (its ctx_other) to read from the device layer inputs
+LLAMA_API void                 llama_lf_set_dev_inject   (struct llama_context * ctx, bool enable);
+// draft context: after the injections of a batch were enqueued; the target's next extraction waits for them on the GPU
+LLAMA_API void                 llama_lf_signal_features_consumed(struct llama_context * ctx_dft);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

@@ -7888,6 +7888,7 @@ static struct ggml_backend_i hexagon_backend_i = {
     /* .event_wait              = */ ggml_backend_hexagon_event_wait,
     /* .stage_buffer            = */ NULL,
     /* .stage_upload            = */ NULL,
+    /* .stage_gather            = */ NULL,
     /* .stage_wait              = */ NULL,
     /* .stage_d2d               = */ NULL,
     /* .stage_h2d_gbps          = */ NULL,

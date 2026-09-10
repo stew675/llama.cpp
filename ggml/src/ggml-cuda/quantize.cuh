@@ -45,6 +45,11 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, const int n_chunks, cudaStream_t stream);
 
+void quantize_mmq_q8_1_glu_cuda(
+        const float * gate, const float * up, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t gate_s01, const int64_t up_s01,
+        const int64_t ne0, const int64_t ne1, const int n_chunks, cudaStream_t stream);
+
 void quantize_mmq_q8_1_swiglu_cuda(
         const float * gate, const float * up, const int32_t * ids, void * vy, ggml_type type_src0,
         int64_t ne00, int64_t ne0, int64_t ne1, int logical_n1,

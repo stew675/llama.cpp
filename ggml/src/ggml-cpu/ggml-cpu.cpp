@@ -240,7 +240,7 @@ static int ggml_backend_cpu_moe_offload_cap(void) {
         def = 1;
     }
 
-    const char * env = getenv("GGML_CPU_MOE_OFFLOAD_THREADS");
+    static const char * env = getenv("GGML_CPU_MOE_OFFLOAD_THREADS");
     if (env != nullptr) {
         const int v = atoi(env);
         if (v <= 0) {
@@ -382,6 +382,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .event_wait              = */ NULL,
     /* .stage_buffer            = */ NULL,
     /* .stage_upload            = */ NULL,
+    /* .stage_gather            = */ NULL,
     /* .stage_wait              = */ NULL,
     /* .stage_d2d               = */ NULL,
     /* .stage_h2d_gbps          = */ NULL,
@@ -692,6 +693,11 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
     /* .event_new            = */ NULL,
     /* .event_free           = */ NULL,
     /* .event_synchronize    = */ NULL,
+    /* .moe_cache_preflight  = */ nullptr,
+    /* .moe_cache_set_reserve = */ nullptr,
+    /* .moe_cache_stats      = */ nullptr,
+    /* .moe_cache_rearm      = */ nullptr,
+    /* .slab_work_size       = */ nullptr,
 };
 
 // CPU backend - backend (reg)

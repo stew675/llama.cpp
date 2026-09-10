@@ -543,6 +543,17 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+    // A qwen4exp MTP context carries a hybrid-idx memory whose recurrent filter matches nothing
+    // (the nextn layer is not recurrent), so its cells are never read back - the graph only gives
+    // the unused recurrent inputs a trivial use, and llama_memory_hybrid_idx skips the recurrent
+    // in seq_rm/state.  The bookkeeping below still runs (the graph input sizes need `n`), but the
+    // speculative verify positions must not spam the non-consecutive-position warning.
+    const bool has_recr = [&] {
+        for (ggml_tensor * t : r_l) { if (t) { return true; } }
+        for (ggml_tensor * t : s_l) { if (t) { return true; } }
+        return false;
+    }();
+
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
@@ -696,7 +707,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (has_recr && cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",

@@ -699,8 +699,25 @@ static constexpr __host__ __device__ int calc_rows_per_block_override(int rows_p
 #ifndef GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS
 #define GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS 512
 #endif
+// Largest grid of the single-token dense decode launch; larger weights loop over their rows (see launch_ksplit_rpb).
+#ifndef GGML_MMVQ_RDNA4_DECODE_GRID
+#define GGML_MMVQ_RDNA4_DECODE_GRID 1792
+#endif
+// The types that take that row loop (Q3_K loses 8-35 % from it); the others compile to the one-row kernel as before.
+static constexpr __host__ __device__ bool mmvq_decode_grid_loop_type(ggml_type type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ4_XS ||
+           type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ2_S;
+}
 static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
     if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
+        // Multi-row blocks only pay off for one-wave blocks: the 8-wave Q8_0 short-K block
+        // (calc_nwarps_weight) was measured slower at every row count (K = 2880, 8 tokens:
+        // +21..41 %, issue #71). Two rows beat one from 4 tokens on (gfx1201, K 640 / 2560 / 2880, 512..10240
+        // rows: -14..-17 % summed at 4..6 tokens, -3 % at 8, worst shape +3.7 %) but not at 2..3 tokens.
+        // Single-token decode does not come here (see launch_ksplit).
+        if (nwarps > 1) {
+            return ncols_dst >= 4 ? 2 : 1;
+        }
         constexpr int rpb_max = GGML_MMVQ_RDNA4_WEIGHT_RPB;
         switch (type) {
             // gfx1201 sweep (rows 1/2/4 x every type x n = 2..8 x 4 shapes): these gain
@@ -1004,6 +1021,65 @@ static __global__ void mul_mat_vec_q(
 }
 
 // ---------------------------------------------------------------------------
+// Llama-Frankenstein R1 helpers: reduce n per-lane values (n <= width) so that every value ends up summed over
+// the whole warp, using the butterfly's pairing tree (offsets width/2 ... 1, own value + partner value).
+// Returns the sum held by this lane: value index lane / (width / pow2_ceil(n)); the padding values are zeros that
+// are only ever added to each other.
+static constexpr int ggml_cuda_lf_pow2_ceil(const int n) {
+    int p = 1;
+    while (p < n) {
+        p <<= 1;
+    }
+    return p;
+}
+
+static constexpr int ggml_cuda_lf_log2(const int n) {
+    int l = 0;
+    while ((1 << l) < n) {
+        ++l;
+    }
+    return l;
+}
+
+// One halving step: keep half of the values, exchange the other half with lane ^ offset. half and offset are
+// template constants so every index stays a compile-time constant (a runtime index turns v[] into selects).
+template <int half, int offset, int width, int p>
+static __device__ __forceinline__ void ggml_cuda_lf_halving_step(float (&v)[p], const int lane) {
+    const bool upper = (lane & offset) != 0;
+#pragma unroll
+    for (int k = 0; k < half; ++k) {
+        const float send = upper ? v[k]        : v[k + half];
+        const float keep = upper ? v[k + half] : v[k];
+        v[k] = keep + __shfl_xor_sync(0xffffffff, send, offset, width);
+    }
+    if constexpr (half > 1) {
+        ggml_cuda_lf_halving_step<half/2, offset/2, width, p>(v, lane);
+    }
+}
+
+template <int offset, int width>
+static __device__ __forceinline__ float ggml_cuda_lf_butterfly_rest(float x) {
+    if constexpr (offset > 0) {
+        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+        return ggml_cuda_lf_butterfly_rest<offset/2, width>(x);
+    } else {
+        return x;
+    }
+}
+
+template <int n, int width>
+static __device__ __forceinline__ float ggml_cuda_lf_reduce_scatter(const float (&v_in)[n]) {
+    constexpr int p = ggml_cuda_lf_pow2_ceil(n);
+    static_assert(p >= 2 && p <= width, "2..width values");
+    float v[p];
+#pragma unroll
+    for (int k = 0; k < p; ++k) {
+        v[k] = k < n ? v_in[k] : 0.0f;
+    }
+    ggml_cuda_lf_halving_step<p/2, width/2, width, p>(v, threadIdx.x % width);
+    return ggml_cuda_lf_butterfly_rest<width/(2*p), width>(v[0]);
+}
+
 // ksplit variant of mul_mat_vec_q: the pre-block-13 K-split accumulation.
 // Block 13's item-split kernel wins for ncols_dst == 1 short-K rows (MoE
 // down/router) but its per-thread accumulator fan-out (tmp[ncols_dst][rpb])
@@ -1020,7 +1096,7 @@ static __global__ void mul_mat_vec_q_ksplit(
         uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t ids_stride) {
+        const uint32_t ids_stride, const uint32_t nrows_loop) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -1037,7 +1113,13 @@ static __global__ void mul_mat_vec_q_ksplit(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    // nrows_loop > 0 (row_loop types only): a smaller grid walks the rows, block b taking row group b, b + gridDim.x, ...
+    // (groups of rows_per_cuda_block rows; see GGML_MMVQ_RDNA4_DECODE_GRID). Each row is still one warp's unchanged dot
+    // product. For every other
+    // instantiation the loop body runs once.
+    constexpr bool row_loop = mmvq_decode_grid_loop_type(type) && ncols_dst == 1 && rows_per_cuda_block <= 2 && nwarps == 1;
+    for (int row0 = rows_per_cuda_block*blockIdx.x; ; row0 += rows_per_cuda_block*gridDim.x) {
+    dst = dst_ptr;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
@@ -1219,83 +1301,116 @@ static __global__ void mul_mat_vec_q_ksplit(
 
     dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
 
+    // Llama-Frankenstein R1: without fusion, reduce all ncols_dst*rows_per_cuda_block partial sums at once by
+    // recursive halving instead of one butterfly per output (8 tokens x 4 rows: 31 lane exchanges instead of 160).
+    // Every output is summed by the same pairing tree (lane ^ 16, ^ 8, ... ^ 1, own value first) as
+    // warp_reduce_sum, only in a different lane, so the results are bit-identical.
+    // One-wave blocks only: in the 8-wave Q8_0 short-K block the gathering warp's serial halving steps were
+    // slower on small grids (gpt-oss k/v, 512 rows x 6 tokens: 6.7 -> 11.1 us per launch).
+    constexpr int lf_nval = ncols_dst*rows_per_cuda_block;
+    if constexpr (!has_fusion && nwarps == 1 && lf_nval >= 2 && lf_nval <= warp_size) {
+        float lf_v[lf_nval];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+                float t = tmp[j][i];
+#pragma unroll
+                for (int l = 0; l < nwarps-1; ++l) {
+                    t += tmp_shared[l][j][i][threadIdx.x];
+                }
+                lf_v[j*rows_per_cuda_block + i] = t;
+            }
+        }
+        const float lf_sum = ggml_cuda_lf_reduce_scatter<lf_nval, warp_size>(lf_v);
+        constexpr int lf_lanes = warp_size / ggml_cuda_lf_pow2_ceil(lf_nval); // lanes holding the same output
+        const int lf_idx = threadIdx.x / lf_lanes;
+        if (threadIdx.x % lf_lanes == 0 && lf_idx < lf_nval) {
+            const int j = lf_idx / rows_per_cuda_block;
+            const int i = lf_idx % rows_per_cuda_block;
+            if (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst) {
+                dst[j*stride_col_dst + i] = lf_sum;
+            }
+        }
+    } else {
     // sum up partial sums and write back result
-#pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
-        for (int i = 0; i < rows_per_cuda_block; ++i) {
-#pragma unroll
-            for (int l = 0; l < nwarps-1; ++l) {
-                tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
-                    }
-                }
-            }
-            tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
-                }
-            }
-
-            float result_val = 0.0f;
-            if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
-                result_val = tmp[j][i];
-                if constexpr (has_fusion) {
-                    if (use_scale) {
-                        result_val *= x_scales;
-                    }
-                    result_val += x_biases[j];
-                    if (use_gate) {
-                        float gate_value = tmp_gate[j][i];
-                        if constexpr (type == GGML_TYPE_NVFP4) {
-                            gate_value *= gate_scales;
+    #pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+    #pragma unroll
+            for (int i = 0; i < rows_per_cuda_block; ++i) {
+    #pragma unroll
+                for (int l = 0; l < nwarps-1; ++l) {
+                    tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            tmp_gate[j][i] += tmp_shared_gate[l][j][i][threadIdx.x];
                         }
-                        gate_value += gate_biases[j];
-                        if (use_dst_gate) {
-                            // separate output: write the gate result to its own destination
-                            // (dst was already offset by sample/channel/row; apply the same to dst_gate)
-                            float * dst_gate_row = (float *) dst_gate + sample_dst*stride_sample_dst +
-                                                   channel_dst*stride_channel_dst + row0 + j*stride_col_dst;
-                            dst_gate_row[i] = gate_value;
-                        } else {
-                            switch (active_glu) {
-                                case GGML_GLU_OP_SWIGLU:
-                                    result_val *= ggml_cuda_op_silu_single(gate_value);
-                                    break;
-                                case GGML_GLU_OP_GEGLU:
-                                    result_val *= ggml_cuda_op_gelu_single(gate_value);
-                                    break;
-                                case GGML_GLU_OP_SWIGLU_OAI:
-                                    result_val = ggml_cuda_op_swiglu_oai_single(gate_value, result_val);
-                                    break;
-                                case GGML_GLU_OP_SWIGLU_CLAMP:
-                                    result_val = ggml_cuda_op_swiglu_clamp_single(gate_value, result_val, glu_limit);
-                                    break;
-                                default:
-                                    result_val = result_val * gate_value;
-                                    break;
+                    }
+                }
+                tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
+                    }
+                }
+
+                float result_val = 0.0f;
+                if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                    result_val = tmp[j][i];
+                    if constexpr (has_fusion) {
+                        if (use_scale) {
+                            result_val *= x_scales;
+                        }
+                        result_val += x_biases[j];
+                        if (use_gate) {
+                            float gate_value = tmp_gate[j][i];
+                            if constexpr (type == GGML_TYPE_NVFP4) {
+                                gate_value *= gate_scales;
+                            }
+                            gate_value += gate_biases[j];
+                            if (use_dst_gate) {
+                                // separate output: write the gate result to its own destination
+                                // (dst was already offset by sample/channel/row; apply the same to dst_gate)
+                                float * dst_gate_row = (float *) dst_gate + sample_dst*stride_sample_dst +
+                                                       channel_dst*stride_channel_dst + row0 + j*stride_col_dst;
+                                dst_gate_row[i] = gate_value;
+                            } else {
+                                switch (active_glu) {
+                                    case GGML_GLU_OP_SWIGLU:
+                                        result_val *= ggml_cuda_op_silu_single(gate_value);
+                                        break;
+                                    case GGML_GLU_OP_GEGLU:
+                                        result_val *= ggml_cuda_op_gelu_single(gate_value);
+                                        break;
+                                    case GGML_GLU_OP_SWIGLU_OAI:
+                                        result_val = ggml_cuda_op_swiglu_oai_single(gate_value, result_val);
+                                        break;
+                                    case GGML_GLU_OP_SWIGLU_CLAMP:
+                                        result_val = ggml_cuda_op_swiglu_clamp_single(gate_value, result_val, glu_limit);
+                                        break;
+                                    default:
+                                        result_val = result_val * gate_value;
+                                        break;
+                                }
                             }
                         }
                     }
                 }
-            }
-            if (use_conv_input) {
-                // interleaved conv input: [state0, state1, ..., state_{cs-2}, result] per
-                // channel. conv_input [cs, C] has nb1 = cs floats, conv_states [(cs-1), C]
-                // has nb1 = cs-1 floats. Spread the 4 writes over threads 0..cs-1.
-                const float r_bcast = __shfl_sync(0xffffffff, result_val, i, warp_size);
-                const int c = row0 + i;
-                const int cs = conv_kernel_size;
-                if (threadIdx.x < cs) {
-                    const int k = threadIdx.x;
-                    const float v = k < cs - 1 ? conv_states[(cs-1)*c + k] : r_bcast;
-                    conv_input[cs*c + k] = v;
+                if (use_conv_input) {
+                    // interleaved conv input: [state0, state1, ..., state_{cs-2}, result] per
+                    // channel. conv_input [cs, C] has nb1 = cs floats, conv_states [(cs-1), C]
+                    // has nb1 = cs-1 floats. Spread the 4 writes over threads 0..cs-1.
+                    const float r_bcast = __shfl_sync(0xffffffff, result_val, i, warp_size);
+                    const int c = row0 + i;
+                    const int cs = conv_kernel_size;
+                    if (threadIdx.x < cs) {
+                        const int k = threadIdx.x;
+                        const float v = k < cs - 1 ? conv_states[(cs-1)*c + k] : r_bcast;
+                        conv_input[cs*c + k] = v;
+                    }
+                } else if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
+                    dst[j*stride_col_dst + i] = result_val;
                 }
-            } else if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
-                dst[j*stride_col_dst + i] = result_val;
             }
         }
     }
@@ -1305,6 +1420,15 @@ static __global__ void mul_mat_vec_q_ksplit(
     }
     if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+    }
+    if constexpr (!row_loop) {
+        GGML_UNUSED(nrows_loop);
+        break;
+    } else {
+        if (uint32_t(row0) + rows_per_cuda_block*gridDim.x >= nrows_loop) {
+            break;
+        }
+    }
     }
 }
 
@@ -1448,6 +1572,8 @@ static __global__ void mul_mat_vec_q_moe(
     const int n_items  = c_rows_per_block * blocks_per_row_x;
     const int n_groups = warp_size / (qi/vdr);
     const int kqs      = vdr * (threadIdx.x % (qi/vdr));
+    // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
+#pragma unroll type == GGML_TYPE_IQ2_XS ? 2 : 1
     for (int it = threadIdx.x / (qi/vdr); it < n_items; it += n_groups) {
         const int i   = it / blocks_per_row_x;
         const int kbx = it % blocks_per_row_x;
@@ -1582,7 +1708,7 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
-        const uint32_t ids_stride, cudaStream_t stream) {
+        const uint32_t ids_stride, cudaStream_t stream, const uint32_t nrows_loop = 0) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
@@ -1593,7 +1719,7 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
             ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
             return;
         }
     }
@@ -1604,7 +1730,7 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
     ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, false, small_k, halve_iters, rows_per_block, long_k>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
 }
 
 template <ggml_type type>
@@ -1914,11 +2040,30 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 if constexpr (c_rpb > 0) {
                     dims.first.x = nrows_x / c_rpb;
                 }
+                // RDNA4 single-token dense decode, one row and one warp per block: the time of this launch
+                // depends chaotically on the grid size (gfx1201: 2048 rows of Q5_K K=2560 take 11.9 us,
+                // 2032 rows 7.3 us, identical with the weights cache-hot, and moving the grid by one empty
+                // block moves the slowdown). A balanced grid of at most GGML_MMVQ_RDNA4_DECODE_GRID blocks
+                // walking the rows (or row pairs, see launch_ksplit) avoids it: up to -27 % at the bad sizes, and
+                // no shape of an 83-shape sweep more than 1 % slower than two rows per block on the full grid. Only
+                // for the types measured to gain (Q3_K loses 8-35 %: a wave now does its rows back to back) and for
+                // 2048..16384 rows (17408-row FFN and lm_head weights lose 0-3 %).
+                // Every row keeps its own one-warp dot product: bit-identical.
+                uint32_t nrows_loop = 0;
+                constexpr int c_rpb_eff = c_rpb > 0 ? c_rpb : 1;
+                if (mmvq_decode_grid_loop_type(type) && table_id == MMVQ_PARAMETERS_RDNA4 && c_ncols_dst == 1 && ids == nullptr &&
+                    c_rpb_eff <= 2 && dims.second.y == 1 && dims.first.x * c_rpb_eff == (unsigned) nrows_x &&
+                    nrows_x >= 2048 && nrows_x <= 16384 && dims.first.x > GGML_MMVQ_RDNA4_DECODE_GRID) {
+                    const int nblocks = dims.first.x;
+                    const int iters   = (nblocks + GGML_MMVQ_RDNA4_DECODE_GRID - 1) / GGML_MMVQ_RDNA4_DECODE_GRID;
+                    nrows_loop   = nrows_x;
+                    dims.first.x = (nblocks + iters - 1) / iters;
+                }
                 mul_mat_vec_q_switch_fusion_ksplit<type, c_ncols_dst, false, false, c_rpb, c_long_k>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                     sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                    dims.first, dims.second, 0, ids_stride, stream);
+                    dims.first, dims.second, 0, ids_stride, stream, nrows_loop);
             };
             const auto launch_ksplit = [&](auto ncols_tag) {
                 constexpr int c_ncols_dst = decltype(ncols_tag)::value;
@@ -1929,12 +2074,40 @@ static void mul_mat_vec_q_switch_ncols_dst(
 #if defined(GGML_USE_HIP)
                 constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
                 if constexpr (c_rpb_weight > 1) {
+                    // the rows the launch will actually use (Q8_0 short-K: 8-warp blocks take fewer rows)
+                    const int rpb_w = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false,
+                        calc_nwarps_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, long_k));
                     if (table_id == MMVQ_PARAMETERS_RDNA4 &&
-                        (nrows_x % c_rpb_weight != 0 || nrows_x < c_rpb_weight * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS)) {
+                        (nrows_x % rpb_w != 0 || nrows_x < rpb_w * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS)) {
                         if (long_k) {
                             launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 1>{}, std::true_type{});
                         } else {
                             launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 1>{}, std::false_type{});
+                        }
+                        return;
+                    }
+                }
+                // Single-token decode, two rows per block where a gfx1201 row sweep measured a steady win at every
+                // row count (not a grid-size effect, see GGML_MMVQ_RDNA4_DECODE_GRID; above that many blocks the pairs
+                // take the row loop): Q4_K / Q5_K (-1..-3 % against the one-row loop, more loads in flight per block;
+                // not long-K weights above 16384 rows, e.g. 17408-row FFN up/gate, where one row is ~1 % faster),
+                // IQ4_XS short-K from 6144 rows (below that the one-row loop is faster), Q8_0 short-K (8-warp blocks,
+                // K 640 / 2560: -19..-37 % / -4..-6 %), Q6_K long-K at 2176..3584 rows (-6..-8 %; fewer rows lose up
+                // to 4 %, 4096..5632 rows up to 12 %) and Q3_K (0..-6 %; it loses 8..35 % in the row loop). From 1024
+                // rows, as in r28. Rows are independent: bit-identical.
+                if constexpr (c_ncols_dst == 1 && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+                                                   type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS)) {
+                    const bool two_rows = table_id == MMVQ_PARAMETERS_RDNA4 && ids == nullptr && nrows_x % 2 == 0 &&
+                        nrows_x >= 2*GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS &&
+                        (type == GGML_TYPE_Q8_0   ? !long_k :
+                         type == GGML_TYPE_Q6_K   ? long_k && nrows_x >= 2176 && nrows_x <= 3584 :
+                         type == GGML_TYPE_IQ4_XS ? !long_k && nrows_x >= 6144 :
+                         type == GGML_TYPE_Q3_K   ? true : !long_k || nrows_x <= 16384);
+                    if (two_rows) {
+                        if (long_k) {
+                            launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 2>{}, std::true_type{});
+                        } else {
+                            launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 2>{}, std::false_type{});
                         }
                         return;
                     }
@@ -2365,13 +2538,14 @@ static __device__ __forceinline__ float ssm_op_sigmoid(float x) {
 // Fused SSM gate/beta projections: two Q8_0 matmuls over the same input, plus
 // the gating chain. gate = softplus(alpha*x + dt) * a; beta = sigmoid(beta*x).
 // Grid: (nrows, 1), block: (warp_size, nwarps), nwarps per row. Each workgroup
-// computes one row of both outputs.
-template <int nwarps>
+// computes one row of both outputs for all ncols tokens; each token keeps the
+// single-token accumulation order, so the verify band matches decode bit for bit.
+template <int nwarps, int ncols>
 static __global__ void ssm_gate_beta_fused_q8_0(
         const void * vx_alpha, const void * vx_beta, const block_q8_1 * y,
         const float * dt, const float * ssm_a,
         float * dst_gate, float * dst_beta,
-        const int nrows, const int ncols_x) {
+        const int nrows, const int ncols_x, const int stride_col_y) {
     const int row = blockIdx.x;
     constexpr int warp_size = 32;
     const int tid = warp_size*threadIdx.y + threadIdx.x;
@@ -2383,37 +2557,46 @@ static __global__ void ssm_gate_beta_fused_q8_0(
     const block_q8_0 * w_alpha = (const block_q8_0 *) vx_alpha + (int64_t) row * blocks_per_row_x;
     const block_q8_0 * w_beta  = (const block_q8_0 *) vx_beta  + (int64_t) row * blocks_per_row_x;
 
-    float sum_alpha = 0.0f;
-    float sum_beta  = 0.0f;
+    float sum_alpha[ncols] = { 0.0f };
+    float sum_beta[ncols]  = { 0.0f };
     const int blocks_per_iter = vdr * nwarps*warp_size / qi;
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx; // qk == QK8_1
         const int kqs = vdr * (tid % (qi/vdr));
-        sum_alpha += vec_dot_q8_0_q8_1(w_alpha, &y[kby], kbx, kqs);
-        sum_beta  += vec_dot_q8_0_q8_1(w_beta,  &y[kby], kbx, kqs);
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            sum_alpha[j] += vec_dot_q8_0_q8_1(w_alpha, &y[j*stride_col_y + kby], kbx, kqs);
+            sum_beta[j]  += vec_dot_q8_0_q8_1(w_beta,  &y[j*stride_col_y + kby], kbx, kqs);
+        }
     }
 
     // cross-warp reduction, same order as mul_mat_vec_q
-    __shared__ float sh_alpha[nwarps > 1 ? nwarps-1 : 1][warp_size];
-    __shared__ float sh_beta[nwarps > 1 ? nwarps-1 : 1][warp_size];
+    __shared__ float sh_alpha[nwarps > 1 ? nwarps-1 : 1][ncols][warp_size];
+    __shared__ float sh_beta[nwarps > 1 ? nwarps-1 : 1][ncols][warp_size];
     if (threadIdx.y > 0) {
-        sh_alpha[threadIdx.y-1][threadIdx.x] = sum_alpha;
-        sh_beta[threadIdx.y-1][threadIdx.x] = sum_beta;
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+            sh_alpha[threadIdx.y-1][j][threadIdx.x] = sum_alpha[j];
+            sh_beta[threadIdx.y-1][j][threadIdx.x] = sum_beta[j];
+        }
     }
     __syncthreads();
     if (threadIdx.y > 0) {
         return;
     }
-    for (int l = 0; l < nwarps-1; ++l) {
-        sum_alpha += sh_alpha[l][threadIdx.x];
-        sum_beta  += sh_beta[l][threadIdx.x];
-    }
-    sum_alpha = warp_reduce_sum<warp_size>(sum_alpha);
-    sum_beta  = warp_reduce_sum<warp_size>(sum_beta);
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+        for (int l = 0; l < nwarps-1; ++l) {
+            sum_alpha[j] += sh_alpha[l][j][threadIdx.x];
+            sum_beta[j]  += sh_beta[l][j][threadIdx.x];
+        }
+        sum_alpha[j] = warp_reduce_sum<warp_size>(sum_alpha[j]);
+        sum_beta[j]  = warp_reduce_sum<warp_size>(sum_beta[j]);
 
-    if (threadIdx.x == 0) {
-        dst_gate[row] = ssm_op_softplus(sum_alpha + dt[row]) * ssm_a[row];
-        dst_beta[row] = ssm_op_sigmoid(sum_beta);
+        if (threadIdx.x == 0) {
+            dst_gate[j*nrows + row] = ssm_op_softplus(sum_alpha[j] + dt[row]) * ssm_a[row];
+            dst_beta[j*nrows + row] = ssm_op_sigmoid(sum_beta[j]);
+        }
     }
 
     GGML_UNUSED(nrows);
@@ -2453,32 +2636,51 @@ void ggml_cuda_op_ssm_gate_beta(
                                src1->ne[1], src1->ne[2], src1->ne[3], stream);
     }
 
-    const int nrows = dst_gate->ne[0];
+    const int nrows = src0_alpha->ne[1];
+    const int ncols = src1->ne[1];
+    GGML_ASSERT(ncols >= 1 && ncols <= MMVQ_MAX_BATCH_SIZE && src1->ne[2] == 1 && src1->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(dst_gate) == nrows*ncols);
+    GGML_ASSERT(ggml_is_contiguous(dst_gate) && ggml_is_contiguous(dst_beta));
     const int device = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[device].cc;
-    // This fusion is DECODE-ONLY (the matcher requires alpha_w->src[1]->ne[1] == 1), so it must
-    // reproduce the standalone dense mmvq *weight* launch it replaces.  calc_nwarps_weight() is that
+    // This fusion must reproduce the standalone dense mmvq *weight* launch it replaces, at every
+    // width of the band (1..MMVQ_MAX_BATCH_SIZE tokens), so nwarps comes from the same selector.  calc_nwarps_weight() is that
     // launch's selector (Q8_0 with K < 4096 takes the wide block on RDNA4); pinning plain
     // calc_nwarps() here reduced K with a different warp count than the unfused chain the verify
     // batch runs, so W = 1 and W >= 2 disagreed by ULPs and a near-tie flipped after a few hundred
     // tokens -- a width-impurity that confounds every plain-vs-draft-mtp coherence check.  It is a
     // no-op for K >= 4096 (long_k), so the long-K models keep the pinned single-token order.
     const bool long_k = src1->ne[0] >= 4096;
-    const int nwarps = calc_nwarps_weight(GGML_TYPE_Q8_0, 1, get_device_table_id(cc), long_k);
+    const int nwarps = calc_nwarps_weight(GGML_TYPE_Q8_0, ncols, get_device_table_id(cc), long_k);
     const dim3 block_nums(nrows);
     const dim3 block_dims(32, nwarps);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-    const auto launch = [&](auto nwarps_c) {
+    const int stride_col_y = ne10_padded / QK8_1;
+    const auto launch = [&](auto nwarps_c, auto ncols_c) {
         constexpr int NW = decltype(nwarps_c)::value;
-        ggml_cuda_kernel_launch(ssm_gate_beta_fused_q8_0<NW>, launch_params,
+        constexpr int NC = decltype(ncols_c)::value;
+        ggml_cuda_kernel_launch(ssm_gate_beta_fused_q8_0<NW, NC>, launch_params,
             src0_alpha->data, src0_beta->data, (const block_q8_1 *) src1_q8_1, (const float *) dt->data, (const float *) ssm_a->data,
-            (float *) dst_gate->data, (float *) dst_beta->data, nrows, src1->ne[0]);
+            (float *) dst_gate->data, (float *) dst_beta->data, nrows, src1->ne[0], stride_col_y);
+    };
+    const auto launch_nw = [&](auto nwarps_c) {
+        switch (ncols) {
+            case 1:  launch(nwarps_c, std::integral_constant<int, 1>{}); break;
+            case 2:  launch(nwarps_c, std::integral_constant<int, 2>{}); break;
+            case 3:  launch(nwarps_c, std::integral_constant<int, 3>{}); break;
+            case 4:  launch(nwarps_c, std::integral_constant<int, 4>{}); break;
+            case 5:  launch(nwarps_c, std::integral_constant<int, 5>{}); break;
+            case 6:  launch(nwarps_c, std::integral_constant<int, 6>{}); break;
+            case 7:  launch(nwarps_c, std::integral_constant<int, 7>{}); break;
+            case 8:  launch(nwarps_c, std::integral_constant<int, 8>{}); break;
+            default: GGML_ASSERT(false); break;
+        }
     };
     switch (nwarps) {
-        case 1:  launch(std::integral_constant<int, 1>{}); break;
-        case 2:  launch(std::integral_constant<int, 2>{}); break;
-        case 4:  launch(std::integral_constant<int, 4>{}); break;
-        case 8:  launch(std::integral_constant<int, 8>{}); break;
+        case 1:  launch_nw(std::integral_constant<int, 1>{}); break;
+        case 2:  launch_nw(std::integral_constant<int, 2>{}); break;
+        case 4:  launch_nw(std::integral_constant<int, 4>{}); break;
+        case 8:  launch_nw(std::integral_constant<int, 8>{}); break;
         default: GGML_ASSERT(false); break;
     }
 

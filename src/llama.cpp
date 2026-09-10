@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -322,6 +323,20 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
+// managed PLE buffer size for the LAZY_MODE_AUTO reader, opt-in via LLAMA_LAZY_BUF_MB (MiB).
+// Unset (or non-positive) disables the managed reader: LAZY_MODE_AUTO then behaves as the
+// classic upstream auto (mmap lazy for large tensors where the mmap path is available).
+// The managed reader is kept for future work but is OFF by default because it measured slower
+// than both the mmap and the resident path on gfx1151 (see wip/closing-the-gap).
+static size_t llama_lazy_managed_budget() {
+    const char * env = getenv("LLAMA_LAZY_BUF_MB");
+    if (env == nullptr) {
+        return 0;
+    }
+    const long mb = strtol(env, nullptr, 10);
+    return mb > 0 ? (size_t) mb * 1024 * 1024 : 0;
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
@@ -329,8 +344,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.host_experts_mode, params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
-        ml.lazy.mode     = params.lazy_mode;
-        ml.lazy.buf_size = params.n_lazy_buf_size;
+        ml.lazy.mode            = params.lazy_mode;
+        ml.lazy.managed_budget  = params.lazy_mode == LLAMA_LAZY_MODE_AUTO ? llama_lazy_managed_budget() : 0;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));

@@ -609,7 +609,9 @@ static bool launch_gdn_chunked(
     const int n_chunks = (int) ((n_tokens + GDN_CHUNKED_CS - 1) / GDN_CHUNKED_CS);
     const int64_t hg_ratio = H / H_k;
 
-    if (getenv("GDN_DBG_SKIP_KKT") == nullptr) {
+    static const char * dbg_skip_kkt = getenv("GDN_DBG_SKIP_KKT");
+    static const char * dbg_skip_scan = getenv("GDN_DBG_SKIP_SCAN");
+    if (dbg_skip_kkt == nullptr) {
         dim3 grid((unsigned) n_chunks, (unsigned) H, (unsigned) n_seqs);
         const dim3 block(GDN_CHUNKED_NTHREADS);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
@@ -619,7 +621,7 @@ static bool launch_gdn_chunked(
             return false;
         }
     }
-    if (getenv("GDN_DBG_SKIP_SCAN") != nullptr) return true;
+    if (dbg_skip_scan != nullptr) return true;
     {
         dim3 grid((unsigned) (S_v / GDN_CHUNKED_VT), (unsigned) (H_k * hg_ratio), (unsigned) n_seqs);
         const dim3 block(GDN_CHUNKED_NTHREADS);

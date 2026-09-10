@@ -2523,6 +2523,17 @@ extern "C" {
     // friendly instead of compute-optimal for a whole card.  Set once per context; default false.
     GGML_API void ggml_set_fa_tensor_parallel(bool enable);
     GGML_API bool ggml_get_fa_tensor_parallel(void);
+    // kq mask derived from compact state: when cell_pos/tok_lo/tok_hi are given, the mask tensor
+    // may be NULL and each cell's value is derived in the kernel as
+    //     cell_pos[cell] >= tok_lo[token] && cell_pos[cell] <= tok_hi[token]  ->  0.0f, else -INF
+    // with cell_pos == INT32_MIN marking a cell that is always dropped (empty or foreign).
+    // cell_pos is I32[n_kv], tok_lo/tok_hi are I32[n_tps] - the same row order the mask would use.
+    GGML_API void ggml_flash_attn_ext_add_kq_derived(
+            struct ggml_tensor * a,
+            struct ggml_tensor * cell_pos,
+            struct ggml_tensor * tok_lo,
+            struct ggml_tensor * tok_hi);
+
     // qwen4exp QSA sparse attention: attend only over the cells that the
     // indexer's top-k names, instead of the whole KV cache.  The mask is the
     // base kq_mask and is gathered in-kernel at the idx positions.
@@ -2534,7 +2545,22 @@ extern "C" {
             struct ggml_tensor  * idx,
             struct ggml_tensor  * mask,
             float                 scale,
-            float                 logit_softcap);
+            float                 logit_softcap,
+            struct ggml_tensor  * cell_vis,
+            struct ggml_tensor  * q_vis);
+
+    // attach the packed-block K/V layouts the qsa3 (packed-block WMMA) prefill kernel reads.
+    // Both must be the F16 tensors built by the reshape/permute/cont pack helpers; passing
+    // NULL,NULL restores the VEC kernel (the packed srcs are optional).
+    // HC_MIX output layout: planar stores the n_tokens mixed rows first, then the n_tokens inject rows
+    // ([n_embd, T] then [hc, T]) instead of one [n_embd + hc] row per token, so both outputs are
+    // contiguous views (no copy before batched consumers).  Same bytes; identical at T == 1.
+    GGML_API void ggml_hc_mix_set_planar(struct ggml_tensor * a);
+
+    GGML_API void ggml_flash_attn_qsa_set_packed(
+            struct ggml_tensor * a,
+            struct ggml_tensor * packed_keys,
+            struct ggml_tensor * packed_values);
 
     GGML_API void ggml_flash_attn_qsa_set_prec(
             struct ggml_tensor * a,
@@ -2546,13 +2572,28 @@ extern "C" {
     // fused expand + mask + top-k for the indexer: value[c] = score[cell_blk[c]] + additive[c]
     // src0: block scores [n_blocks, n_tps, n_stream] F32
     // src1: cell -> block map [n_kv, n_stream] I32
-    // src2: per-cell additive [n_kv, n_tps, n_stream] F16 or F32 (attention mask or bias)
+    // src2: per-cell additive [n_kv, n_tps, n_stream] F16 or F32 (attention mask or bias), or
+    //       NULL when the additive is derived from src3/src4 (see below)
+    // src3: per-cell positions [n_kv, n_stream] I32, or NULL (derived visibility: the position of
+    //       the cell in this stream's sequence, -1 for an empty or foreign cell; the kernel then
+    //       adds 0 for a visible cell and -INFINITY for a hidden one, replacing src2)
+    // src4: per-token query positions [n_tps, n_stream] I32, or NULL (required with src3)
+    // src5: per-block bias state [n_blocks, n_stream] I32, or NULL (derived per-block bias: -1 for
+    //       a block that is not complete for this stream, INT32_MAX for the spare block holding
+    //       the unpooled tail cells, else the position of the block's first cell; the caller must
+    //       then NOT add the per-block bias into score0 itself)
+    // src6: per-token tail start [n_tps, n_stream] I32, or NULL (required with src5)
     // k:   number of top cells to return
     GGML_API struct ggml_tensor * ggml_indexer_top_k(
             struct ggml_context * ctx,
             struct ggml_tensor  * score,
             struct ggml_tensor  * cell_blk,
             struct ggml_tensor  * additive,
+            struct ggml_tensor  * cell_pos,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * blk_idx,
+            struct ggml_tensor  * blk_tail,
+            struct ggml_tensor  * blk_cells,
             int                   k);
 
     // Fused indexer block-pool + rms-norm (qwen4exp QSA): replaces the per-op chain

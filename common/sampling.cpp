@@ -131,7 +131,98 @@ struct common_sampler {
         llama_sampler_reset(chain);
     }
 
-    void set_logits(struct llama_context * ctx, int idx) {
+    // Llama-Frankenstein S2: exact top-k fast path.  When the samplers ahead of top-k leave the logits alone (logit bias
+    // aside) and the k largest (biased) logits are distinct and strictly above the (k+1)-th, the chain's top-k keeps
+    // exactly those k tokens in one order, whatever else is in the array; so only they are handed to the chain (with
+    // their raw logits: the chain still adds the bias) instead of the whole vocabulary.  Otherwise the full array.
+    bool set_logits_topk(const float * logits, int n_vocab) {
+        const int k  = fast_k;
+        const int nb = (int) fast_bias_ids.size();
+        if (nb > 0 && fast_bias_ids.back() >= n_vocab) {
+            return false;
+        }
+        // the raw top (k + 1 + nb) holds the top k + 1 of the tokens without a bias
+        const int m  = k + 1 + nb;
+        auto & top = fast_top; // descending by value
+        top.clear();
+        float thr = -INFINITY;
+        bool  bad = false;
+        constexpr int B = 64;
+        for (int i0 = 0; i0 < n_vocab; i0 += B) {
+            const int i1 = std::min(i0 + B, n_vocab);
+            float bm = -INFINITY;
+            bool  bn = false;
+            for (int i = i0; i < i1; ++i) {
+                const float x = logits[i];
+                bm = x > bm ? x : bm;
+                bn |= x != x;
+            }
+            bad |= bn;
+            if (!(bm > thr)) {
+                continue;
+            }
+            for (int i = i0; i < i1; ++i) {
+                const float x = logits[i];
+                if (!(x > thr)) {
+                    continue;
+                }
+                if ((int) top.size() == m) {
+                    top.pop_back();
+                }
+                int j = (int) top.size();
+                top.emplace_back(x, i);
+                for (; j > 0 && top[j - 1].first < x; --j) {
+                    top[j] = top[j - 1];
+                }
+                top[j] = { x, i };
+                if ((int) top.size() == m) {
+                    thr = top.back().first;
+                }
+            }
+        }
+        if (bad || (int) top.size() < m) {
+            return false;
+        }
+        if (nb > 0) {
+            // drop the raw values of the biased tokens, add their biased values (added in the chain's order)
+            top.erase(std::remove_if(top.begin(), top.end(), [&](const std::pair<float, llama_token> & e) {
+                return std::binary_search(fast_bias_ids.begin(), fast_bias_ids.end(), e.second);
+            }), top.end());
+            for (const llama_token id : fast_bias_ids) {
+                float x = logits[id];
+                for (const auto & b : fast_bias) {
+                    if (b.token == id) {
+                        x += b.bias;
+                    }
+                }
+                if (x != x) {
+                    return false;
+                }
+                if (x > -INFINITY) {
+                    top.emplace_back(x, id);
+                }
+            }
+            std::sort(top.begin(), top.end(), [](const std::pair<float, llama_token> & a, const std::pair<float, llama_token> & b) {
+                return a.first > b.first;
+            });
+            if ((int) top.size() < k + 1) {
+                return false;
+            }
+        }
+        for (int j = 1; j <= k; ++j) {
+            if (!(top[j - 1].first > top[j].first)) {
+                return false; // a tie among the k + 1 largest: leave the order to the full path
+            }
+        }
+        cur.resize(k);
+        for (int j = 0; j < k; ++j) {
+            const llama_token id = top[j].second;
+            cur[j] = llama_token_data{id, logits[id], 0.0f};
+        }
+        return true;
+    }
+
+    void set_logits(struct llama_context * ctx, int idx, bool allow_fast = false) {
         const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
         const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
         const llama_token * sampled_ids    = llama_get_sampled_candidates_ith(ctx, idx);
@@ -156,9 +247,11 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            cur.resize(n_vocab);
-            for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-                cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            if (!(allow_fast && fast_k > 0 && fast_k < n_vocab && set_logits_topk(logits, n_vocab))) {
+                cur.resize(n_vocab);
+                for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+                    cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+                }
             }
         }
 
@@ -170,7 +263,45 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    int fast_k = 0;                           // S2: k of the exact top-k fast path, 0 = off
+    std::vector<llama_logit_bias> fast_bias = {};                // S2: the chain's logit biases, in the chain's order
+    std::vector<llama_token> fast_bias_ids = {};                 // S2: the biased tokens, sorted, unique
+    std::vector<std::pair<float, llama_token>> fast_top = {};    // S2: scratch
 };
+
+// S2: the fast path's k when every sampler ahead of top-k is a no-op for these parameters (logit bias is handled by the
+// fast path itself), else 0.  GGML_LF_FAST_TOPK=0 turns it off.
+static int common_sampler_fast_topk_k(const common_params_sampling & p) {
+    static const bool off = [] { const char * e = getenv("GGML_LF_FAST_TOPK"); return e && atoi(e) == 0; }();
+    if (off || p.mirostat != 0 || p.top_k <= 0) {
+        return 0;
+    }
+    for (const auto s : p.samplers) {
+        switch (s) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+                return p.top_k;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (!(p.penalty_last_n == 0 || (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f))) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (!(p.dry_multiplier == 0.0f || p.dry_base < 1.0f || p.dry_penalty_last_n == 0)) {
+                    return 0;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (p.top_n_sigma > 0.0f) {
+                    return 0;
+                }
+                break;
+            default:
+                return 0;
+        }
+    }
+    return 0;
+}
 
 std::string common_params_sampling::print() const {
     char result[1024];
@@ -327,9 +458,8 @@ struct common_sampler * common_sampler_init(
     }
 
     // logit bias: user biases + model suppress tokens (-INFINITY)
+    std::vector<llama_logit_bias> merged = params.logit_bias;
     {
-        std::vector<llama_logit_bias> merged = params.logit_bias;
-
         int32_t n_suppress = 0;
         const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
         for (int32_t i = 0; i < n_suppress; ++i) {
@@ -440,6 +570,21 @@ struct common_sampler * common_sampler_init(
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
+    result->fast_k = common_sampler_fast_topk_k(params);
+    if (result->fast_k > 0) {
+        result->fast_bias = merged;
+        for (const auto & b : merged) {
+            result->fast_bias_ids.push_back(b.token);
+        }
+        std::sort(result->fast_bias_ids.begin(), result->fast_bias_ids.end());
+        result->fast_bias_ids.erase(std::unique(result->fast_bias_ids.begin(), result->fast_bias_ids.end()), result->fast_bias_ids.end());
+        // many biases, a token biased twice (the chain may add them in another order) or a negative id: the full path
+        if (result->fast_bias_ids.size() > 256 || result->fast_bias_ids.size() != merged.size() ||
+                (!result->fast_bias_ids.empty() && result->fast_bias_ids.front() < 0)) {
+            result->fast_k = 0;
+        }
+    }
+
     return result;
 }
 
@@ -519,9 +664,13 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .cur     = */ {},   // S2: scratch, rebuilt by the next sample (was a full-vocabulary copy)
+        /* .cur_p   = */ {},
         /* .rng     = */ gsmpl->rng,
+        /* .t_total_us */ gsmpl->t_total_us,
+        /* .fast_k  */ gsmpl->fast_k,
+        /* .fast_bias */ gsmpl->fast_bias,
+        /* .fast_bias_ids */ gsmpl->fast_bias_ids,
     };
 }
 
@@ -612,7 +761,12 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    {
+        // S2: the fast path only where the chain is the first thing to touch the logits
+        const bool allow_fast = !(grammar_first && grammar_should_apply(gsmpl)) &&
+            (!gsmpl->rbudget || common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING);
+        gsmpl->set_logits(ctx, idx, allow_fast);
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.

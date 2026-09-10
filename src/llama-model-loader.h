@@ -94,9 +94,10 @@ struct llama_model_loader {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
 
-        // managed buffer size in bytes for on-demand tensors; 0 = mmap-based lazy
-        // loading (set by the caller before the create_tensor() calls)
-        size_t buf_size = 0;
+        // managed buffer size in bytes for the managed LAZY_MODE_AUTO PLE reader
+        // (qwen4exp per_layer_token_embd); 0 = no managed reader (fall back to the mmap
+        // lazy path / full load).  Set by the caller before the create_tensor() calls.
+        size_t managed_budget = 0;
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask

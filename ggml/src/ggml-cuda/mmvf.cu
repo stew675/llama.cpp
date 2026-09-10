@@ -135,6 +135,7 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
+#pragma unroll 4
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
@@ -243,6 +244,7 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const int *) gate_x;
             }
         }
+#pragma unroll 4
         for (int col2 = tid; col2 < ncols2; col2 += block_size) {
             const int tmpx = x2[col2];
             int tmpx_gate = 0;
@@ -305,8 +307,26 @@ static __global__ void mul_mat_vec_f(
     }
 
     ggml_cuda_pdl_lc();
+    // multi-token: one cross-warp exchange for all columns instead of two barriers per column. Per column the
+    // arithmetic is unchanged: the warp butterfly, then warp 0 butterflies the per-warp sums (0 past nwarps).
+    constexpr bool batched_reduce = !has_fusion && ncols_dst > 1 && block_size > warp_size;
+    if constexpr (batched_reduce) {
+        __shared__ float buf_cols[ncols_dst][warp_size];
 #pragma unroll
-    for (int j = 0; j < ncols_dst; ++j) {
+        for (int j = 0; j < ncols_dst; ++j) {
+            sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            buf_cols[j][tid/warp_size] = sumf[j];
+        }
+        __syncthreads();
+        if (tid < warp_size) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                sumf[j] = warp_reduce_sum<warp_size>(tid < block_size/warp_size ? buf_cols[j][tid] : 0.0f);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < (batched_reduce ? 0 : ncols_dst); ++j) {
         sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
 
         if constexpr (has_fusion) {
@@ -383,6 +403,94 @@ static __global__ void mul_mat_vec_f(
     }
 }
 
+// Short rows (few K iterations per thread) waste most of a multi-warp block on the cross-warp reduction and launch
+// 5..8 waves per row. This kernel gives each row one warp that plays the vblock threads of mul_mat_vec_f: lane l
+// accumulates virtual threads l, l + warp_size, ... in their own registers, in the same K order; each virtual warp's
+// sum is the same butterfly, and the per-warp sums are combined by the same butterfly (0 past the virtual warps).
+// So every output is bit-identical to mul_mat_vec_f<T, float, ncols_dst, vblock> (no fusion, no ids).
+// Warp w of block b takes rows (b*rows_per_block + w) + k*gridDim.x*rows_per_block.
+template <typename T, int ncols_dst, int vblock, int rows_per_block>
+__launch_bounds__(rows_per_block*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_f_vb(
+        const T * x_ptr, const float * y_ptr, float * dst_ptr, const int ncols2, const int nrows,
+        const int stride_row, const int stride_col_y2, const int stride_col_dst,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nv        = vblock / warp_size;
+    static_assert(vblock % warp_size == 0 && nv > 1 && nv <= warp_size, "bad vblock");
+
+    const int lane        = threadIdx.x % warp_size;
+    const int channel_dst = blockIdx.y;
+    const int sample_dst  = blockIdx.z;
+    const int channel_x   = fastdiv((uint32_t) channel_dst, channel_ratio);
+    const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
+
+    ggml_cuda_pdl_sync();
+    const float2 * y2 = (const float2 *) (y_ptr + int64_t(sample_dst)*stride_sample_y + channel_dst*stride_channel_y);
+    float * dst = dst_ptr + int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
+
+    for (int row = blockIdx.x*rows_per_block + threadIdx.x/warp_size; row < nrows; row += gridDim.x*rows_per_block) {
+        const T * x = x_ptr + int64_t(sample_x)*stride_sample_x + channel_x*stride_channel_x + int64_t(row)*stride_row;
+
+        float sumf[nv][ncols_dst];
+#pragma unroll
+        for (int v = 0; v < nv; ++v) {
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                sumf[v][j] = 0.0f;
+            }
+        }
+
+#pragma unroll
+        for (int v = 0; v < nv; ++v) {
+            if constexpr (std::is_same_v<T, float>) {
+                const float2 * x2 = (const float2 *) x;
+#pragma unroll 4
+                for (int col2 = v*warp_size + lane; col2 < ncols2; col2 += vblock) {
+                    const float2 tmpx = x2[col2];
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        const float2 tmpy = y2[j*stride_col_y2 + col2];
+                        ggml_cuda_mad(sumf[v][j], tmpx.x, tmpy.x);
+                        ggml_cuda_mad(sumf[v][j], tmpx.y, tmpy.y);
+                    }
+                }
+            } else {
+                static_assert(std::is_same_v<T, nv_bfloat16>, "mul_mat_vec_f_vb: F32 and BF16 only");
+                const int * x2 = (const int *) x;
+#pragma unroll 4
+                for (int col2 = v*warp_size + lane; col2 < ncols2; col2 += vblock) {
+                    const int tmpx = x2[col2];
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        const float2 tmpy = y2[j*stride_col_y2 + col2];
+                        const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
+                        const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
+                        ggml_cuda_mad(sumf[v][j], tmpx0, tmpy.x);
+                        ggml_cuda_mad(sumf[v][j], tmpx1, tmpy.y);
+                    }
+                }
+            }
+        }
+
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            float total = 0.0f;
+#pragma unroll
+            for (int v = 0; v < nv; ++v) {
+                const float wsum = warp_reduce_sum<warp_size>(sumf[v][j]);
+                total = lane == v ? wsum : total;
+            }
+            total = warp_reduce_sum<warp_size>(total);
+            if (lane == j) {
+                dst[j*stride_col_dst + row] = total;
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+}
+
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -450,6 +558,45 @@ void launch_mul_mat_vec_f_cuda(
     }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+#if defined(GGML_USE_HIP)
+    // RDNA4, short F32/BF16 rows (one K iteration per thread, K <= 512) and many of them: one warp per row through
+    // mul_mat_vec_f_vb (bit-identical), 4 rows per block, at most 1792 warps in flight (the grid-size stall, see
+    // GGML_MMVQ_RDNA4_DECODE_GRID). gfx1201 sweep (K 192..512 x 3072..10240 rows x 1..8 tokens): -1..-69 % while
+    // (block_size/warp_size) * ncols_dst <= 36, losing up to 17 % above that; fewer rows lose up to 37 %.
+    // E.g. the 10240 x 320 BF16 hyper-connection up-projection of Flash-Next GSQ: 23.6 -> 14.1 us per token.
+    if constexpr (!is_multi_token_id && (std::is_same_v<T, float> || std::is_same_v<T, nv_bfloat16>) && std::is_same_v<type_acc, float>) {
+        constexpr int vb_rpb = 4;
+        constexpr int vb_max_warps = 1792;
+        if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc) && warp_size == 32 && ids == nullptr && !has_fusion &&
+            niter_best == 1 && nrows >= 3072 && (block_size_best/warp_size)*ncols_dst <= 36) {
+            const int64_t nblk = (nrows + vb_rpb - 1) / vb_rpb;
+            const dim3 vb_nums(std::min<int64_t>(nblk, vb_max_warps/vb_rpb), nchannels_dst, nsamples_or_ntokens);
+            const ggml_cuda_kernel_launch_params vb_params = {vb_nums, dim3(vb_rpb*warp_size, 1, 1), 0, stream};
+            const auto vb_launch = [&](auto vb_tag) {
+                constexpr int c_vb = decltype(vb_tag)::value;
+                if constexpr ((c_vb/32)*ncols_dst <= 36) {
+                    ggml_cuda_kernel_launch(mul_mat_vec_f_vb<T, ncols_dst, c_vb, vb_rpb>, vb_params,
+                        x, y, dst, (int) (ncols/2), (int) nrows, (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst,
+                        channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y, (int) stride_channel_dst,
+                        sample_ratio_fd, (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
+                } else {
+                    GGML_ABORT("fatal error");
+                }
+            };
+            switch (block_size_best) {
+                case  64: vb_launch(std::integral_constant<int,  64>{}); return;
+                case  96: vb_launch(std::integral_constant<int,  96>{}); return;
+                case 128: vb_launch(std::integral_constant<int, 128>{}); return;
+                case 160: vb_launch(std::integral_constant<int, 160>{}); return;
+                case 192: vb_launch(std::integral_constant<int, 192>{}); return;
+                case 224: vb_launch(std::integral_constant<int, 224>{}); return;
+                case 256: vb_launch(std::integral_constant<int, 256>{}); return;
+                default: break;
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);

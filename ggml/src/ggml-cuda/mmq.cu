@@ -259,7 +259,8 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_ASSERT(src0s[0]->ne[2] == src0s[1]->ne[2]);
 
     // ISOLATION HOOK: run the two muls through the ORIGINAL single-node path (no merge)
-    if (getenv("GGML_PAIR_2X") != nullptr) {
+    static const bool pair_2x = getenv("GGML_PAIR_2X") != nullptr;
+    if (pair_2x) {
         ggml_cuda_mul_mat_q(ctx, dst0->src[0], dst0->src[1], dst0->src[2], dst0, nullptr, nullptr);
         ggml_cuda_mul_mat_q(ctx, dst1->src[0], dst1->src[1], dst1->src[2], dst1, nullptr, nullptr);
         return;
@@ -333,7 +334,7 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * swiglu) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const ggml_tensor * swiglu, bool swiglu_dense) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -356,7 +357,10 @@ void ggml_cuda_mul_mat_q(
 
     const ggml_tensor * gate = swiglu ? swiglu->src[0] : nullptr;
     const ggml_tensor * up   = swiglu ? swiglu->src[1] : nullptr;
-    if (swiglu) {
+    if (swiglu && swiglu_dense) {
+        GGML_ASSERT(!ids && gate && gate->type == GGML_TYPE_F32 && (up == nullptr || up->type == GGML_TYPE_F32));
+        GGML_ASSERT(src1->ne[2] == 1 && src1->ne[3] == 1);
+    } else if (swiglu) {
         GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_IQ4_NL);
         GGML_ASSERT(gate && up && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, src1));
@@ -414,6 +418,15 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
+            } else if (swiglu && swiglu_dense) {
+                // gate/up: the two GLU sources, or the two halves of one (swapped picks which is the gate)
+                const bool split = up != nullptr;
+                const int32_t swapped = ggml_get_op_params_i32(swiglu, 1);
+                const float * gate_d = (const float *) gate->data + (split ? 0 : (swapped ? ne10 : 0));
+                const float * up_d   = split ? (const float *) up->data : (const float *) gate->data + (swapped ? 0 : ne10);
+                quantize_mmq_q8_1_glu_cuda(gate_d, up_d, src1_q8_1.get(), src0->type, ne10,
+                    gate->nb[1] / sizeof(float), (split ? up->nb[1] : gate->nb[1]) / sizeof(float),
+                    ne10_padded, ne11, q8_1_chunks, stream);
             } else if (swiglu) {
                 quantize_mmq_q8_1_swiglu_cuda(
                     (const float *) gate->data, (const float *) up->data, nullptr, src1_q8_1.get(), src0->type,
@@ -556,6 +569,11 @@ void ggml_cuda_mul_mat_q(
 void ggml_cuda_mul_mat_q_swiglu(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * swiglu) {
     ggml_cuda_mul_mat_q(ctx, src0, swiglu, ids, dst, nullptr, swiglu);
+}
+
+void ggml_cuda_mul_mat_q_swiglu_dense(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * dst, const ggml_tensor * swiglu) {
+    ggml_cuda_mul_mat_q(ctx, src0, swiglu, nullptr, dst, nullptr, swiglu, /*swiglu_dense=*/true);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
