@@ -7,6 +7,7 @@
 #include "mmvq.cuh"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +60,7 @@ struct table_t {
     const void * host       = nullptr;
     void *      host_dev    = nullptr;  // device-accessible alias of `host` (UVA), Phase 1b cold reads
     bool        host_dev_bound = false; // the alias was resolved (or ruled out) once
+    bool        host_pinned = false;    // `host` is pinned (cudaHostGetDevicePointer succeeded): the in-place reads need it
     int         device      = -1;       // CUDA ordinal that owns (allocates and reads) this table's arena
 
     int         slots       = 0;        // 0 => disabled (no budget / alloc failed)
@@ -250,6 +252,10 @@ int                                 g_uniform_slots = -1;       // the decided p
 // it after a compute-buffer drop returned the VRAM.  -1 = the layer was not cacheable at sizing time.
 int                                 g_rearm_slots[512];
 bool                                g_sized           = false;  // the deferred sizing has run
+// Bumped by every entry point that can write an arena or a device slot map (the decode-band hooks, sizing, re-arm,
+// eviction).  The cache-aware staging orders its copy stream after the compute stream only when this moved since its
+// last staging on that device: during a prefill nothing writes, so the staging keeps overlapping the compute.
+std::atomic<uint64_t>               g_write_seq{1};
 bool                                g_cold_uva        = false;  // MOE_EXPERT_CACHE_COLD=uva: serve rejected misses from the host alias
 int64_t                             g_cold_reaches    = 0;
 // Phase 1b fill-vs-cold admission policy (only consulted when a cold read is available):
@@ -371,6 +377,7 @@ void bind_host_dev_locked(table_t & t) {
     void * dev = nullptr;
     if (cudaHostGetDevicePointer(&dev, (void *) t.host, 0) == cudaSuccess && dev != nullptr) {
         t.host_dev = dev;
+        t.host_pinned = true;
         return;
     }
     (void) cudaGetLastError();
@@ -463,14 +470,14 @@ void parse_env() {
     // kernels do the cold-region lookup, so a cold id is safe with fusions on.  A miss served cold
     // reads the pinned host slice in place (the same bytes the H2D fill would have placed in the
     // slot), and it also lets a small arena represent an overflow (`id = slots + e`).
-    g_cold_uva = true;
+    g_cold_uva = env_int("MOE_EXPERT_CACHE_COLD_UVA", 1) != 0;
     // Admission: `touch` (measured best at every arena size): a first-touch expert is served cold and
     // only a re-touch is admitted, so one-shot experts stop churning the arena - which raises `h` as
     // well as cutting transferred bytes.
-    g_admit = 2;
+    g_admit = env_int("MOE_EXPERT_CACHE_ADMIT", 2);
     g_touch = env_int("MOE_EXPERT_CACHE_TOUCH", 2);
-    if (g_touch < 2) {
-        g_touch = 2;
+    if (g_touch < 1) {
+        g_touch = 1;
     }
     // Fail-soft / --fit: the reserve kept for the compute reserve / KV growth.
     g_reserve_mib      = env_int("MOE_EXPERT_CACHE_RESERVE_MIB", 1024);
@@ -1793,6 +1800,7 @@ bool g_floor_active = false;
 // `total_expert_bytes` is known once the first decode pass has registered every table; that first
 // pass runs uncached (the scheduler copies the full experts), the second sizes and starts filling.
 void alloc_all_locked() {
+    g_write_seq++;
     if (g_sized) {
         return;
     }
@@ -2503,6 +2511,7 @@ void moe_cache_disable_streaming(const char * why) {
 // is in flight and the compute buffer has already been dropped (the drop site re-reserves the narrow
 // layout first), so the CPU-side take-over decisions of the next graph all see the same residency.
 bool moe_cache_rearm() {
+    g_write_seq++;
     if (!g_enabled) {
         return false;   // released wholesale, or never sized: nothing to re-arm against
     }
@@ -2588,6 +2597,7 @@ bool moe_cache_rearm() {
 // Called with `g_slab_mutex` NOT held (the slab releases it around this call) but WITH the cache lock, so
 // the slab's own lock is taken here -- ordering is always cache -> slab.
 size_t moe_cache_evict_slab_range(int device, void * lo, void * hi) {
+    g_write_seq++;
     if (!g_enabled) {
         return 0;
     }
@@ -2916,6 +2926,12 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
     t.host_pitch   = host_pitch;
     t.split_axis   = split_axis;
     t.cold_safe    = cold_safe;
+    // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
+    // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
+    if (getenv("GGML_CUDA_CACHE_GEOM_DEBUG") != nullptr) {
+        GGML_LOG_WARN("CACHE_GEOM layer=%d role=%s n_experts=%d expert_bytes=%zu host_bytes=%zu src_off=%zu host_pitch=%zu split_axis=%d cold_safe=%d\n",
+                      layer, t.role.c_str(), n_experts, expert_bytes, host_bytes, src_off, host_pitch, split_axis, (int) cold_safe);
+    }
     t.host         = host;
     t.device       = device;
     attach_host_src_locked(t, host);
@@ -3158,6 +3174,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
                            const int32_t * ids, int64_t n_used, int64_t n_tok,
                            size_t ids_nb0, size_t ids_nb1, void * stream,
                            int device, size_t slice_off, int split_axis) {
+    g_write_seq++;
     if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
         return false;
     }

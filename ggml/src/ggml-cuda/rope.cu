@@ -3,6 +3,17 @@
 #include "ggml.h"
 #include "rope.cuh"
 
+// The ROPE -> VIEW -> SET_ROWS fusion (ggml_cuda_should_fuse_rope_set_rows, upstream #16884) is
+// selected by ggml_cuda_check_fusion_memory_ranges(), i.e. by buffer addresses, so its fused
+// (D=half/bf16) kernel must round identically to the unfused chain (D=float/float + k_set_rows).
+// It does not: clang contracts the multiply-adds of the two template instantiations differently,
+// and a single f16 cache element of a 27B IMROPE prefill then differs by 1 ULP, which amplifies
+// into different greedy text across process starts (issue #67).  Disable FP contraction for this
+// file so every rope instantiation uses the same rounding; the fused kernels then reproduce the
+// chain they replace.  The unfused chain's rounding moves to the contracted-off form as well
+// (both agree on the new value); the 4B same-seed gate and the width probe are unchanged.
+#pragma clang fp contract(off)
+
 struct rope_corr_dims {
     float v[2];
 };

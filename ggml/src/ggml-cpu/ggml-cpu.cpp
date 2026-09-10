@@ -240,7 +240,7 @@ static int ggml_backend_cpu_moe_offload_cap(void) {
         def = 1;
     }
 
-    const char * env = getenv("GGML_CPU_MOE_OFFLOAD_THREADS");
+    static const char * env = getenv("GGML_CPU_MOE_OFFLOAD_THREADS");
     if (env != nullptr) {
         const int v = atoi(env);
         if (v <= 0) {
@@ -382,6 +382,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .event_wait              = */ NULL,
     /* .stage_buffer            = */ NULL,
     /* .stage_upload            = */ NULL,
+    /* .stage_gather            = */ NULL,
     /* .stage_wait              = */ NULL,
     /* .stage_d2d               = */ NULL,
     /* .stage_h2d_gbps          = */ NULL,

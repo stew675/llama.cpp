@@ -314,6 +314,24 @@ void ggml_backend_dev_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes) {
     dev->iface.slab_narrow_floor(dev, bytes);
 }
 
+void ggml_backend_dev_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes) {
+    // wip/moe-verify-fusions (narrow-2): pin the MTP draft's COMPUTE region.  Optional hook; a backend
+    // without a slab (or that never set it) is a no-op.
+    if (dev == nullptr || dev->iface.slab_narrow2_floor == nullptr) {
+        return;
+    }
+    dev->iface.slab_narrow2_floor(dev, bytes);
+}
+
+void ggml_backend_dev_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable) {
+    // wip/moe-verify-fusions (narrow-2): route this context's COMPUTE allocations to the pinned narrow-2
+    // region.  Optional hook; a backend without a slab (or that never set it) is a no-op.
+    if (dev == nullptr || dev->iface.slab_compute_narrow2 == nullptr) {
+        return;
+    }
+    dev->iface.slab_compute_narrow2(dev, enable);
+}
+
 size_t ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev) {
     // OPEN 2 (TODO #42): 0 when this backend has no movable-boundary slab (or never set the hook), which is
     // how the caller tells "no slab to reclaim the wide layout with" from "slab, and it is this wide".
@@ -668,7 +686,6 @@ void ggml_backend_synchronize(ggml_backend_t backend) {
     if (backend->iface.synchronize == NULL) {
         return;
     }
-
     backend->iface.synchronize(backend);
 }
 
@@ -1951,6 +1968,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         },
         /* .user_data     = */ &alloc_deps,
+        /* .has_eval_callback = */ sched->callback_eval != nullptr,
+        /* .full_graph    = */ graph,
+        /* .marks_only    = */ false,
+        /* .allocs_only   = */ false,
     };
 
     for (int i = 0; i < sched->n_splits; i++) {
@@ -2197,7 +2218,7 @@ static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
 // the default threshold is calibrated from the backend's measured H2D bandwidth.  An explicit
 // GGML_SCHED_STAGE_MIN_TOKENS overrides it (0 = stage for every batch).
 static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
-    const char * e = getenv("GGML_SCHED_STAGE_MIN_TOKENS");
+    const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_MIN_TOKENS");
     if (e != nullptr) {
         return (int64_t) atoll(e);
     }
@@ -2220,7 +2241,7 @@ static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
         calibrated = (int64_t) (t > 64.0 ? t : 64.0);
         GGML_LOG_INFO("%s: H2D staging calibration: %.1f GB/s -> min_tokens=%lld\n",
                       __func__, double(bw), (long long) calibrated);
-        if (getenv("GGML_SCHED_STAGE") != nullptr) {
+        if (GGML_ENV_STR("GGML_SCHED_STAGE") != nullptr) {
             // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
             // so a field log would not show which gate this host actually chose (only the messages
             // emitted before llama_log_set installs the filter get through by default).  An explicit
@@ -2906,14 +2927,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
 
-    const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
+    const char * GGML_SCHED_DEBUG = GGML_ENV_STR("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
     sched->debug_realloc = 1;
 #endif
-    const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
+    const char * GGML_SCHED_DEBUG_REALLOC = GGML_ENV_STR("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
@@ -2956,7 +2977,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         // ON (2026-09-30, r26): with a single graph copy the full synchronize ran thousands of times
         // per offloaded prefill pass (measured 5.2 s at `-ub 8192`, and 861 -> 1072 t/s once the
         // events are created).  `GGML_SCHED_EVENTS=0` opts out.
-        static const bool sched_events = getenv("GGML_SCHED_EVENTS") == NULL || atoi(getenv("GGML_SCHED_EVENTS")) != 0;
+        static const bool sched_events = GGML_ENV_STR("GGML_SCHED_EVENTS") == NULL || atoi(GGML_ENV_STR("GGML_SCHED_EVENTS")) != 0;
         if (sched->n_copies > 1 || sched_events) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
@@ -2967,11 +2988,25 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
     {
-        const char * stage_env = getenv("GGML_SCHED_STAGE");
-        sched->stage_enabled = stage_env != NULL && atoi(stage_env) != 0;
-        const char * mode_env = getenv("GGML_SCHED_STAGE_MODE");
-        sched->stage_mode = mode_env != NULL ? atoi(mode_env) : 1;
-        const char * slots_env = getenv("GGML_SCHED_STAGE_SLOTS");
+        // Op-offload H2D staging (issue #50) is ON by default: it is what overlaps a host-resident
+        // weight upload with the previous split's compute, and on `-sm tensor -ncmoe` it is worth
+        // +64 % at pp8192 (3271 -> 5364).  GGML_SCHED_STAGE=0 opts out (the pre-staging behaviour);
+        // the adaptive width gate (`sched_stage_min_tokens`) still decides per split, so a narrow
+        // decode/verify batch never stages a whole expert tensor.  A backend that does not implement
+        // staging is unaffected (see the capability check below).
+        const char * stage_env = GGML_ENV_STR("GGML_SCHED_STAGE");
+        const bool stage_forced = stage_env != NULL && atoi(stage_env) != 0;
+        sched->stage_enabled = stage_env == NULL || atoi(stage_env) != 0;
+        const char * mode_env = GGML_ENV_STR("GGML_SCHED_STAGE_MODE");
+        // Redirect mode (1) points the split input straight at the ring slot to save one D2D copy.  It is
+        // **default off as of 2026-10-06**: it assumes the consumer reads the tensor's `data` at launch
+        // time, and that is false -- the meta path proved it (the stage guard restored the pointer right
+        // after enqueuing the child graphs, and the kernels then read the restored pointer, so 0 of 24
+        // staged slots ever reached `MUL_MAT_ID`; `stage_d2d` fixed it and measured the *same* speed, so
+        // the copy this mode avoids is not worth anything).  `GGML_SCHED_STAGE_MODE=1` re-enables it for
+        // A/B only; a correct redirect would have to defer the restore to the slot's free event.
+        sched->stage_mode = mode_env != NULL ? atoi(mode_env) : 0;
+        const char * slots_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");
         sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
         if (sched->stage_n_slots < 1) {
             sched->stage_n_slots = 1;
@@ -3003,8 +3038,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 }
             }
             if (!stage_capable) {
-                GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1 but no backend supports it; staging inactive\n",
-                              __func__);
+                if (stage_forced) {
+                    GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1 but no backend supports it; staging inactive\n",
+                                  __func__);
+                }
+                sched->stage_enabled = false;
             }
         }
     }
@@ -3088,6 +3126,17 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_reset(sched);
 
     return true;
+}
+
+// WIP r42 (TODO #42): release the scheduler's compute buffers so the next alloc_graph re-reserves them
+// from the graph at hand.  The buffers are otherwise grow-only, so a wide-prefill layout stays resident
+// for the rest of the run and crowds out the MoE expert cache arena.  The caller must be at a graph
+// boundary (the previous graph has completed); we synchronize here to be safe.
+void ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    ggml_backend_sched_synchronize(sched);
+    ggml_gallocr_drop_buffers(sched->galloc);
+    sched->is_alloc = false;
 }
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
@@ -3583,6 +3632,9 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
             /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
             /* .get_alloc_size_n    = */ NULL,
             /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .get_compute_margin_pct = */ NULL,
+            /* .alloc_buffer_usage  = */ NULL,
+            /* .get_compute_chunk_bytes = */ NULL,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ NULL,
@@ -3608,6 +3660,9 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
             /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
             /* .get_alloc_size_n    = */ NULL,
             /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .get_compute_margin_pct = */ NULL,
+            /* .alloc_buffer_usage  = */ NULL,
+            /* .get_compute_chunk_bytes = */ NULL,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ NULL,

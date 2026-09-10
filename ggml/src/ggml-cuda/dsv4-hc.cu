@@ -1,5 +1,13 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "mmb.cuh"
+
+// RNE f32 -> bf16, bit-identical to mmb.cu's mmb_f2bf.
+static __device__ __forceinline__ uint16_t dsv4_f2bf(float f) {
+    uint32_t u = __float_as_uint(f);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (uint16_t)(u >> 16);
+}
 
 
 static constexpr int DSV4_HC = 4;
@@ -100,7 +108,13 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-template <bool gated>
+// The HC pre/post kernels are pure streaming (every element is read/written once, no reuse), so the
+// bulk accesses use non-temporal loads/stores: they are value-preserving cache hints only (identical
+// results), but they stop these buffers from thrashing the L2/MALL that the surrounding GEMM weight
+// streams are using.  Measured in situ (gfx1151, IQ4_XS Flash-Next, pp8192): dsv4_hc_pre 605 -> 493
+// us/call (+18.6 %), dsv4_hc_post 691 -> 660 ms; the standalone microbench (no competing traffic)
+// shows no difference, which is why this was not visible before.
+template <bool gated, bool wbf16, bool xbf16>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
         const float * weights,
@@ -116,7 +130,9 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sw2,
         int64_t sd0,
         int64_t sd1,
-        float   scale) {
+        float   scale,
+        uint16_t * dst16 = nullptr,
+        bool    store_f32 = true) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
@@ -132,17 +148,40 @@ static __global__ void dsv4_hc_pre_f32(
 
     float sum = 0.0f;
     for (int64_t ih = 0; ih < hc; ++ih) {
-        const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+        float xv;
+        if constexpr (xbf16) {
+            // HC16: the xn producer skipped its F32 store; read the bf16 copy instead (exact
+            // expansion of the RNE-rounded value, so only the F32->bf16 rounding is new).
+            const uint16_t h = __builtin_nontemporal_load((const uint16_t *) x + i0*sx0 + ih*sx1 + it*sx2);
+            xv = __uint_as_float(((uint32_t) h) << 16);
+        } else {
+            xv = x[i0*sx0 + ih*sx1 + it*sx2];
+        }
         float wv;
         if constexpr (gated) {
-            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+            float wr;
+            if constexpr (wbf16) {
+                // the producer (MMB dense) wrote the gate into its pinned BF16 slot; expand the
+                // bf16 back to f32 exactly (round-to-nearest-even on the way in, so this reproduces
+                // the value the producer rounded to -- a numerics change vs the F32 chain, approved
+                // as a prefill re-baseline).
+                const uint16_t h = __builtin_nontemporal_load((const uint16_t *) weights + i0*sw0 + ih*sw1 + it*sw2);
+                wr = __uint_as_float(((uint32_t) h) << 16);
+            } else {
+                wr = weights[i0*sw0 + ih*sw1 + it*sw2];
+            }
+            wv = 1.0f / (1.0f + expf(-wr));
         } else {
             wv = weights[ih*sw0 + it*sw1];
         }
         sum += xv * wv;
     }
 
-    dst[i0*sd0 + it*sd1] = scale * sum;
+    const float v = scale * sum;
+    if (store_f32) __builtin_nontemporal_store(v, dst + i0*sd0 + it*sd1);
+    if (dst16 != nullptr) {
+        __builtin_nontemporal_store(dsv4_f2bf(v), dst16 + i0*sd0 + it*sd1);
+    }
 }
 
 template <bool has_comb>
@@ -182,16 +221,16 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+    float sum = __builtin_nontemporal_load(x + i0*sx0 + it*sx1) * post[idst*sp0 + it*sp1];
     if constexpr (has_comb) {
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
-            sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+            sum += __builtin_nontemporal_load(residual + i0*sr0 + isrc*sr1 + it*sr2) * comb[idst*sc0 + isrc*sc1 + it*sc2];
         }
     } else {
-        sum += residual[i0*sr0 + idst*sr1 + it*sr2];
+        sum += __builtin_nontemporal_load(residual + i0*sr0 + idst*sr1 + it*sr2);
     }
 
-    dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+    __builtin_nontemporal_store(sum, dst + i0*sd0 + idst*sd1 + it*sd2);
 }
 
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -256,20 +295,50 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
+    // If the graph marked the gate producer BF16-only, the MMB dense kernel wrote the gate into its
+    // pinned BF16 slot; read that copy instead of the (not-written) F32 tensor.  The lookup is null
+    // when no BF16 copy exists (MMB off, producer not taken, or threshold not met), so the F32 path
+    // runs and the result is bit-identical to before.
+    const ggml_tensor * w_root = weights->view_src ? weights->view_src : weights;
+    const uint16_t * w16 = (gated && ggml_cuda_mmb_is_bf16_only(w_root)) ? ggml_cuda_mmb_cache_lookup(w_root) : nullptr;
+
+    // HC16: the normalized stream xn (src[0]) may have been marked BF16-only by the graph optimizer
+    // when every consumer (this op and the two F32 inject GEMMs) reads the bf16 copy.  Then its
+    // producer skipped the F32 store and only the bf16 slot holds data.  NOTE: x is a double view
+    // (mul -> reshape_2d -> reshape_3d) and the mark is on the mul root, so walk the whole view chain.
+    const ggml_tensor * x_root = x;
+    while (x_root->view_src) x_root = x_root->view_src;
+    const uint16_t * x16 = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root) : nullptr;
+
     const int block_size = 256;
     const int64_t nr = n_embd * n_tokens;
     const dim3 block_dims(block_size, 1, 1);
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
+    auto kernel = gated ? (w16 ? (x16 ? dsv4_hc_pre_f32<true, true, true>  : dsv4_hc_pre_f32<true, true, false>)
+                               : (x16 ? dsv4_hc_pre_f32<true, false, true> : dsv4_hc_pre_f32<true, false, false>))
+                        : (x16 ? dsv4_hc_pre_f32<false, false, true> : dsv4_hc_pre_f32<false, false, false>);
+    const float * xptr = x16 ? (const float *) x16 : (const float *) x->data;
+    const float * wptr = w16 ? (const float *) w16 : (const float *) weights->data;
+    // HC16: if this mixed stream is an MMB GEMM activation, also emit the BF16 copy the GEMM will
+    // read (RNE-rounded exactly as mmb_cvt_f32_bf16), so it skips its own conversion pass.  The F32
+    // output is still written, so every other consumer is unaffected (bit-identical).
+    uint16_t * dst16 = nullptr;
+    bool store_f32 = true;
+    if (ggml_cuda_mmb_is_bf16_only(dst)) {
+        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
+        store_f32 = false;
+    } else if (ggml_cuda_mmb_wants_bf16_copy(dst)) {
+        dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
+    }
     ggml_cuda_kernel_launch(kernel, launch_params,
-            (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+            xptr, wptr, (float *) dst->data,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale);
+            scale, dst16, store_f32);
 }
 
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

@@ -50,6 +50,10 @@ static __global__ void flash_attn_qsa(
         const char * V_ptr,
         const int  * idx_ptr,
         const char * mask_ptr,
+        const int  * cell_vis_ptr,
+        const int  * q_vis_ptr,
+        const int    nb_cv1,
+        const int    nb_qv1,
         float      * dst_ptr,
         float      * parts_ptr,
         float2     * meta_ptr,
@@ -112,7 +116,22 @@ static __global__ void flash_attn_qsa(
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
     idx += col*ne40 + sequence*ne40*ne41; // [n_top_k, n_tps, 1, n_stream]
-    const half * maskh = (const half *) (mask + nb33*(sequence % ne33) + nb31*col);
+    const half * maskh = mask_ptr != nullptr
+            ? (const half *) (mask + nb33*(sequence % ne33) + nb31*col) : nullptr;
+
+    // the per-cell visibility: derived from the compact keys when they are present (cell_vis is
+    // the cell's compaction key, -1 for an empty or foreign cell; q_vis is the query's key), else
+    // gathered from the mask.  Same values, and the same fp16 constants the mask holds.
+    const int * cell_vis = cell_vis_ptr != nullptr ? cell_vis_ptr + sequence*nb_cv1 : nullptr;
+    const int   q_vis_r  = q_vis_ptr    != nullptr ? q_vis_ptr[col + sequence*nb_qv1] : 0;
+
+    auto qsa_cell_mask = [&](int cell_g) -> half {
+        if (cell_vis != nullptr) {
+            const int cv = cell_vis[cell_g];
+            return cv >= 0 && cv <= q_vis_r ? __float2half(0.0f) : __float2half(-INFINITY);
+        }
+        return maskh[cell_g];
+    };
 
     const int row  = (sequence*int(ne01.z) + col)*ne02 + head;
     const int k0   = slice*n_slice_cells;
@@ -241,7 +260,7 @@ static __global__ void flash_attn_qsa(
                     }
                 }
                 if (flat < tile_len) {
-                    M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];
+                    M_smem[flat] = qsa_cell_mask(identity ? tile0 + flat : idx[tile0 + flat]);
                 }
             }
             __syncthreads();
@@ -389,7 +408,7 @@ static __global__ void flash_attn_qsa(
                 // reads M_smem for every K/V type, but only the F16/Q8_0
                 // gather wrote it (uninitialized smem otherwise)
                 if (flat < tile_len) {
-                    M_smem[flat] = maskh[identity ? tile0 + flat : idx[tile0 + flat]];
+                    M_smem[flat] = qsa_cell_mask(identity ? tile0 + flat : idx[tile0 + flat]);
                 }
             }
             __syncthreads();
@@ -487,6 +506,8 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
     const ggml_tensor * V   = dst->src[2];
     const ggml_tensor * idx = dst->src[3];
     const ggml_tensor * mask = dst->src[4];
+    const ggml_tensor * cell_vis = dst->src[5];
+    const ggml_tensor * q_vis    = dst->src[6];
 
     cudaStream_t main_stream = ctx.stream();
 
@@ -511,7 +532,7 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
 
     int n_slices      = 1;
     int n_slice_cells = (int) n_top_k;
-    const char * qsa_slices_env = getenv("GGML_CUDA_QSA_SLICES");
+    static const char * qsa_slices_env = getenv("GGML_CUDA_QSA_SLICES");
     if (qsa_slices_env != nullptr) {
         n_slices = std::max(1, std::atoi(qsa_slices_env)); // debug override
         n_slice_cells = (n_slices > 1) ? (int) ((n_top_k + n_slices - 1) / n_slices + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE : (int) n_top_k;
@@ -574,14 +595,20 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
                 (const char *) K->data,
                 (const char *) V->data,
                 (const int  *) idx->data,
-                (const char *) mask->data,
+                mask != nullptr ? (const char *) mask->data : nullptr,
+                cell_vis != nullptr ? (const int *) cell_vis->data : nullptr,
+                q_vis    != nullptr ? (const int *) q_vis->data    : nullptr,
+                cell_vis != nullptr ? (int) (cell_vis->nb[1]/sizeof(int)) : 0,
+                q_vis    != nullptr ? (int) (q_vis->nb[1]/sizeof(int))    : 0,
                 (float *) dst->data,
                 dst_data, meta.ptr, n_slices, n_slice_cells,
                 scale, logit_softcap, identity, head_base,
                 Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
                 K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
                 V->nb[1], V->nb[2], V->nb[3],
-                mask->ne[0], mask->ne[1], mask->ne[3], mask->nb[1], mask->nb[3],
+                mask != nullptr ? mask->ne[0] : 0, mask != nullptr ? mask->ne[1] : 0,
+                mask != nullptr ? mask->ne[3] : 0, mask != nullptr ? mask->nb[1] : 0,
+                mask != nullptr ? mask->nb[3] : 0,
                 idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
         } else {
             constexpr bool use_logit_softcap = true;
@@ -590,14 +617,20 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
                 (const char *) K->data,
                 (const char *) V->data,
                 (const int  *) idx->data,
-                (const char *) mask->data,
+                mask != nullptr ? (const char *) mask->data : nullptr,
+                cell_vis != nullptr ? (const int *) cell_vis->data : nullptr,
+                q_vis    != nullptr ? (const int *) q_vis->data    : nullptr,
+                cell_vis != nullptr ? (int) (cell_vis->nb[1]/sizeof(int)) : 0,
+                q_vis    != nullptr ? (int) (q_vis->nb[1]/sizeof(int))    : 0,
                 (float *) dst->data,
                 dst_data, meta.ptr, n_slices, n_slice_cells,
                 scale, logit_softcap, identity, head_base,
                 Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
                 K->ne[0], K->ne[1], K->ne[2], K->ne[3], K->nb[1], K->nb[2], K->nb[3],
                 V->nb[1], V->nb[2], V->nb[3],
-                mask->ne[0], mask->ne[1], mask->ne[3], mask->nb[1], mask->nb[3],
+                mask != nullptr ? mask->ne[0] : 0, mask != nullptr ? mask->ne[1] : 0,
+                mask != nullptr ? mask->ne[3] : 0, mask != nullptr ? mask->nb[1] : 0,
+                mask != nullptr ? mask->nb[3] : 0,
                 idx->ne[0], idx->ne[1], idx->ne[3], idx->nb[1], idx->nb[3]);
         }
     }
@@ -632,6 +665,14 @@ static void ggml_cuda_flash_attn_qsa_dispatch(ggml_backend_cuda_context & ctx, g
 void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
+    // prefill takes the packed-block WMMA kernel when the graph built the packs (fattn-qsa3.cu);
+    // the W=1..8 decode/verify band never satisfies its q->ne[1] >= 128 gate, so it keeps the
+    // VEC kernel below and width purity holds by construction.
+    if (ggml_cuda_flash_attn_qsa3_supported(ctx.device, dst)) {
+        ggml_cuda_flash_attn_qsa3(ctx, dst);
+        return;
+    }
+
     const ggml_tensor * Q   = dst->src[0];
     const ggml_tensor * K   = dst->src[1];
     const ggml_tensor * V   = dst->src[2];
@@ -651,7 +692,7 @@ void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // kernel is templated on a single type_KV).
     GGML_ASSERT(K->type == V->type);
 
-    const bool identity = getenv("GGML_CUDA_QSA_IDENTITY") != nullptr;
+    static const bool identity = getenv("GGML_CUDA_QSA_IDENTITY") != nullptr;
 
     switch (K->type) {
         case GGML_TYPE_F16:  ggml_cuda_flash_attn_qsa_dispatch<GGML_TYPE_F16 >(ctx, dst, identity, D); break;
@@ -696,7 +737,14 @@ bool ggml_cuda_flash_attn_qsa_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * V   = dst->src[2];
     const ggml_tensor * idx = dst->src[3];
 
-    GGML_UNUSED(device);
+    // A packed (qsa3) op is only supported where the packed kernel is.  This is what lets the
+    // model decide whether to materialise the natural F16 K/V packs by probing the backend
+    // (qsa3_op_supported in src/models/qwen4exp.cpp) instead of mirroring the arch policy, and it
+    // keeps a packed op from being scheduled onto a backend that would silently run the VEC kernel
+    // while the packs still consume memory.
+    if (dst->src[7] != nullptr || dst->src[8] != nullptr) {
+        return ggml_cuda_flash_attn_qsa3_supported(device, dst);
+    }
 
     const bool kv_ok = K->type == V->type && ggml_cuda_flash_attn_qsa_kv_type_supported(K->type);
 

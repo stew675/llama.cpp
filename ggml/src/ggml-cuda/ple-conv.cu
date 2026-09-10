@@ -7,7 +7,9 @@
 // See gdn-conv.cu: the direct conv kernel diverges from the reference under a multi-device tensor
 // split, so keep the fusion on single-device graphs only until that is root-caused.
 static bool ple_conv_enabled() {
-    if (getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr) return false;
+    // Cache the switches: this runs once per conv launch, and getenv() is expensive on Windows.
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr;
+    if (disabled) return false;
     static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
     return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
 }

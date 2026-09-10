@@ -206,11 +206,12 @@ void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    static const bool mmid_512_disabled = getenv("GGML_CUDA_DISABLE_MMID_512") != nullptr;
     // mm_ids_helper_512_10: one 1024-thread block replaces the 512 one-warp expert blocks of the
     // generic helper for the 512-expert/10-used shape.  RDNA3_5 (source of record) + RDNA4
     // (2026-09-06 gfx1201 validation: prefill +4.5% pp16384 / +5.2% pp2048, same-seed text
     // byte-identical; decode unaffected - the helper feeds the mmq prefill path only).
-    if ((GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) && n_experts == 512 && n_expert_used == 10 && getenv("GGML_CUDA_DISABLE_MMID_512") == nullptr) {
+    if ((GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) && n_experts == 512 && n_expert_used == 10 && !mmid_512_disabled) {
         mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
             ids, ids_src1, ids_dst, expert_bounds, n_tokens, nchannels_y, si1, sis1, write_inverse);
         return;

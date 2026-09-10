@@ -130,3 +130,6 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+bool ggml_cuda_sigmoid_mul_add_fusable(const ggml_tensor * sig, const ggml_tensor * mul, const ggml_tensor * add);
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sig, ggml_tensor * mul, ggml_tensor * add);

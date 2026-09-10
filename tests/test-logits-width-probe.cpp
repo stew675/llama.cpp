@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <string>
 #include <vector>
 
@@ -79,8 +80,42 @@ int main(int argc, char ** argv) {
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 99;
+    // wip/moe-verify-fusions: optional host-expert offload (`NCMOE=N` = the first N layers' experts on
+    // the CPU, `NCMOE=0` = every expert on the CPU), so the probe can exercise the `-ncmoe` cache-band
+    // routed-expert path (all-GPU is already covered by the default).
+    {
+        static std::list<std::string> ov_strs;
+        static std::vector<llama_model_tensor_buft_override> ov;
+        const char * ncmoe_env = getenv("NCMOE");
+        const int n_cpu_moe = ncmoe_env ? atoi(ncmoe_env) : -1;
+        if (n_cpu_moe == 0) {
+            ov.push_back({ "\\.ffn_(up|down|gate|gate_up)_(ch|)exps", ggml_backend_cpu_buffer_type() });
+            ov.push_back({ nullptr, nullptr });
+            mp.tensor_buft_overrides = ov.data();
+        } else if (n_cpu_moe > 0) {
+            for (int i = 0; i < n_cpu_moe; ++i) {
+                ov_strs.push_back("blk\\." + std::to_string(i) + "\\.ffn_(up|down|gate|gate_up)_(ch|)exps");
+                ov.push_back({ ov_strs.back().c_str(), ggml_backend_cpu_buffer_type() });
+            }
+            ov.push_back({ nullptr, nullptr });
+            mp.tensor_buft_overrides = ov.data();
+        }
+    }
+    // wip/moe-verify-fusions: split-mode control, so the `-sm tensor` multi-device split path (the
+    // per-op upload/gather/pruning machinery) can be probed instead of the default layer split.
+    if (const char * sp = getenv("SPLIT")) {
+        if (!strcmp(sp, "tensor")) mp.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+        else if (!strcmp(sp, "row")) mp.split_mode = LLAMA_SPLIT_MODE_ROW;
+        else if (!strcmp(sp, "layer")) mp.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    }
     llama_model * model = llama_model_load_from_file(model_path, mp);
     if (!model) { fprintf(stderr, "model load failed\n"); return 1; }
+    // wip/moe-verify-fusions: optionally arm the expert cache exactly like common.cpp does, so the
+    // cache-band routed-expert path is exercised (the bare probe otherwise only streams host experts).
+    if (getenv("CACHE") != nullptr && atoi(getenv("CACHE")) != 0) {
+        const char * am = getenv("AUX_MIB");
+        llama_model_moe_cache_preflight(model, (size_t) (am ? atoll(am) : 4096) * 1024 * 1024);
+    }
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     std::string text;
@@ -94,7 +129,10 @@ int main(int argc, char ** argv) {
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
     const ggml_type kv_type = kv_from_env();
-    printf("tokens=%d P=%d ubatch=%d widths=1..%d KV=%s\n", n, P, ubatch, NW, ggml_type_name(kv_type));
+    printf("tokens=%d P=%d ubatch=%d widths=1..%d KV=%s split=%s ncmoe=%s\n", n, P, ubatch, NW,
+           ggml_type_name(kv_type),
+           mp.split_mode == LLAMA_SPLIT_MODE_TENSOR ? "tensor" : mp.split_mode == LLAMA_SPLIT_MODE_ROW ? "row" : "layer",
+           getenv("NCMOE") ? getenv("NCMOE") : "-");
 
     // rows[w-1] = the logits of every row of the W-token batch, in row order
     std::vector<std::vector<float>> rows[NW];
@@ -104,6 +142,7 @@ int main(int argc, char ** argv) {
         // n_batch is the max tokens per llama_decode call (the whole prefill batch),
         // n_ubatch the max per micro-batch -- they are NOT the same knob.
         cp.n_ctx = 4096; cp.n_batch = P > ubatch ? P : ubatch; cp.n_ubatch = ubatch; cp.n_seq_max = 1;
+        if (const char * q = getenv("NSEQ")) cp.n_seq_max = (uint32_t) atoi(q);
         // Replicate the MTP verify-batch recurrent-state snapshot count: common sets
         // n_rs_seq = draft.n_max, so a W-token batch with n_max = W-1 uses n_rs_seq = W-1.
         {
@@ -154,13 +193,12 @@ int main(int argc, char ** argv) {
     float worst = 0.0f;
     for (int W = 1; W <= NW; ++W) {
         float wmax = 0.0f;
-        int   jmax = -1;
         for (int j = 0; j < W; ++j) {
             const std::vector<float> & a = rows[W - 1][j];
             const std::vector<float> & b = rows[NW - 1][j];
             for (size_t k = 0; k < a.size(); ++k) {
                 const float d = std::fabs(a[k] - b[k]);
-                if (d > wmax) { wmax = d; jmax = j; }
+                if (d > wmax) { wmax = d; }
             }
         }
         if (wmax != 0.0f) bad++;

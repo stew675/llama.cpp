@@ -114,7 +114,10 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // set to false for keys-only caches (e.g. the qwen4exp QSA indexer store):
+        // no V tensor is allocated, and no V-side op may be issued against the cache
+                         bool   v_enabled = true);
 
     ~llama_kv_cache() = default;
 
@@ -235,6 +238,14 @@ public:
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // V3 derived kq mask: true when the packed mask for this batch can be replaced by the compact
+    // per-cell state (see set_input_kq_derived).  The predicate is exactly the shape the phase-1
+    // host oracle proved bit-exact against the packed fill - extend it only with new coverage.
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+    void set_input_kq_derived(
+            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+            const llama_ubatch * ubatch, bool causal_attn) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -431,6 +442,12 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // V3 derived kq mask - see llama_kv_cache::kq_mask_derivable
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+    void set_input_kq_derived(
+            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+            const llama_ubatch * ubatch, bool causal_attn) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

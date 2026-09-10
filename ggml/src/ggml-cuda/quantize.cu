@@ -454,11 +454,14 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+// glu: x is the SWIGLU gate and the value quantized is silu(x) * up, the same float the unfused
+// unary_gated_op_kernel<op_silu> writes (up rows at stride up_s01), so the result is bit-identical.
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool glu = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, const int n_chunks) {
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, const int n_chunks,
+        const float * __restrict__ up = nullptr, const int64_t up_s01 = 0) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -491,7 +494,16 @@ static __global__ void quantize_mmq_q8_1(
         const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
         // Load 4 floats per thread and calculate max. abs. value between them:
-        const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if constexpr (glu) {
+            if (i0 < ne00) {
+                const float4 u = ((const float4 *) up)[((int64_t) blockIdx.x*up_s01 + i00)/4];
+                xi.x = ggml_cuda_op_silu_single(xi.x) * u.x;
+                xi.y = ggml_cuda_op_silu_single(xi.y) * u.y;
+                xi.z = ggml_cuda_op_silu_single(xi.z) * u.z;
+                xi.w = ggml_cuda_op_silu_single(xi.w) * u.w;
+            }
+        }
         float amax = fabsf(xi.x);
         amax = fmaxf(amax, fabsf(xi.y));
         amax = fmaxf(amax, fabsf(xi.z));
@@ -608,6 +620,38 @@ void quantize_mmq_q8_1_cuda(
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
             quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0, n_chunks);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+            break;
+    }
+}
+
+// Dense SWIGLU -> mmq down-projection feed (any ds layout): quantize silu(gate) * up without
+// materializing the GLU output.  2-D only (ne2 == ne3 == 1); same grid and chunking as
+// quantize_mmq_q8_1_cuda, so the blocks land exactly where the unfused quantize writes them.
+void quantize_mmq_q8_1_glu_cuda(
+        const float * gate, const float * up, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t gate_s01, const int64_t up_s01,
+        const int64_t ne0, const int64_t ne1, const int n_chunks, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 4 == 0 && gate_s01 % 4 == 0 && up_s01 % 4 == 0);
+    GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
+    const int64_t vals_per_block = 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ*n_chunks;
+    const int64_t block_num_y = (ne0 + vals_per_block - 1) / vals_per_block;
+    const dim3 num_blocks(ne1, block_num_y, 1);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    switch (mmq_get_q8_1_ds_layout(type_src0)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, false, true>
+                <<<num_blocks, block_size, 0, stream>>>(gate, nullptr, vy, ne00, gate_s01, 0, 0, ne0, ne1, 1, 0, n_chunks, up, up_s01);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, false, true>
+                <<<num_blocks, block_size, 0, stream>>>(gate, nullptr, vy, ne00, gate_s01, 0, 0, ne0, ne1, 1, 0, n_chunks, up, up_s01);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, false, true>
+                <<<num_blocks, block_size, 0, stream>>>(gate, nullptr, vy, ne00, gate_s01, 0, 0, ne0, ne1, 1, 0, n_chunks, up, up_s01);
             break;
         default:
             GGML_ABORT("fatal error");

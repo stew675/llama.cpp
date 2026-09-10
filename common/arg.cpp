@@ -2722,7 +2722,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
-        "- auto: on, but only for tensors larger than 4 GiB\n"
+        "- auto: on, but only for tensors larger than 4 GiB; the optional managed host-arena\n"
+        "        PLE reader is enabled with LLAMA_LAZY_BUF_MB=<MiB>\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
@@ -2731,28 +2732,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
-    add_opt(common_arg(
-        {"--lazy-buffer-size"}, "N(K|M|G)",
-        "managed buffer size in bytes for on-demand tensors, e.g. the qwen4exp PLE n-gram table (default: 0, mmap-based lazy loading)",
-        [](common_params & params, const std::string & value) {
-            size_t multiplier = 1;
-            std::string num = value;
-            if (!num.empty()) {
-                const char suffix = num.back();
-                switch (suffix) {
-                    case 'K': case 'k': multiplier = 1024;             num.pop_back(); break;
-                    case 'M': case 'm': multiplier = 1024 * 1024;       num.pop_back(); break;
-                    case 'G': case 'g': multiplier = 1024 * 1024 * 1024; num.pop_back(); break;
-                    default: break;
-                }
-            }
-            const uint64_t size = std::stoull(num) * multiplier;
-            if (size > (uint64_t) SIZE_MAX) {
-                throw std::invalid_argument("size too large");
-            }
-            params.lazy_buf_size = (size_t) size;
-        }
-    ).set_env("LLAMA_ARG_LAZY_BUF_SIZE"));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"

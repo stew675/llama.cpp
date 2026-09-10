@@ -73,6 +73,16 @@ extern "C" {
     // place the staging ring above it.  No-op for a backend without a slab.
     GGML_API void                  ggml_backend_dev_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes);
 
+    // wip/moe-verify-fusions (narrow-2): pin the MTP draft's COMPUTE region at the top of the slab's
+    // reserved VA, so it cannot alias the target's narrow verify buffer at slab base 0.  Idempotent;
+    // no-op for a backend without a slab.
+    GGML_API void                  ggml_backend_dev_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes);
+
+    // wip/moe-verify-fusions (narrow-2): mark this context's COMPUTE allocations as the MTP draft's, so
+    // they route to the pinned narrow-2 region (or, with GGML_CUDA_SLAB_NARROW2=0, bypass the slab).
+    // No-op for a backend without a slab.
+    GGML_API void                  ggml_backend_dev_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable);
+
     // OPEN 2 (TODO #42): the size of the device's movable-boundary slab WORK region, or 0 when it has no
     // slab.  `llama_context` uses it to right-size the compute reserve to the observed workload.
     GGML_API size_t                ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev);
@@ -363,6 +373,11 @@ extern "C" {
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
+
+    // WIP r42 (TODO #42): free the compute buffers so the next alloc_graph sizes them from that graph
+    // instead of the (grow-only) previous peak.  Used to release a wide-prefill compute layout before
+    // the MoE expert cache arena is sized, so a big -ub and a big arena can coexist.
+    GGML_API void                 ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched);
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);

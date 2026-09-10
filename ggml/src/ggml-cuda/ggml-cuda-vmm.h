@@ -55,6 +55,9 @@ void * ggml_cuda_slab_work_alloc(int device, size_t need);
 // A work-region view was dropped; the next, smaller work need may shrink the boundary and hand the slack
 // back to the arena.
 void   ggml_cuda_slab_work_release(int device, size_t off, size_t need);
+// wip/moe-verify-fusions (narrow-2): pin (idempotently) the MTP draft's COMPUTE region at the top of the
+// slab's reserved VA from a known narrow size.  No-op when the slab is not live.
+void   ggml_cuda_slab_narrow2_floor(int device, size_t bytes);
 // Chunk-aligned arena allocation from `[boundary, size)`; nullptr when the arena region is full.
 void * ggml_cuda_slab_arena_alloc(int device, size_t size);
 // Serve a large TRANSIENT from the slab's reserved, NON-EVICTABLE ring hole (a fixed region at the top of
