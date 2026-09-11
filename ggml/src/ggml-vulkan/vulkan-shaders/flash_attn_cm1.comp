@@ -62,6 +62,11 @@ shared O_TYPEV4 pvsh[MatBc * osh_stride];
 
 shared ACC_TYPE slope[Br];
 
+// Per-column liveness for the current KV tile: col_live[c] is set when at least one
+// real query row has a nonzero softmax weight (P) for KV column c of this tile. A
+// column with no live row is fully masked and must never read V (see below).
+shared uint32_t col_live[Bc];
+
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
@@ -155,6 +160,10 @@ void main() {
 
         [[unroll]] for (uint32_t idx = 0; idx < mask_cache.length(); ++idx) {
             mask_cache[idx] = f16vec4(0);
+        }
+
+        if (tid < Bc) {
+            col_live[tid] = 0;
         }
 
         if (MASK_ENABLE) {
@@ -389,6 +398,9 @@ void main() {
                     const FLOAT_TYPEV4 Pf = FLOAT_TYPEV4(exp(vec4(sfsh[row / 4 + col * sfshstride]) - mfvec));
                     [[unroll]] for (uint32_t vec_idx = 0; vec_idx < 4; ++vec_idx) {
                         Lf[r + vec_idx] += Pf[vec_idx];
+                        if (i * Br + row + vec_idx < N && float(Pf[vec_idx]) != 0.0f) {
+                            col_live[col] = 1;
+                        }
                     }
                     Psh[col * psh_stride + row / 4] = Pf;
                 }
@@ -396,12 +408,14 @@ void main() {
         }
 
         if (SHMEM_STAGING != 0) {
+            // col_live is written by the Pf loop above; make it visible before zeroing
+            barrier();
             [[unroll]] for (uint32_t idx = 0; idx < Bc * HSV_pad / 4; idx += gl_WorkGroupSize.x) {
                 uint32_t d = (idx + tid) % (HSV_pad / 4);
                 uint32_t c = (idx + tid) / (HSV_pad / 4);
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV_pad / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
-                    if ((!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
+                    if (col_live[c] != 0 && (!KV_bounds_check || j * Bc + c < KV) && (HSV == HSV_pad || d < HSV / 4)) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE_V + 4 * d;
@@ -420,6 +434,27 @@ void main() {
             }
         }
         barrier();
+
+        // A tile that applied a mask can contain fully masked columns (no live query
+        // row, col_live == 0). Those columns must not read V (see the stage_v comment).
+        // The test is workgroup-uniform and only runs for tiles that may have masked
+        // cells, so fully-live tiles keep the direct path untouched.
+        bool tile_has_dead = false;
+        if (MASK_ENABLE && (!USE_MASK_OPT || (mask_opt_bits != MASK_OPT_ALL_ZERO && mask_opt_bits != MASK_OPT_ALL_NEG_INF))) {
+            if (tid < Bc && col_live[tid] == 0) {
+                tile_has_dead = true;
+            }
+            tile_has_dead = subgroupOr(tile_has_dead);
+            barrier();
+            if (gl_SubgroupInvocationID == 0) {
+                tmpsh[gl_SubgroupID] = tile_has_dead ? 1.0f : 0.0f;
+            }
+            barrier();
+            tile_has_dead = false;
+            [[unroll]] for (uint s = 0; s < gl_NumSubgroups; ++s) {
+                tile_has_dead = tile_has_dead || (tmpsh[s] != 0.0f);
+            }
+        }
 
         const uint num_hsv_tiles = (HSV + MatBc * row_split - 1) / (MatBc * row_split); // round up
 
@@ -441,7 +476,11 @@ void main() {
             if (SHMEM_STAGING == 0) {
             // For quants we always preload via kvsh. For f16/bf16 we only preload when
             // alignment / bounds force it (otherwise we coopMatLoad direct from data_vv4).
-            const bool stage_v = USE_DECODE_V || KV_bounds_check;
+            // A fully masked column (col_live[c] == 0) must never read V: masked cells
+            // would accumulate +-0.0 x V inexactly on gfx11 f16 WMMA and leak the sign
+            // of whatever V the cell last held. Such columns are staged through kvsh
+            // with their V zeroed instead of being loaded direct.
+            const bool stage_v = USE_DECODE_V || KV_bounds_check || tile_has_dead;
             if (stage_v) {
                 [[unroll]] for (uint32_t i = 0; i < v_loads_per_thread; ++i) {
                     const uint idx = i * gl_WorkGroupSize.x + tid;
@@ -455,7 +494,7 @@ void main() {
                     const uint ib = coord / BLOCK_SIZE_V;
                     const uint iqs = coord % BLOCK_SIZE_V;
 
-                    if (!KV_bounds_check || (v_row < KV && v_col < HSV)) {
+                    if (col_live[row] != 0 && (!KV_bounds_check || (v_row < KV && v_col < HSV))) {
 #if !defined(BFLOAT16)
                         if (USE_DECODE_V) {
                             kvsh[row * vsh_stride + col] = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
@@ -479,7 +518,7 @@ void main() {
                     coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride, gl_CooperativeMatrixLayoutColumnMajor);
 
                     if (SHMEM_STAGING == 0) {
-                    if (!USE_DECODE_V && !KV_bounds_check) {
+                    if (!USE_DECODE_V && !KV_bounds_check && !tile_has_dead) {
                         // F16/BF16 values can be loaded directly from global memory
                         const uint v_tile_row = j * Bc + bc_chunk * MatBc;
                         const uint v_tile_offset = v_offset / 4 + v_tile_row * v_stride / 4 + hsv_offset / 4;

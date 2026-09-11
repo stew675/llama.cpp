@@ -512,9 +512,26 @@ void main() {
             }
 
             FLOAT_TYPE Pf[rows_per_thread];
+            bool any_live = false;   // any row of this thread that attends to column c
+            bool any_mask = false;   // any row masked out at column c (P == +0.0)
             [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
                 Pf[r] = FLOAT_TYPE(exp(float(Sf[r][c]) - Mf[r]));
                 Lf[r] += Pf[r];
+                if (Pf[r] != FLOAT_TYPE(0.0)) {
+                    any_live = true;
+                } else {
+                    any_mask = true;
+                }
+            }
+
+            // Masked cells (P == +0.0) must not read V at all: on some targets
+            // (e.g. gfx1151 f16 WMMA / matrix units) accumulating +-0.0 products
+            // is inexact, so a fully masked column would leak the sign of whatever
+            // V the cell last held (e.g. a freed KV cell) into the output. A fully
+            // masked column contributes exactly +0.0, so it can be skipped outright;
+            // partially masked columns skip the masked rows below.
+            if (!any_live) {
+                continue;
             }
 
             [[unroll]] for (uint32_t d = 0; d < HSV_per_thread / 4; ++d) {
@@ -529,8 +546,16 @@ void main() {
                 } else {
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
                 }
-                [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-                    Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
+                if (any_mask) {
+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                        if (Pf[r] != FLOAT_TYPE(0.0)) {
+                            Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
+                        }
+                    }
+                } else {
+                    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                        Of[r][d] += FLOAT_TYPEV4(Pf[r] * Vf);
+                    }
                 }
             }
         }
