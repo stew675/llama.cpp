@@ -238,6 +238,9 @@ struct host_pool_t {
     size_t      align       = 4096;
     std::vector<int32_t>                 slot_expert;   // slot -> expert, -1 empty
     std::unordered_map<int32_t, int32_t> expert_slot;
+    // ADDITIVE lifecycle per slot: 0 = free, 1 = the pool holds it (the arena does not), 2 = retiring
+    // (the arena admitted it; the entry is freed once every in-flight copy drains).
+    std::vector<uint8_t>                 slot_state;
     // Per (slot, device) in-flight events.  The pool is PROCESS-WIDE, so the same slot can be copied to
     // several devices and every copy must drain before the slot is reused or retired.  Indexed
     // `slot * GGML_CUDA_MAX_DEVICES + device`, nullptr = never used; created lazily on the recording
@@ -784,6 +787,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
             p.path        = t.src_path;
             p.file_offs   = t.src_offs;
             p.slot_expert.assign((size_t) slots, -1);
+            p.slot_state.assign((size_t) slots, 0);
             p.last.assign((size_t) t.n_experts, 0);
             p.slot_ev.assign((size_t) slots * GGML_CUDA_MAX_DEVICES, nullptr);   // lazily created per device
         } else {
@@ -800,14 +804,52 @@ static host_pool_t * table_pool_locked(table_t & t) {
     return res.first->second.failed ? nullptr : &res.first->second;
 }
 
-// Ensure `expert` is in the pool (O_DIRECT fill on a miss, LRU eviction) and return its slot base (and
-// the slot index), or null when the pool is unusable (the caller then reads the full master).  A slot's
-// arena fill is an async copy, so before a slot is REUSED its previous copy is drained via `slot_ev`
-// (a per-slot event; waits only for that copy, not the whole stream).  Caller holds `g_mutex`.
+// ADDITIVE lifecycle: free every pool slot whose arena copy has drained.  The pool holds the experts the
+// arena does NOT, so once a block has been copied into the arena its pool entry is dead weight.  Slots
+// still in transit (state 2) are skipped; non-blocking.  Caller holds `g_mutex`.
+static void pool_reap_locked(host_pool_t & p) {
+    for (int s = 0; s < p.slots; s++) {
+        if (p.slot_state[(size_t) s] != 2) {
+            continue;
+        }
+        bool drained = true;
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
+            const size_t idx = (size_t) s * GGML_CUDA_MAX_DEVICES + (size_t) d;
+            if (idx >= p.slot_ev.size() || p.slot_ev[idx] == nullptr) {
+                continue;
+            }
+#if defined(GGML_USE_HIP)
+            const bool ready = hipEventQuery((hipEvent_t) p.slot_ev[idx]) != hipErrorNotReady;
+#else
+            const bool ready = cudaEventQuery(p.slot_ev[idx]) != cudaErrorNotReady;
+#endif
+            if (!ready) {
+                drained = false;
+                break;
+            }
+            (void) cudaGetLastError();
+        }
+        if (!drained) {
+            continue;
+        }
+        const int32_t e = p.slot_expert[(size_t) s];
+        if (e >= 0) {
+            p.expert_slot.erase(e);
+        }
+        p.slot_expert[(size_t) s] = -1;
+        p.slot_state[(size_t) s]  = 0;
+    }
+}
+
+// Ensure `expert` is in the pool and return its slot base (and the slot index), or null when the pool is
+// unusable (the caller then reads the full master / disk directly).  A miss reads the GGUF (buffered
+// through the page cache by default).  Retiring slots (state 2, their arena copy is still in flight) are
+// never reused or evicted.  Caller holds `g_mutex`.
 static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool sync_on_evict) {
     if (expert < 0 || expert >= p.n_experts) {
         return nullptr;
     }
+    pool_reap_locked(p);
     const auto hit = p.expert_slot.find(expert);
     if (hit != p.expert_slot.end()) {
         p.hits++;
@@ -830,8 +872,8 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
         int     victim = -1;
         for (int s = 0; s < p.slots; s++) {
             const int32_t e = p.slot_expert[(size_t) s];
-            if (e < 0) {
-                continue;
+            if (e < 0 || p.slot_state[(size_t) s] != 1) {
+                continue;   // free, or retiring (its arena copy may still be reading it)
             }
             if (victim < 0 || p.last[(size_t) e] < best) {
                 best   = p.last[(size_t) e];
@@ -876,6 +918,7 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
     }
     p.slot_expert[(size_t) slot] = expert;
     p.expert_slot[expert]        = slot;
+    p.slot_state[(size_t) slot]  = 1;
     p.last[(size_t) expert]      = ++p.clock;
     p.fills++;
     if (out_slot != nullptr) {
@@ -1054,7 +1097,8 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
         }
         return { nullptr, false };
     }
-    int slot = -1;
+    int     slot   = -1;
+    int32_t victim = -1;   // arena resident evicted by this miss (also fetched into the pool: additive)
     if ((int) t.expert_slot.size() < t.slots) {
         for (int s = 0; s < t.slots; s++) {
             if (t.slot_expert[s] < 0) { slot = s; break; }
@@ -1062,7 +1106,6 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
     }
     if (slot < 0) {
         // evict the resident with the smallest decaying count; tie -> oldest use.
-        int32_t victim = -1;
         for (int s = 0; s < t.slots; s++) {
             const int32_t e = t.slot_expert[s];
             if (e < 0 || is_protected(e)) { continue; }
@@ -1141,6 +1184,12 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
         char *        pool_expert = nullptr;
         int           pool_slot   = -1;
         host_pool_t * pool        = table_pool_locked(t);
+        // ADDITIVE: put the expert the arena just evicted into the pool, so it is ready when the arena
+        // needs it again (usually within a few tokens).  The arena slot still holds it, but re-reading
+        // through the page cache is simpler than a D2H and does not stall the compute stream.
+        if (pool != nullptr && victim >= 0) {
+            (void) pool_slot_locked(*pool, victim, nullptr, false);
+        }
         // Only source from the pool when this table's slice fits inside a whole-expert slot.  The meta
         // splitter can hand a device a DEGENERATE simple tensor (`ne[split]=0`, `nb[2]=0`), which
         // `moe_cache_table` registers with `expert_bytes = host_bytes` and a nonzero `slice_off`; a pool
@@ -1177,6 +1226,11 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
             cudaEvent_t ev = pool_slot_event(*pool, pool_slot, t.device >= 0 ? t.device : 0);
             if (ev != nullptr) {
                 (void) cudaEventRecord(ev, (cudaStream_t) stream);
+            }
+            // ADDITIVE: the arena now owns this block; free the pool entry as soon as the copy drains
+            // (`pool_reap_locked`), so the pool stays the complement of the arena.
+            if (pool_slot < (int) pool->slot_state.size()) {
+                pool->slot_state[(size_t) pool_slot] = 2;
             }
         }
         if (err != cudaSuccess) {
