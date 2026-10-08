@@ -4502,8 +4502,10 @@ void moe_cache_report() {
             p_bytes += (int64_t) p.slots * (int64_t) p.host_bytes;
         }
         const int64_t ptot = p_hits + p_misses;
-        GGML_LOG_INFO("%s: host pool (L2): %zu tensors, %lld slots, %.1f MiB pinned; h=%.4f (%lld/%lld), "
-                      "DIO fills=%lld evictions=%lld\n",
+        // WARN, not INFO: llama-cli's default threshold filters INFO, so the pool summary was invisible on a
+        // plain run (it needs `-lv 4`/`-v`).  The pool is a tuning surface, so its summary must be visible.
+        GGML_LOG_WARN("%s: host pool (L2): %zu tensors, %lld slots, %.1f MiB pinned; h=%.4f (%lld/%lld), "
+                      "fills=%lld evictions=%lld\n",
                       __func__, g_host_pools.size(), (long long) p_slots, (double) p_bytes / (1024 * 1024),
                       ptot > 0 ? (double) p_hits / (double) ptot : 0.0, (long long) p_hits, (long long) ptot,
                       (long long) p_fills, (long long) p_evict);
