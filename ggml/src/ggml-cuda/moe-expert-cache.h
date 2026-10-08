@@ -31,10 +31,12 @@
 //   MOE_EXPERT_CACHE_PREFILL_SEED_N=N  cap the seeded experts/table (0 = all slots)
 //   MOE_EXPERT_CACHE_PROVISIONAL=0  disable reclaiming pre-filled/seed slots before first hit
 //                              (default 1)
-//   MOE_HOST_POOL_MIB=N        per-device pinned host pool (L2) size in MiB; 0/unset disables it (default
-//                              0).  The pool is a GPU-readable BOUNCE BUFFER: the GPU reads it (pinned),
-//                              and it is refilled from the GGUF BUFFERED, through the page cache, so a
-//                              miss is a RAM read, not disk.  Phase 2 of wip/host-expert-dio-cache.
+//   MOE_HOST_POOL_MIB=N        PROCESS-WIDE pinned host pool (L2) size in MiB; 0/unset disables it
+//                              (default 0).  One pool per host tensor, shared by every device; the budget
+//                              is split over the registered host tensors.  The pool is a GPU-readable
+//                              BOUNCE BUFFER: the GPU reads it (pinned), and it is refilled from the GGUF
+//                              BUFFERED, through the page cache, so a miss is a RAM read, not disk.
+//                              Phase 2b of wip/host-expert-dio-cache.
 //   MOE_HOST_POOL_DIO=1        fill the pool with O_DIRECT instead of buffered (debug fallback only:
 //                              bypasses the page cache)
 //   MOE_HOST_POOL_PREWARM=0    do not DIO/buffered-fill every pool slot when it is built (default on)
