@@ -1569,7 +1569,15 @@ static __global__ void mul_mat_vec_q_moe(
 
     // split (row, kblock) items across the 8 thread groups: the K-split loop
     // leaves most groups idle on short-K MoE GEMMs (down K=512 -> 2 K-blocks)
-    const int n_items  = c_rows_per_block * blocks_per_row_x;
+    //
+    // Row-loop clamp: the last row-block may hold fewer than `c_rows_per_block` valid rows, but the loop
+    // below used to read all of them (only the write was guarded).  The dead loads walk `rpb - rem` rows
+    // past the expert's last row -- into the next expert, and off the end of the tensor for the last
+    // expert of the last host tensor (a cold read sources the pinned master in place).  Clamping the item
+    // count skips them and leaves the valid-row accumulation order unchanged.
+    const int rows_left  = row0 < (int) nrows_x ? (int) nrows_x - row0 : 0;
+    const int rows_valid = rows_left < c_rows_per_block ? rows_left : c_rows_per_block;
+    const int n_items    = rows_valid * blocks_per_row_x;
     const int n_groups = warp_size / (qi/vdr);
     const int kqs      = vdr * (threadIdx.x % (qi/vdr));
     // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it

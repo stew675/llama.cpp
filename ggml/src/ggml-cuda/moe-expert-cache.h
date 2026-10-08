@@ -31,6 +31,13 @@
 //   MOE_EXPERT_CACHE_PREFILL_SEED_N=N  cap the seeded experts/table (0 = all slots)
 //   MOE_EXPERT_CACHE_PROVISIONAL=0  disable reclaiming pre-filled/seed slots before first hit
 //                              (default 1)
+//   MOE_HOST_POOL_MIB=N        per-device pinned host pool (L2) size in MiB; 0/unset disables it (default
+//                              0).  The pool is a GPU-readable BOUNCE BUFFER: the GPU reads it (pinned),
+//                              and it is refilled from the GGUF BUFFERED, through the page cache, so a
+//                              miss is a RAM read, not disk.  Phase 2 of wip/host-expert-dio-cache.
+//   MOE_HOST_POOL_DIO=1        fill the pool with O_DIRECT instead of buffered (debug fallback only:
+//                              bypasses the page cache)
+//   MOE_HOST_POOL_PREWARM=0    do not DIO/buffered-fill every pool slot when it is built (default on)
 
 // Phase 1a status: registration + LFRU policy + arena + alias + fill + report.  The
 // `mul_mat_id` dispatch already calls `moe_cache_observe()` (live hit-rate measurement) and the
@@ -164,6 +171,14 @@ bool moe_cache_has_arena();
 int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                     size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
                     const void * host, int device);
+
+// wip/host-expert-dio-cache Phase 1 (plumbing, inert): register the on-disk source of a host-resident
+// expert tensor, keyed by its host data pointer (== the `host` passed to `moe_cache_table`).  Called by
+// the model loader with the GGUF path, the tensor's file offset and its whole-tensor geometry; the
+// per-device slice geometry is merged in `moe_cache_table`.  A no-op unless `MOE_HOST_POOL_MIB > 0`, so
+// with the env unset/0 no state is created and behaviour is byte-identical.
+void moe_cache_set_host_source(const void * tensor_data, const char * path, size_t offs,
+                               int n_experts, size_t host_bytes, size_t total_bytes);
 
 // LFRU residency decision + alias for expert `expert` of `table`.  The single compute-path seam.
 moe_cache_alias moe_cache_alias_get(int table, int expert);

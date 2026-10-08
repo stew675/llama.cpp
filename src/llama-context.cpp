@@ -1730,8 +1730,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
     if (drop_now) {
         ggml_backend_sched_drop_buffers(sched.get());
-        // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit
-        const bool narrow_ok = graph_reserve(cparams.n_rs_batch, 1, cparams.n_rs_batch, mctx, false) != nullptr;
+        // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit.
+        // The reserve must use the CURRENT ubatch's sequence count, not a fixed 1: the memory context
+        // (`mctx`) spans this ubatch's streams, and `build_attn_mha`/`ggml_flash_attn_ext` require the
+        // query and the cache to agree on the stream dim (`q->ne[3] == k->ne[3]`).  A hard-coded 1
+        // against a multi-sequence batch took `q->ne[2]/n_stream` to zero and aborted (issue #48).
+        const uint32_t n_rs_seqs = std::max<uint32_t>(1, ubatch.n_seqs);
+        const bool narrow_ok = graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, false) != nullptr;
         if (!narrow_ok) {
             LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
                     " growth may not fit next to the MoE expert cache arena\n", __func__);

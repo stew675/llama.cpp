@@ -14,6 +14,12 @@
 #include <future>
 #include <regex>
 
+// wip/host-expert-dio-cache Phase 1 (plumbing, inert): the host-expert on-disk source registry lives in
+// ggml-cuda.  libllama already links libggml-hip, so declaring it here avoids a layering include.  The
+// call is a no-op unless MOE_HOST_POOL_MIB > 0, so with the env unset/0 nothing is created.
+void moe_cache_set_host_source(const void * tensor_data, const char * path, size_t offs,
+                               int n_experts, size_t host_bytes, size_t total_bytes);
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -560,16 +566,12 @@ llama_model_loader::llama_model_loader(
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
-    // Host-resident expert weights: pinned by default (fast H2D uploads / device-readable host master).
-    // AUTO keeps the legacy env knob (LLAMA_MMAP_HOST_EXPERTS=0 selects the pageable mmap); the explicit
-    // modes ignore it.  See llama_host_experts_mode.
-    {
-        bool mmap = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP;
-        if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_AUTO) {
-            const char * e = getenv("LLAMA_MMAP_HOST_EXPERTS");
-            mmap = e != nullptr && atoi(e) == 0;
-        }
-        this->mmap_host_experts = mmap;
+    // Host-resident expert weights are always pinned (`ROCm_Host`): the GPU reads the host master in
+    // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
+    // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
+    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP) {
+        LLAMA_LOG_WARN("%s: host_experts_mode=MMAP is unsupported (a pageable host master cannot be read "
+                       "by a no-XNACK GPU, issue #116); using pinned instead\n", __func__);
     }
 
     if (!fname.empty()) {
@@ -1333,17 +1335,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // avoid using a host buffer when using mmap
-        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type is exactly the
-        // weight the scheduler's op-offload H2D-uploads every ubatch.  Downgrading it to the mmap'd CPU
-        // buffer makes those uploads read the pageable model mapping, which on ROCm 7.14 stalls the host
-        // for the whole copy and makes the meta backend's 2-D spliced upload fault in `hipMemcpy2DAsync`
-        // (`__amd_rocclr_copyBufferRectAligned`).  Keeping it pinned costs the expert set in
-        // non-swappable RAM but makes the uploads safe and asynchronous (35B-A3B `-sm tensor -ncmoe`
-        // pp8192: ~2.7k t/s pageable vs ~5.1k t/s pinned).  `--host-experts mmap` (or the legacy
-        // `LLAMA_MMAP_HOST_EXPERTS=0`) restores the mmap downgrade.
+        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type stays in the
+        // device's PINNED host buffer (`ROCm_Host`).  The expert cache reads the master in place on the
+        // GPU, and a pageable `CPU_Mapped` master has no device mapping without XNACK (issue #116); the
+        // scheduler's per-op H2D from pageable memory also faults/stalls on ROCm 7.14.  Pinning the
+        // expert set costs non-swappable RAM but is the only safe host master on RDNA.
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
-                !(!mmap_host_experts && op == GGML_OP_MUL_MAT_ID)) {
+                op != GGML_OP_MUL_MAT_ID) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
@@ -1829,6 +1828,15 @@ bool llama_model_loader::load_all_data(
                     }
                 }
             }
+        }
+
+        // wip/host-expert-dio-cache Phase 1: record the on-disk source of a host-resident expert tensor
+        // (`cur->data` is the pinned master the cache reads).  Inert unless MOE_HOST_POOL_MIB > 0.
+        if (cur->data != nullptr && cur->buffer != nullptr && cur->ne[2] > 1 &&
+                ggml_backend_buffer_is_host(cur->buffer) &&
+                std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
+            moe_cache_set_host_source(cur->data, files.at(weight->idx)->path().c_str(), weight->offs,
+                                      (int) cur->ne[2], (size_t) cur->nb[2], ggml_nbytes(cur));
         }
 
         size_done += n_size;

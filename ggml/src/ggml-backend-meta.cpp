@@ -18,6 +18,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1291,6 +1292,51 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         return split_state;
     };
+
+    // Non-recursive pre-warm of the per-buffer-context split-state cache, run only on a cache miss of
+    // the tensor itself.  `calculate_split_state` recurses into every `src` and each frame is large; a
+    // deep `src` chain (qwen35moe under `-sm tensor` with MTP builds a chain over 1200 nodes long, and
+    // that many frames overflow the 8 MiB thread stack) crashed the allocator with a stack overflow.
+    // The outermost call walks the not-yet-cached ancestors on an explicit heap stack and computes them
+    // bottom-up, so each recursive lookup below is a cache hit and the C++ recursion depth stays at one.
+    // Recursive calls see `ss_warm_active != 0` and skip this; a fully cached lookup never enters the
+    // walk, so the steady-state hit path is unchanged.  The walk is cycle-safe and visits each node once.
+    static thread_local int ss_warm_active = 0;
+    struct ss_warm_guard {
+        bool owner;
+        ss_warm_guard() : owner(ss_warm_active == 0) { if (owner) { ss_warm_active = 1; } }
+        ~ss_warm_guard() { if (owner) { ss_warm_active = 0; } }
+    } ss_warm;
+
+    // Current-version cache test, used only to prune the walk (a false negative just visits a node that
+    // the nested lookup then resolves from another version, so pruning is always safe).
+    auto ss_cached = [&](const ggml_tensor * t) -> bool {
+        const std::pair k = std::make_pair(t, true);
+        const auto & c = buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];
+        const auto itc = c.find(k);
+        return itc != c.end() && memcmp(itc->second.bytes, (const char *) t, sizeof(itc->second.bytes)) == 0;
+    };
+    if (ss_warm.owner && !ss_cached(tensor)) {
+        std::vector<std::pair<const ggml_tensor *, uint32_t>> wstack;
+        std::unordered_set<const ggml_tensor *> wseen;
+        wstack.emplace_back(tensor, 0);
+        wseen.insert(tensor);
+        while (!wstack.empty()) {
+            const ggml_tensor * t = wstack.back().first;
+            uint32_t & wi = wstack.back().second;
+            if (wi < GGML_MAX_SRC) {
+                const ggml_tensor * s = t->src[wi++];
+                if (s != nullptr && s != t && wseen.insert(s).second && !ss_cached(s)) {
+                    wstack.emplace_back(s, 0);
+                }
+                continue;
+            }
+            wstack.pop_back();
+            if (t != tensor) {
+                ggml_backend_meta_get_split_state(stc, t, /*assume_sync =*/ true);
+            }
+        }
+    }
 
     const std::pair key = std::make_pair(tensor, assume_sync);
     auto * cache = &buf_ctx->split_state_cache[buf_ctx->split_state_cache_cur];

@@ -490,7 +490,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
-    printf("  --host-experts <pinned|mmap|auto>                 (default: %s)\n", join(transform_to_str(cmd_params_defaults.host_experts_mode, host_experts_mode_str), ",").c_str());
+    printf("  --host-experts <pinned|auto>                       (default: %s)\n", join(transform_to_str(cmd_params_defaults.host_experts_mode, host_experts_mode_str), ",").c_str());
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
@@ -860,7 +860,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     } else if (m == "pinned" || m == "pin" || m == "1") {
                         mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
                     } else if (m == "mmap" || m == "0") {
-                        mode = LLAMA_HOST_EXPERTS_MODE_MMAP;
+                        fprintf(stderr, "error: --host-experts mmap is not supported (pageable host masters fault without XNACK, issue #116)\n");
+                        invalid_param = true;
+                        break;
                     } else {
                         invalid_param = true;
                         break;

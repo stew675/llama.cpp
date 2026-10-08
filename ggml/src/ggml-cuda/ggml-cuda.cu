@@ -533,14 +533,42 @@ static bool ggml_cuda_vmm_map_phys(int device, CUdeviceptr addr, size_t aligned)
         return false;
     }
 
-    CUmemAccessDesc access = {};
-    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    access.location.id   = phys;
-    access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    if (cuMemSetAccess(addr, aligned, &access, 1) != cudaSuccess) {
+    // Grant READWRITE to THIS device and every PEER device.  The scheduler copies a split input
+    // device-to-device (`hipMemcpyPeerAsync`) into the compute buffer, which is a view of this same
+    // slab mapping; granting only the owning device left the peer's copy engine with no access to the
+    // destination and it faulted `Page not present or supervisor privilege` (the parked `-sm tensor`
+    // + partial-arena fault).  Devices that cannot peer-map the range keep their own access (best
+    // effort): a failed peer descriptor must not fail the mapping.
+    const int n_dev = ggml_backend_cuda_get_device_count();
+    std::vector<CUmemAccessDesc> access;
+    access.reserve((size_t) n_dev);
+    {
+        CUmemAccessDesc own = {};
+        own.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        own.location.id   = phys;
+        own.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access.push_back(own);
+    }
+    for (int d = 0; d < n_dev; d++) {
+        const int p = ggml_cuda_get_physical_device(d);
+        if (p == phys) {
+            continue;
+        }
+        CUmemAccessDesc peer = {};
+        peer.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        peer.location.id   = p;
+        peer.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access.push_back(peer);
+    }
+    if (cuMemSetAccess(addr, aligned, access.data(), access.size()) != cudaSuccess) {
+        // Retry with only the owning device: a peer descriptor rejection is not a mapping failure.
         (void) cudaGetLastError();
-        (void) cuMemUnmap(addr, aligned);
-        return false;
+        CUmemAccessDesc own = access.front();
+        if (cuMemSetAccess(addr, aligned, &own, 1) != cudaSuccess) {
+            (void) cudaGetLastError();
+            (void) cuMemUnmap(addr, aligned);
+            return false;
+        }
     }
     return true;
 }

@@ -223,9 +223,9 @@ extern "C" {
 
     // how host-resident MoE expert weights (the `-ncmoe`/`-cmoe` GGML_OP_MUL_MAT_ID tables) are backed
     enum llama_host_experts_mode {
-        LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // use the env (LLAMA_MMAP_HOST_EXPERTS=0 selects mmap), else pinned
+        LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // pinned (the pageable mmap mode was removed; issue #116)
         LLAMA_HOST_EXPERTS_MODE_PINNED =  0, // keep them in the device's pinned host buffer (ROCm_Host) - fast path
-        LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // leave them in the pageable model mmap (CPU_Mapped) - reclaimable RAM
+        LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // REMOVED: pageable masters fault on no-XNACK GPUs (issue #116)
     };
 
     enum llama_context_type {

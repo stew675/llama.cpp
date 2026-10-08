@@ -2706,17 +2706,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_LOAD_MODE"));
     add_opt(common_arg(
         {"--host-experts"}, "MODE",
-        "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) when the model is mmap'd (default: pinned)\n"
-        "- pinned: device's pinned host buffer (ROCm_Host) - fastest uploads, but the expert set is non-swappable RAM\n"
-        "- mmap: pageable model mapping (CPU_Mapped) - reclaimable RAM, slower / less stable uploads\n"
-        "- auto: pinned, unless the legacy LLAMA_MMAP_HOST_EXPERTS=0 is set (then mmap)",
+        "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
+        "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
+        "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "auto")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
             else if (value == "pinned" || value == "pin" || value == "1") { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED; }
-            else if (value == "mmap"   || value == "0")          { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_MMAP;   }
+            else if (value == "mmap"   || value == "0")          { throw std::invalid_argument("--host-experts mmap is not supported (a pageable host master cannot be read by a no-XNACK GPU, issue #116); use 'pinned'"); }
             else { throw std::invalid_argument("invalid value"); }
         }
-    ).set_env("LLAMA_MMAP_HOST_EXPERTS"));
+    ));
     add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"

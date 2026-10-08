@@ -81,9 +81,8 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
-    // true: host-resident expert weights (`-ncmoe`/`-cmoe`) stay in the pageable model mmap
-    // false (default): keep them in the device's pinned host buffer (ROCm_Host)
-    bool mmap_host_experts = false;
+    // Host-resident expert weights (`-ncmoe`/`-cmoe`) are always pinned (`ROCm_Host`).  The pageable
+    // `--host-experts mmap` mode was removed (issue #116).
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
