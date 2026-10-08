@@ -904,6 +904,56 @@ static void pool_prepopulate_locked(host_pool_t & p, const table_t & t) {
     }
 }
 
+// wip/host-expert-dio-cache Phase 2b (target 3): re-rank a table's host pool from its device prefill
+// tally.  The pool is built at load time, before any prefill, so its warm order comes from an arena that
+// has never seen the prompt; this replaces it with the routing the prompt actually produced.  ADDITIVE:
+// the experts the arena already holds are EXCLUDED, so the pool is the complement of the arena (the
+// maintainer's contract) and is ready with the next-most-wanted expert when the arena evicts one.
+// Caller holds `g_mutex`; a no-op without a pool, a tally or a device alias to fill from.
+static void pool_rerank_from_tally_locked(table_t & t, const std::vector<int32_t> & tally) {
+    if ((int) tally.size() != t.n_experts || t.n_experts <= 0) {
+        return;
+    }
+    host_pool_t * pool = table_pool_locked(t);
+    if (pool == nullptr || pool->failed || pool->slots <= 0) {
+        return;
+    }
+    std::vector<int32_t> rank;
+    rank.reserve((size_t) t.n_experts);
+    for (int e = 0; e < t.n_experts; e++) {
+        if (tally[(size_t) e] <= 0) {
+            continue;   // the prompt never touched it: not a wanted expert
+        }
+        if (t.expert_slot.find(e) != t.expert_slot.end()) {
+            continue;   // the arena already holds it (additive: the pool is the complement)
+        }
+        rank.push_back(e);
+    }
+    if (rank.empty()) {
+        return;
+    }
+    std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
+        if (tally[(size_t) a] != tally[(size_t) b]) {
+            return tally[(size_t) a] > tally[(size_t) b];
+        }
+        return a < b;
+    });
+    // `pool_slot_locked` evicts the LRU entry once the pool is full, so this replaces the load-time
+    // id-order warm with the prompt order.  A miss here is a page-cache read, paid once at seed time.
+    const int n = std::min((int) rank.size(), pool->slots);
+    int filled = 0;
+    for (int i = 0; i < n; i++) {
+        if (pool_slot_locked(*pool, rank[(size_t) i], nullptr, false) == nullptr) {
+            break;
+        }
+        filled++;
+    }
+    if (filled > 0) {
+        GGML_LOG_WARN("%s: pool re-ranked from prompt tally layer=%d role=%s: %d/%d slots (%zu wanted non-resident)\n",
+                      __func__, t.layer, t.role.c_str(), filled, pool->slots, rank.size());
+    }
+}
+
 // `protect`/`n_protect`: experts that belong to the token currently being staged and must NOT be chosen as
 // an eviction victim.  Without this, an expert admitted earlier in the same token can be evicted by a later
 // one (its freshly-seeded count is the smallest), which is what made the hook's `all` flag flip from token
@@ -1430,35 +1480,43 @@ void policy_pull_host_locked(table_t & t, int device) {
 // non-empty; the seed takes effect from the NEXT token (this call is post-graph, before the batched policy
 // kernel, which then treats the seeded slots as provisional).  A no-op until a prefill has tallied.
 bool seed_prefill_lazy_locked(int device, void * stream) {
-    if (!g_prefill_seed || device < 0 || device >= (int) g_policy_dev.size()) {
+    if (!g_prefill_seed || device < 0) {
         return false;
     }
-    policy_dev_t & pd = g_policy_dev[device];
+    // Iterate the device's registered cache tables DIRECTLY, not the device-policy descriptor list: the
+    // seed must run for the host expert pool path too, where the pool forces `t.policy` off and the
+    // descriptor list is empty even though the device tally was collected.
+    std::vector<int> ids;
     bool any = false;
-    for (int id : pd.ids) {
-        if (g_tables[id].prefill_tally_pending && !g_tables[id].prefill_seeded) { any = true; break; }
+    for (int i = 0; i < (int) g_tables.size(); i++) {
+        const table_t & t = g_tables[i];
+        if (t.device != device || t.n_experts <= 0) {
+            continue;
+        }
+        ids.push_back(i);
+        if (t.prefill_tally_pending && !t.prefill_seeded) {
+            any = true;
+        }
     }
     if (!any) {
         return false;
     }
-    // If the policy is already live the host mirrors are stale; snapshot the true residency so a victim is
-    // never a slot the device still holds.  On the very first flush the mirrors ARE the source (the policy
-    // prebuild seeds them from the same mirrors), so no snapshot is needed.
-    if (pd.initialized && pd.desc != nullptr) {
-        for (int id : pd.ids) {
-            policy_pull_host_locked(g_tables[id], device);
-        }
+    // If the device policy is live the host mirrors are stale; snapshot the true residency so a victim is
+    // never a slot the device still holds.  A no-op for a non-policy table, where the mirrors ARE the
+    // source (the host-promotion path).
+    for (int id : ids) {
+        policy_pull_host_locked(g_tables[id], device);
     }
     int seeded_tables = 0, seeded_slots = 0;
     device_guard dg(device);
-    for (int id : pd.ids) {
+    for (int id : ids) {
         table_t & t = g_tables[id];
         if (!t.prefill_tally_pending || t.prefill_seeded || t.n_experts <= 0) {
             continue;
         }
         t.prefill_seeded        = true;
         t.prefill_tally_pending = false;
-        if (t.prefill_count_dev == nullptr || t.identity || t.slots <= 0 || t.host == nullptr) {
+        if (t.prefill_count_dev == nullptr) {
             continue;
         }
         std::vector<int32_t> tally((size_t) t.n_experts, 0);
@@ -1474,30 +1532,34 @@ bool seed_prefill_lazy_locked(int device, void * stream) {
             total += tally[(size_t) e];
             rank[(size_t) e] = e;
         }
-        if (total <= 0) {
-            continue;
+        if (total > 0 && !t.identity && t.slots > 0 && t.host != nullptr && t.host_dev != nullptr) {
+            std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
+                if (tally[(size_t) a] != tally[(size_t) b]) return tally[(size_t) a] > tally[(size_t) b];
+                return a < b;
+            });
+            int k = t.n_experts;
+            if (g_prefill_seed_n > 0 && g_prefill_seed_n < k) {
+                k = g_prefill_seed_n;
+            }
+            if (k > t.slots) {
+                k = t.slots;
+            }
+            const int placed = apply_prefill_seed_rank_locked(t, rank, k, stream);
+            if (placed > 0) {
+                seeded_tables++;
+                seeded_slots += placed;
+            }
         }
-        std::sort(rank.begin(), rank.end(), [&](int32_t a, int32_t b) {
-            if (tally[(size_t) a] != tally[(size_t) b]) return tally[(size_t) a] > tally[(size_t) b];
-            return a < b;
-        });
-        int k = t.n_experts;
-        if (g_prefill_seed_n > 0 && g_prefill_seed_n < k) {
-            k = g_prefill_seed_n;
-        }
-        if (k > t.slots) {
-            k = t.slots;
-        }
-        const int placed = apply_prefill_seed_rank_locked(t, rank, k, stream);
-        if (placed > 0) {
-            seeded_tables++;
-            seeded_slots += placed;
-        }
+        // Target 3: rank the host pool from the same tally AFTER the arena seed, so the seeded residents
+        // are excluded and the pool holds the next-most-wanted (additive) experts.
+        pool_rerank_from_tally_locked(t, tally);
     }
     if (seeded_tables > 0) {
         GGML_LOG_WARN("%s: prompt-routing seed dev=%d: %d tables, %d provisional slots\n",
                       __func__, device, seeded_tables, seeded_slots);
-        pd.initialized = false;   // force `build_policy_descs_locked` to resync the device from the host
+        if (device < (int) g_policy_dev.size()) {
+            g_policy_dev[device].initialized = false;   // resync the policy from the seeded host mirrors
+        }
         return true;
     }
     return false;
@@ -4212,27 +4274,31 @@ bool moe_cache_policy_flush(int device, void * stream) {
     pd.tokens++;
     if (g_devpolicy) {
         build_policy_descs_locked(device);
-        // Prompt-routing seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): the first decode-band flush after the
-        // prefill tally is non-empty bulk-admits the prompt's hottest experts; a true return means the
-        // device state must be resynced from the (now seeded) host mirrors before the policy kernel.
-        if (seed_prefill_lazy_locked(device, stream)) {
+    }
+    // Prompt-routing seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): the first decode-band flush after the prefill
+    // tally is non-empty bulk-admits the prompt's hottest experts.  This is INDEPENDENT of the admission
+    // engine: with the host expert pool on, `t.policy` is off for every table, but the device tally
+    // (`moe_cache_tally_prefill`) is still collected and both the arena seed and the pool must rank from
+    // it.  A true return means the device-policy state must resync from the (now seeded) host mirrors.
+    if (g_prefill_seed && g_devmap) {
+        if (seed_prefill_lazy_locked(device, stream) && g_devpolicy) {
             build_policy_descs_locked(device);
         }
-        if (pd.desc != nullptr && pd.shape_dev != nullptr && pd.n > 0) {
-            for (int i = 0; i < pd.n; i++) {
-                table_t & t = g_tables[pd.ids[(size_t) i]];
-                pd.shape_host[(size_t) i] = t.policy_pending ? (int32_t) (t.policy_n_used * t.policy_n_tok) : 0;
-                t.policy_pending = false;
-            }
-            device_guard dg(device);
-            (void) cudaMemcpyAsync(pd.shape_dev, pd.shape_host.data(), (size_t) pd.n * sizeof(int32_t),
-                                   cudaMemcpyHostToDevice, (cudaStream_t) stream);
-            const int threads = 256;
-            const int admit_arg = g_admit;
-            moe_cache_policy_kernel<<<pd.n, threads, 0, (cudaStream_t) stream>>>(
-                pd.desc, pd.shape_dev, pd.n, admit_arg, (int) g_touch, (int) g_period,
-                0, g_fill ? 1 : 0, g_prov_evict ? 1 : 0);
+    }
+    if (g_devpolicy && pd.desc != nullptr && pd.shape_dev != nullptr && pd.n > 0) {
+        for (int i = 0; i < pd.n; i++) {
+            table_t & t = g_tables[pd.ids[(size_t) i]];
+            pd.shape_host[(size_t) i] = t.policy_pending ? (int32_t) (t.policy_n_used * t.policy_n_tok) : 0;
+            t.policy_pending = false;
         }
+        device_guard dg(device);
+        (void) cudaMemcpyAsync(pd.shape_dev, pd.shape_host.data(), (size_t) pd.n * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, (cudaStream_t) stream);
+        const int threads = 256;
+        const int admit_arg = g_admit;
+        moe_cache_policy_kernel<<<pd.n, threads, 0, (cudaStream_t) stream>>>(
+            pd.desc, pd.shape_dev, pd.n, admit_arg, (int) g_touch, (int) g_period,
+            0, g_fill ? 1 : 0, g_prov_evict ? 1 : 0);
     }
     return true;
 }
