@@ -1873,6 +1873,13 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    // Hybrid only: NCCL is brought up LAZILY on the first tensor too large for the internal pipeline
+    // (prefill).  Eager `ncclCommInitAll` measurably poisons the internal path even when no collective
+    // uses it (2x R9700 `-sm tensor` decode 78 -> 46 t/s, 3x: 67 -> 22 t/s).  Every decode reduce is
+    // already routed to the internal pipeline, so this is NCCL's init side-effect, not a reduce cost.
+    bool                        nccl_lazy  = false;
+    bool                        nccl_tried = false;
+
     // --- copy-engine (SDMA) P2P AllReduce scratch (GGML_CUDA_ALLREDUCE=ce; opt-in) ---
     // Lazily grown bf16 staging per rank + four events per rank for cross-device ordering:
     //   ce_ev_send : phase-1 (reduce-scatter) sends drained
@@ -2435,6 +2442,7 @@ static bool ggml_backend_cuda_comm_init_ce(ggml_backend_cuda_comm_context * ret)
         }
     }
     ret->try_allreduce = ggml_backend_cuda_comm_allreduce_ce;
+    ret->nccl_lazy     = false;   // CE now owns the large arm; do not lazy-init NCCL over it
     return true;
 }
 
@@ -2445,26 +2453,22 @@ static bool ggml_backend_cuda_comm_init_ce(ggml_backend_cuda_comm_context * ret)
 // pipeline directly; everything else falls through to try_allreduce, which we
 // set to NCCL when available.
 static void ggml_backend_cuda_comm_init_hybrid(ggml_backend_cuda_comm_context * ret) {
-    const bool has_nccl     = ggml_backend_cuda_comm_init_nccl(ret);
+    // Bring the internal pipeline up first -- it serves every decode-sized tensor directly.  NCCL is
+    // deferred to the first tensor large enough to need it (see `nccl_lazy`); until then the large arm
+    // falls through to the internal pipeline (correct, just not bandwidth-optimal for a large prefill).
     const bool has_internal = ggml_backend_cuda_comm_init_internal(ret);
+    if (has_internal) {
+        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_internal;
 #ifdef GGML_USE_NCCL
-    if (has_nccl) {
-        // Large tensors -> NCCL (P2P).  Small tensors are routed to the
-        // internal pipeline by the dispatcher regardless of this pointer.
-        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
-    } else if (!has_internal) {
-        // Neither path came up; butterfly fallback below (try_allreduce stays
-        // as-is until comm_init_none is called by the caller).
-        ret->try_allreduce = nullptr;
-    }
-#else
-    // No NCCL/RCCL compiled in (has_nccl is always false); only the internal
-    // pipeline can serve AR.
-    (void) has_nccl;
-    if (!has_internal) {
-        ret->try_allreduce = nullptr;
-    }
+        ret->nccl_lazy     = true;
 #endif
+    } else {
+        // No internal pipeline: NCCL is the only option, so bring it up now (eagerly).
+        ret->nccl_lazy = false;
+        if (!ggml_backend_cuda_comm_init_nccl(ret)) {
+            ret->try_allreduce = nullptr;
+        }
+    }
 }
 
 // Top-level init.  Picks a comm setup based on GGML_CUDA_ALLREDUCE (or the
@@ -2561,6 +2565,17 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     // internal pipeline as well instead of returning false and letting the meta
     // backend's butterfly run -- on a RCCL-broken host the butterfly is what
     // hangs.
+    // Lazy hybrid: the first tensor too large for the internal pipeline brings NCCL up and switches the
+    // large arm to it.  A decode-only run never pays the eager init cost.
+    if (comm_ctx->nccl_lazy && !comm_ctx->nccl_tried) {
+        comm_ctx->nccl_tried = true;
+#ifdef GGML_USE_NCCL
+        if (ggml_backend_cuda_comm_init_nccl(comm_ctx)) {
+            comm_ctx->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+        }
+#endif
+        comm_ctx->nccl_lazy = false;
+    }
     auto fn = comm_ctx->try_allreduce;
     const bool ok = fn(comm_ctx, tensors);
     if (!ok && comm_ctx->ar_pipeline != nullptr &&
