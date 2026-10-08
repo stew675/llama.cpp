@@ -13,11 +13,15 @@
 #include <map>
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
+#include <condition_variable>
+#include <deque>
 #include <set>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -238,8 +242,10 @@ struct host_pool_t {
     size_t      align       = 4096;
     std::vector<int32_t>                 slot_expert;   // slot -> expert, -1 empty
     std::unordered_map<int32_t, int32_t> expert_slot;
-    // ADDITIVE lifecycle per slot: 0 = free, 1 = the pool holds it (the arena does not), 2 = retiring
-    // (the arena admitted it; the entry is freed once every in-flight copy drains).
+    // ADDITIVE lifecycle per slot: 0 = free, 1 = resident (the pool holds it, the arena does not),
+    // 2 = retiring (the arena admitted it; freed once every in-flight copy drains), 3 = the low-priority
+    // background worker is filling it (data not ready), 4 = that fill was cancelled (the arena took the
+    // expert first) and is freed by the worker after its read.
     std::vector<uint8_t>                 slot_state;
     // Per (slot, device) in-flight events.  The pool is PROCESS-WIDE, so the same slot can be copied to
     // several devices and every copy must drain before the slot is reused or retired.  Indexed
@@ -261,7 +267,23 @@ std::map<const void *, host_pool_t> g_host_pools;   // node-based: pointers stay
 bool    g_pool_enabled     = false;
 bool    g_pool_prewarm     = true;   // MOE_HOST_POOL_PREWARM: fill every pool slot when it is built
 bool    g_pool_dio         = false;  // MOE_HOST_POOL_DIO=1: O_DIRECT fill (debug fallback; bypasses the page cache)
+bool    g_pool_bg          = true;   // MOE_HOST_POOL_BGFETCH=0: do eviction fills synchronously on the critical path
 int64_t g_pool_total_bytes = 0;   // PROCESS-WIDE total budget (split over all registered host tensors)
+
+// Target 2: a LOW-PRIORITY background queue for the eviction prefetch.  An eviction no longer blocks the
+// token on a page-cache read; it hands the expert to the worker, which fills a reserved slot off the
+// critical path.  The worker holds `g_mutex` only to reserve/publish a slot and reads the GGUF WITHOUT
+// it, so it never stalls an urgent load.  It re-checks `expert_slot` before reserving, so a synchronous
+// critical-path fill that beat it makes the request a no-op.
+// These are deliberately LEAKED (heap objects with no destructor): the detached worker blocks in
+// `g_bg_cv.wait`, and a static `condition_variable` destructor at process exit deadlocks in
+// `pthread_cond_destroy` (observed: `__cxa_finalize` waiting on the worker's futex).  A process-lifetime
+// worker needs process-lifetime primitives.
+std::mutex &              g_bg_mutex = *new std::mutex();
+std::condition_variable & g_bg_cv    = *new std::condition_variable();
+std::deque<std::pair<host_pool_t *, int32_t>> & g_bg_queue = *new std::deque<std::pair<host_pool_t *, int32_t>>();
+bool                      g_bg_stop    = false;
+bool                      g_bg_started = false;
 
 // An alias is keyed by a scheduler tensor address, and the graph allocator reuses those addresses across graphs - with
 // several devices, for a split input on ANOTHER device.  A lookup that is not preceded by a registration in the same
@@ -494,6 +516,7 @@ void parse_env() {
     g_pool_enabled     = moe_host_pool_mib() > 0;
     g_pool_prewarm     = env_int("MOE_HOST_POOL_PREWARM", 1) != 0;
     g_pool_dio         = env_int("MOE_HOST_POOL_DIO", 0) != 0;
+    g_pool_bg          = env_int("MOE_HOST_POOL_BGFETCH", 1) != 0;
     g_pool_total_bytes = g_pool_enabled ? moe_host_pool_mib() * 1024 * 1024 : 0;
     if (g_pool_enabled) {
         GGML_LOG_INFO("%s: MoE host expert pool: %lld MiB PROCESS-WIDE, pinned, page-cache-filled "
@@ -852,12 +875,19 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
     pool_reap_locked(p);
     const auto hit = p.expert_slot.find(expert);
     if (hit != p.expert_slot.end()) {
-        p.hits++;
-        p.last[(size_t) expert] = ++p.clock;
-        if (out_slot != nullptr) {
-            *out_slot = hit->second;
+        const int hs = hit->second;
+        if (hs >= 0 && hs < p.slots && p.slot_state[(size_t) hs] == 1) {
+            p.hits++;
+            p.last[(size_t) expert] = ++p.clock;
+            if (out_slot != nullptr) {
+                *out_slot = hs;
+            }
+            return p.base + (size_t) hs * p.host_bytes;
         }
-        return p.base + (size_t) hit->second * p.host_bytes;
+        // State 3/4: the background worker owns this slot (its data is not ready, or its fill was
+        // cancelled).  Do NOT duplicate the read here; return null so the caller falls back to the
+        // master (cheap, pinned) and the background entry becomes the ready copy.
+        return nullptr;
     }
     p.misses++;
     int slot = -1;
@@ -925,6 +955,156 @@ static char * pool_slot_locked(host_pool_t & p, int expert, int * out_slot, bool
         *out_slot = slot;
     }
     return dst;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Target 2: the low-priority background eviction prefetch
+// ---------------------------------------------------------------------------------------------
+
+static void pool_bg_worker();
+
+// Start the worker on first use.  It is detached: it lives for the process and only touches
+// `host_pool_t`s (stable `std::map` nodes) under `g_mutex` for the reserve/publish steps.
+static void pool_bg_start() {
+    if (g_bg_started) {
+        return;
+    }
+    g_bg_started = true;
+    std::thread t(pool_bg_worker);
+    t.detach();
+}
+
+// Hand an expert to the background worker.  A dropped request is only a lost prefetch, never a
+// correctness issue (the critical path still reads it from the master on a miss).
+static void pool_bg_enqueue(host_pool_t * p, int32_t expert) {
+    if (!g_pool_bg || p == nullptr) {
+        return;
+    }
+    pool_bg_start();
+    std::lock_guard<std::mutex> lk(g_bg_mutex);
+    if (g_bg_queue.size() >= 8192) {
+        return;
+    }
+    g_bg_queue.emplace_back(p, expert);
+    g_bg_cv.notify_one();
+}
+
+// The background fill.  It reserves a slot and opens the fd under `g_mutex`, reads the GGUF WITHOUT it
+// (so a slow page-cache miss never stalls an urgent load), then publishes.  If the critical path filled
+// the same expert meanwhile, `expert_slot` already holds it and the reserve is dropped.
+static void pool_bg_worker() {
+#if !defined(_WIN32)
+    // Lowest practical scheduling priority: this thread may only use the I/O the critical path is not.
+    (void) setpriority(PRIO_PROCESS, 0, 19);
+#endif
+    for (;;) {
+        host_pool_t * p  = nullptr;
+        int32_t       ex = -1;
+        {
+            std::unique_lock<std::mutex> lk(g_bg_mutex);
+            g_bg_cv.wait(lk, [] { return g_bg_stop || !g_bg_queue.empty(); });
+            if (g_bg_stop && g_bg_queue.empty()) {
+                return;
+            }
+            const auto item = g_bg_queue.front();
+            g_bg_queue.pop_front();
+            p  = item.first;
+            ex = item.second;
+        }
+        if (p == nullptr || p->failed || ex < 0 || ex >= p->n_experts) {
+            continue;
+        }
+        int    slot = -1, fd = -1;
+        size_t off = 0, hb = 0, align = 4096;
+        char * dst = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            if (p->failed) {
+                continue;
+            }
+            pool_reap_locked(*p);
+            if (p->expert_slot.find(ex) != p->expert_slot.end()) {
+                continue;   // already resident (the critical path won) or already in flight
+            }
+            for (int s = 0; s < p->slots; s++) {
+                if (p->slot_expert[(size_t) s] < 0) { slot = s; break; }
+            }
+            if (slot < 0) {
+                int victim = -1;
+                int64_t best = 0;
+                for (int s = 0; s < p->slots; s++) {
+                    const int32_t e = p->slot_expert[(size_t) s];
+                    if (e < 0 || p->slot_state[(size_t) s] != 1) {
+                        continue;   // resident-only: never evict a retiring/reserved slot
+                    }
+                    if (victim < 0 || p->last[(size_t) e] < best) {
+                        best   = p->last[(size_t) e];
+                        victim = e;
+                        slot   = s;
+                    }
+                }
+                if (victim >= 0) {
+                    p->expert_slot.erase(victim);
+                    p->slot_expert[(size_t) slot] = -1;
+                    p->slot_state[(size_t) slot]  = 0;
+                    p->evictions++;
+                }
+            }
+            if (slot < 0) {
+                continue;   // every slot is reserved or retiring: drop the prefetch
+            }
+            if (p->fd < 0) {
+                p->fd = open(p->path.c_str(), O_RDONLY | (g_pool_dio ? O_DIRECT : 0));
+                if (p->fd < 0) {
+                    p->failed = true;
+                    continue;
+                }
+                struct stat st;
+                if (fstat(p->fd, &st) == 0 && st.st_blksize > 0) {
+                    p->align = (size_t) st.st_blksize;
+                }
+            }
+            p->slot_expert[(size_t) slot] = ex;
+            p->expert_slot[ex]            = slot;
+            p->slot_state[(size_t) slot]  = 3;   // reserved: the arena must not read it yet
+            p->last[(size_t) ex]          = ++p->clock;
+            fd    = p->fd;
+            off   = p->file_offs + (size_t) ex * p->host_bytes;
+            hb    = p->host_bytes;
+            align = p->align;
+            dst   = p->base + (size_t) slot * p->host_bytes;
+        }
+        const bool ok = g_pool_dio ? pool_dio_read(fd, dst, hb, off, align)
+                                   : (pread(fd, dst, hb, (off_t) off) == (ssize_t) hb);
+        {
+            std::lock_guard<std::mutex> lk(g_mutex);
+            if (p->slot_state[(size_t) slot] == 3) {
+                if (ok) {
+                    p->slot_state[(size_t) slot] = 1;
+                    p->fills++;
+                } else {
+                    p->expert_slot.erase(ex);
+                    p->slot_expert[(size_t) slot] = -1;
+                    p->slot_state[(size_t) slot]  = 0;
+                }
+            } else if (p->slot_state[(size_t) slot] == 4) {
+                // Cancelled: the arena took the expert while this read was in flight.  Discard it.
+                p->expert_slot.erase(ex);
+                p->slot_expert[(size_t) slot] = -1;
+                p->slot_state[(size_t) slot]  = 0;
+            }
+        }
+    }
+}
+
+// The critical path served an expert from the master while the background worker had a reservation in
+// flight: cancel it (state 3 -> 4) so the worker discards its read.  Caller holds `g_mutex`.
+static void pool_cancel_bg_locked(host_pool_t & p, int32_t expert) {
+    const auto it = p.expert_slot.find(expert);
+    if (it != p.expert_slot.end() && it->second >= 0 && it->second < p.slots &&
+        p.slot_state[(size_t) it->second] == 3) {
+        p.slot_state[(size_t) it->second] = 4;
+    }
 }
 
 // Pre-warm a freshly created pool: fill every slot from the GGUF with O_DIRECT while there is no decode
@@ -1185,10 +1365,15 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
         int           pool_slot   = -1;
         host_pool_t * pool        = table_pool_locked(t);
         // ADDITIVE: put the expert the arena just evicted into the pool, so it is ready when the arena
-        // needs it again (usually within a few tokens).  The arena slot still holds it, but re-reading
-        // through the page cache is simpler than a D2H and does not stall the compute stream.
+        // needs it again (usually within a few tokens).  Target 2: unless the kill-switch is set, hand it
+        // to the low-priority background worker instead of reading it here, so the token never blocks on
+        // the page cache.  The worker re-checks `expert_slot` (a critical-path fill may have won).
         if (pool != nullptr && victim >= 0) {
-            (void) pool_slot_locked(*pool, victim, nullptr, false);
+            if (g_pool_bg) {
+                pool_bg_enqueue(pool, victim);
+            } else {
+                (void) pool_slot_locked(*pool, victim, nullptr, false);
+            }
         }
         // Only source from the pool when this table's slice fits inside a whole-expert slot.  The meta
         // splitter can hand a device a DEGENERATE simple tensor (`ne[split]=0`, `nb[2]=0`), which
@@ -1220,18 +1405,25 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
                                         kind, (cudaStream_t) stream);
             }
         }
-        if (from_pool && pool != nullptr && pool_slot >= 0 && stream != nullptr) {
+        if (from_pool && pool != nullptr && pool_slot >= 0) {
             // Mark when this slot's copy to THIS device has drained, so a later eviction can safely
             // overwrite it (per-device: a process-wide slot may serve several devices).
-            cudaEvent_t ev = pool_slot_event(*pool, pool_slot, t.device >= 0 ? t.device : 0);
-            if (ev != nullptr) {
-                (void) cudaEventRecord(ev, (cudaStream_t) stream);
+            if (stream != nullptr) {
+                cudaEvent_t ev = pool_slot_event(*pool, pool_slot, t.device >= 0 ? t.device : 0);
+                if (ev != nullptr) {
+                    (void) cudaEventRecord(ev, (cudaStream_t) stream);
+                }
             }
             // ADDITIVE: the arena now owns this block; free the pool entry as soon as the copy drains
             // (`pool_reap_locked`), so the pool stays the complement of the arena.
             if (pool_slot < (int) pool->slot_state.size()) {
                 pool->slot_state[(size_t) pool_slot] = 2;
             }
+        } else if (pool != nullptr) {
+            // The master served this fill (a background reservation held state 3, or the pool was full):
+            // cancel any in-flight background copy of this expert so the pool does not keep a duplicate
+            // the arena now owns.
+            pool_cancel_bg_locked(*pool, expert);
         }
         if (err != cudaSuccess) {
             GGML_LOG_WARN("%s: async fill failed table layer=%d role=%s expert=%d: %s\n",
