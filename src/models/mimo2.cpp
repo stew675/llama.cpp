@@ -37,18 +37,18 @@ void llama_model_mimo2::load_arch_tensors(llama_model_loader & ml) {
 
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
-        uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(i);
-        uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(i);
-        uint32_t n_head = hparams.n_head(i);
+        uint32_t n_embd_k_gqa_l = hparams.n_embd_k_gqa(i);
+        uint32_t n_embd_v_gqa_l = hparams.n_embd_v_gqa(i);
+        uint32_t n_head_l = hparams.n_head(i);
 
         const bool is_nextn = i >= n_layer;
         const int  flags    = is_nextn ? mtp_flags : trunk_flags;
 
-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, flags);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_v * n_head, n_embd }, flags);
+        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head_l, n_embd_k_gqa_l, n_embd_v_gqa_l, flags);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), { n_embd_head_v * n_head_l, n_embd }, flags);
 
         layer.attn_norm  = create_tensor(tn(LLM_TENSOR_ATTN_NORM,  "weight", i), {n_embd}, flags);
-        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head}, TENSOR_NOT_REQUIRED | flags);
+        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), {n_head_l}, TENSOR_NOT_REQUIRED | flags);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
 

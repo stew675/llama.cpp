@@ -641,9 +641,9 @@ const char * llama_grammar_parser::parse_sequence(
                 pos = parse_space(pos + 1, is_nested);
 
                 if (is_digit_char(*pos)) {
-                    const char * int_end = parse_int(pos);
-                    max_times = std::stoull(std::string(pos, int_end - pos));
-                    pos = parse_space(int_end, is_nested);
+                    const char * max_int_end = parse_int(pos);
+                    max_times = std::stoull(std::string(pos, max_int_end - pos));
+                    pos = parse_space(max_int_end, is_nested);
                 }
 
                 if (*pos != '}') {

@@ -836,7 +836,7 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
 
             // validate the quantized data
             if (!ggml_validate_row_data(new_type, this_data, this_size)) {
-                std::unique_lock<std::mutex> lock(mutex);
+                std::unique_lock<std::mutex> lock_validate(mutex);
                 valid = false;
                 break;
             }

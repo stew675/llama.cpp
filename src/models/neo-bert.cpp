@@ -58,15 +58,15 @@ llama_model_neo_bert::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
-        ggml_tensor * cur = inpL;
+        ggml_tensor * cur_l = inpL;
 
         // pre-norm
-        cur = build_norm(inpL,
+        cur_l = build_norm(inpL,
                 model.layers[il].attn_norm, NULL,
                 LLM_NORM_RMS, il);
 
         {
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur_l,
                     n_embd_head, n_head, n_head_kv, il);
 
             // RoPE
@@ -86,29 +86,29 @@ llama_model_neo_bert::graph::graph(const llama_model & model, const llm_graph_pa
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
+            cur_l = build_attn(inp_attn,
                     model.layers[il].wo, nullptr, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
-            cb(cur, "kqv_out", il);
+            cb(cur_l, "kqv_out", il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
-            cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+            cur_l  = ggml_get_rows(ctx0,  cur_l, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
         // re-add the layer input
-        cur = ggml_add(ctx0, cur, inpL);
+        cur_l = ggml_add(ctx0, cur_l, inpL);
 
-        ggml_tensor * ffn_inp = cur;
+        ggml_tensor * ffn_inp = cur_l;
         cb(ffn_inp, "ffn_inp", il);
 
         // pre-norm
-        cur = build_norm(ffn_inp,
+        cur_l = build_norm(ffn_inp,
                 model.layers[il].ffn_norm, NULL,
                 LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
+        cb(cur_l, "ffn_norm", il);
 
         // feed-forward network
-        cur = build_ffn(cur,
+        cur_l = build_ffn(cur_l,
                 model.layers[il].ffn_up,
                 NULL, NULL, NULL, NULL, NULL,
                 model.layers[il].ffn_down,
@@ -116,10 +116,10 @@ llama_model_neo_bert::graph::graph(const llama_model & model, const llm_graph_pa
                 LLM_FFN_SWIGLU, LLM_FFN_SEQ, il);
 
         // attentions bypass the intermediate layer
-        cur = ggml_add(ctx0, cur, ffn_inp);
+        cur_l = ggml_add(ctx0, cur_l, ffn_inp);
 
         // input for next layer
-        inpL = cur;
+        inpL = cur_l;
     }
     cur = inpL;
 
