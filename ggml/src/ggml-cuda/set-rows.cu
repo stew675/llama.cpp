@@ -1,6 +1,8 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
 
+#include <type_traits>
+
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
 // Generic quantized set_rows kernel template
@@ -70,6 +72,77 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     GGML_UNUSED(ne13);
 }
 
+// q8_0: one 32-lane group per block instead of one thread.  The KV cache write is a single short row per token, so
+// one thread looping over 32 elements (and 32 byte stores) was the latency of the whole launch.  amax is an exact max
+// and every element takes the same d and roundf as quantize_f32_q8_0_block, so the bytes written are identical.
+template <typename idx_t>
+static __global__ void k_set_rows_q8_0_group(const float * __restrict__ src0,
+                                             const idx_t * __restrict__ src1,
+                                             block_q8_0 * __restrict__ dst,
+                                             const int64_t ne_total,
+                                             const int64_t s01,
+                                             const int64_t s02,
+                                             const int64_t s03,
+                                             const int64_t s10,
+                                             const int64_t s11,
+                                             const int64_t s12,
+                                             const int64_t s1,
+                                             const int64_t s2,
+                                             const int64_t s3,
+                                             const uint3   ne00,
+                                             const uint3   ne01,
+                                             const uint3   ne02,
+                                             const uint3   ne11_fd,
+                                             const uint3   ne12_fd) {
+    const int     lane = threadIdx.x % QK8_0;
+    const int64_t i    = int64_t(blockIdx.x) * (blockDim.x / QK8_0) + threadIdx.x / QK8_0;
+
+    if (i >= ne_total) {
+        return; // the whole group leaves together
+    }
+
+    const int64_t i_base = i * QK8_0;
+    uint32_t      tmp    = (uint32_t) i_base;
+    uint2         div_mod;
+
+    div_mod           = fast_div_modulo(tmp, ne00);
+    const int64_t i00 = div_mod.y;
+    tmp               = div_mod.x;
+
+    div_mod           = fast_div_modulo(tmp, ne01);
+    const int64_t i01 = div_mod.y;
+    tmp               = div_mod.x;
+
+    div_mod           = fast_div_modulo(tmp, ne02);
+    const int64_t i02 = div_mod.y;
+    const int64_t i03 = div_mod.x;
+
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
+    const int64_t i10 = i01;
+
+    ggml_cuda_pdl_sync();
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+
+    const float * src_block = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
+    block_q8_0  * dst_block = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_q8_0) + i00 / QK8_0;
+
+    const float v = src_block[lane];
+    float amax = fmaxf(0.0f, fabsf(v));   // seeded with 0 like quantize_f32_q8_0_block (all-NaN block -> d = 0)
+#pragma unroll
+    for (int offset = QK8_0/2; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, QK8_0));
+    }
+
+    const float d  = amax / ((1 << 7) - 1);
+    const float id = d ? 1.0f/d : 0.0f;
+
+    if (lane == 0) {
+        dst_block->d = d;
+    }
+    dst_block->qs[lane] = roundf(v*id);
+}
+
 // Template dispatch function for quantized set_rows
 template<typename idx_t, typename block_type, int qk, void (*quantize_func)(const float*, block_type*)>
 static void set_rows_cuda_quant(
@@ -104,9 +177,16 @@ static void set_rows_cuda_quant(
         const uint3 ne11_fd = init_fastdiv_values((uint32_t) ne11);
         const uint3 ne12_fd = init_fastdiv_values((uint32_t) ne12);
 
-        k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
-            src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
-            ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+        if constexpr (std::is_same_v<block_type, block_q8_0>) {
+            constexpr int groups = CUDA_SET_ROWS_BLOCK_SIZE / QK8_0;
+            k_set_rows_q8_0_group<idx_t><<<(ne_total + groups - 1) / groups, block_size, 0, stream>>>(
+                src0_d, src1_d, dst_d, ne_total, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
+                ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+        } else {
+            k_set_rows_quant<idx_t, block_type, qk, quantize_func><<<grid_size, block_size, 0, stream>>>(
+                src0_d, src1_d, dst_d, ne_total, ne10, ne11, ne12, ne13, s01, s02, s03, s10, s11, s12, s1, s2, s3, ne00_fd,
+                ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+        }
     }
 }
 
