@@ -1,0 +1,33 @@
+#pragma once
+#include "common.cuh"
+// MMB: dequant-to-BF16 WMMA GEMM path for IQ4_NL weights on gfx1151 (RDNA3.5). Env-gated: LLAMA_MMB=1, LLAMA_MMB_MIN_T (default 512).
+bool ggml_cuda_mmb_supported_mm  (const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_mmb   (ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+void ggml_cuda_mmb_begin_graph();
+// producers that can emit a BF16 copy of an F32 output register it here; returns the BF16 buffer to fill (n elements)
+uint16_t * ggml_cuda_mmb_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n);
+// BF16 copy of tensor t if one is cached for the current graph (consumers may read it instead of the F32 data)
+const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t);
+// producer slots (pinned until the next producer of the same kind): 0 = HC normalized stream xn, 1 = HC gate
+uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n);
+void ggml_cuda_mmb_marks_clear();
+size_t ggml_cuda_mmb_marks_count();
+void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t);
+bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t);
+bool ggml_cuda_mmb_gatemix();
+bool ggml_cuda_mmb_active();
+// True iff MMB will actually take a dense MUL_MAT / a routed MUL_MAT_ID or its SWIGLU pair for this
+// weight type. The graph optimizer stands its own fusions down on this predicate rather than on the
+// global gate, so enabling MMB on a model whose expert type it does not support keeps the fusions.
+bool ggml_cuda_mmb_dense_will_take(const ggml_tensor * w);
+bool ggml_cuda_mmb_routed_will_take(const ggml_tensor * w);
+bool ggml_cuda_mmb_down16();
+bool ggml_cuda_mmb_res16();
+bool ggml_cuda_mmb_blk16();
+bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst, int hc, float scale, float bias);
+bool ggml_cuda_mmb_supported_glu(const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * glu);
+void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * gw, const ggml_tensor * uw, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * glu);
+void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor * w);
+void ggml_cuda_mmb_release_all();
