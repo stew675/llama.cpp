@@ -2708,6 +2708,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
     add_opt(common_arg(
+        {"--host-experts"}, "MODE",
+        "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
+        "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
+        "- pool: the pinned master plus a bounded pinned host pool (MOE_HOST_POOL_MIB, default 25% of the MoE host expert bytes)\n"
+        "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "auto")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
+            else if (value == "pinned" || value == "pin" || value == "1") { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED; }
+            else if (value == "pool")                            { params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_POOL;   }
+            else if (value == "mmap"   || value == "0")          { throw std::invalid_argument("--host-experts mmap is not supported (a pageable host master cannot be read by a no-XNACK GPU, issue #116); use 'pinned'"); }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ));
+    add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
@@ -2766,11 +2780,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
+        "keep the Mixture of Experts (MoE) weights of the LAST N trunk layers in the CPU (set\n"
+        "LLAMA_HOST_EXPERTS_FROM_END=0 to restore the historical first-N placement)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.n_cpu_moe = value;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
@@ -4145,11 +4161,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
     add_opt(common_arg(
         {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model",
+        "keep the Mixture of Experts (MoE) weights of the LAST N trunk layers in the CPU for the draft model",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.speculative.draft.n_cpu_moe = value;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));

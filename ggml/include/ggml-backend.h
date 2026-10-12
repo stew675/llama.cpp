@@ -44,6 +44,87 @@ extern "C" {
     GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
 
+    // Early MoE expert cache auto-sizing (wip/moe-cache-autosize): called by the model layer after the
+    // target context is allocated, before an auxiliary context is created.  No-op for backends without a
+    // cache.  Returns true when a cache remains active.  `max_host_table_bytes` is the largest single
+    // host-resident weight tensor (wip/slab-ring-region: sizes the slab's H2D-ring hole).
+    GGML_API bool                  ggml_backend_dev_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes);
+
+    // WIP r42 (TODO #42): reserve `bytes` of this device's free VRAM for the post-prefill compute
+    // layout.  Called at the prefill -> decode transition, before the MoE expert cache arena is sized.
+    GGML_API void                  ggml_backend_dev_moe_cache_set_reserve(ggml_backend_dev_t dev, size_t bytes);
+
+    // WIP r42: aggregate the MoE expert cache arena's cumulative hit/miss counters (per-turn logging).
+    // Returns false when the backend has no cache or it is disabled.
+    GGML_API bool                  ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes);
+
+    // OPEN 2 (TODO #42): re-arm the MoE expert cache arena after a compute-buffer drop returned the VRAM.
+    // Called at the prefill -> decode transition, after the wide compute layout is released and the narrow
+    // one re-reserved, so the stood-down tables can be re-allocated while the survivors stay resident.
+    // Returns true when anything was re-armed.
+    GGML_API bool                  ggml_backend_dev_moe_cache_rearm(ggml_backend_dev_t dev);
+
+    // wip/host-expert-dio-cache: enable the bounded pinned host pool (`--host-experts pool`) and register
+    // the on-disk source of a host-resident expert tensor.  Routed through the device API so a backend-DL
+    // build (and a Windows DLL) links without a direct ggml-cuda forward declaration (issue #130).
+    // No-op for a backend without the host pool.
+    GGML_API void                  ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_t dev, bool on);
+    GGML_API void                  ggml_backend_dev_moe_cache_set_host_source(ggml_backend_dev_t dev, const void * tensor_data, const char * path, size_t offs, int n_experts, size_t host_bytes, size_t total_bytes);
+
+    // wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.  Armed at a wide
+    // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.
+    // No-op for a backend without a slab or with no ring hole.
+    GGML_API void                  ggml_backend_dev_slab_ring_set(ggml_backend_dev_t dev, bool arm);
+
+    // wip/slab-ring-region: pin the always-resident narrow (decode/verify) work size, so the allocator can
+    // place the staging ring above it.  No-op for a backend without a slab.
+    GGML_API void                  ggml_backend_dev_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes);
+
+    // wip/first-prefill-latency: reserve the wide (prefill) work region above the narrow floor + ring,
+    // so the MoE cache's load-time arena is placed above the region the first wide prefill will use.
+    // No-op for a backend without a slab.
+    GGML_API void                  ggml_backend_dev_slab_reserve_wide(ggml_backend_dev_t dev, size_t bytes);
+
+    // wip/moe-verify-fusions (narrow-2): pin the MTP draft's COMPUTE region at the top of the slab's
+    // reserved VA, so it cannot alias the target's narrow verify buffer at slab base 0.  Idempotent;
+    // no-op for a backend without a slab.
+    GGML_API void                  ggml_backend_dev_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes);
+
+    // wip/moe-verify-fusions (narrow-2): mark this context's COMPUTE allocations as the MTP draft's, so
+    // they route to the pinned narrow-2 region (or, with GGML_CUDA_SLAB_NARROW2=0, bypass the slab).
+    // No-op for a backend without a slab.
+    GGML_API void                  ggml_backend_dev_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable);
+
+    // allocate this context's COMPUTE buffers outside the slab and without the chunk quantization (a buffer the
+    // slab never serves, e.g. the MTP draft's second scheduler).  No-op for a backend without a slab.
+    GGML_API void                  ggml_backend_dev_slab_compute_plain(ggml_backend_dev_t dev, bool enable);
+
+    // OPEN 2 (TODO #42): the size of the device's movable-boundary slab WORK region, or 0 when it has no
+    // slab.  `llama_context` uses it to right-size the compute reserve to the observed workload.
+    GGML_API size_t                ggml_backend_dev_slab_work_size(ggml_backend_dev_t dev);
+
+    // wip/slab-ring-region (issue #164): the size of the device's reserved H2D staging-ring hole, or 0
+    // when the slab carved none.  `llama_context` uses it to skip the narrow -> wide compute-buffer drop
+    // when there is no ring to arm.  No-op (0) for a backend without a slab.
+    GGML_API size_t                ggml_backend_dev_slab_ring_region(ggml_backend_dev_t dev);
+
+    // wip/slab-ring-region (issue #164): set the H2D staging-ring auto-size cap (bytes), computed by
+    // `llama_context` from the ubatch and the host-expert device count.  Call before the slab is created.
+    // No-op for a backend without a slab.  `GGML_CUDA_SLAB_RING_MIB` overrides it per GPU.
+    GGML_API void                  ggml_backend_dev_slab_set_ring_cap(ggml_backend_dev_t dev, size_t bytes);
+    // issue #164: whether this device's movable-boundary slab is enabled (armed for a host-expert model).
+    // The ring sizing warns about a too-small `GGML_CUDA_SLAB_RING_MIB` only when the slab will use it.
+    GGML_API bool                  ggml_backend_dev_slab_enabled(ggml_backend_dev_t dev);
+    // issue #164: the backend's H2D staging-ring depth (slots the ring region is divided into), or 0 when
+    // the backend has no ring.  The context sizes the ring region so one staged table fits per slot.
+    GGML_API size_t                ggml_backend_dev_slab_ring_slots(ggml_backend_dev_t dev);
+
+    // wip/fit-slab-accounting (Phase 1): the VRAM this device's allocator must keep free OUTSIDE the
+    // movable-boundary slab, or 0 when there is no such consumer.  hipBLASLt loads its Tensile code
+    // objects and workspace behind the application's back and the slab cannot serve them, so `--fit`
+    // reserves this much before sizing the context.
+    GGML_API size_t                ggml_backend_dev_slab_headroom_bytes(ggml_backend_dev_t dev);
+
     //
     // Backend buffer
     //
@@ -342,6 +423,11 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
+    // WIP r42 (TODO #42): free the compute buffers so the next alloc_graph sizes them from that graph
+    // instead of the (grow-only) previous peak.  Used to release a wide-prefill compute layout before
+    // the MoE expert cache arena is sized, so a big -ub and a big arena can coexist.
+    GGML_API void                 ggml_backend_sched_drop_buffers(ggml_backend_sched_t sched);
+
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
 
@@ -429,6 +515,27 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // returns true if the device was created by ggml_backend_meta_device()
+    GGML_API bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
+
+    // Select the view slot (0 or 1) of the meta buffers' external views.  A context that keeps two graphs allocated at
+    // once (two schedulers) gives each its own slot, set around the graph's allocation, inputs, compute and outputs.
+    GGML_API void ggml_backend_meta_set_view_slot(int slot);
+
+    // number of "simple" devices wrapped by a meta device
+    GGML_API size_t ggml_backend_meta_dev_n_devs(ggml_backend_dev_t dev);
+
+    // the index-th "simple" device wrapped by a meta device
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t dev, size_t index);
+
+    // issue #164: the byte size of device `dev`'s slice of `tensor` under `split_state`.  This is the
+    // single definition of the meta split size -- `ggml_backend_meta_stage_input` sizes the H2D ring slot
+    // with it, and the host-expert ring hole is sized from the same value, so the hole always holds the
+    // largest upload the staging will ask for.  Returns the whole tensor for a mirrored split.
+    GGML_API size_t ggml_backend_meta_split_dev_bytes(
+        const struct ggml_tensor * tensor, const struct ggml_backend_meta_split_state * split_state,
+        size_t n_devs, size_t dev);
 
     //
     // Utils

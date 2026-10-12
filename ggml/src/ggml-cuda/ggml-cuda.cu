@@ -33,6 +33,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmb.cuh"
+#include "ggml-cuda/moe-expert-cache.h"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -89,6 +90,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <cstdarg>
@@ -143,7 +145,16 @@ int ggml_cuda_get_device() {
     return id;
 }
 
-static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+// Issue/TODO #42: shared device-allocation helper.  It yields the lowest-priority MoE expert-cache
+// arena when an allocation cannot otherwise be satisfied, so EVERY device allocation inherits the same
+// fail-soft policy (defined in ggml-cuda.cu).  The slab query is declared here because the slab itself
+// is defined further down this TU.
+bool ggml_cuda_slab_active(int device);
+bool ggml_cuda_slab_enabled();
+
+cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+
+cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
     // read once: the single device-allocation choke point, and getenv() is expensive on Windows
@@ -171,6 +182,58 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
 #endif // defined(GGML_USE_HIP)
     } else {
         err = cudaMalloc(ptr, size);
+    }
+    if (err == cudaErrorMemoryAllocation) {
+        (void) cudaGetLastError();
+        // OPEN 2 slab: with the movable-boundary slab the arena's physical is MAPPED INTO the slab, so
+        // freeing a table returns its bytes to the slab's free list -- never to the driver -- and ROCm
+        // will not unmap a sub-range of the slab's single mapping.  Churning the cache here cannot make
+        // the retry succeed and only throws away residency, so say what actually helps instead: whatever
+        // this allocation needs must have been reserved OUTSIDE the slab at creation time.
+        // Issue #136 (item D): guard on the predicate that chose the arena backing (`use_slab` is the
+        // global `ggml_cuda_slab_enabled()`), not the failing device's own slab.  When the slab is armed
+        // the arena's physical is mapped into it on every device, so freeing tables cannot return bytes to
+        // the driver and the stand-down loop below only throws residency away.  (`ggml_cuda_slab_active`
+        // let a device whose slab failed to initialise enter that loop even though every table is
+        // slab-backed.)
+        if (ggml_cuda_slab_enabled()) {
+            GGML_LOG_WARN("%s: %.2f MiB allocation failed on device %d while the movable-boundary slab holds "
+                          "the VRAM; the arena cannot yield physical back to the driver.  Raise "
+                          "GGML_CUDA_SLAB_RESERVE_MIB (or disable the slab with GGML_CUDA_SLAB=0) so the "
+                          "weights / KV cache / workspaces stay outside it.\n",
+                          __func__, size / 1024.0 / 1024.0, device);
+            moe_cache_validate("device-malloc-yield");
+            return err;
+        }
+        // WIP r42 (TODO #42) fail-soft policy at the ONE choke point every device allocation can share.
+        // The MoE expert-cache arena is the LOWEST-priority VRAM consumer, so it yields -- largest table
+        // first (usually a few hundred MiB is enough for a grow-in-place realloc), then whole -- before an
+        // allocation is allowed to fail.  Measured: the compute buffer's growth, the mmq workspace pool
+        // (`ggml_cuda_pool_leg::alloc`) and the Q8_1 cache arena (`q8_1_cache_get`) can each be the
+        // allocation that runs when the arena holds the last free VRAM, so patching them one by one is a
+        // losing game; the policy belongs here.  Every allocator that already has its own recovery (the
+        // workspace pool flushes its cached blocks) keeps it -- this simply adds the arena to the pool of
+        // things that can be given back.  Nothing changes when the cache is off.
+        while (moe_cache_shrink_step(device)) {
+            GGML_LOG_WARN("%s: %.2f MiB allocation failed on device %d; shrank the MoE arena and retrying\n",
+                          __func__, size / 1024.0 / 1024.0, device);
+            err = cudaMalloc(ptr, size);
+            if (err == cudaSuccess) {
+                break;
+            }
+            (void) cudaGetLastError();
+        }
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (moe_cache_release_arena()) {
+                GGML_LOG_WARN("%s: %.2f MiB allocation still failed on device %d; released the MoE arena and retrying\n",
+                              __func__, size / 1024.0 / 1024.0, device);
+                err = cudaMalloc(ptr, size);
+            }
+        }
+        // OPEN 2 debug validator (no-op unless MOE_EXPERT_CACHE_VALIDATE is set): catch a cache the
+        // stand-down left inconsistent before the next graph reads it.
+        moe_cache_validate("device-malloc-yield");
     }
     return err;
 }
@@ -312,7 +375,24 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
+        // Fork divergence from PR #24233 (restored prop.integrated on HIP builds): the CUDA
+        // host-buffer path (zero-copy UMA weights) it enables on APUs corrupts full-model
+        // results under async execution on this box (PPL 5.9243 -> 8.51+ without
+        // HIP_LAUNCH_BLOCKING).  Upstream reverted #24233 in #28604 (2026-09-08), making
+        // forced-integrated-false the upstream default again.
+        //
+        // Re-tested 2026-09-23 (closing-the-gap host-buffer investigation): the corruption was
+        // the scheduler reading a host-resident graph input in place; see the host-input guard
+        // in ggml_backend_sched_buffer_supported().  With that guard the real flag is stable on
+        // this box, and it is what lets an APU gather the input embeddings on the GPU (no CPU
+        // backend dispatch) while the embedding weights stay in zero-copy host memory.
+        // GGML_FORCE_NO_INTEGRATED=1 restores the previous default for A/B and bisection.
+#if defined(GGML_USE_HIP)
+        static const bool force_no_integrated = getenv("GGML_FORCE_NO_INTEGRATED") != nullptr;
+        info.devices[id].integrated = force_no_integrated ? false : prop.integrated;
+#else
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
+#endif
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
@@ -414,9 +494,1123 @@ const ggml_cuda_device_info & ggml_cuda_info() {
     return info;
 }
 
+
+// Map physical into an already-reserved VA range.  No slab lock (no shared state).
+//
+// NOTE: the range is mapped as ONE mapping.  ROCm rejects `hipMemUnmap` of a SUB-range (measured:
+// hipErrorInvalidValue), so a per-table TAIL prune would need one mapping per granularity unit -- and a
+// 11776 MiB compute buffer mapped as ~5900 unit mappings then fails an unrelated `hipMemcpy2DAsync`
+// (cpy.cu:479, hipErrorInvalidValue) in-tree, even though a standalone 6144-unit map of the same size
+// succeeds.  That is why the design maps the whole slab ONCE and never gives physical back: the boundary
+// moves at runtime instead, and the arena reclaim is per-table (the tables in the taken chunks).
+static bool ggml_cuda_vmm_map_phys(int device, CUdeviceptr addr, size_t aligned) {
+    const int phys = ggml_cuda_get_physical_device(device);
+
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = phys;
+
+    CUmemGenericAllocationHandle handle;
+    if (cuMemCreate(&handle, aligned, &prop, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    // Every step below is checked explicitly rather than with CU_CHECK: a failure must leave the caller
+    // able to fall back to the plain cudaMalloc path, and CU_CHECK ends the process.  The slab depends
+    // on that (it is offered to every device, including ones whose driver refuses part of this sequence).
+    if (cuMemMap(addr, aligned, 0, handle, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cuMemRelease(handle);
+        return false;
+    }
+    if (cuMemRelease(handle) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cuMemUnmap(addr, aligned);
+        return false;
+    }
+
+    // Grant READWRITE to THIS device and every PEER device.  The scheduler copies a split input
+    // device-to-device (`hipMemcpyPeerAsync`) into the compute buffer, which is a view of this same
+    // slab mapping; granting only the owning device left the peer's copy engine with no access to the
+    // destination and it faulted `Page not present or supervisor privilege` (the parked `-sm tensor`
+    // + partial-arena fault).  Devices that cannot peer-map the range keep their own access (best
+    // effort): a failed peer descriptor must not fail the mapping.
+    const int n_dev = ggml_backend_cuda_get_device_count();
+    std::vector<CUmemAccessDesc> access;
+    access.reserve((size_t) n_dev);
+    {
+        CUmemAccessDesc own = {};
+        own.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        own.location.id   = phys;
+        own.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access.push_back(own);
+    }
+    for (int d = 0; d < n_dev; d++) {
+        const int p = ggml_cuda_get_physical_device(d);
+        if (p == phys) {
+            continue;
+        }
+        CUmemAccessDesc peer = {};
+        peer.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        peer.location.id   = p;
+        peer.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        access.push_back(peer);
+    }
+    if (cuMemSetAccess(addr, aligned, access.data(), access.size()) != cudaSuccess) {
+        // Retry with only the owning device: a peer descriptor rejection is not a mapping failure.
+        (void) cudaGetLastError();
+        CUmemAccessDesc own = access.front();
+        if (cuMemSetAccess(addr, aligned, &own, 1) != cudaSuccess) {
+            (void) cudaGetLastError();
+            (void) cuMemUnmap(addr, aligned);
+            return false;
+        }
+    }
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// OPEN 2: the movable-boundary slab -- ONE per device.
+//
+// The whole allocatable VRAM is reserved and MAPPED EXACTLY ONCE as a single slab, then split by a
+// BOUNDARY: the LOW region `[0, boundary)` is the work pool (the compute buffer) and the HIGH region
+// `[boundary, size)` is the MoE expert-cache arena.  Growing the work pool is a BOUNDARY MOVE inside the
+// already-mapped slab -- the lowest arena chunks are reassigned to the work pool and the arena tables
+// that live there are dropped -- so `cuMemCreate`/`cuMemMap`/`cuMemUnmap` are NOT called at runtime: HIP
+// is touched only when the slab is created and when it is destroyed.  Because the work region's base VA
+// never moves, a growing layout keeps every tensor address it had.
+//
+// LOCKING: `g_slab_mutex` guards the map.  The boundary move must NOT hold it across the arena eviction
+// (which re-enters via `ggml_cuda_slab_arena_free`), so `work_alloc` computes the range, unlocks, evicts,
+// relocks.  Ordering is cache lock -> slab lock everywhere (the cache allocates arena slabs under its own
+// lock); nothing takes the slab lock and then the cache lock.
+struct ggml_cuda_slab {
+    bool                     inited   = false;
+    int                      device   = -1;
+    CUdeviceptr              base     = 0;
+    size_t                   size     = 0;      // VA reserved for the slab (chunk-aligned).  Physical is
+                                                //  mapped into it in two steps -- `mapped` at creation and
+                                                //  the rest by `ggml_cuda_slab_extend` -- so the arena can
+                                                //  grow into reserve the model turned out not to need.
+    size_t                   mapped   = 0;      // how much of `size` has physical behind it: the ARENA's
+                                                //  top is `mapped`, NOT `size`
+    size_t                   chunk    = 0;      // chunk unit for the BOUNDARY move
+    size_t                   unit     = 0;      // finer unit for ARENA allocations (chunk-aligned slabs
+                                                //  would waste up to chunk-1 bytes per table: ~9 GiB over
+                                                //  288 tables, which made most tables fail to allocate)
+    size_t                   boundary = 0;      // work = [0, boundary), arena = [boundary, size)
+    // wip/slab-ring-region (0 -> narrow -> RB -> wide -> arena): the work region is split so the
+    // always-resident NARROW (decode/verify) compute view owns [0, `narrow_floor`), the H2D staging ring
+    // owns [`narrow_floor`, `narrow_floor + ring_region`), and the transient WIDE (prefill) compute view
+    // owns [`narrow_floor + ring_region`, boundary).  The arena is always [boundary, mapped), i.e. above
+    // the work, so the ring is NEVER part of the arena and arming it is an ordinary work-boundary move
+    // (it evicts the COLDEST tables, exactly like a prefill grow).  When the wide view is dropped the
+    // boundary shrinks back to `narrow_floor` and the ring + wide regions return to the arena.
+    size_t                   narrow_floor = 0;  // the fixed, always-resident narrow size (0 = not established)
+    // wip/moe-verify-fusions (narrow-2): a SECOND static narrow view -- the MTP draft context's compute
+    // buffer -- is pinned at the TOP of the reserved VA: `[narrow2_off, size)`.  With MTP there are TWO
+    // live compute buffers (the target's verify view and the draft context's), so without this they both
+    // aliased at base 0 (measured: plain != MTP, near-tie flip at decode token 69).  Pinning narrow-2 at
+    // the top of `size` (NOT `mapped`) lets `slab_extend` grow the arena only up to `narrow2_off`: nothing
+    // moves and no arena table is evicted to make room.  It is never part of the work pool or the arena.
+    size_t                   narrow2_floor = 0; // the pinned narrow-2 size (0 = not established)
+    size_t                   narrow2_off   = 0; // = size - narrow2_floor, fixed once established
+    int                      narrow2_live  = 0; // live narrow-2 views (diagnostic/guard)
+    size_t                   ring_region  = 0;  // ring bytes above the narrow floor (0 = no ring)
+    bool                     ring_armed   = false; // the wide view (hence the ring region) is reserved
+    size_t                   ring_used    = 0;  // bump cursor within the ring region
+    int                      ring_slots   = 0;  // slots the ring region was sized for (capacity = region/slots)
+    std::multiset<size_t>    work_needs;        // REQUESTED size of every live work view -- the floor the
+                                                //  boundary may shrink to (see `work_alloc`)
+    bool                     cache_unusable = false; // the slab was declined because `work + min arena`
+                                                //  does not fit: the cache must stream instead
+    // Issue #136 (item F): the slab was armed/wanted for this device but could not be CREATED at all.
+    // `decline_reason` is a static-lifetime string for the diagnostic.  Either decline means the cache
+    // must stream; it must never fall back to a raw arena (the pre-slab crash mode).
+    bool                     declined       = false;
+    const char *             decline_reason = nullptr;
+    std::map<size_t, size_t> arena_free;        // arena free runs: offset -> size (chunk-aligned)
+};
+
+static std::mutex    g_slab_mutex;
+static ggml_cuda_slab g_slabs[GGML_CUDA_MAX_DEVICES];
+
+// The slab exists for ONE reason: to let a wide prefill's work region and the MoE expert-cache arena
+// coexist on a driver that will not coalesce.  With no arena to arbitrate (a dense model, or `-ncmoe 0`)
+// the movable boundary serves nothing and the slab only parks nearly all of the card's free VRAM in an
+// "arena" that will never hold a table.  It is therefore ARMED by the MoE preflight, which runs before the
+// context and only for models that actually have host-resident expert weights; the env var alone can no
+// longer switch it on for a dense model.  `GGML_CUDA_SLAB=0` still kills it outright.
+static bool g_slab_armed = false;
+
+// wip/moe-verify-fusions: when false, COMPUTE buffers bypass the slab (raw cudaMalloc from the slab
+// reserve).  The A/B arm (`GGML_CUDA_SLAB_NARROW2=0`) sets it for the MTP draft context so its compute
+// buffer cannot alias the target's narrow verify buffer at slab base 0 (the session's "quick fix").
+static bool g_slab_compute_enabled = true;
+
+// wip/moe-verify-fusions (narrow-2): when true, the COMPUTE buffer being allocated belongs to the MTP
+// draft context and is routed to the slab's second pinned narrow region (the top of the reserved VA).
+// Set/cleared around the draft's reserve and alloc_graph calls by `llama_context`.
+static bool g_slab_compute_narrow2 = false;
+
+// `GGML_CUDA_SLAB_NARROW2=0` is the A/B arm: the draft's compute buffers then bypass the slab entirely
+// (raw cudaMalloc), which is the session's quick fix.  Default on.
+static bool ggml_cuda_slab_narrow2_enabled() {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GGML_CUDA_SLAB_NARROW2");
+        on = e != nullptr ? atoi(e) : 1;
+    }
+    return on != 0;
+}
+
+// wip/slab-ring-region: the H2D staging-ring hole the slab must carve (0 = the ring stays a cudaMalloc
+// outside the slab).  Set once by the model preflight, before the slab is created, from the largest
+// host-resident weight table (so the per-slot capacity covers every upload the ring will see).
+static size_t g_slab_ring_region_bytes = 0;
+static size_t ggml_cuda_slab_up(size_t x, size_t a);   // defined below (used by the ring-floor pin)
+void ggml_cuda_slab_set_ring_region(size_t bytes) {
+    g_slab_ring_region_bytes = bytes;
+}
+
+// wip/slab-ring-region: pin the always-resident narrow (decode/verify) floor.  The context knows the real
+// decode/verify compute size (from the narrow re-reserve), which is more reliable than inferring it from the
+// reserve sizes -- a decode view can be LARGER than the first small reserve (measured: the field's target
+// decode is 1792 MiB while the first small reserve is 768 MiB, and treating 1792 as a wide view kept the
+// boundary high so the ring region was never reclaimed).  Only honored before the first wide view is placed
+// above the ring, so the ring's VA does not move.
+void ggml_cuda_slab_set_narrow_floor(int device, size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    ggml_cuda_slab & s = g_slabs[device];
+    if (!s.inited || s.ring_used > 0) {
+        return;   // the ring is already in use: its VA must not move
+    }
+    // The `split_only` probe reports the LAYOUT size; the real compute allocation is rounded up to whole
+    // `GGML_COMPUTE_BUFFER_CHUNK_MIB` units plus one spare unit (`ggml_vbuffer_chunk_alloc_size`).  Apply
+    // the same formula so the pinned floor matches the size the first narrow reserve will actually request
+    // (otherwise the floor is a chunk short and that reserve is misclassified as wide).
+    static const size_t cchunk = []() {
+        const char * e = getenv("GGML_COMPUTE_BUFFER_CHUNK_MIB");
+        return (size_t) (e ? atoll(e) : 256) << 20;
+    }();
+    size_t nf = ggml_cuda_slab_up(bytes, s.chunk);
+    if (cchunk > 0) {
+        nf = ggml_cuda_slab_up(bytes, cchunk) + cchunk;
+    }
+    if (nf <= s.narrow_floor) {
+        return;
+    }
+    s.narrow_floor = nf;
+    size_t ring = g_slab_ring_region_bytes;
+    if (ring > 0) {
+        ring = ggml_cuda_slab_up(ring, s.chunk);
+        if (s.narrow_floor + ring + s.chunk > s.mapped) {
+            ring = 0;
+        }
+    }
+    s.ring_region = ring;
+    s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
+    s.ring_used   = 0;
+}
+
+static size_t ggml_cuda_slab_chunk_bytes() {
+    static size_t chunk_mib = SIZE_MAX;
+    if (chunk_mib == SIZE_MAX) {
+        const char * env = getenv("GGML_CUDA_SLAB_CHUNK_MIB");
+        chunk_mib = env != NULL ? (size_t) atoll(env) : 64;
+    }
+    return chunk_mib * 1024 * 1024;
+}
+
+// fit-slab-accounting revival (G3): the MTP/DFlash draft context's VRAM, passed to the MoE preflight
+// before the slab is armed.  The reserve uses it because the draft is created AFTER the slab.
+static size_t g_slab_aux_reserve_bytes = 0;
+void ggml_cuda_slab_set_aux_reserve(size_t bytes) {
+    g_slab_aux_reserve_bytes = bytes;
+}
+
+// Forward declaration: the reserve policy reads the (single-sourced) headroom.
+static size_t ggml_cuda_slab_headroom_bytes();
+
+static size_t ggml_cuda_slab_reserve_bytes(size_t total_b) {
+    static size_t reserve_mib = SIZE_MAX;
+    if (reserve_mib == SIZE_MAX) {
+        const char * env = getenv("GGML_CUDA_SLAB_RESERVE_MIB");
+        if (env != NULL) {
+            reserve_mib = (size_t) atoll(env);
+        } else {
+            // fit-slab-accounting revival (G3): size the reserve from what actually appears AFTER the
+            // slab, not a flat guess.  The slab is born during `sched_reserve`, and `llama_context`
+            // allocates the KV cache BEFORE that (`create_memory` at llama-context.cpp:543 vs
+            // `sched_reserve` at :609), so the reserve does NOT need to cover the weights or the KV --
+            // they are already resident and are counted in `free_b`.  It only has to cover the
+            // allocations that follow: the MTP draft context (the `aux_reserve_bytes` the preflight was
+            // given, ~3.7 GiB when a draft is present, 0 otherwise) plus the slab's own headroom (the
+            // workspaces hipBLASLt and the FA staging draw on).  A flat max(8192, total/4) still charged
+            // a no-draft run 8 GiB, so under partial offload `want` fell below `work + min_arena` and the
+            // slab DECLINED -- the cache streamed from the host (measured on a 32 GiB card, Q8_0 35B-A3B,
+            // `-ncmoe 16`: 47 t/s, vs 55-59 t/s once the reserve fits).  `GGML_CUDA_SLAB_RESERVE_MIB`
+            // remains the explicit override.
+            const size_t headroom_mib = ggml_cuda_slab_headroom_bytes() / (1024 * 1024);
+            const size_t aux_mib      = g_slab_aux_reserve_bytes / (1024 * 1024);
+            reserve_mib = std::max<size_t>(headroom_mib + aux_mib, (size_t) 1024);
+        }
+    }
+    return reserve_mib * 1024 * 1024;
+}
+
+// MiB form for messages.
+static size_t ggml_cuda_slab_reserve_mib(size_t total_b) {
+    return ggml_cuda_slab_reserve_bytes(total_b) / (1024 * 1024);
+}
+
+// HARD MINIMUM for the slab: the estimated maximum work buffer PLUS a floor for the MoE expert cache.// Below the floor the cache's fixed per-op cost outweighs the host bytes it saves (measured: a small arena
+// is slower than the plain host-expert path, MTP especially), so a slab that cannot provide
+// `work + floor` is not worth creating -- the cache falls back to STREAMING the experts from the host
+// (the stock `-ncmoe` path) instead.  `work` is the first work need, which is the widest layout the
+// fitting probe reserves, so it IS the estimate of the maximum work buffer.
+//
+// NOTE this is a floor at the ESTIMATE, not an absolute cap: a later graph needing more than the estimate
+// moves the boundary again and eats into the floor.  The cache's own auto floor at sizing
+// (`MOE_EXPERT_CACHE_MIN_MIB`) is the second, later guard for that case.
+static size_t ggml_cuda_slab_min_arena_bytes() {
+    static size_t mib = SIZE_MAX;
+    if (mib == SIZE_MAX) {
+        const char * env = getenv("GGML_CUDA_SLAB_MIN_ARENA_MIB");
+        mib = env != NULL ? (size_t) atoll(env) : 2048;
+    }
+    return mib * 1024 * 1024;
+}
+
+// How much VRAM to leave OUTSIDE the slab once the model's own buffers are resident, when the slab GROWS
+// into the reserve the fitting probe made it hold back (`ggml_cuda_slab_extend`).  The slab is created
+// before the weights exist, so `GGML_CUDA_SLAB_RESERVE_MIB` has to be a guess; this is the measured
+// correction -- whatever the weights / KV / draft did NOT use comes back to the arena, minus this much for
+// the allocations that can still appear later.  `0` disables the extension (the slab then keeps exactly
+// the reserve it took at creation).
+//
+// DEFAULT 4096 MiB.  This is NOT slack: it must cover the largest TRANSIENT workspace any graph
+// allocates, and those are allocated by `ggml_cuda_pool_leg` / `ggml_backend_cuda_buffer_type_alloc_buffer`
+// with CUDA_CHECK -- i.e. a failure ABORTS, and a thin headroom can even be SILENTLY CORRUPT rather than
+// loud (see the 2048 table in `archive/work/fit-slab-accounting/README.md` §2.2: `!!!!!!!!`, 475 t/s,
+// and the older `hipModuleLoad failed` abort at `-ub 4096 -c 163860`).  The requirement grows with prefill
+// width/context.
+//
+// Set it in MiB with `GGML_CUDA_SLAB_HEADROOM_MIB` (there is no boolean switch): the value is the
+// steady-state free VRAM kept outside the slab after `ggml_cuda_slab_extend` reclaims the reserve.
+//
+// TRIALLED 3072 (2026-10-10, `wip/slab-ring-region/`): the op-offload H2D staging ring moved INSIDE the
+// slab, so it no longer spends ~1 GiB of this headroom (r38 refused a 990 MiB ring growth here), and on
+// the field config 3072 measured +8.5 % decode step rate (arena residency 61.7 -> 64.9 %).  REJECTED:
+// it is not safe once the context is force-fitted.  On the §2.2 wide-prefill config (`--fit off`, IQ4_XS,
+// `-ngl 99 -sm tensor -ncmoe 48 -ub 6144 -c 204800`, 5697-token prefill) 4096 is clean (312 t/s, 0
+// corruption) while 3072 dies with `Hip error: 'out of memory' at hipblaslt.cpp:164`.  So the default
+// stays 4096 and lowering it remains a per-user choice via the env var, not a shipped default.
+#define GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT 4096
+
+static size_t g_slab_headroom_min_mib = 0;
+void ggml_cuda_slab_headroom_at_least_mib(size_t mib) {
+    g_slab_headroom_min_mib = mib;
+}
+static size_t ggml_cuda_slab_headroom_bytes() {
+    static size_t mib = SIZE_MAX;
+    static bool   env_set = false;
+    if (mib == SIZE_MAX) {
+        const char * env = getenv("GGML_CUDA_SLAB_HEADROOM_MIB");
+        env_set = env != NULL;
+        mib = env_set ? (size_t) atoll(env) : GGML_CUDA_SLAB_HEADROOM_MIB_DEFAULT;
+    }
+    const size_t eff = (!env_set && g_slab_headroom_min_mib > mib) ? g_slab_headroom_min_mib : mib;
+    return eff * 1024 * 1024;
+}
+
+// Public MiB form, for the cache's own fallback message.
+size_t ggml_cuda_slab_min_arena_mib() {
+    return ggml_cuda_slab_min_arena_bytes() / (1024 * 1024);
+}
+
+static size_t ggml_cuda_slab_up(size_t x, size_t a) {
+    return a * ((x + a - 1) / a);
+}
+
+// wip/moe-verify-fusions: the arena's VA ceiling and usable top when a narrow-2 region is pinned at the
+// top of the reserved VA.  Before narrow-2 exists the ceiling is the whole reserved VA (`size`); after, it
+// stops at `narrow2_off` so neither `slab_extend` nor `arena_alloc` can touch the pinned region.  The
+// usable top is the mapped extent, clamped to the ceiling (narrow-2 is established only while
+// `narrow2_off >= mapped`, so the clamp is defensive).
+static size_t ggml_cuda_slab_arena_limit(const ggml_cuda_slab & s) {
+    return s.narrow2_floor > 0 ? s.narrow2_off : s.size;
+}
+static size_t ggml_cuda_slab_arena_top(const ggml_cuda_slab & s) {
+    const size_t lim = ggml_cuda_slab_arena_limit(s);
+    return s.mapped < lim ? s.mapped : lim;
+}
+
+// The arena's allocation unit: fine (the VMM granularity).  The slab is ONE mapping, so this is pure
+// bookkeeping -- the sub-slab ranges are not separately mapped -- which is why it can be much finer than
+// the boundary's chunk without any extra HIP work.
+static size_t ggml_cuda_slab_unit_bytes(int device) {
+    const size_t g = ggml_cuda_info().devices[device].vmm_granularity;
+    return g != 0 ? g : (2u * 1024 * 1024);
+}
+
+size_t ggml_cuda_slab_arena_unit(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    const ggml_cuda_slab & s = g_slabs[device];
+    return s.inited ? s.unit : ggml_cuda_slab_unit_bytes(device);
+}
+
+#if defined(GGML_USE_HIP)
+// The env kill switch, read once.  Nonzero = the user wants the movable-boundary slab.
+static int ggml_cuda_slab_env() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        // DEFAULT ON (RDNA/ROCm scope): the movable-boundary slab is what keeps a wide prefill and a large
+        // expert-cache arena able to coexist, and without it a later wide prefill on a server aborts
+        // (`cudaMalloc failed` -> assert) -- see WORKLOG / the OPEN 2 handover.  It costs a few percent of
+        // decode because the arena region is smaller than the double-booked one the plain path gets away
+        // with, so it is a kill switch, not an opt-in: GGML_CUDA_SLAB=0 restores the plain allocation path
+        // (and the abort).  The slab declines per device where VMM is unavailable, and falls back cleanly.
+        const char * env = getenv("GGML_CUDA_SLAB");
+        enabled = env != NULL ? atoi(env) : 1;
+    }
+    return enabled;
+}
+#endif
+
+bool ggml_cuda_slab_enabled() {
+#if defined(GGML_USE_HIP)
+    // Armed only for host-resident-expert models (see `g_slab_armed`): a dense model has no arena, so the
+    // slab would just withhold the free VRAM the model/KV/workspaces need.
+    return ggml_cuda_slab_env() != 0 && g_slab_armed;
+#else
+    return false;   // RDNA/ROCm-scoped
+#endif
+}
+
+// The env kill switch alone (ignoring `g_slab_armed`): "the user asked for the slab".  Needed because
+// `ggml_cuda_slab_enabled()` is false until the MoE preflight arms it, so the not-armed diagnostic cannot
+// use it to tell "configured off" from "configured on but never armed" (issue #136, item B).
+bool ggml_cuda_slab_configured() {
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_slab_env() != 0;
+#else
+    return false;
+#endif
+}
+
+// Is the slab live on THIS device?  (The gate can be on while a device failed to create one.)
+bool ggml_cuda_slab_active(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    return g_slabs[device].inited;
+}
+
+// The slab declined because `work estimate + cache floor` does not fit on this device (see
+// `ggml_cuda_slab_min_arena_bytes`).  The expert cache must then stream from the host rather than build an
+// arena that a wide prefill would have to evict wholesale.
+bool ggml_cuda_slab_cache_unusable(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    return g_slabs[device].cache_unusable;
+}
+
+// Issue #136 (item F): the slab was armed for a host-expert model but could not be created on this device.
+bool ggml_cuda_slab_declined(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    return g_slabs[device].declined;
+}
+
+const char * ggml_cuda_slab_decline_reason(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    return g_slabs[device].decline_reason;
+}
+
+size_t ggml_cuda_slab_chunk_size(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    const ggml_cuda_slab & s = g_slabs[device];
+    return s.inited ? s.chunk : ggml_cuda_slab_chunk_bytes();
+}
+
+void * ggml_cuda_slab_work_base(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    const ggml_cuda_slab & s = g_slabs[device];
+    return s.inited ? (void *) s.base : nullptr;
+}
+
+size_t ggml_cuda_slab_work_size(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    const ggml_cuda_slab & s = g_slabs[device];
+    return s.inited ? s.boundary : 0;
+}
+
+// The arena region's total size on this device -- what the expert cache may size itself against (the
+// slab, not the free VRAM, owns it).  Free runs may be smaller than this total; it is the CAP.
+// `mapped`, not `size`: the VA reserved above `mapped` has no physical behind it (yet).
+size_t ggml_cuda_slab_arena_total(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    const ggml_cuda_slab & s = g_slabs[device];
+    if (!s.inited) {
+        return 0;
+    }
+    // wip/moe-verify-fusions: the arena is [boundary, arena_top) -- never past a pinned narrow-2 region.
+    // wip/slab-ring-region: the cache's real allocations are bounded by `arena_free`, so this is the CAP
+    // it sizes its budget against and it must reflect what is allocatable NOW (an inflated cap here makes
+    // `alloc_table_locked` fail and self-disable).
+    const size_t top = ggml_cuda_slab_arena_top(s);
+    const size_t total = top > s.boundary ? top - s.boundary : 0;
+    return total;
+}
+
+// GROW the slab into the VA it reserved at creation but left unmapped, down to `headroom` of free VRAM.
+//
+// The reserve had to be a guess (the slab is born before the weights exist); once they ARE resident this
+// measures what is actually free and maps it, so the arena gets the VRAM the model turned out not to need
+// instead of it sitting idle (measured: ~1.9 GiB/card idle with an 8 GiB reserve).  Called once, from the
+// cache's sizing; harmless to call again (it is a no-op when there is no room or nothing to map).
+//
+// This is the design's second (and last) HIP touch: the extension maps a NEW range above everything in
+// use, so it moves no address -- the work region and every arena table keep theirs -- and nothing needs
+// unmapping, which is what ROCm cannot do at sub-range granularity.
+bool ggml_cuda_slab_extend(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    ggml_cuda_slab & s = g_slabs[device];
+    if (!s.inited) {
+        return false;
+    }
+    const size_t headroom = ggml_cuda_slab_headroom_bytes();
+    if (headroom == 0) {
+        return false;
+    }
+    ggml_cuda_set_device(device);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (free_b <= headroom + s.chunk) {
+        return false;
+    }
+    // `free_b` is what is free OUTSIDE the slab, so the gain is a DELTA: map that much MORE VA, bounded by
+    // what the creation reservation left spare.  (Treating it as a total extent would compare a few GiB of
+    // free VRAM against a 20+ GiB `mapped` and never fire.)
+    size_t add = (free_b - headroom) / s.chunk * s.chunk;
+    // wip/moe-verify-fusions: never map into a pinned narrow-2 region -- the VA left for the arena.
+    const size_t lim = ggml_cuda_slab_arena_limit(s);
+    if (s.mapped >= lim) {
+        return false;                                    // no VA left below narrow-2 (or the full reserved VA)
+    }
+    const size_t room = lim - s.mapped;                  // VA left unmapped by the creation reservation
+    if (add > room) {
+        add = room;
+    }
+    if (add < s.chunk) {
+        return false;                                    // less than a chunk to gain: not worth a mapping
+    }
+    if (!ggml_cuda_vmm_map_phys(device, (CUdeviceptr) ((uintptr_t) s.base + s.mapped), add)) {
+        GGML_LOG_WARN("%s: device %d: could not map a further %.2f GiB into the slab; the arena stays at "
+                      "%.2f GiB (raise GGML_CUDA_SLAB_HEADROOM_MIB if this repeats)\n",
+                      __func__, device, (double) add / (1ull << 30),
+                      (double) (s.mapped - s.boundary) / (1ull << 30));
+        return false;
+    }
+    // Hand the new range to the arena (coalescing with the run below it if there is one; the arena fills
+    // top-down, so normally the top of the region IS the free run).
+    const size_t lo = s.mapped;
+    const size_t hi = s.mapped + add;
+    s.mapped = hi;
+    auto next = s.arena_free.lower_bound(lo);
+    size_t new_lo = lo, new_hi = hi;
+    if (next != s.arena_free.end() && next->first == new_hi) {
+        new_hi = next->first + next->second;
+        s.arena_free.erase(next);
+    }
+    if (s.arena_free.find(new_lo) != s.arena_free.end()) {   // not expected, but never clobber an entry
+        new_lo = lo;
+        new_hi = hi;
+    }
+    s.arena_free[new_lo] = new_hi - new_lo;
+    GGML_LOG_WARN("%s: device %d: slab grew by %.2f GiB into the reserve the model did not need "
+                  "(now %.2f GiB: work %.2f GiB + arena %.2f GiB; %.2f GiB left free AFTER this mapping, "
+                  "which is GGML_CUDA_SLAB_HEADROOM_MIB -- not extra headroom)\n",
+                  __func__, device, (double) add / (1ull << 30), (double) s.mapped / (1ull << 30),
+                  (double) s.boundary / (1ull << 30), (double) (s.mapped - s.boundary) / (1ull << 30),
+                  (double) (free_b - add) / (1ull << 30));
+    return true;
+}
+
+// Extend every device's slab (see above).  Called by the expert cache before it sizes itself, which is the
+// first moment the weights / KV / draft are all resident.
+void ggml_cuda_slab_extend_all() {
+    if (!ggml_cuda_slab_enabled()) {
+        return;
+    }
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
+        ggml_cuda_slab_extend(d);
+    }
+}
+
+// Reserve + map the whole slab ONCE.  `work_min` sets the initial boundary (the first work need).
+static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t work_min) {
+    // VMM capability first: on a device that does not report it the driver API calls below are not
+    // merely useless, they abort (CU_CHECK), so the slab must decline before touching them.  This is
+    // what lets the slab be offered by default without endangering other devices/backends.
+    if (!ggml_cuda_info().devices[device].vmm) {
+        s.declined       = true;
+        s.decline_reason = "the device does not report VMM (virtual memory management) support";
+        return false;
+    }
+    s.device = device;
+    s.chunk  = ggml_cuda_slab_chunk_bytes();
+    s.unit   = ggml_cuda_slab_unit_bytes(device);
+    if (s.chunk == 0 || s.unit == 0 || s.chunk % s.unit != 0) {
+        s.declined       = true;
+        s.decline_reason = "the slab chunk/unit geometry is invalid";
+        return false;
+    }
+    // `cuMemAddressReserve` requires a power-of-two alignment; a hand-set chunk that is not one would
+    // otherwise fail after the fact, so decline now and let the plain path serve the buffer.
+    if ((s.chunk & (s.chunk - 1)) != 0) {
+        s.declined       = true;
+        s.decline_reason = "GGML_CUDA_SLAB_CHUNK_MIB is not a power of two";
+        return false;
+    }
+    ggml_cuda_set_device(device);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        (void) cudaGetLastError();
+        s.declined       = true;
+        s.decline_reason = "cudaMemGetInfo failed";
+        return false;
+    }
+    const size_t reserve = ggml_cuda_slab_reserve_bytes(total_b);
+    if (free_b <= reserve + 2 * s.chunk) {
+        s.declined       = true;
+        s.decline_reason = "there is not enough free VRAM for the slab reserve plus two chunks";
+        return false;
+    }
+    const size_t want = (free_b - reserve) / s.chunk * s.chunk;   // (W + A), chunk-aligned
+    const size_t w    = ggml_cuda_slab_up(work_min, s.chunk);
+    if (w == 0 || w + s.chunk > want) {
+        s.declined       = true;
+        s.decline_reason = "the estimated work buffer does not fit after the reserve";
+        return false;
+    }
+    // HARD MINIMUM (see `ggml_cuda_slab_min_arena_bytes`): the work estimate plus a usable cache floor.
+    // Report it and decline the slab -- `cache_unusable` then makes the expert cache stream from the host
+    // instead of building an arena that a wide prefill would have to evict wholesale (the r21 abort).
+    // wip/slab-ring-region: the ring region sits ABOVE the narrow floor and its size only needs to be
+    // reserved against the arena budget (it is work space while the wide view is reserved).
+    size_t ring = g_slab_ring_region_bytes;
+    if (ring > 0) {
+        ring = ggml_cuda_slab_up(ring, s.chunk);
+        if (ring + s.chunk > want) {
+            ring = 0;   // no room for a meaningful hole: leave the ring on the cudaMalloc path
+        }
+    }
+    const size_t min_arena = ggml_cuda_slab_min_arena_bytes();
+    if (want < w + min_arena + ring) {
+        s.cache_unusable = true;
+        GGML_LOG_ERROR("%s: device %d: the movable-boundary slab does NOT fit the MoE expert cache here: "
+                       "it needs the estimated work buffer (%.0f MiB) plus a %.0f MiB cache floor"
+                       "%s, but only %.0f MiB is available after the %zu MiB reserve (free %.0f MiB of %.0f MiB "
+                       "total).  Not using the slab; the experts will STREAM from the host (the stock -ncmoe "
+                       "path).  Lower GGML_CUDA_SLAB_RESERVE_MIB if the reserve is larger than the "
+                       "weights/KV need.\n",
+                       __func__, device, (double) w / (1024 * 1024), (double) min_arena / (1024 * 1024),
+                       ring > 0 ? " plus the H2D-ring hole" : "",
+                       (double) want / (1024 * 1024), ggml_cuda_slab_reserve_mib(total_b),
+                       (double) free_b / (1024 * 1024), (double) total_b / (1024 * 1024));
+        s.declined       = true;
+        s.decline_reason = "there is not enough room for the work region plus the minimum expert-cache arena";
+        return false;
+    }
+    // Reserve VA for the whole slab, but only MAP `want`: the reserve has to be a guess because the
+    // weights do not exist yet, so `ggml_cuda_slab_extend` later maps the part of it the model turned out
+    // not to need (down to `headroom`) and the arena uses it.  A VA reservation holds no physical, so
+    // reserving wide costs nothing and cannot deprive the weights' cudaMalloc of anything.
+    const size_t va = ggml_cuda_slab_headroom_bytes() > 0
+                    ? (free_b - ggml_cuda_slab_headroom_bytes()) / s.chunk * s.chunk
+                    : want;
+    s.size   = va > want ? va : want;
+    s.mapped = want;
+    if (cuMemAddressReserve(&s.base, s.size, s.chunk, 0, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (!ggml_cuda_vmm_map_phys(device, s.base, s.mapped)) {
+        (void) cuMemAddressFree(s.base, s.size);
+        return false;
+    }
+    s.boundary     = w;
+    s.narrow_floor = 0;   // established on the first narrow reserve or by `ggml_cuda_slab_set_narrow_floor`
+    s.narrow2_floor = 0;  // established lazily on the draft context's first narrow compute allocation
+    s.narrow2_off   = 0;
+    s.narrow2_live  = 0;
+    s.ring_region  = 0;
+    s.ring_armed   = false;
+    s.ring_used    = 0;
+    s.ring_slots   = ggml_backend_cuda_context::h2d_stage_slots();
+    s.arena_free.clear();
+    s.arena_free[w] = s.mapped - w;
+    s.inited = true;
+    // TEMP diagnostic (wip/moe-verify-fusions): the full layout accounting.
+    GGML_LOG_WARN("SLAB_INIT dev=%d free=%.2f GiB reserve=%.2f GiB headroom=%.2f GiB aux=%.2f GiB "
+                  "size(VA)=%.2f GiB mapped=%.2f GiB boundary=%.2f GiB va_spare=%.2f GiB chunk=%.1f MiB ring_req=%.2f GiB\n",
+                  device, (double) free_b/(1ull<<30), (double) ggml_cuda_slab_reserve_bytes(total_b)/(1ull<<30),
+                  (double) ggml_cuda_slab_headroom_bytes()/(1ull<<30), (double) g_slab_aux_reserve_bytes/(1ull<<30),
+                  (double) s.size/(1ull<<30), (double) s.mapped/(1ull<<30), (double) s.boundary/(1ull<<30),
+                  (double) (s.size - s.mapped)/(1ull<<30), (double) s.chunk/(1024*1024),
+                  (double) g_slab_ring_region_bytes/(1ull<<30));
+    GGML_LOG_WARN("%s: device %d: slab %.2f GiB (chunk %.1f MiB): work %.2f GiB + arena %.2f GiB "
+                  "(%.2f GiB reserve, %.2f GiB VA spare for `ggml_cuda_slab_extend`; ring region %s)\n",
+                  __func__, device, (double) s.mapped / (1ull << 30), (double) s.chunk / (1024 * 1024),
+                  (double) s.boundary / (1ull << 30), (double) (s.mapped - s.boundary) / (1ull << 30),
+                  (double) ggml_cuda_slab_reserve_bytes(total_b) / (1ull << 30),
+                  (double) (s.size - s.mapped) / (1ull << 30),
+                  g_slab_ring_region_bytes > 0 ? "pending (above the narrow floor)" : "off");
+    return true;
+}
+
+// A work-region view was dropped (`reported` = the size the buffer reported, i.e. the boundary at its
+// alloc).  Removing it lowers the floor the boundary may shrink to; the actual shrink happens on the next
+// `work_alloc`, which knows the new need.
+//
+// This is a MULTISET, not a flag: more than one compute buffer is live at a time (the main context and the
+// MTP draft context each own one), so a release must not make the slab believe the work region is idle.
+// Tracking each view's REPORTED size is also required, not its request: a narrow view allocated while the
+// boundary was wide was handed the wide range, so the graph allocator may have laid its tensors out
+// anywhere in it.
+// A work-region view was dropped (`need` = the size it requested).  Removing it lowers the floor the
+// boundary may shrink to; the actual shrink happens on the next `work_alloc`, which knows the new need.
+//
+// wip/moe-verify-fusions (narrow-2): establish the MTP draft's pinned compute region at the top of the
+// reserved VA and map its physical.  Idempotent: the draft reserves at construction, DROPS those buffers
+// (`llama_context_drop_compute_buffers`, before the target's first prefill) and lazily re-reserves on its
+// first real (n_max+1-token) graph, so this is called repeatedly.  Returns the region's base offset, or 0
+// when it cannot be established (no room for the work region + a usable arena above `boundary`, the top
+// overlaps already-mapped physical, or `ggml_cuda_vmm_map_phys` failed); the caller then falls back to
+// the plain cudaMalloc path for that buffer.
+//
+// The size is FIXED at the first establishment: narrow-2 is anchored at the top (`off = size - floor`), so
+// a later, larger request would move a live view's base.  In practice the first request is the draft's
+// `sched_reserve` pp layout, which is its widest graph, so the region never needs to grow.
+static size_t ggml_cuda_slab_narrow2_floor_locked(int device, ggml_cuda_slab & s, size_t bytes) {
+    if (!s.inited || bytes == 0) {
+        return 0;
+    }
+    const size_t nf2 = ggml_cuda_slab_up(bytes, s.chunk);
+    if (s.narrow2_floor == 0) {
+        if (nf2 == 0 || nf2 >= s.size) {
+            return 0;
+        }
+        const size_t off = s.size - nf2;
+        const size_t min_arena = ggml_cuda_slab_min_arena_bytes();
+        // The work region (`boundary`, which includes the wide prefill view and the ring) and a usable
+        // arena must both fit below narrow-2, and the top must not overlap physical the arena already
+        // mapped (`off < mapped` would put narrow-2 inside the main mapping, where live tables may sit).
+        if (off < s.boundary + min_arena + s.chunk || off < s.mapped) {
+            GGML_LOG_WARN("%s: device %d: no room for a %.2f GiB narrow-2 region above the work region "
+                          "(%.2f GiB) and a %.2f GiB arena floor in a %.2f GiB slab (mapped %.2f GiB); "
+                          "the draft compute buffer stays on the cudaMalloc path\n",
+                          __func__, device, (double) nf2 / (1ull << 30), (double) s.boundary / (1ull << 30),
+                          (double) min_arena / (1ull << 30), (double) s.size / (1ull << 30),
+                          (double) s.mapped / (1ull << 30));
+            return 0;
+        }
+        ggml_cuda_set_device(device);
+        if (!ggml_cuda_vmm_map_phys(device, (CUdeviceptr) ((uintptr_t) s.base + off), nf2)) {
+            GGML_LOG_WARN("%s: device %d: could not map the %.2f GiB narrow-2 region; the draft compute "
+                          "buffer stays on the cudaMalloc path\n",
+                          __func__, device, (double) nf2 / (1ull << 30));
+            return 0;
+        }
+        s.narrow2_floor = nf2;
+        s.narrow2_off   = off;
+        GGML_LOG_WARN("%s: device %d: narrow-2 (MTP draft compute) pinned at [%.2f, %.2f] GiB "
+                      "(%.2f GiB); the arena now tops out at %.2f GiB\n",
+                      __func__, device, (double) off / (1ull << 30), (double) s.size / (1ull << 30),
+                      (double) nf2 / (1ull << 30), (double) (ggml_cuda_slab_arena_top(s) - s.boundary) / (1ull << 30));
+    } else if (nf2 > s.narrow2_floor) {
+        GGML_LOG_WARN("%s: device %d: narrow-2 request %.2f GiB exceeds the pinned %.2f GiB and the region "
+                      "cannot grow without moving a live view; falling back\n",
+                      __func__, device, (double) nf2 / (1ull << 30), (double) s.narrow2_floor / (1ull << 30));
+        return 0;
+    }
+    return s.narrow2_off;
+}
+
+// Public form: pin narrow-2 from a known (worst-case) narrow size.  Called by the draft context after its
+// reserve so the region covers the widest layout the scheduler reserved, not just the first graph.
+void ggml_cuda_slab_narrow2_floor(int device, size_t bytes) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    ggml_cuda_slab & s = g_slabs[device];
+    if (!s.inited) {
+        return;
+    }
+    (void) ggml_cuda_slab_narrow2_floor_locked(device, s, bytes);
+}
+
+// This is a MULTISET, not a flag: more than one compute buffer is live at a time (the main context and the
+// MTP draft context each own one), so a release must not make the slab believe the work region is idle --
+// doing that is what corrupted the no-drop runs (a release shrank the boundary under a live view and the
+// arena re-took chunks that view was still using: MTP acceptance 0.010, `////` output).
+void ggml_cuda_slab_work_release(int device, size_t off, size_t need) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    ggml_cuda_slab & s = g_slabs[device];
+    if (!s.inited) {
+        return;
+    }
+    // wip/moe-verify-fusions: a narrow-2 view owns no boundary/arena contribution -- the region is pinned
+    // at the top of the reserved VA and never enters `work_needs`.
+    if (s.narrow2_floor > 0 && off == s.narrow2_off) {
+        if (s.narrow2_live > 0) {
+            s.narrow2_live--;
+        }
+        if (ggml_cuda_work_alloc_debug()) {
+            GGML_LOG_WARN("NARROW2_RELEASE dev=%d need=%.1f MiB off=%.1f MiB live=%d\n",
+                device, (double) need/1048576.0, (double) off/1048576.0, s.narrow2_live);
+        }
+        return;
+    }
+    // Remove this view's boundary contribution (`off + up(need)`), the same value `work_alloc` inserted.
+    const size_t contrib = off + ggml_cuda_slab_up(need, s.chunk);
+    const auto it = s.work_needs.find(contrib);
+    if (it != s.work_needs.end()) {
+        s.work_needs.erase(it);
+    }
+    // TEMP diagnostic (wip/moe-verify-fusions): trace alloc/release overlap.
+    if (ggml_cuda_work_alloc_debug()) {
+        GGML_LOG_WARN("WORK_RELEASE dev=%d off=%.1f MiB need=%.1f MiB found=%d live_needs=%zu boundary=%.1f narrow_floor=%.1f\n",
+            device, (double) off/1048576.0, (double) need/1048576.0, (int)(it != s.work_needs.end()),
+            s.work_needs.size(), (double) s.boundary/1048576.0, (double) s.narrow_floor/1048576.0);
+    }
+}
+
+// The work pool's base for a `need`-byte compute buffer, moving the boundary up if required.  The arena
+// tables in the taken range are evicted (the callback frees their slabs back through `arena_free`).
+//
+// wip/slab-ring-region (0 -> narrow -> RB -> wide -> arena): TWO stable bases are handed out.  A NARROW
+// request (the decode/verify compute view) always gets `s.base`; a WIDE request (the prefill view) always
+// gets `s.base + narrow_floor + ring_region`, i.e. above the fixed narrow region and the ring.  The
+// always-resident narrow view never moves; the ring and wide regions are transient and return to the arena
+// when the wide view is dropped.  The ring is never part of the arena, so arming it is an ordinary
+// boundary move (evicting the COLDEST tables), not an independent arena eviction.
+void * ggml_cuda_slab_work_alloc(int device, size_t need) {
+    size_t lo = 0, hi = 0;
+    bool   move = false;
+    size_t ret_off = 0;
+    CUdeviceptr base = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_slab_mutex);
+        ggml_cuda_slab & s = g_slabs[device];
+        if (!s.inited) {
+            if (s.declined) {
+                return nullptr;   // declined once: do not retry init or repeat the diagnostic
+            }
+            if (!ggml_cuda_slab_init_locked(device, s, need)) {
+                return nullptr;
+            }
+            if (!g_slab_compute_narrow2) {
+                s.work_needs.insert(ggml_cuda_slab_up(need, s.chunk));
+                // Provisional base 0: the first reserve is the WIDE one, before the narrow floor exists.
+                return (void *) s.base;
+            }
+        }
+        // wip/moe-verify-fusions (narrow-2): the MTP draft context's compute buffers go to the SECOND
+        // static narrow region, pinned at the top of the reserved VA.  They never touch the boundary,
+        // the ring or the arena; the region is mapped on first use.  A failure falls back to cudaMalloc.
+        if (g_slab_compute_narrow2) {
+            // narrow-2 is ONE region: two simultaneous draft views would alias each other exactly as the
+            // pre-fix defect did at base 0.  The MTP draft's buffers are sequential (the construction
+            // reserve is released before the live verify buffer), but fall back to cudaMalloc rather than
+            // alias if that ever changes.
+            if (s.narrow2_live > 0) {
+                GGML_LOG_WARN("%s: device %d: a narrow-2 view is already live (need %.2f MiB); falling back "
+                              "to cudaMalloc to avoid an alias\n",
+                              __func__, device, (double) need / (1ull << 20));
+                return nullptr;
+            }
+            const size_t off = ggml_cuda_slab_narrow2_floor_locked(device, s, need);
+            if (off == 0) {
+                return nullptr;
+            }
+            s.narrow2_live++;
+            if (ggml_cuda_work_alloc_debug()) {
+                GGML_LOG_WARN("NARROW2_ALLOC dev=%d need=%.1f MiB off=%.1f MiB live=%d\n",
+                    device, (double) need/1048576.0, (double) off/1048576.0, s.narrow2_live);
+            }
+            return (void *) (uintptr_t) ((char *) s.base + off);
+        }
+        // Establish the fixed narrow floor: the first reserve smaller than the boundary (the
+        // prefill -> decode drop re-reserves the decode/verify layout there).  Its ring region then sits
+        // just above it, and the wide view above that.  The live wide view (the target/draft context keeps
+        // one) stays at base 0 until the graph allocator re-creates it above the ring on the next wide
+        // reserve; `work_needs` still floors the boundary at the wide need meanwhile.
+        if (s.narrow_floor == 0 && need < s.boundary) {
+            s.narrow_floor = ggml_cuda_slab_up(need, s.chunk);
+            size_t ring = g_slab_ring_region_bytes;
+            if (ring > 0) {
+                ring = ggml_cuda_slab_up(ring, s.chunk);
+                if (s.narrow_floor + ring + s.chunk > s.mapped) {
+                    ring = 0;   // no room for a meaningful region: leave the ring on the cudaMalloc path
+                }
+            }
+            s.ring_region = ring;
+            s.ring_slots  = ggml_backend_cuda_context::h2d_stage_slots();
+            s.ring_used   = 0;
+        }
+
+        const bool   narrow   = s.narrow_floor > 0 && need <= s.narrow_floor;
+        const size_t wide_off = s.narrow_floor + s.ring_region;
+
+        // The boundary may shrink only to the TALLEST live view's boundary contribution.  Each view's
+        // contribution is `base_off + up(need)` (a narrow view at base 0, a wide view above the ring), so
+        // the multiset stores that directly and a view placed before the narrow floor existed cannot
+        // inflate the floor after the fact.
+        ret_off = narrow ? 0 : wide_off;
+        // TEMP diagnostic (wip/moe-verify-fusions): show the base offset each compute buffer gets.
+        if (ggml_cuda_work_alloc_debug()) {
+            GGML_LOG_WARN("WORK_ALLOC dev=%d need=%.1f MiB narrow=%d ret_off=%.1f MiB narrow_floor=%.1f ring=%.1f boundary=%.1f\n",
+                device, (double) need/1048576.0, (int) narrow, (double) ret_off/1048576.0,
+                (double) s.narrow_floor/1048576.0, (double) s.ring_region/1048576.0, (double) s.boundary/1048576.0);
+        }
+        const size_t contrib = ret_off + ggml_cuda_slab_up(need, s.chunk);
+        size_t floor = s.narrow_floor;
+        if (!s.work_needs.empty()) {
+            const size_t mx = *s.work_needs.rbegin();
+            if (mx > floor) {
+                floor = mx;
+            }
+        }
+        if (contrib > floor) {
+            floor = contrib;
+        }
+        const size_t target = ggml_cuda_slab_up(floor, s.chunk);
+        base    = s.base;
+        // wip/moe-verify-fusions: never grow the work pool into a pinned narrow-2 region (the draft's
+        // compute VA).  A request that does not fit falls back to cudaMalloc rather than corrupt it.
+        if (target > ggml_cuda_slab_arena_limit(s)) {
+            GGML_LOG_WARN("%s: device %d: work request %.2f MiB (target %.2f GiB) does not fit below the "
+                          "pinned narrow-2 region at %.2f GiB; falling back to cudaMalloc\n",
+                          __func__, device, (double) need / (1ull << 20), (double) target / (1ull << 30),
+                          (double) s.narrow2_off / (1ull << 30));
+            return nullptr;
+        }
+        if (target <= s.boundary) {
+            // Shrink to the live need so the slack goes back to the arena (the decode layout should not hold
+            // the wide region).  Safe while a view is live: the target never goes below the floor.
+            if (target < s.boundary) {
+                const size_t old = s.boundary;
+                s.boundary = target;
+                // return [target, old) to the arena free list (coalescing)
+                size_t lo2 = target, hi2 = old;
+                auto next = s.arena_free.lower_bound(target);
+                if (next != s.arena_free.end() && next->first == hi2) {
+                    hi2 = next->first + next->second;
+                    next = s.arena_free.erase(next);
+                }
+                if (next != s.arena_free.begin()) {
+                    auto prev = std::prev(next);
+                    if (prev->first + prev->second == lo2) {
+                        lo2 = prev->first;
+                        s.arena_free.erase(prev);
+                    }
+                }
+                s.arena_free[lo2] = hi2 - lo2;
+            }
+            s.ring_armed = s.ring_region > 0 && wide_off > s.narrow_floor && s.boundary >= wide_off;
+            s.work_needs.insert(contrib);
+            return (void *) (uintptr_t) ((char *) s.base + ret_off);
+        }
+        lo   = s.boundary;
+        hi   = target;
+        move = true;
+    }
+    if (move) {
+        // Evict everything the arena still holds in [lo, hi).  MUST run without `g_slab_mutex`.
+        moe_cache_evict_slab_range(device, (void *) (uintptr_t) ((char *) base + lo), (void *) (uintptr_t) ((char *) base + hi));
+        std::lock_guard<std::mutex> lock(g_slab_mutex);
+        ggml_cuda_slab & s = g_slabs[device];
+        if (s.inited && hi > s.boundary) {
+            s.boundary = hi;
+            // drop/clip every arena free run at or below the new boundary
+            for (auto it = s.arena_free.begin(); it != s.arena_free.end(); ) {
+                const size_t off = it->first;
+                const size_t end = off + it->second;
+                if (end <= s.boundary) {
+                    it = s.arena_free.erase(it);
+                } else if (off < s.boundary) {
+                    const size_t keep_off = s.boundary;
+                    const size_t keep_sz  = end - keep_off;
+                    s.arena_free.erase(it);
+                    s.arena_free[keep_off] = keep_sz;
+                    break;
+                } else {
+                    ++it;
+                }
+            }
+        }
+        if (s.inited) {
+            const size_t wide_off = s.narrow_floor + s.ring_region;
+            s.ring_armed = s.ring_region > 0 && wide_off > s.narrow_floor && s.boundary >= wide_off;
+            s.work_needs.insert(ret_off + ggml_cuda_slab_up(need, s.chunk));
+        }
+        return (void *) (uintptr_t) ((char *) base + ret_off);
+    }
+    return nullptr;
+}
+
+// Chunk-aligned arena allocation from [boundary, size).
+//
+// PLACEMENT IS THE EVICTION POLICY.  A boundary move can only take a CONTIGUOUS range of chunks at the
+// bottom of the arena, so there is no "evict the coldest table" decision to make at move time -- the
+// only lever is where a table sits.  Filling from the TOP DOWN therefore keeps the band just above the
+// boundary free for as long as the arena has slack, and a boundary move walks through empty chunks and
+// evicts nothing.  A bottom-up fill would put the very first table hard against the boundary and make
+// every growth of the work pool cost a table even when the arena is nearly empty.
+void * ggml_cuda_slab_arena_alloc(int device, size_t size) {
+    if (size == 0) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    ggml_cuda_slab & s = g_slabs[device];
+    if (!s.inited) {
+        return nullptr;
+    }
+    const size_t want = ggml_cuda_slab_up(size, s.unit);
+    // Highest run that fits, and take its TOP.  (Erase by key: the run's offset is unique.)
+    for (auto it = s.arena_free.rbegin(); it != s.arena_free.rend(); ++it) {
+        if (it->second < want) {
+            continue;
+        }
+        const size_t run_off = it->first;
+        const size_t run_sz  = it->second;
+        s.arena_free.erase(run_off);
+        if (run_sz > want) {
+            s.arena_free[run_off] = run_sz - want;
+        }
+        return (void *) (uintptr_t) ((char *) s.base + (run_off + run_sz - want));
+    }
+    return nullptr;   // the arena region is full (the work pool may take more, or the cache is capped)
+}
+
+void ggml_cuda_slab_arena_free(int device, void * ptr, size_t size) {
+    if (ptr == nullptr || size == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    ggml_cuda_slab & s = g_slabs[device];
+    if (!s.inited) {
+        return;
+    }
+    const size_t want = ggml_cuda_slab_up(size, s.unit);
+    const size_t off  = (size_t) ((char *) ptr - (char *) s.base);
+    if (off < s.boundary) {
+        return;   // already reassigned to the work pool: nothing to give back
+    }
+    size_t lo = off;
+    size_t hi = off + want;
+    auto next = s.arena_free.lower_bound(off);
+    if (next != s.arena_free.end() && next->first == hi) {
+        hi = next->first + next->second;
+        next = s.arena_free.erase(next);
+    }
+    if (next != s.arena_free.begin()) {
+        auto prev = std::prev(next);
+        if (prev->first + prev->second == lo) {
+            lo = prev->first;
+            s.arena_free.erase(prev);
+        }
+    }
+    s.arena_free[lo] = hi - lo;
+}
+
+// wip/slab-ring-region: the H2D staging ring.
+//
+// The ring is the sub-region `[narrow_floor, narrow_floor + ring_region)` of the work region, i.e. ABOVE the
+// always-resident narrow (decode/verify) view and BELOW the transient wide (prefill) view.  It is not part
+// of the arena, so there is no arm/disarm and no arena eviction: it is reserved exactly when the wide view
+// is (`boundary >= narrow_floor + ring_region`), and when the wide view is dropped the boundary shrinks to
+// `narrow_floor` and the ring region returns to the arena as its coldest space.  `arena_alloc_transient`
+// bump-allocates the slots within it; the ring calls it once per slot with the full per-slot capacity, so
+// each slot has a stable VA.
+size_t ggml_cuda_slab_ring_slot_capacity(int device) {
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    const ggml_cuda_slab & s = g_slabs[device];
+    if (!s.inited || !s.ring_armed || s.ring_region == 0 || s.ring_slots <= 0) {
+        return 0;
+    }
+    return (s.ring_region / (size_t) s.ring_slots) / s.unit * s.unit;
+}
+
+void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size) {
+    if (size == 0) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(g_slab_mutex);
+    ggml_cuda_slab & s = g_slabs[device];
+    if (!s.inited || !s.ring_armed || s.ring_region == 0) {
+        return nullptr;
+    }
+    const size_t want = ggml_cuda_slab_up(size, s.unit);
+    if (s.ring_used + want > s.ring_region) {
+        return nullptr;   // region exhausted (sized for `ring_slots` full-capacity slots, so unexpected)
+    }
+    void * p = (void *) (uintptr_t) ((char *) s.base + s.narrow_floor + s.ring_used);
+    s.ring_used += want;
+    return p;
+}
+
+// Retained for the device API: the ring's lifecycle is now implicit in the wide work reservation (see
+// `work_alloc`), so there is nothing to toggle.  Kept so the generic arm/disarm plumbing stays valid for a
+// future non-slab allocator.
+void ggml_cuda_slab_ring_set(int device, bool arm) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(arm);
+}
+
 // #define DEBUG_CUDA_MALLOC
 
 // buffer pool for cuda (legacy)
+// TEMP INSTRUMENT (exp7): pool alloc/free cost (cudaMalloc/cudaFree on this path are synchronizing).
+static int64_t g_pool_us = 0, g_pool_n = 0, g_pool_free_us = 0, g_pool_free_n = 0, g_pool_oom_n = 0;
+
+static std::atomic<uint64_t> g_cuda_graph_mem_gen[GGML_CUDA_MAX_DEVICES];
+
+uint64_t ggml_cuda_graph_mem_gen(int device) {
+    return g_cuda_graph_mem_gen[device].load(std::memory_order_relaxed);
+}
+
+void ggml_cuda_graph_mem_freed(int device) {
+    g_cuda_graph_mem_gen[device]++;
+}
+
+// Free-VRAM floor for the workspace pool's first attempt (the current device).  With host-expert tables in the
+// MoE expert cache, letting the pool take a device down to ~40 MiB free left the slab extension's arena tables
+// overwritten with live data (pinned -sm layer, the greedy decode right after a 61k prefill).  We have not found
+// what writes there; keeping 512 MiB free avoids the state.  GGML_CUDA_POOL_MIN_FREE_MIB sets the floor (0 = off).
+static bool ggml_cuda_pool_floor_refuses(size_t size) {
+    // read the value once: a cached getenv() pointer is not safe on Windows (the CRT buffer is reused)
+    static const long long floor_env_mib = [] {
+        const char * env = getenv("GGML_CUDA_POOL_MIN_FREE_MIB");
+        return env != nullptr ? atoll(env) : -1;
+    }();
+    const size_t floor = floor_env_mib >= 0 ? (size_t) floor_env_mib << 20 : (moe_cache_floor_active() ? (size_t) 512 << 20 : 0);
+    if (floor == 0 || size < ((size_t) 1 << 20)) {
+        return false;
+    }
+    size_t f = 0;
+    size_t t = 0;
+    if (cudaMemGetInfo(&f, &t) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return f < size + floor;
+}
+
+static bool ggml_cuda_graph_capture_active();
+
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
 
@@ -428,9 +1622,17 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    // GGML_CUDA_POOL_CACHE_MB: cap on the bytes of FREED buffers the pool keeps cached (unset/0 = unlimited).
+    // Temporaries that grow with the KV length (long prefills) otherwise leave every smaller predecessor cached,
+    // and that idle VRAM starves allocations made outside the pool (graph/compute buffers, FA staging).
+    size_t cached_size = 0;
+    size_t cache_cap   = 0;
 
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
+        const char * cap = getenv("GGML_CUDA_POOL_CACHE_MB");
+        const long long mb = cap ? atoll(cap) : 0;
+        cache_cap = mb > 0 ? (size_t) mb << 20 : 0;
     }
 
     ~ggml_cuda_pool_leg() {
@@ -449,6 +1651,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 b.size = 0;
             }
         }
+        cached_size = 0;
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
@@ -473,6 +1676,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                         if (!best_diff) {
                             void * ptr = b.ptr;
                             *actual_size = b.size;
+                            cached_size -= b.size;
                             b.ptr = nullptr;
                             b.size = 0;
                             return ptr;
@@ -485,6 +1689,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             ggml_cuda_buffer& b = buffer_pool[ibest];
             void * ptr = b.ptr;
             *actual_size = b.size;
+            cached_size -= b.size;
             b.ptr = nullptr;
             b.size = 0;
             return ptr;
@@ -493,7 +1698,23 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
-        cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        // never flush while a CUDA graph is being captured: the sync is illegal and the capture may reference the
+        // cached buffers; the next allocation outside capture flushes instead
+        if (cache_cap && cached_size > cache_cap && !ggml_cuda_graph_capture_active()) {
+            GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: %.2f MiB cached exceeds GGML_CUDA_POOL_CACHE_MB, flushing\n",
+                           device, cached_size/1024.0/1024.0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            clear_pool();
+        }
+        static const bool gc_dbg = getenv("GGML_CUDA_GCDBG") != nullptr;
+        const int64_t t_pl = gc_dbg ? ggml_time_us() : 0;
+        // With the MoE expert cache holding host-expert tables, the first attempt keeps a free-VRAM floor and the
+        // flush + retry below runs instead (see ggml_cuda_pool_floor_refuses).  The retry has no floor, so this
+        // never turns into an abort.
+        cudaError_t err = cudaErrorMemoryAllocation;
+        if (!ggml_cuda_pool_floor_refuses(look_ahead_size)) {
+            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        }
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             const size_t cached_bytes = pool_size;
@@ -522,6 +1743,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr == nullptr) {
                 b.ptr = ptr;
                 b.size = size;
+                cached_size += size;
                 return;
             }
         }
@@ -700,6 +1922,10 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+static bool ggml_cuda_graph_capture_active() {
+    return ggml_cuda_lock_counter.load(std::memory_order_relaxed) > 0;
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_mmb_release_all();
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
@@ -711,6 +1937,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     for (char * p : q8_1_arena_retired) {
         CUDA_CHECK(cudaFree(p));
     }
+    h2d_stage_free();
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -735,6 +1962,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    // OPEN 2: the buffer is a VIEW of the movable-boundary slab's work region (base = slab base).  Freeing
+    // it must NOT release anything -- the region belongs to the slab, which lives until the process exits.
+    bool slab_view = false;
+    // The size this view REQUESTED (what bounds its tensor layout) and its base offset in the slab work
+    // region; together they form the boundary contribution `ggml_cuda_slab_work_release` removes.
+    size_t slab_need = 0;
+    size_t slab_off  = 0;
     std::string name;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -743,6 +1977,12 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        if (slab_view) {
+            ggml_cuda_slab_work_release(device, slab_off, slab_need);   // the slab owns the region; the slack may go to the arena
+            return;
+        }
+        // A compute buffer allocated from the slab is a VIEW (handled above); everything else here is a
+        // plain cudaMalloc pointer.
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -791,10 +2031,170 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+
+// GGML_CUDA_ASYNC_INPUT=1: graph inputs (small host -> device writes into a compute buffer) are staged through a
+// per-device pinned ring and copied asynchronously on cudaStreamPerThread (the stream the synchronous path uses, so a
+// later get_tensor stays ordered after it); an event is recorded per copy and the next graph on that device makes its
+// compute stream wait for it (ggml_cuda_async_input_wait).  The host no longer waits for each input copy.  The ring
+// is reused only after a full drain of the copy stream (once per lap).
+struct ggml_cuda_async_input_dev {
+    std::mutex  mtx;
+    char *      ring    = nullptr;
+    size_t      cap     = 0;
+    size_t      head    = 0;
+    cudaEvent_t ev      = nullptr;
+    bool        pending = false;
+    int64_t     hits    = 0;
+    cudaEvent_t done_ev  = nullptr;   // recorded on the compute stream when a graph_compute returns
+    bool        has_done = false;
+};
+static ggml_cuda_async_input_dev g_async_input[GGML_CUDA_MAX_DEVICES];
+static const bool g_async_input_on = [] {
+    const char * e = getenv("GGML_CUDA_ASYNC_INPUT");
+    return e != nullptr && atoi(e) != 0;
+}();
+static constexpr size_t GGML_CUDA_ASYNC_INPUT_MAX  = 1u << 20;
+static constexpr size_t GGML_CUDA_ASYNC_INPUT_RING = 16u << 20;
+
+static bool ggml_cuda_async_input_set(int device, void * dst, const void * src, size_t size) {
+    ggml_cuda_async_input_dev & d = g_async_input[device];
+    std::lock_guard<std::mutex> lock(d.mtx);
+    if (d.ring == nullptr) {
+        if (cudaMallocHost((void **) &d.ring, GGML_CUDA_ASYNC_INPUT_RING) != cudaSuccess ||
+            cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming) != cudaSuccess ||
+            (d.done_ev == nullptr && cudaEventCreateWithFlags(&d.done_ev, cudaEventDisableTiming) != cudaSuccess)) {
+            (void) cudaGetLastError();
+            d.ring = nullptr;
+            return false;
+        }
+        d.cap = GGML_CUDA_ASYNC_INPUT_RING;
+    }
+    const size_t need = (size + 255) & ~(size_t) 255;
+    if (d.head + need > d.cap) {
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));   // every copy out of the ring has completed
+        d.head = 0;
+    }
+    char * slot = d.ring + d.head;
+    d.head += need;
+    memcpy(slot, src, size);
+    if (d.has_done) {
+        // the previous graph on this device may still read this input: copy only after it (a GPU-side wait)
+        CUDA_CHECK(cudaStreamWaitEvent(cudaStreamPerThread, d.done_ev, 0));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dst, slot, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(cudaEventRecord(d.ev, cudaStreamPerThread));
+    d.pending = true;
+    if (d.hits++ == 0) {
+        GGML_LOG_WARN("%s: device %d: async graph-input uploads on (GGML_CUDA_ASYNC_INPUT=1)\n", __func__, device);
+    }
+    return true;
+}
+
+struct ggml_cuda_async_input_done_guard {
+    int          device;
+    cudaStream_t stream;
+    ~ggml_cuda_async_input_done_guard() {
+        if (!g_async_input_on) {
+            return;
+        }
+        ggml_cuda_async_input_dev & d = g_async_input[device];
+        std::lock_guard<std::mutex> lock(d.mtx);
+        if (d.done_ev == nullptr && cudaEventCreateWithFlags(&d.done_ev, cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            d.done_ev = nullptr;
+            return;
+        }
+        CUDA_CHECK(cudaEventRecord(d.done_ev, stream));
+        d.has_done = true;
+    }
+};
+
+static void ggml_cuda_async_input_wait(int device, cudaStream_t stream) {
+    if (!g_async_input_on) {
+        return;
+    }
+    ggml_cuda_async_input_dev & d = g_async_input[device];
+    std::lock_guard<std::mutex> lock(d.mtx);
+    if (d.pending) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, d.ev, 0));
+        d.pending = false;
+    }
+}
+
+// One reused pinned chunk per device for the bounce of pageable host copies (ggml_cuda_bounce_min).  The caller holds
+// `lock` for as long as it uses the chunk.  Returns nullptr if the chunk
+// cannot be allocated (pinned host memory exhausted; the error is cleared).  A failed allocation is not retried: the
+// bounce runs on every small copy, so a retry per call would put a failing 64 MiB hipHostMalloc on the hot path.
+static constexpr size_t ggml_cuda_pin_chunk_bytes = 64ull << 20;
+
+static char * ggml_cuda_pin_chunk(int device, std::unique_lock<std::mutex> & lock) {
+    static std::mutex mutex[GGML_CUDA_MAX_DEVICES];
+    static void *     buf[GGML_CUDA_MAX_DEVICES] = {};
+    static bool       failed[GGML_CUDA_MAX_DEVICES] = {};
+    lock = std::unique_lock<std::mutex>(mutex[device]);
+    if (buf[device] == nullptr && !failed[device] && cudaMallocHost(&buf[device], ggml_cuda_pin_chunk_bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        buf[device]    = nullptr;
+        failed[device] = true;
+    }
+    return (char *) buf[device];
+}
+
+// A copy between the device and pageable host memory is slow on ROCm at any size: a large one runs at ~2 GB/s through
+// the runtime's own staging, and a small one still costs ~25 us (1-D) / ~57 us (2-D) on gfx1201.  The server's context
+// checkpoint (~118 MB of recurrent state in 512 KiB tensors) is saved after every prompt, before the first token, and
+// its prompt-cache save of a slot reads the KV / recurrent state as thousands of small row ranges (twice as many under
+// -sm tensor, one per device), so all such copies bounce through the reused pinned chunk instead.
+// Only a pageable host pointer bounces: a pinned one (e.g. a CUDA_Host graph input) already copies at full speed, so
+// the extra memcpy would be pure overhead.  If the chunk cannot be allocated the copy stays direct.
+// GGML_CUDA_BOUNCE_MIN sets the threshold in bytes (default 1 = every size, 0 or an unparsable value = off).
+static size_t ggml_cuda_bounce_min() {
+    static const size_t v = [] {
+        const char * e = getenv("GGML_CUDA_BOUNCE_MIN");
+        const size_t n = e != nullptr ? (size_t) atoll(e) : (size_t) 1;
+        return n != 0 ? n : SIZE_MAX;
+    }();
+    return v;
+}
+
+#if defined(GGML_USE_HIP) || defined(GGML_USE_CUDA)
+static bool ggml_cuda_host_ptr_pageable(const void * ptr) {
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        (void) cudaGetLastError();   // an unregistered host pointer is an error on some runtimes
+        return true;
+    }
+    return attr.type != cudaMemoryTypeHost && attr.type != cudaMemoryTypeDevice && attr.type != cudaMemoryTypeManaged;
+}
+#else
+// vendors/musa.h has no cudaPointerGetAttributes/cudaMemoryType* aliases; keep the MUSA transport direct rather
+// than add untested defines (the bounce is a ROCm win).  The threshold also makes the call sites short-circuit.
+static bool ggml_cuda_host_ptr_pageable(const void * /*ptr*/) { return false; }
+#endif
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (g_async_input_on && size <= GGML_CUDA_ASYNC_INPUT_MAX &&
+        ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_cuda_async_input_set(ctx->device, (char *) tensor->data + offset, data, size)) {
+        return;
+    }
+    // see ggml_cuda_bounce_min (the context checkpoint restore).  Model weights keep the direct copy: the loader's
+    // uploads stay as they were instead of paying one more memcpy per weight.
+    std::unique_lock<std::mutex> lock;
+    char * pin = nullptr;
+    if (size >= ggml_cuda_bounce_min() && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_cuda_host_ptr_pageable(data) && (pin = ggml_cuda_pin_chunk(ctx->device, lock)) != nullptr) {
+        for (size_t done = 0; done < size; done += ggml_cuda_pin_chunk_bytes) {
+            const size_t n = std::min(ggml_cuda_pin_chunk_bytes, size - done);
+            memcpy(pin, (const char *) data + done, n);
+            CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + done, pin, n, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -803,6 +2203,19 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    // see ggml_cuda_bounce_min (the server's context checkpoint save)
+    std::unique_lock<std::mutex> lock;
+    char * pin = nullptr;
+    if (size >= ggml_cuda_bounce_min() && ggml_cuda_host_ptr_pageable(data) &&
+        (pin = ggml_cuda_pin_chunk(ctx->device, lock)) != nullptr) {
+        for (size_t done = 0; done < size; done += ggml_cuda_pin_chunk_bytes) {
+            const size_t n = std::min(ggml_cuda_pin_chunk_bytes, size - done);
+            CUDA_CHECK(cudaMemcpyAsync(pin, (const char *) tensor->data + offset + done, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            memcpy((char *) data + done, pin, n);
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -848,6 +2261,25 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    // A 2-D D2H into pageable memory is slow on ROCm even when small (~57 us per call on gfx1201): under -sm tensor the
+    // server's prompt-cache save reads every split KV / recurrent-state row range this way, thousands of calls per slot.
+    // Pack the rows into the pinned chunk and scatter them on the host instead (see ggml_cuda_bounce_min).
+    std::unique_lock<std::mutex> lock;
+    char * pin = nullptr;
+    if (size > 0 && n_copies > 0 && size <= ggml_cuda_pin_chunk_bytes && size * n_copies >= ggml_cuda_bounce_min() &&
+        ggml_cuda_host_ptr_pageable(data) && (pin = ggml_cuda_pin_chunk(ctx->device, lock)) != nullptr) {
+        const size_t rows = ggml_cuda_pin_chunk_bytes / size;
+        for (size_t e0 = 0; e0 < n_copies; e0 += rows) {
+            const size_t n = std::min(rows, n_copies - e0);
+            CUDA_CHECK(cudaMemcpy2DAsync(pin, size, (const char *) tensor->data + offset + e0 * stride_tensor, stride_tensor,
+                    size, n, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            for (size_t e = 0; e < n; ++e) {
+                memcpy((char *) data + (e0 + e) * stride_data, pin + e * size, size);
+            }
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -935,6 +2367,93 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
+// r42 (OPEN 2): allocate the COMPUTE buffer from the per-device VMM pool when enabled.  Only the graph
+// allocator calls this (with the real usage); model weights go through alloc_buffer and are untouched.
+static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer_usage(ggml_backend_buffer_type_t buft, size_t size, enum ggml_backend_buffer_usage usage) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+
+    if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE && ggml_cuda_work_alloc_debug()) {
+        GGML_LOG_WARN("COMPUTE_ALLOC %.1f MiB dev=%d slab_on=%d flag=%d\n", (double) size/1048576.0,
+                      buft_ctx->device, (int) ggml_cuda_slab_enabled(), (int) g_slab_compute_enabled);
+    }
+
+    if (usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        // OPEN 2: the movable-boundary slab.  The compute buffer is a VIEW of the slab's work region: its
+        // base is the slab base (so a growing layout keeps its tensor addresses) and its REPORTED size is
+        // the boundary (so growth inside the region does not look like a realloc to the graph allocator).
+        // Growing past the boundary moves the split -- evicting the arena tables in the taken chunks -- and
+        // HIP is NOT called at runtime.
+        if (ggml_cuda_slab_enabled() && g_slab_compute_enabled) {
+            ggml_cuda_set_device(buft_ctx->device);
+            void * dev_ptr = ggml_cuda_slab_work_alloc(buft_ctx->device, size);
+            if (dev_ptr != NULL) {
+                // REPORT the size that was actually REQUESTED, not the slab's boundary.  The boundary is
+                // shared by every view (the widest one pins it), so reporting it makes a small buffer
+                // claim the whole region: `ggml_vbuffer_size()` feeds the graph allocator AND the
+                // `--fit` memory accounting, and a fit probe buffer claiming ~11.5 GiB instead of its
+                // requested 512 MiB sends the fit into seven extra rounds, where a pre-existing Meta
+                // backend assert can fire (measured: 1-2 starts in 5 crashed with the boundary reported,
+                // 5/5 clean with the request reported -- and 5/5 clean with the slab off entirely).
+                // Growth is unaffected: the requested size already carries the chunk rounding and the
+                // spare chunk, and beyond that a "realloc" under the slab re-uses the SAME base (the
+                // work region's VA never moves), so it costs a layout pass, not a move.
+                GGML_LOG_INFO("%s: compute buffer %.2f MiB from the slab work region (boundary %.2f MiB) on device %d\n",
+                              __func__, size / 1024.0 / 1024.0, ggml_cuda_slab_work_size(buft_ctx->device) / 1024.0 / 1024.0,
+                              buft_ctx->device);
+                ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+                ctx->slab_view     = true;
+                ctx->slab_need     = size;
+                ctx->slab_off      = (size_t) ((char *) dev_ptr - (char *) ggml_cuda_slab_work_base(buft_ctx->device));
+                return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+            }
+            GGML_LOG_WARN("%s: slab work region has no room for %.2f MiB on device %d; falling back\n",
+                          __func__, size / 1024.0 / 1024.0, buft_ctx->device);
+            // The slab can also fail because `work estimate + cache floor` does not fit at all, which is
+            // not a "no room right now" case: the arena and a wide prefill can never coexist here, so the
+            // cache must STREAM instead of building one.  This is the earliest point the answer exists and
+            // it is before any cache-consulting graph, which is what makes the disable safe (see
+            // `moe_cache_disable_streaming`); the slab lock is already released here.
+            if (ggml_cuda_slab_cache_unusable(buft_ctx->device)) {
+                moe_cache_disable_streaming("the movable-boundary slab cannot hold the work buffers plus the "
+                                            "minimum MoE cache on this device (GGML_CUDA_SLAB_MIN_ARENA_MIB); "
+                                            "lower GGML_CUDA_SLAB_RESERVE_MIB if the reserve is too large");
+            } else if (ggml_cuda_slab_configured() && ggml_cuda_slab_declined(buft_ctx->device)) {
+                // Issue #136 (item F): the slab was armed for a host-expert model but could not be CREATED on
+                // this device at all (VMM unavailable, bad chunk geometry, cudaMemGetInfo failure, or too
+                // little free VRAM for the reserve).  Nothing was committed (`!inited`; the single
+                // mid-init failure frees its VA), so streaming is safe -- but never silently build a raw
+                // arena.  This is the earliest point the answer exists and is before any cache-consulting
+                // graph, which is what makes the disable safe (see `moe_cache_disable_streaming`).  If it
+                // is somehow too late, that would be an inconsistent run: refuse to continue.
+                const char * why = ggml_cuda_slab_decline_reason(buft_ctx->device);
+                if (moe_cache_is_sized()) {
+                    GGML_ABORT("%s: device %d: the movable-boundary slab was armed but could not be created "
+                               "(%s), and the MoE expert cache is already sized -- it is too late to stream "
+                               "without an inconsistent run.  Set GGML_CUDA_SLAB=0 and restart, or report the "
+                               "reproduction at https://github.com/stew675/llama-cpp-rdna-boosts/issues\n",
+                               __func__, buft_ctx->device, why != nullptr ? why : "unknown reason");
+                }
+                static bool warned[GGML_CUDA_MAX_DEVICES] = {};
+                if (!warned[buft_ctx->device]) {
+                    warned[buft_ctx->device] = true;
+                    GGML_LOG_ERROR("%s: device %d: the movable-boundary slab was armed for this host-expert "
+                                   "model but could not be created (%s).  Disabling the MoE expert cache and "
+                                   "streaming the experts from the host; the run is correct but slower.  "
+                                   "Workarounds: free VRAM / lower GGML_CUDA_SLAB_RESERVE_MIB, or set "
+                                   "GGML_CUDA_SLAB=0 to silently take the plain path.  If this is unexpected, "
+                                   "please report the reproduction at "
+                                   "https://github.com/stew675/llama-cpp-rdna-boosts/issues\n",
+                                   __func__, buft_ctx->device, why != nullptr ? why : "unknown reason");
+                }
+                moe_cache_disable_streaming("the movable-boundary slab was armed but could not be created on "
+                                            "this device");
+            }
+        }
+    }
+
+    return ggml_backend_cuda_buffer_type_alloc_buffer(buft, size);
+}
+
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return 128;
 
@@ -960,8 +2479,56 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     return size;
 }
 
-static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
-    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
+// RDNA/ROCm (TODO #42): the graph allocator reserves the compute buffer from a *measure* graph, but a
+// runtime graph can carry a different live-tensor set (host-expert staging, MTP taps) and need a little
+// more -- measured +3.3 % (6564 -> 6780 MiB; the cli case was a 11765.52 MiB allocation).  Growing it is
+// a free-then-allocate-larger, so it needs a contiguous block BIGGER than the one just released, which
+// fails once the leftover VRAM belongs to the MoE expert-cache arena.  Taking the slack up front moves
+// it to *before* the arena is sized.  Deliberately HIP-only: this repo is RDNA/ROCm-scoped and no other
+// backend's allocation sizes change at all.  `GGML_COMPUTE_BUFFER_MARGIN_PCT=0` disables it.
+static size_t ggml_backend_cuda_buffer_type_get_compute_margin_pct(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+#if defined(GGML_USE_HIP)
+    static int margin_pct = -1;
+    if (margin_pct < 0) {
+        const char * env = getenv("GGML_COMPUTE_BUFFER_MARGIN_PCT");
+        margin_pct = env != NULL ? atoi(env) : 10;
+        if (margin_pct < 0) {
+            margin_pct = 0;
+        }
+    }
+    return (size_t) margin_pct;
+#else
+    return 0;
+#endif
+}
+
+// OPEN 2: uniform COMPUTE-buffer chunk size (bytes).  Chunk-quantizing the allocation (+ one spare chunk)
+// absorbs a later graph's growth without a free-then-allocate-larger, and makes workspace and arena memory
+// interchangeable units for the VMM pool.  HIP-only, like the margin above.  `GGML_COMPUTE_BUFFER_CHUNK_MIB`
+// (MiB, default 256) sets it; 0 falls back to the percentage margin.
+static size_t ggml_backend_cuda_buffer_type_get_compute_chunk_bytes(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+#if defined(GGML_USE_HIP)
+    static size_t chunk_mib = SIZE_MAX;
+    if (chunk_mib == SIZE_MAX) {
+        const char * env = getenv("GGML_COMPUTE_BUFFER_CHUNK_MIB");
+        chunk_mib = env != NULL ? (size_t) atoll(env) : 256;
+    }
+    // Chunk-quantizing the compute buffer (`(ceil(need/C)+1)*C`) exists to keep the SLAB's work region in
+    // whole units, so it makes sense only when the slab is in use.  With no slab (a dense model) it just
+    // inflates small buffers -- a 178 MiB layout becomes 512 MiB -- so fall back to the percentage margin,
+    // which is the pre-slab behaviour.  This is what removes the dense +739 MiB of issue #120.
+    if (!ggml_cuda_slab_enabled()) {
+        return 0;
+    }
+    return chunk_mib * 1024 * 1024;
+#else
+    return 0;
+#endif
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
     /* .alloc_buffer        = */ ggml_backend_cuda_buffer_type_alloc_buffer,
     /* .alloc_buffer_n      = */ NULL,
     /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
@@ -969,6 +2536,9 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ NULL,
     /* .is_host             = */ NULL,
+    /* .get_compute_margin_pct = */ ggml_backend_cuda_buffer_type_get_compute_margin_pct,
+    /* .alloc_buffer_usage  = */ ggml_backend_cuda_buffer_type_alloc_buffer_usage,
+    /* .get_compute_chunk_bytes = */ ggml_backend_cuda_buffer_type_get_compute_chunk_bytes,
 };
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
@@ -1821,23 +3391,41 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     return buffer;
 }
 
-ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
-    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host = {
-        /* .iface    = */ {
-            /* .get_name            = */ ggml_backend_cuda_host_buffer_type_name,
-            /* .alloc_buffer        = */ ggml_backend_cuda_host_buffer_type_alloc_buffer,
-            /* .alloc_buffer_n      = */ NULL,
-            /* .get_alignment       = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
-            /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-            /* .get_alloc_size_n    = */ NULL,
-            /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
-        },
-        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
-        /* .context  = */ nullptr,
-    };
+// Per-device pinned host buffer types.  A buffer type's `device` is the device the scheduler places
+// the consumers of its tensors on, so a single device-0 host buffer type routes every host-resident
+// MoE expert (MUL_MAT_ID) op to device 0 under `-sm layer`, leaving the other GPUs idle on the expert
+// half.  The pinned allocation itself is device-agnostic (UVA), so only `device` differs; the public
+// `ggml_backend_cuda_host_buffer_type()` keeps returning device 0's for callers that mean "the host
+// buffer type" (and for API compatibility).
+static ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type_dev(int device) {
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
 
-    return &ggml_backend_cuda_buffer_type_host;
+    static struct ggml_backend_buffer_type bufts[GGML_CUDA_MAX_DEVICES];
+    static bool init[GGML_CUDA_MAX_DEVICES] = {};
+
+    if (!init[device]) {
+        bufts[device] = {
+            /* .iface    = */ {
+                /* .get_name            = */ ggml_backend_cuda_host_buffer_type_name,
+                /* .alloc_buffer        = */ ggml_backend_cuda_host_buffer_type_alloc_buffer,
+                /* .alloc_buffer_n      = */ NULL,
+                /* .get_alignment       = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+                /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                /* .get_alloc_size_n    = */ NULL,
+                /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            },
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+            /* .context  = */ nullptr,
+        };
+        init[device] = true;
+    }
+
+    return &bufts[device];
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+    return ggml_backend_cuda_host_buffer_type_dev(0);
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
@@ -2226,13 +3814,13 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
-static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
-                                          const ggml_tensor * ffn_up_bias = nullptr,
-                                          const ggml_tensor * ffn_gate_bias = nullptr,
-                                          const ggml_tensor * ffn_up_scale = nullptr,
-                                          const ggml_tensor * ffn_gate_scale = nullptr) {
+                                          const ggml_tensor * ffn_up_bias,
+                                          const ggml_tensor * ffn_gate_bias,
+                                          const ggml_tensor * ffn_up_scale,
+                                          const ggml_tensor * ffn_gate_scale) {
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 
@@ -2370,88 +3958,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 // and leave the matmul itself unchanged.  Their kernels are row-generic, so on RDNA4 the verify band
 // (2..8 tokens) takes them too; the quantized values are the ones quantize_q8_1 would write, so W = 1..8
 // stay bit-identical.  GGML_CUDA_FUSE_Q8_1_VERIFY=0 turns it off.
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false) {
-    ggml_tensor *       src0 = tensor->src[0];
-    ggml_tensor *       src1 = tensor->src[1];
-    const ggml_tensor * dst  = tensor;
-
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
-                                   src0->view_src;
-
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
-
-    // fusion is not universally faster on Pascal
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (cc <= GGML_CUDA_CC_PASCAL) {
-        return false;
-    }
-    //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
-    static const bool q8_1_verify = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
-            !(verify_band && q8_1_verify && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
-        return false;
-    }
-
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
-        return false;
-    }
-
-    return use_mul_mat_vec_q;
-}
-
-static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
-    if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
-        return false;
-    }
-    const int nodes[] = { routed_idx, routed_idx + 1, routed_idx + 2, shared_idx, shared_idx + 1, shared_idx + 2 };
-    const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
-                           GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
-    const int outputs[] = { routed_idx + 2, shared_idx + 2 };
-    if (!ggml_can_fuse_subgraph_ext(graph, nodes, 6, ops, outputs, 2)) {
-        return false;
-    }
-
-    const ggml_tensor * routed = graph->nodes[routed_idx + 2];
-    const ggml_tensor * shared = graph->nodes[shared_idx + 2];
-    const ggml_tensor * gate = routed->src[0];
-    const ggml_tensor * up = routed->src[1];
-    const ggml_tensor * shared_gate = shared->src[0];
-    const ggml_tensor * shared_up = shared->src[1];
-    const auto is_pair = [&](const ggml_tensor * a, const ggml_tensor * b, int idx) {
-        return (a == graph->nodes[idx] && b == graph->nodes[idx + 1]) ||
-               (b == graph->nodes[idx] && a == graph->nodes[idx + 1]);
-    };
-    // only batch-size independent checks here: graph_optimize must produce the same graph topology for every ubatch
-    // size, otherwise ggml-alloc has to re-reserve (and the scheduler to synchronize) at runtime.
-    // the MMVQ batch size check is done in ggml_cuda_try_fuse
-    if (!is_pair(gate, up, routed_idx) || !is_pair(shared_gate, shared_up, shared_idx) ||
-            !ggml_cuda_should_fuse_mul_mat(up, gate, routed) ||
-            !ggml_cuda_should_fuse_mul_mat(shared_up, shared_gate, shared) ||
-            !up->src[0]->buffer ||
-            !ggml_is_quantized(up->src[0]->type)) {
-        return false;
-    }
-    const ggml_tensor * input = up->src[1];
-    const ggml_tensor * weight = up->src[0];
-    const ggml_tensor * shared_weight = shared_up->src[0];
-    if (input->op != GGML_OP_RESHAPE || input->src[0] != shared_up->src[1] ||
-            input->ne[1] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
-            !ggml_is_contiguous(shared_up->src[1]) || !ggml_is_matrix(shared_up->src[1]) ||
-            weight->type != shared_weight->type || weight->ne[0] != shared_weight->ne[0] ||
-            weight->ne[1] != shared_weight->ne[1] || weight->nb[1] != shared_weight->nb[1] || weight->ne[3] != 1 ||
-            !ggml_is_matrix(shared_weight) || !ggml_is_contiguous(shared_weight) ||
-            !ggml_is_contiguous(shared_gate->src[0]) || !ggml_is_contiguous(routed) || !ggml_is_contiguous(shared)) {
-        return false;
-    }
-    if (shared_weight->op != GGML_OP_NONE || shared_gate->src[0]->op != GGML_OP_NONE ||
-            ggml_get_glu_op(routed) != ggml_get_glu_op(shared) ||
-            ggml_get_op_params_f32(routed, 3) != ggml_get_op_params_f32(shared, 3)) {
-        return false;
-    }
-    return true;
-}
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -2559,6 +4065,62 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    // wip/moe-heatmap-persistence (R2): the device-side prefill routing tally.  Run at the OUTER entry
+    // only: the cache's slot-remap redirect below re-enters this function with a stack `src0` whose
+    // `buffer` is null and whose `dst->src[2]` is the slot remap (not the routing), while the outer
+    // entry always carries the graph's true raw ids - for every path (identity, eager, staged prefill).
+    // The tally itself is band-gated (prefill only) and a no-op unless MOE_EXPERT_HEATMAP is set.
+    if (moe_cache_enabled() && src0->buffer != nullptr && ids != nullptr) {
+        moe_cache_heat_observe(dst, src0, ids, ctx.stream(), ctx.device);
+    }
+
+    // wip/moe-expert-cache slot-remap consumer: if the scheduler handed this expert table to the
+    // cache (the backend iface `moe_cache_update` returned true), read the compact arena and the
+    // slot-remapped ids instead of the full expert table.  `src0` is the redirected `input_cpy`,
+    // which the cache aliased; `moe_cache_get_table` maps it to the arena.  The shallow `src0`/
+    // `ids` copies are re-dispatched through this same function, whose cache check then misses
+    // (the copies are stack pointers), so the normal kernel selection runs on the compact table.
+    if (moe_cache_enabled()) {
+        void *    arena   = nullptr;
+        void *    remap   = nullptr;
+        int64_t   n_slots = 0;
+        int64_t   nu = 0;
+        int64_t   nt = 0;
+        size_t    eb = 0;
+        if (moe_cache_get_table(dst, src0, ctx.device, &arena, &n_slots, &eb, &remap, &nu, &nt) &&
+            (remap == nullptr || (nu == ids->ne[0] && nt == ids->ne[1]))) {
+            // Keep `ne[2]`/`nb` exactly as the full table so the dispatcher's kernel-family
+            // heuristics (which read `ne[2]`/`n_experts`) are unchanged and the arithmetic stays
+            // bit-identical; only the base pointer moves to the arena, and the remapped ids stay
+            // below `slots`, so the kernel never reads an expert outside the arena.  Unused expert
+            // slots are never referenced by the ids and are only skipped over.
+            GGML_UNUSED(n_slots);
+            GGML_UNUSED(eb);
+            ggml_tensor src0c = *src0;
+            src0c.data = arena;
+            // The arena is a raw cudaMalloc, not a ggml buffer; drop `buffer` so the mmvq
+            // compute-buffer padding clear (which would offset by `ggml_nbytes(src0)` = the FULL
+            // expert count) is skipped and cannot memset past the compact arena.
+            src0c.buffer = nullptr;
+            ggml_tensor idsc = *ids;
+            if (remap != nullptr) {
+                idsc.data   = remap;
+                // the remap buffer is contiguous (`n_used x n_tok`), while `ids` is a strided view
+                idsc.nb[0]  = sizeof(int32_t);
+                idsc.nb[1]  = (size_t) ids->ne[0] * sizeof(int32_t);
+            }   // else: identity fast path - the raw routing ids already index the arena
+
+            ggml_tensor * saved_s0 = dst->src[0];
+            ggml_tensor * saved_s2 = dst->src[2];
+            dst->src[0] = &src0c;
+            dst->src[2] = &idsc;
+            ggml_cuda_mul_mat_id(ctx, dst);
+            dst->src[0] = saved_s0;
+            dst->src[2] = saved_s2;
+            return;
+        }
+    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -3162,6 +4724,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
 
+    // an async graph-input upload into src may still be in flight (GGML_CUDA_ASYNC_INPUT=1)
+    ggml_cuda_async_input_wait(cuda_ctx_src->device, cuda_ctx_src->stream());
+
     if (backend_src != backend_dst) {
         // copy on src stream
         // compare the backing physical devices: distinct virtual devices may share one physical GPU,
@@ -3211,6 +4776,27 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
+    // wip/moe-expert-cache: the slot-remap redirect is a HOST decision made in `ggml_cuda_mul_mat_id`,
+    // which a CUDA graph only executes during CAPTURE.  The captured graph bakes in, per op, whether it
+    // reads the compact arena or the full `input_cpy`, while the scheduler's per-token hook decides
+    // whether to take the input over (and skip the `input_cpy` copy).  That is safe only if the decision
+    // is CONSTANT for a given graph shape, so capture is blocked until the arena is sized.  After that
+    // the hook always takes over whenever `slots >= n_used * n_tok` (the current token's experts are
+    // protected from each other) and always declines below it - in both cases a per-shape constant.
+    //
+    // Only block a graph that ACTUALLY contains a cache-manageable routed MoE op.  A graph whose every
+    // `MUL_MAT_ID` is above the decode band (e.g. a 16-sequence batched decode, `ne[2] == 16`) never
+    // involves the cache, so its redirect decision is trivially constant and capture is safe - blocking
+    // it left those workloads running graph-less (measured: `llama-batched-bench -npl 16` 137 -> 52 t/s).
+    if (moe_cache_enabled() && !moe_cache_ready()) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            if (n->op == GGML_OP_MUL_MAT_ID && n->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
+                return false;
+            }
+        }
+    }
+
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
@@ -3242,14 +4828,53 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+// The batch token count a CUDA/HIP graph carries.  The first node's ne[1] is NOT a
+// reliable token count: with expert offload (-ncmoe) the scheduler splits the graph
+// around the CPU-resident experts, so a one-token decode split routinely starts with
+// an expert-path tensor of shape [n_ff, n_expert_used, n_tokens] and ne[1] ==
+// n_expert_used (10) even at one token.  Read it from the first op that actually
+// carries it instead:
+//   - MUL_MAT_ID  -> result is [n_out, n_expert_used, n_tokens], so ne[2] is n_tokens
+//   - MUL_MAT     -> result is [src0->ne[1], src1->ne[1], ...], so src1->ne[1] is n_tokens
+// The MUL_MAT arm requires a constant, unbatched weight (src0 is op NONE and 2-D) so the
+// probe reads a layer's activation batch; attention score matmuls are skipped.
+static int64_t ggml_cuda_graph_n_tokens(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            return node->ne[2];
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr &&
+            node->src[0]->op == GGML_OP_NONE && node->src[0]->ne[2] == 1) {
+            return node->src[1]->ne[1];
+        }
+    }
+
+    // No weight matmul found in this split: fall back to the first node's second dim.
+    return cgraph->n_nodes > 0 ? cgraph->nodes[0]->ne[1] : 0;
+}
+
+// One graph per (first node, token count): decode and each speculative verify width keep
+// their own captured graph instead of invalidating one another's warmup.
+static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    return ggml_cuda_graph_key { cgraph->nodes[0], ggml_cuda_graph_n_tokens(cgraph) };
+}
+
+// Whether a CUDA/HIP graph should skip the graph-capture path.  Only a true PRE-FILL (a
+// varying ubatch, where capture never amortises) is skipped; single-token decode and the
+// spec-verify widths (n_tokens <= MMVQ_MAX_BATCH_SIZE, a fixed shape every step) keep HIP
+// graph replay.  GGML_CUDA_DISABLE_VERIFY_GRAPHS=1 restores the pre-r20 behaviour where
+// every multi-token graph skipped the graph path.
+static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
+    static const bool verify_graphs_off = getenv("GGML_CUDA_DISABLE_VERIFY_GRAPHS") != nullptr;
+    return ggml_cuda_graph_n_tokens(cgraph) > (verify_graphs_off ? 1 : MMVQ_MAX_BATCH_SIZE);
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (cgraph->uid != 0 &&
@@ -3288,8 +4913,30 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+#ifdef GGML_USE_HIP
+    // HIP/ROCm <= 10.0 leaks device memory in hipGraphExecUpdate: the driver's
+    // GraphKernelArgManager bump-allocates a fresh kernel-argument slot on every update
+    // and only reclaims slots when the exec is destroyed (ROCm/rocm-systems#10713; driver
+    // fix in PR #11434).  A split-moe decode recaptures the graph on the order of once per
+    // few tokens, so a long-lived exec grows by a few KB per token.  Destroying and
+    // re-instantiating is the only reclaim path that exists today and was measured flat
+    // over a soak; it also cannot leave a stale executable behind, which the update path
+    // can silently do when the driver drops an error.  Cheap in practice: this runs only
+    // on the recapture path, not per token.  Set GGML_HIP_GRAPH_FORCE_UPDATE=1 to take the
+    // update path anyway (e.g. on a ROCm that has the driver fix).
+    static const bool force_update = getenv("GGML_HIP_GRAPH_FORCE_UPDATE") != nullptr;
+    if (!force_update) {
+        if (graph->instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+            graph->instance = nullptr;
+        }
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        return;
+    }
+#endif // GGML_USE_HIP
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -3780,12 +5427,12 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 }
 
 // returns whether the write (out) nodes overwrite the read nodes in operation
-static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_idx,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -4256,10 +5903,129 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+
+// the hc_mix window must be closed (its only external consumer is the fused output) before the
+// gate GEMM can be folded into it: otherwise the gate tensor the GEMM no longer materializes could
+// still be read by another node.
+
+// Structural identification of the qwen4exp hyper-connection combine+norm subgraph for the BF16 HC
+// streams (LLAMA_HC_BLK16 / LLAMA_HC_RES16, both default OFF).  graph_optimize runs before the
+// buffers are assigned, so this is structure/shape only (no alias checks); the fusion site
+// re-checks everything.  Only the repeat-anchored form qwen4exp emits is recognised (the narrow
+// block_out base is a graph output and the REPEAT is consumed inside the fused window); if it does
+// not match, the caller simply does not mark and the two flags stay inert.
+
+// Fill the BF16 HC-stream pointers for a matched combine+norm window.  Each pointer is left null when
+// the graph did not mark the matching tensor, so an unmarked stream keeps its F32 read/write.
+
+// Prefill indexer head reduction: relu + head-sum.  Anchored at the RELU.  Our qwen4exp graph (the
+// L2a memory win) puts the relu BEFORE the 4-D reshape, so an optional RESHAPE between the relu and
+// the head views is accepted; the reference's relu-on-4-D form matches with no reshape.  The fused
+// kernel recomputes the relu from the pre-relu scores and sums in graph order, so it is bit-identical.
+
+// wip/moe-expert-cache (H1): while the cache is active, only the fusions that read a routed
+// expert table in the cache band stand down; every other backend fusion (router/topk, GDN, QSA,
+// rope, norms, and the *prefill* MoE fusions) stays on.  The decode/verify MoE must run through
+// `ggml_cuda_mul_mat_id`, which is where the slot-remap consumer lives; a fused MoE bypasses it
+// and would read the redirected `input_cpy`, which the scheduler did not populate (the cache took
+// the input over).  Prefill (n_tokens > band) is untouched: the cache does not take those inputs
+// over, their `input_cpy` is fully copied, and their fusions keep firing bit-identically.
+static void moe_fuse_trace(int ne2, bool blocked, const char * why) {
+    static const bool on = getenv("GGML_CUDA_FUSE_TRACE") != nullptr;
+    if (!on) {
+        return;
+    }
+    static std::map<std::string, int> seen;
+    const std::string k = std::to_string(ne2) + "/" + (blocked ? "block" : "allow") + "/" + why;
+    if (seen.emplace(k, 1).second) {
+        GGML_LOG_WARN("FUSE_TRACE ne2=%d %s (%s)\n", ne2, blocked ? "BLOCK" : "allow", why);
+    }
+}
+
+static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    if (!moe_cache_enabled()) {
+        return false;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+
+    // gate+up+GLU, the routed pair, and the qwen4exp weighted-down all start at the routed
+    // matmul; `ne[2]` is its token count, so gate on the cache band (prefill stays fused).
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        if (node->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
+            moe_fuse_trace((int) node->ne[2], false, "prefill");
+            return false;   // prefill: the cache does not take these inputs over
+        }
+        // No routed expert table at all (the model is fully device-resident: `-ncmoe 0`, or a `-ncmoe`
+        // that did not offload, e.g. on unified memory).  The cache can never take an input over, so its
+        // fusions must behave exactly as if it were disabled -- otherwise enabling the cache changes the
+        // output vs the cache-less oracle, because this stand-down changes the arithmetic.
+        if (!moe_cache_has_tables()) {
+            moe_fuse_trace((int) node->ne[2], false, "no-tables");
+            return false;
+        }
+        // Tables exist but cannot serve (priming pass, every arena allocation failed, or a budget below
+        // one expert): the cache takes no input over, so its cache-aware fusions MUST stay stood down.
+        // The gate+up mmvq fusion reads the scheduler's copy through the fused call site, which is only
+        // staged when the scheduler performs the copy itself; forcing the per-op path here is what keeps
+        // the output byte-identical to the cache-less run.
+        //
+        // wip/moe-verify-fusions (OPEN 2 / #50): this used to be the GLOBAL `moe_cache_has_arena()`,
+        // which requires EVERY table.  The movable-boundary slab evicts tables PER TABLE, so one
+        // evicted table flipped the cache-band arithmetic of the whole graph -- and because the plain
+        // and MTP arms evict at different points, the greedy streams diverged at a near-tie.  Ask THIS
+        // table instead, under the exact `identity` condition the scheduler take-over uses,
+        // so the fusion guard and the take-over agree per table (the code's own OPEN 2 invariant).
+        const int device = cuda_ctx->device;
+        // gate+up+GLU: one fused kernel reads both lanes, and it seeds the gate lane from the up
+        // table's remap, so BOTH tables must serve or the pair stands down together.
+        if (i + 2 < cgraph->n_nodes &&
+                cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
+                cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+            const bool up_ok   = moe_cache_table_serves(node, node->src[0], device);
+            const bool gate_ok = moe_cache_table_serves(cgraph->nodes[i + 1],
+                                                        cgraph->nodes[i + 1]->src[0], device);
+            moe_fuse_trace((int) node->ne[2], !(up_ok && gate_ok), up_ok && gate_ok ? "gate+up+glu" : "gate+up+glu-unserveable");
+            return !(up_ok && gate_ok);   // allowed: the plain gate+up+GLU decode fusion
+        }
+        // down projection + per-(expert,token) routing-weight fold ([MUL_MAT_ID, MUL]): the
+        // cache-aware variant in the epilogue below redirects the down table and the routing onto
+        // the arena/remap, so it may fire.  The qwen4exp weighted-down chain (a 21-node tail,
+        // opt-in via GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS and RDNA3_5-only) is NOT
+        // redirect-safe; it is kept stood down by its own `!moe_cache_enabled()` gate at its site.
+        if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL &&
+                cgraph->nodes[i + 1]->src[0] == node) {
+            const bool ok = moe_cache_table_serves(node, node->src[0], device);
+            // The down-fold is redirect-safe by construction: its call site (`moe_cache_redirect_fused`)
+            // sends a served table to the arena and falls back to the raw, scheduler-copied table when
+            // the cache does not serve, and the raw fallback is bit-identical to the per-op chain.  Do
+            // NOT stand it down while the arena is still cold: that selected raw MUL_MAT_ID + MWR at
+            // W=1 and the cache-aware down-fold at W>=2, which are not bit-identical (the qwen35moe
+            // (35B-A3B) `-sm tensor -ncmoe` width impurity, TODO #53).
+            moe_fuse_trace((int) node->ne[2], false, ok ? "down-fold" : "down-fold-unserveable-fallback");
+            return false;   // allowed unconditionally: the call site redirects or falls back to the raw table
+        }
+        moe_fuse_trace((int) node->ne[2], true, "other");
+        return true;
+    }
+
+    // swiglu -> routed-down fold (leading GLU, consuming the next MUL_MAT_ID).  Prefill-only in
+    // practice, but guard it too so a cache-band variant can never read the redirected table.
+    if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
+            cgraph->nodes[i + 1]->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
+        return true;
+    }
+
+    return false;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
+        return 0;
+    }
+    if (ggml_cuda_cache_blocks_fusion(cuda_ctx, cgraph, i)) {
         return 0;
     }
 
@@ -4270,24 +6036,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
-            ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
-            ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
-        const int outputs[] = { i + 2, i + 5 };
-        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {
-            ggml_tensor * routed = cgraph->nodes[i + 2];
-            ggml_tensor * shared = cgraph->nodes[i + 5];
-            const ggml_tensor * up = routed->src[1];
-            ggml_cuda_mm_fusion_args_host fusion{};
-            fusion.gate = routed->src[0]->src[0];
-            fusion.glu_op = ggml_get_glu_op(routed);
-            fusion.glu_limit = ggml_get_op_params_f32(routed, 3);
-            fusion.shared_up = shared->src[1]->src[0];
-            fusion.shared_gate = shared->src[0]->src[0];
-            fusion.shared_dst = shared;
-            ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
-            return 5;
-        }
+    // GLU -> Q8_1 (GGML_CUDA_FUSE_GLU_Q8_1=0: off): an F32 GLU whose next node (or the one after a reshape) is a verify-band
+    // mmvq matmul over it is marked here (RDNA4 only, through ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)); the regular
+    // GLU launcher then also writes the matmul's Q8_1 blocks into the quantize cache, which the matmul finds.
+    // GLU -> Q8_1 marking (owned by mmvq.cu).
+    ggml_cuda_glu_q8_1_mark(*cuda_ctx, cgraph, i);
+
+    // Upstream fused shared-expert MMVQ (owned by mmvq.cu).
+    if (const int n_shared_expert = ggml_cuda_match_shared_expert_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_shared_expert;
     }
 
     if (node->op == GGML_OP_MUL) {
@@ -4990,13 +6747,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
 
-                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                // wip/moe-expert-cache: the decode MoE may read a compact arena + slot-remapped ids
+                // instead of the full expert tables.  Redirect BOTH lanes together (the cache took
+                // both inputs over, skipping the scheduler copy); on a decline the scheduler's full
+                // copy stands and the original tensors are used.
+                ggml_tensor src0_c, ids_c, gate_c;
+                ggml_cuda_mm_fusion_args_host fusion_local = fusion_data;
+                if (moe_cache_redirect_fused(glu, src0, fusion_data.gate, ids, cuda_ctx->device, cuda_ctx->stream(),
+                                             &src0_c, &ids_c, &gate_c)) {
+                    fusion_local.gate = &gate_c;
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, src1, &ids_c, glu, &fusion_local);
+                } else {
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                }
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;
@@ -5156,6 +6925,95 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // MoE: ffn_moe_weighted = moe_down * topk_weights. The down projection
+    // output is scaled per token (the topk softmax weights); fold the MUL into
+    // the matmul epilogue. The pattern is [MUL_MAT_ID, MUL] with the MUL's
+    // src1 being a contiguous per-channel F32 vector (a view of the
+    // normalized weights).
+    static const bool disable_moe_down_fold = getenv("GGML_CUDA_DISABLE_MOE_DOWN_FOLD") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_DOWN_FOLD"));
+    if (!disable_moe_down_fold && i + 1 < cgraph->n_nodes && cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+        ggml_tensor * mm_node  = cgraph->nodes[i];
+        ggml_tensor * mul_node = cgraph->nodes[i + 1];
+
+        const int out_nodes[] = { i + 1 };
+        // The x_scale_channel_dst kernel path scales by a per-(expert, token)
+        // vector of mm_node->ne[1]*mm_node->ne[2] values (topk weights).
+        if (mul_node->op == GGML_OP_MUL &&
+                mul_node->src[0] == mm_node &&
+                (mm_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                (mul_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+            const ggml_tensor * weights = mul_node->src[1];
+            if (weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) &&
+                    weights->ne[0] == 1 && weights->ne[1] == mm_node->ne[1] &&
+                    weights->ne[2] == mm_node->ne[2] &&
+                    ggml_are_same_shape(mm_node, mul_node) &&
+                    ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.x_scale             = weights;
+                fusion_data.x_scale_channel_dst = true;
+                // wip/moe-expert-cache: the down table may be cache-managed; redirect the weight
+                // table and the routing onto the compact arena/remap exactly as the gate+up+GLU
+                // site does.  The redirect and the scheduler hook key off the same table lookup,
+                // so a taken-over input is always redirected and a declined one is fully copied.
+                ggml_tensor src0_c, ids_c;
+                if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
+                                             cuda_ctx->device, cuda_ctx->stream(), &src0_c, &ids_c, nullptr)) {
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
+                } else {
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
+                }
+                return 1;
+            }
+        }
+    }
+
+    // Pair of L2 norms over two views of the same tensor (the SSM conv output
+    // q/k slices). The view source is an external compute tensor, so the
+    // subgraph helper cannot express the pattern; check the wiring manually.
+    // Pair of L2 norms over two views of the same tensor (owned by norm.cu).
+    // GGML_CUDA_DISABLE_L2_NORM_PAIR=1 turns it off.
+    if (const int n_l2_norm_pair = ggml_cuda_l2_norm_pair_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_l2_norm_pair;
+    }
+
+    // SSM gated delta net: gate = softplus(alpha*x + dt) * a, beta = sigmoid(beta*x).
+    // Two small Q8_0 projections over the same input plus the gating chain, fused
+    // into one kernel. Both outputs feed only the gated delta net kernel.
+    // SSM gate/beta verify-band fusion (owned by mmvq.cu).
+    if (const int n_gate_beta = ggml_cuda_gate_beta_verify_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_gate_beta;
+    }
+
+    // Shared-expert output chain: down projection + gate + gating + residual
+    // adds. dst = down(swiglu) * sigmoid(gate(x)) + moe_out + ffn_residual.
+    //
+    // This is DISJOINT from upstream's fused shared-expert MMVQ
+    // (ggml_cuda_match_shared_expert / the MUL_MAT_ID branch above, base bed0a8566),
+    // which folds the routed+shared gate/up pair and writes the shared GLU; this
+    // matcher consumes that GLU plus the shared gate_inp sigmoid.  Both fire on the
+    // same layer (verified gfx1201 `-sm layer`, Qwen3.6-35B-A3B Q8_0: upstream
+    // 200x + this 160x on one 2-token pass).  Under `-sm tensor` the routed expert
+    // is sharded while the shared expert is mirrored, so the routed/shared n_ff
+    // differs and the upstream arm stands down; this one still runs.  The
+    // LLAMA_HC_BLK16 MWR merge (default off) consumes the ffn_out ADD and so
+    // intentionally replaces this epilogue when it is armed.  (wip/shared-expert-fusion-reconcile.)
+    //
+    // Decode/verify band.  The fused gate reduction (shexp_gate_sigmoid) does not
+    // reproduce the order of the standalone mmvq/MUL_MAT it replaces, so the fused and the
+    // unfused chain are not bit-identical - and a 1-token decode and an n-token verify of
+    // the same MoE layer must be.  The fused kernels are therefore token-generic and pinned
+    // to the single-token reduction order, and the whole band (n_tokens <= MMVQ_MAX_BATCH_SIZE)
+    // takes the fused path: the multi-token path no longer runs the unfused chain.  Worth +3.1%
+    // decode on Qwen3.6-35B-A3B (tg128 101.6 vs 98.5 t/s), and the verify widths gain the same
+    // epilogue.  The unfused chain remains the reference; set
+    // GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1 to compare against it (then decode and verify differ,
+    // as before the 2026-09-11 band amendment).  Hard opt-out for A/B too.
+    // Shared-expert output chain (owned by mmvq.cu). GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1 off.
+    if (const int n_shexp_down = ggml_cuda_shexp_down_gate_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_shexp_down;
     }
 
     // mul_mat + add, with an optional view (reshape) node between the matmul and the add
@@ -5403,7 +7261,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const ggml_cuda_graph_key & graph_key) {
     bool graph_evaluated_or_captured = false;
 
     // per-op timing instrumentation (env-gated, diagnostic only)
@@ -5727,7 +7585,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
@@ -5747,6 +7605,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_async_input_wait(cuda_ctx->device, cuda_ctx->stream());
+    const ggml_cuda_async_input_done_guard async_input_done { cuda_ctx->device, cuda_ctx->stream() };
 
     ggml_cuda_mmb_begin_graph();
 
@@ -5756,7 +7616,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
-    const void * graph_key = nullptr;
+    ggml_cuda_graph_key graph_key = {};
 
     // op timing instruments each node with stream events, which is not possible during capture
     const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
@@ -5770,6 +7630,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (!op_timing && graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
+            // PRE-FILL graphs use varying ubatch sizes, so each is a separate graph
+            // key and CUDA-graph capture never amortizes: the per-call update_required
+            // probe + failed capture is pure overhead. Measured pp512 is ~6.7% faster
+            // with graphs OFF. Only single-token decode (stable shape) benefits from
+            // graph replay. Skip the whole graph path (incl. the update_required probe)
+            // for multi-token graphs. Note this must not use nodes[0]->ne[1] directly:
+            // a split-MoE decode split can start on an expert tensor whose ne[1] is
+            // n_expert_used (see ggml_cuda_graph_is_multi_token).
+            if (ggml_cuda_graph_is_multi_token(cgraph)) {
+                use_cuda_graph = false;
+            } else {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
@@ -5792,6 +7663,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+            } // else: not prefill
         }
     }
 #endif // USE_CUDA_GRAPH
@@ -5976,7 +7848,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const ggml_cuda_graph_key graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
@@ -6218,6 +8090,180 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 }
 
+static void * ggml_backend_cuda_stage_buffer(ggml_backend_t backend, int slot, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    return cuda_ctx->h2d_stage_buffer(slot, size);
+}
+
+// MoE expert cache: whole-table staging from the cache arena (removed with the device-remap path; this
+// now always declines so the caller falls back to the plain staging upload).
+static bool ggml_backend_cuda_stage_from_cache(ggml_backend_cuda_context * cuda_ctx, const void * src, size_t offset,
+        size_t width, size_t stride_src, size_t n_copies, void * dst, ggml_backend_event_t ev, bool defer) {
+    // The cache no longer participates in whole-table staging (that path required the device slot map).
+    GGML_UNUSED(cuda_ctx); GGML_UNUSED(src); GGML_UNUSED(offset); GGML_UNUSED(width); GGML_UNUSED(stride_src);
+    GGML_UNUSED(n_copies); GGML_UNUSED(dst); GGML_UNUSED(ev); GGML_UNUSED(defer);
+    return false;
+}
+
+static void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    // Deferred unless the scheduler's redirect mode (GGML_SCHED_STAGE_MODE=1) points the input at the slot: every
+    // other caller (the scheduler's ring in its default mode, the meta backend's mirrored upload) copies the slot
+    // into the input with stage_d2d, where the deferral is resolved.
+    static const bool redirect = getenv("GGML_SCHED_STAGE_MODE") != nullptr && atoi(getenv("GGML_SCHED_STAGE_MODE")) != 0;
+    if (ggml_backend_cuda_stage_from_cache(cuda_ctx, data, 0, size, size, 1, dst, ev, /*defer =*/ !redirect)) {
+        return;
+    }
+    cudaStream_t s = cuda_ctx->copy_stream();
+    CUDA_CHECK(cudaMemcpyAsync(dst, data, size, cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
+}
+
+// wip/tensor-split-expert-split: a split device's slice is strided in the source weight.  Assemble it
+// into the ring slot on the copy stream -- no pageable H2D 2-D copy (pathologically slow on ROCm) and no
+// host-blocking transfer.  Two shapes, chosen by how fine-grained the slice is:
+//   * coarse (`n` small, e.g. ffn_gate/up: one block per expert): gather on the host into pinned staging
+//     and issue ONE 1-D H2D.
+//   * fine (`n` huge, e.g. ffn_down: a block per (n_embd, expert) row, 500k+ of them): a per-block host
+//     gather is hundreds of thousands of `memcpy` calls, so H2D the contiguous range once into the device
+//     scratch and let a device D2D 2-D copy do the compaction.  Prefer the host gather where it is cheap
+//     because it moves only the device's half, while the scratch path moves the whole range.
+static bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void * src, size_t offset, size_t width, size_t stride_src, size_t n_copies, ggml_backend_event_t ev, bool src_pinned) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    const size_t total = width * n_copies;                 // the device's compacted slice
+    void * dst = cuda_ctx->h2d_stage_buffer(slot, total);
+    if (dst == nullptr) {
+        return false;
+    }
+    if (ggml_backend_cuda_stage_from_cache(cuda_ctx, src, offset, width, stride_src, n_copies, dst, ev, /*defer =*/ true)) {
+        return true;
+    }
+    cudaStream_t s = cuda_ctx->copy_stream();
+    // WIP r42 (stage-1 item 2): a pinned source lets the compacted slice be copied straight with one
+    // 2-D H2D, moving only `total` bytes instead of the whole contiguous range.  The pageable 2-D H2D
+    // was the pathological ROCm case (the campaign's `hipMemcpy2DAsync` fault); this is the pinned
+    // form the source-pinning fix made possible.  `GGML_STAGE_GATHER_SCRATCH=1` forces the old path.
+    static const bool force_scratch = getenv("GGML_STAGE_GATHER_SCRATCH") != nullptr && atoi(getenv("GGML_STAGE_GATHER_SCRATCH")) != 0;
+    if (src_pinned && !force_scratch) {
+        CUDA_CHECK(cudaMemcpy2DAsync(dst, width, (const char *) src + offset, stride_src, width, n_copies, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
+        return true;
+    }
+    // A host gather when the per-block compaction is cheap (few copies), else stage the whole
+    // contiguous range and pick this device's `width`-byte block out of every `stride_src` on the copy
+    // stream (the F2D compaction hides with the H2D).
+    const bool host_gather = n_copies <= 4096;
+    if (host_gather) {
+        void * pin = cuda_ctx->h2d_pin_buffer(slot, total);
+        if (pin == nullptr) {
+            return false;
+        }
+        // the pinned slot may still be read by the copy that last targeted this ring slot
+        CUDA_CHECK(cudaEventSynchronize(cuda_ctx->h2d_pin_ev[slot]));
+        for (size_t i = 0; i < n_copies; ++i) {
+            memcpy((char *) pin + i*width, (const char *) src + offset + i*stride_src, width);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(dst, pin, total, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaEventRecord(cuda_ctx->h2d_pin_ev[slot], s));
+    } else {
+        // stage the whole contiguous range, then pick this device's `width`-byte block out of every
+        // `stride_src` (the F2D compaction runs on the copy stream, so it hides with the H2D)
+        const size_t whole = stride_src * n_copies;
+        void * scratch = cuda_ctx->h2d_scratch(whole);
+        if (scratch == nullptr) {
+            return false;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(scratch, src, whole, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpy2DAsync(dst, width, (const char *) scratch + offset, stride_src, width, n_copies, cudaMemcpyDeviceToDevice, s));
+    }
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
+    return true;
+}
+
+static void ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t ev) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->copy_stream(), (cudaEvent_t) ev->context, 0));
+}
+
+static void ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+}
+
+static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    // One-off H2D bandwidth calibration (issue #50 WIP), cached per device.  Sized past the Infinity
+    // Cache (a 64 MiB probe reads ~25 GB/s on a x4 link because the L3 serves it).  Timed with a
+    // synchronous copy so it needs no event API (this toolchain does not alias cudaEventCreate /
+    // cudaEventElapsedTime).
+    static float bw[GGML_CUDA_MAX_DEVICES];
+    static bool  done[GGML_CUDA_MAX_DEVICES] = {};
+    const int dev = cuda_ctx->device;
+    if (done[dev]) {
+        return bw[dev];
+    }
+    done[dev] = true;
+    bw[dev] = 0.0f;
+
+    const size_t sz = 512u << 20;
+    void * h = malloc(sz);
+    void * d = nullptr;
+    if (h == nullptr || cudaMalloc(&d, sz) != cudaSuccess) {
+        (void) cudaGetLastError(); // clear the sticky error
+        if (d != nullptr) CUDA_CHECK(cudaFree(d));
+        free(h);
+        return bw[dev];
+    }
+    memset(h, 1, sz);
+    CUDA_CHECK(cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice)); // warmup + fault the pages
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    const int64_t t0 = ggml_time_us();
+    for (int i = 0; i < 3; ++i) {
+        CUDA_CHECK(cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice));
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const int64_t t1 = ggml_time_us();
+
+    const double sec = double(t1 - t0) / 1e6;
+    bw[dev] = sec > 0.0 ? float(3.0*double(sz)/1e9 / sec) : 0.0f;
+    GGML_LOG_INFO("%s: H2D bandwidth calibration: %.1f GB/s (%zu MiB x3 in %.2f ms)\n", __func__, double(bw[dev]), sz >> 20, 1000.0*sec);
+    CUDA_CHECK(cudaFree(d));
+    free(h);
+    return bw[dev];
+}
+
+static bool ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    return moe_cache_update_host(weight, weight_cpy, ids, n_used, n_tok, ids_nb0, ids_nb1, ctx->stream(), ctx->device, slice_off, split_axis);
+}
+
+// Session 7 identity fast path (see moe-expert-cache.h).  Called by the scheduler before it reads the
+// routing ids back to the host: a true lets it skip the readback, the full device synchronize it forces,
+// the used-expert pruning and the copy, because the consumer reads the compact arena with the raw ids.
+static bool ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    return moe_cache_take_over(weight, weight_cpy, ctx->device);
+}
+
+// B2: device-side host-weight expert gather for an offloaded `MUL_MAT_ID` prefill (see the iface comment).
+static int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
+    const ggml_backend_cuda_context * cuda_ctx = (const ggml_backend_cuda_context *) backend->context;
+    return moe_cache_max_tok_dev(cuda_ctx->device);
+}
+
+static bool ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    return moe_cache_gather_host(weight, weight_cpy, ids, ctx->stream(), ctx->device, slice_off, split_axis);
+}
+
 static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_get_name,
     /* .free                    = */ ggml_backend_cuda_free,
@@ -6234,7 +8280,18 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
+    /* .stage_buffer            = */ ggml_backend_cuda_stage_buffer,
+    /* .stage_upload            = */ ggml_backend_cuda_stage_upload,
+    /* .stage_gather            = */ ggml_backend_cuda_stage_gather,
+    /* .stage_wait              = */ ggml_backend_cuda_stage_wait,
+    /* .stage_d2d               = */ ggml_backend_cuda_stage_d2d,
+    /* .stage_h2d_gbps          = */ ggml_backend_cuda_stage_h2d_gbps,
+    /* .stage_input             = */ nullptr, // the CUDA backend stages into a single ring: stage_buffer
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .moe_cache_update        = */ ggml_backend_cuda_moe_cache_update,
+    /* .moe_cache_take_over     = */ ggml_backend_cuda_moe_cache_take_over,
+    /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
+    /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
@@ -6508,8 +8565,8 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
 }
 
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
-    GGML_UNUSED(dev);
-    return ggml_backend_cuda_host_buffer_type();
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    return ggml_backend_cuda_host_buffer_type_dev(ctx->device);
 }
 
 // TODO: move these functions here
@@ -7016,6 +9073,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // wip/moe-expert-cache: a cache-managed MoE op has its resident experts on the device even at
+    // a one-token decode (where `get_op_batch_size` is 1), so offload it so the slot-remap
+    // consumer can read the compact arena.  ONLY within the decode band: above it the cache is not
+    // involved, and forcing offload there took the >8-token batched decode off its normal path
+    // (measured: `llama-batched-bench -npl 16` 137 -> 52 t/s with the cache merely enabled).
+    if (moe_cache_enabled() && op->op == GGML_OP_MUL_MAT_ID &&
+        op->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
+        return true;
+    }
+
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
@@ -7050,6 +9117,127 @@ static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, g
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
 }
 
+static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
+    if (on) {
+        // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
+        // is created BEFORE the draft context, so the reserve has to leave room for it).
+        ggml_cuda_slab_set_aux_reserve(aux_reserve_bytes);
+        // wip/slab-ring-region: size the slab's reserved, non-evictable H2D-ring hole from the largest
+        // host-resident weight table.  Done here, before the slab is created, so the hole is part of the
+        // slab from birth and never competes with the post-slab consumers for free VRAM.
+        ggml_cuda_slab_set_ring_region(ggml_backend_cuda_context::h2d_stage_region_bytes(max_host_table_bytes));
+        // This model HAS host-resident experts, so the work/arena split is meaningful -- arm the slab.
+        // Dense models never reach here (`llama_model_moe_cache_preflight` skips an empty host-expert map),
+        // which is what keeps the slab off them.  Runs before the context, so before any compute buffer.
+        g_slab_armed = true;
+    }
+    return on;
+}
+
+static void ggml_backend_cuda_device_moe_cache_set_reserve(ggml_backend_dev_t dev, size_t bytes) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    moe_cache_set_extra_reserve(ctx->device, bytes);
+}
+
+static bool ggml_backend_cuda_device_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
+    (void) dev;
+    return moe_cache_get_stats(hits, misses, arena_bytes);
+}
+
+static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
+    // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
+    (void) dev;
+    const bool rearmed = moe_cache_rearm();
+    // Debug validator (no-op unless MOE_EXPERT_CACHE_VALIDATE is set); runs outside the cache lock.
+    moe_cache_validate("after-rearm");
+    return rearmed;
+}
+
+// issue #130: route the host-pool entry points through the device API so that libllama does not
+// forward-declare and call a ggml-cuda symbol directly (a backend-DL build, and a Windows DLL, only
+// export what is marked GGML_API).  The pool is global in ggml-cuda, so any CUDA device serves.
+static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t dev, bool on) {
+    (void) dev;
+    moe_cache_set_host_pool(on);
+}
+
+static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_t dev,
+        const void * tensor_data, const char * path, size_t offs,
+        int n_experts, size_t host_bytes, size_t total_bytes) {
+    (void) dev;
+    moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
+}
+
+static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
+    // OPEN 2 (TODO #42): the movable-boundary slab WORK region's current size (the boundary), or 0 when this
+    // device has no slab.  `llama_context` compares it against the narrow size it last settled on to decide
+    // whether the compute reserve should follow the workload instead of holding the widest-graph reserve.
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    return ggml_cuda_slab_active(ctx->device) ? ggml_cuda_slab_work_size(ctx->device) : 0;
+}
+
+static size_t ggml_backend_cuda_device_slab_headroom_bytes(ggml_backend_dev_t dev) {
+    // wip/fit-slab-accounting (Phase 1, re-cut for r37): the configured slab headroom, reported even
+    // though the slab is not armed yet.  `--fit` runs BEFORE the MoE preflight arms the slab, and r37
+    // makes `ggml_cuda_slab_enabled()` false until then (`env_on && g_slab_armed`), so it cannot gate
+    // this getter.  Report the headroom whenever the slab could be created (the env kill switch is on);
+    // the fit only consults it for a model that actually has host-resident experts.
+    GGML_UNUSED(dev);
+    const char * env = getenv("GGML_CUDA_SLAB");
+    if (env != NULL && atoi(env) == 0) {
+        return 0;
+    }
+    return ggml_cuda_slab_headroom_bytes();
+}
+
+static void ggml_backend_cuda_device_slab_ring_set(ggml_backend_dev_t dev, bool arm) {
+    // wip/slab-ring-region: arm/disarm the reserved H2D staging-ring hole.  One meta-unit with the wide
+    // compute layout: armed at a wide (prefill) pass, disarmed at the prefill -> decode drop, so a
+    // decode-only stretch gets the ring's VRAM back in the arena.
+    //
+    // Do NOT disarm before the cache has sized.  The auto-sized arena sizes against `arena_total`; if the
+    // hole is available at that moment its highest (hottest) tables land IN the hole, and the next arm
+    // evicts them -- the cold re-arm is what corrupts a wide MTP-export consumer (measured: MTP draft NaN,
+    // acceptance 0.002).  Keeping the hole armed through sizing makes the later arm a no-op.
+    if (!arm && !moe_cache_is_sized()) {
+        return;
+    }
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    ggml_cuda_slab_ring_set(ctx->device, arm);
+}
+
+static void ggml_backend_cuda_device_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes) {
+    // wip/slab-ring-region: pin the narrow (decode/verify) work size; the ring is placed just above it.
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    ggml_cuda_slab_set_narrow_floor(ctx->device, bytes);
+}
+
+static void ggml_backend_cuda_device_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes) {
+    // wip/moe-verify-fusions (narrow-2): pin (idempotently) the MTP draft's compute region from its
+    // measured narrow size.  No-op when the slab is not live on this device.
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    ggml_cuda_slab_narrow2_floor(ctx->device, bytes);
+}
+
+static void ggml_backend_cuda_device_slab_compute_narrow2(ggml_backend_dev_t dev, bool enable) {
+    // wip/moe-verify-fusions (narrow-2): `enable` marks the MTP draft context's COMPUTE allocations.
+    // Default: route them to the slab's pinned second narrow region.  `GGML_CUDA_SLAB_NARROW2=0` is the
+    // A/B arm -- the draft bypasses the slab entirely (raw cudaMalloc), the session's quick fix.
+    GGML_UNUSED(dev);
+    if (enable && !ggml_cuda_slab_narrow2_enabled()) {
+        g_slab_compute_enabled = false;
+        g_slab_compute_narrow2 = false;
+    } else if (enable) {
+        g_slab_compute_enabled  = true;
+        g_slab_compute_narrow2  = true;
+    } else {
+        g_slab_compute_enabled  = true;   // the target / any non-draft context: normal slab routing
+        g_slab_compute_narrow2  = false;
+    }
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_device_get_description,
@@ -7066,6 +9254,18 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .event_new               = */ ggml_backend_cuda_device_event_new,
     /* .event_free              = */ ggml_backend_cuda_device_event_free,
     /* .event_synchronize       = */ ggml_backend_cuda_device_event_synchronize,
+    /* .moe_cache_preflight     = */ ggml_backend_cuda_device_moe_cache_preflight,
+    /* .moe_cache_set_reserve   = */ ggml_backend_cuda_device_moe_cache_set_reserve,
+    /* .moe_cache_stats         = */ ggml_backend_cuda_device_moe_cache_stats,
+    /* .moe_cache_rearm         = */ ggml_backend_cuda_device_moe_cache_rearm,
+    /* .slab_work_size          = */ ggml_backend_cuda_device_slab_work_size,
+    /* .slab_headroom_bytes     = */ ggml_backend_cuda_device_slab_headroom_bytes,
+    /* .slab_ring_set           = */ ggml_backend_cuda_device_slab_ring_set,
+    /* .slab_narrow_floor       = */ ggml_backend_cuda_device_slab_narrow_floor,
+    /* .slab_narrow2_floor      = */ ggml_backend_cuda_device_slab_narrow2_floor,
+    /* .slab_compute_narrow2    = */ ggml_backend_cuda_device_slab_compute_narrow2,
+    /* .moe_cache_set_host_pool   = */ ggml_backend_cuda_device_moe_cache_set_host_pool,
+    /* .moe_cache_set_host_source = */ ggml_backend_cuda_device_moe_cache_set_host_source,
 };
 
 // backend reg
@@ -7244,6 +9444,9 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
     }
+
+    // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
+    moe_cache_init(device);
 
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),

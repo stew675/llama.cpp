@@ -40,6 +40,17 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+// Read-once diagnostic flags.  These are queried on per-allocation / per-table paths and getenv() is
+// expensive on Windows; a function-local static caches the answer for the process.
+static inline bool ggml_cuda_work_alloc_debug() {
+    static const bool on = getenv("GGML_CUDA_WORK_ALLOC_DEBUG") != nullptr;
+    return on;
+}
+static inline bool ggml_cuda_cache_geom_debug() {
+    static const bool on = getenv("GGML_CUDA_CACHE_GEOM_DEBUG") != nullptr;
+    return on;
+}
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -140,6 +151,20 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaTriggerProgrammaticLaunchCompletion();
 #endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+}
+
+// Non-temporal (streaming) load for pure-streaming kernels: it keeps the access out of the L2/MALL
+// that the surrounding weight GEMMs need (see the WIP mmb-general notes).  __builtin_nontemporal_load
+// only accepts pointers to builtin scalar/vector types, so wrapper types (__half, bfloat16, float4,
+// ...) fall back to a normal access -- a templated kernel therefore takes the hint on its f32 path
+// only, which is the path these activations use.
+template <typename T>
+static __device__ __forceinline__ T ggml_cuda_nt_load(const T * p) {
+    if constexpr (std::is_same<T, float>::value) {
+        return __builtin_nontemporal_load(p);
+    } else {
+        return *p;
+    }
 }
 
 #ifdef __CUDA_ARCH_LIST__
@@ -451,10 +476,38 @@ struct ggml_cuda_unroll<1> {
     }
 };
 
+// RDNA3/RDNA4 (wave32): the XOR lane exchange of the warp butterflies via DPP (row_xmask for offsets 1-8,
+// permlanex16 for 16) instead of __shfl_xor (an LDS ds_bpermute each).  It moves the same value from the same lane,
+// so every reduction keeps its exact order and result.  GGML_HIP_NO_DPP_XOR at build time restores __shfl_xor.
+#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4)) && !defined(GGML_HIP_NO_DPP_XOR)
+#define GGML_CUDA_DPP_XOR 1
+template <int offset>
+static __device__ __forceinline__ int ggml_cuda_xor_lane(int x) {
+    static_assert(offset == 16 || (offset >= 1 && offset <= 8), "wave32 xor offset");
+    if constexpr (offset == 16) {
+        return __builtin_amdgcn_permlanex16(0, x, 0x76543210, 0xfedcba98, false, false);
+    } else {
+        return __builtin_amdgcn_update_dpp(0, x, 0x160 | offset, 0xF, 0xF, false);
+    }
+}
+template <int offset>
+static __device__ __forceinline__ float ggml_cuda_xor_lane(float x) {
+    return __int_as_float(ggml_cuda_xor_lane<offset>(__float_as_int(x)));
+}
+#endif // GGML_CUDA_DPP_XOR
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_sum(int x) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
     return __reduce_add_sync(0xffffffff, x);
+#elif defined(GGML_CUDA_DPP_XOR)
+    static_assert(width <= 32, "wave32 DPP butterfly");
+    if constexpr (width >= 32) { x += ggml_cuda_xor_lane<16>(x); }
+    if constexpr (width >= 16) { x += ggml_cuda_xor_lane<8>(x); }
+    if constexpr (width >= 8)  { x += ggml_cuda_xor_lane<4>(x); }
+    if constexpr (width >= 4)  { x += ggml_cuda_xor_lane<2>(x); }
+    if constexpr (width >= 2)  { x += ggml_cuda_xor_lane<1>(x); }
+    return x;
 #else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
@@ -466,21 +519,37 @@ static __device__ __forceinline__ int warp_reduce_sum(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
+#if defined(GGML_CUDA_DPP_XOR)
+    static_assert(width <= 32, "wave32 DPP butterfly");
+    if constexpr (width >= 32) { x += ggml_cuda_xor_lane<16>(x); }
+    if constexpr (width >= 16) { x += ggml_cuda_xor_lane<8>(x); }
+    if constexpr (width >= 8)  { x += ggml_cuda_xor_lane<4>(x); }
+    if constexpr (width >= 4)  { x += ggml_cuda_xor_lane<2>(x); }
+    if constexpr (width >= 2)  { x += ggml_cuda_xor_lane<1>(x); }
+    return x;
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x += __shfl_xor_sync(0xffffffff, x, offset, width);
     }
     return x;
+#endif // GGML_CUDA_DPP_XOR
 }
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
+#if defined(GGML_CUDA_DPP_XOR)
+    a.x = warp_reduce_sum<width>(a.x);
+    a.y = warp_reduce_sum<width>(a.y);
+    return a;
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         a.x += __shfl_xor_sync(0xffffffff, a.x, offset, width);
         a.y += __shfl_xor_sync(0xffffffff, a.y, offset, width);
     }
     return a;
+#endif // GGML_CUDA_DPP_XOR
 }
 
 template<int width = WARP_SIZE>
@@ -526,11 +595,21 @@ static __device__ __forceinline__ int warp_reduce_any(int x) {
 
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_max(float x) {
+#if defined(GGML_CUDA_DPP_XOR)
+    static_assert(width <= 32, "wave32 DPP butterfly");
+    if constexpr (width >= 32) { x = fmaxf(x, ggml_cuda_xor_lane<16>(x)); }
+    if constexpr (width >= 16) { x = fmaxf(x, ggml_cuda_xor_lane<8>(x)); }
+    if constexpr (width >= 8)  { x = fmaxf(x, ggml_cuda_xor_lane<4>(x)); }
+    if constexpr (width >= 4)  { x = fmaxf(x, ggml_cuda_xor_lane<2>(x)); }
+    if constexpr (width >= 2)  { x = fmaxf(x, ggml_cuda_xor_lane<1>(x)); }
+    return x;
+#else
 #pragma unroll
     for (int offset = width/2; offset > 0; offset >>= 1) {
         x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
     }
     return x;
+#endif // GGML_CUDA_DPP_XOR
 }
 
 template<typename T, int width = WARP_SIZE>
@@ -1275,6 +1354,12 @@ static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & bloc
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// Incremented whenever memory that captured graphs may reference is returned to the driver: the pools'
+// cached temporaries and the per-context scratch buffers that grow by free + malloc (FA prefill staging,
+// the H2D staging ring).  Graphs captured under an older generation are recaptured before their next replay.
+uint64_t ggml_cuda_graph_mem_gen(int device);
+void     ggml_cuda_graph_mem_freed(int device);
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
@@ -1357,6 +1442,10 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // ggml_cuda_graph_mem_gen() of the graph's device when it was captured: a captured graph bakes in
+    // the addresses of pool temporaries and per-context scratch buffers, so it is recaptured once any
+    // of that memory has been freed (see ggml_cuda_graph_mem_freed)
+    uint64_t mem_gen = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1523,6 +1612,54 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// Cache key for the per-context CUDA/HIP graph cache: one graph per
+// (first graph node, token count).  Decode (1 token) and the speculative verify
+// widths (2..MMVQ_MAX_BATCH_SIZE) therefore each keep their own captured graph
+// instead of invalidating one another's warmup when the batch width changes.
+struct ggml_cuda_graph_key {
+    const void * first_node_ptr;
+    int64_t      n_tokens;
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return first_node_ptr == other.first_node_ptr && n_tokens == other.n_tokens;
+    }
+};
+
+struct ggml_cuda_graph_key_hash {
+    size_t operator()(const ggml_cuda_graph_key & k) const {
+        size_t h = std::hash<const void *>()(k.first_node_ptr);
+        h ^= std::hash<int64_t>()(k.n_tokens) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+// fit-slab-accounting revival (G4, issue #117): is the movable-boundary slab live on this device?  The
+// H2D staging ring consults it before growing -- see `h2d_stage_buffer` in this header.  Defined in
+// ggml-cuda.cu (declared in ggml-cuda-vmm.h, which this header does not include).
+bool ggml_cuda_slab_active(int device);
+
+// wip/slab-ring-region: the slab's reserved, non-evictable ring hole (defined in ggml-cuda.cu; declared in
+// ggml-cuda-vmm.h, which this header does not include).  `h2d_stage_buffer` serves a slot from the hole when
+// it exists, falling back to cudaMalloc otherwise.
+void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size);
+size_t ggml_cuda_slab_ring_slot_capacity(int device);
+void   ggml_cuda_slab_ring_set(int device, bool arm);
+
+// The per-operand cap GGML_CUDA_FA_STAGE_MAX_MB resolves to (0 = unbounded): a staging request
+// larger than this is not staged at all.  Shared by launch_fattn and the --fit accounting of the
+// staging arena (ggml_backend_cuda_fattn_stage_bound).
+static inline size_t ggml_cuda_fattn_stage_max_bytes() {
+    static const size_t stage_max_bytes = []() {
+        const char * e = getenv("GGML_CUDA_FA_STAGE_MAX_MB");
+        return (size_t) (e ? atoll(e) : 512) << 20;
+    }();
+    return stage_max_bytes;
+}
+
+// Issue/TODO #42: the shared device-allocation helper (defined in ggml-cuda.cu).  It yields the
+// lowest-priority MoE expert-cache arena when an allocation cannot otherwise be satisfied, so every
+// device allocation inherits the same fail-soft policy.
+cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1535,14 +1672,18 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // GET_ROWS state gathers skipped in the current graph evaluation; the GDN reading them loads the cache rows itself
+    std::vector<const ggml_tensor *> gdn_deferred_gathers;
+
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Map from (first_node_ptr, token count) to cuda_graph - allows multiple graphs per context
+    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe), and a separate
+    // graph per decode/verify width.
+    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1557,9 +1698,9 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
@@ -1621,6 +1762,12 @@ struct ggml_backend_cuda_context {
     char * q8_1_arena = nullptr;
     size_t q8_1_arena_size = 0;
     std::vector<char *> q8_1_arena_retired;
+
+    // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
+    // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
+    // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
+    const ggml_tensor * glu_q8_1_node = nullptr;
+    const ggml_tensor * glu_q8_1_mm   = nullptr;
     std::vector<q8_1_cache_entry> q8_1_cache;
     size_t q8_1_arena_pos = 0;
 
@@ -1647,7 +1794,10 @@ struct ggml_backend_cuda_context {
         if (q8_1_arena_pos + size > q8_1_arena_size) {
             const size_t new_size = std::max(size_t(1) << 25, 2*(q8_1_arena_pos + size)); // 32 MiB min
             char * new_arena = nullptr;
-            CUDA_CHECK(cudaMalloc(&new_arena, new_size));
+            // Issue/TODO #42: go through the shared helper, not a bare cudaMalloc -- it yields the
+            // lowest-priority MoE expert-cache arena on OOM instead of aborting the run (measured: this
+            // exact allocation was the one that failed when the arena held the last free VRAM).
+            CUDA_CHECK(ggml_cuda_device_malloc((void **) &new_arena, new_size, device));
             if (q8_1_arena != nullptr) {
                 CUDA_CHECK(cudaMemcpy(new_arena, q8_1_arena, q8_1_arena_pos, cudaMemcpyDeviceToDevice));
                 // Captured CUDA/HIP graphs keep pointers into the old arena, and the multi-token graph that
@@ -1671,6 +1821,432 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+
+    // Issue #30 TODO 21: F16 staging scratch for a native-capable (q8_0/q4_0/bf16) K/V operand at
+    // prefill.  A prefill stages (the conversion is amortised over many query rows, and the F16
+    // tiles then feed the cp_async pipeline) while decode/verify reads the raw cache, so this
+    // buffer is only ever touched by a multi-token graph -- which is never CUDA-graph captured (see
+    // the prefill skip in ggml_backend_cuda_graph_compute).  It is therefore safe to allocate it
+    // here instead of reserving it in the compute graph, where the reserve sizes it for n_ctx (up
+    // to ~800 MiB per GPU at a 200k context) even though the real scratch tracks the prefix length.
+    // One arena per stream (concurrent streams can be staging at the same time), bounding the
+    // retained memory to ~1.25x the largest request: the generic pool retains every distinct size,
+    // and this request grows with the prefix, so a long prefill would leave ~150 buffers cached.
+    // The growth policy is not a performance lever (exact-fit realloc measured the same).
+    char * fattn_stage[GGML_CUDA_MAX_STREAMS]      = {};
+    size_t fattn_stage_size[GGML_CUDA_MAX_STREAMS] = {};
+    bool   fattn_stage_oom_warned                  = false;
+
+    // Total bytes currently held by the per-stream FA prefill staging arenas.  The arenas are a
+    // raw device allocation, deliberately outside the compute-graph reserve, so llama_get_memory_breakdown
+    // (and therefore --fit) cannot see them; this accessor is what the accounting hook reports.
+    size_t fattn_stage_bytes() const {
+        size_t total = 0;
+        for (int i = 0; i < GGML_CUDA_MAX_STREAMS; ++i) {
+            total += fattn_stage_size[i];
+        }
+        return total;
+    }
+
+    // Try to make the per-stream staging arena hold at least `size` bytes.  Returns the arena
+    // (possibly larger than requested) on success, or nullptr when the device has no room for the
+    // transient: the previous arena is kept so a later, smaller request can still be served.
+    //
+    // A nullptr must not abort the compute: the arena is a deep-prefill *speed* buffer, not a
+    // correctness requirement (the caller falls back to reading the raw K/V cache, which is what
+    // decode/verify does anyway).  The allocation is deliberately not part of the compute-graph
+    // reserve -- the reserve sizes it for n_ctx -- so a llama-server --fit run can legitimately have
+    // less free memory at the first deep prefill than the fit projected; failing here must degrade
+    // to the native read, not kill the run.
+    //
+    // `size_hint`, when non-zero, is the eventual full size this arena will be asked for (the F16
+    // size of the K/V view roots, capped per operand by GGML_CUDA_FA_STAGE_MAX_MB; computed by
+    // launch_fattn).  When it is set and at least `size`, the arena is allocated once at that size
+    // instead of climbing the 1.25x growth ladder: on Windows/WDDM a freed allocation stays
+    // committed against the process, so the ladder strands roughly 5x the final arena over a deep
+    // prefill.  The hint is only honoured when it stays within the optional-allocation free cap
+    // (the slab-active guard) and is tried before the ladder, so on refusal or cudaMalloc failure
+    // the existing growth step runs -- an oversized (or unbounded) hint can never cost more than
+    // the pre-change path.  GGML_CUDA_FA_STAGE_PREALLOC=0 disables the hint (A/B and bisection).
+    void * fattn_stage_try_get(int stream_no, size_t size, size_t size_hint = 0) {
+        GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
+        if (size > fattn_stage_size[stream_no]) {
+            static const bool prealloc = []() {
+                const char * e = getenv("GGML_CUDA_FA_STAGE_PREALLOC");
+                return e == nullptr || atoi(e) != 0;
+            }();
+            const size_t new_size  = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
+            const size_t cur_total = fattn_stage_bytes() - fattn_stage_size[stream_no];
+            size_t alloc_size = new_size;
+            char * new_arena = nullptr;
+            if (prealloc && size_hint >= size) {
+                const size_t hint_size = std::max<size_t>(size_t(1) << 24, size_hint);
+                if (optional_alloc_within_free_cap(cur_total + hint_size)) {
+                    if (cudaMalloc(&new_arena, hint_size) == cudaSuccess) {
+                        alloc_size = hint_size;
+                    } else {
+                        (void) cudaGetLastError(); // clear the sticky error, fall back to the growth step
+                    }
+                }
+            }
+            if (new_arena == nullptr) {
+                // fit-slab-accounting revival (G4): bound this optional transient by the free VRAM it would
+                // still leave when the movable-boundary slab is active (see
+                // `optional_alloc_within_free_cap`).  A refusal falls back to the native K/V read.
+                if (!optional_alloc_within_free_cap(cur_total + new_size)) {
+                    if (!fattn_stage_oom_warned) {
+                        fattn_stage_oom_warned = true;
+                        GGML_LOG_WARN("%s: leaving the FA prefill staging arena at %zu MiB rather than %zu MiB "
+                                      "(the slab is active and free VRAM is tight); reading the K/V cache "
+                                      "natively instead (prefill may be slower)\n",
+                                      __func__, fattn_stage_size[stream_no] >> 20, new_size >> 20);
+                    }
+                    return nullptr;
+                }
+                if (cudaMalloc(&new_arena, new_size) != cudaSuccess) {
+                    (void) cudaGetLastError(); // clear the sticky error
+                    if (!fattn_stage_oom_warned) {
+                        fattn_stage_oom_warned = true;
+                        GGML_LOG_WARN("%s: not enough free device memory for a %zu MiB FA prefill staging "
+                                      "buffer, reading the K/V cache natively instead (prefill may be slower)\n",
+                                      __func__, new_size >> 20);
+                    }
+                    return nullptr;
+                }
+            }
+            if (fattn_stage[stream_no] != nullptr) {
+                ggml_cuda_graph_mem_freed(device);   // captured graphs may read the old arena
+                CUDA_CHECK(cudaFree(fattn_stage[stream_no]));
+            }
+            fattn_stage[stream_no]      = new_arena;
+            fattn_stage_size[stream_no] = alloc_size;
+        }
+        return fattn_stage[stream_no];
+    }
+
+    // Op-offload H2D staging ring (issue #50 WIP).  Whole-tensor host->device uploads of offloaded
+    // weights are issued on a dedicated copy stream (stream 1) into a small ring of device slots, so
+    // the upload of one split overlaps the compute of the previous one.  stage_buffer grows a slot on
+    // demand and returns null on allocation failure (the caller then falls back to the in-order path).
+    static constexpr int H2D_STAGE_SLOTS = 16;
+    void * h2d_stage[H2D_STAGE_SLOTS]      = {};
+    size_t h2d_stage_size[H2D_STAGE_SLOTS] = {};
+    // wip/slab-ring-region: this slot was carved from the slab's reserved ring hole (do not cudaFree it;
+    // the slab owns the VA, and it is handed to the arena when the ring is disarmed).
+    bool   h2d_stage_slab[H2D_STAGE_SLOTS] = {};
+    size_t h2d_stage_total                 = 0;
+    size_t h2d_stage_max_req               = 0;
+
+    // Bytes the ring currently holds (for llama_get_memory_breakdown / --fit diagnostics).
+    size_t h2d_stage_bytes() const {
+        return h2d_stage_total;
+    }
+
+    // Worst-case bytes the auto-sized ring can grow to for a model whose largest host-resident weight
+    // tensor is `max_table` bytes (one table per slot).  Used by the --fit / no-alloc bound, since the
+    // ring lives outside the compute-graph reserve.
+    static size_t h2d_stage_bound(size_t max_table) {
+        if (max_table == 0) {
+            return 0;
+        }
+        return (size_t) h2d_stage_slots() * (max_table + 512);
+    }
+
+    // wip/slab-ring-region: bytes the slab should reserve for the ring.  The auto budget is the same
+    // `h2d_stage_bound`; GGML_SCHED_STAGE_MAX_MB bounds it explicitly; 0 when staging is disabled.  The slab
+    // carves this as a fixed, non-evictable hole and hands it back to the arena when the ring is disarmed.
+    static size_t h2d_stage_region_bytes(size_t max_table) {
+        if (max_table == 0) {
+            return 0;
+        }
+        // read once (this runs per slab/reserve query); getenv() is expensive on Windows
+        static const int stage_env = [] {
+            const char * e = getenv("GGML_SCHED_STAGE");
+            return e != nullptr ? atoi(e) : -1;
+        }();
+        if (stage_env == 0) {
+            return 0;
+        }
+        size_t bound = h2d_stage_bound(max_table);
+        // `max_table` comes from `llama_model::max_host_weight_tensor_bytes()`, which can be a MERGED host
+        // tensor (every layer/expert in one) far larger than one staged table -- measured 27 GiB on
+        // Qwen3.8-Flash-Next where the largest staged slice is 270 MiB.  Cap the auto hole so it stays
+        // proportional to a real table (GGML_CUDA_SLAB_RING_MIB); a staged request larger than a slot falls
+        // back to cudaMalloc, the pre-change path.  An explicit GGML_SCHED_STAGE_MAX_MB still wins.
+        static const size_t cap = []() {
+            const char * e = getenv("GGML_CUDA_SLAB_RING_MIB");
+            return (size_t) (e ? atoll(e) : 6144) << 20;
+        }();
+        if (bound > cap) {
+            bound = cap;
+        }
+        const size_t explicit_budget = h2d_stage_budget_explicit();
+        if (explicit_budget > 0 && explicit_budget < bound) {
+            bound = explicit_budget;
+        }
+        return bound;
+    }
+
+    // Effective ring depth, GGML_SCHED_STAGE_SLOTS (default 8, clamped to H2D_STAGE_SLOTS).  The
+    // scheduler uses the same variable for its own round-robin; the backend needs it only to size the
+    // auto budget below.
+    static int h2d_stage_slots() {
+        static const int n = []() {
+            const char * e = getenv("GGML_SCHED_STAGE_SLOTS");
+            int v = e ? atoi(e) : 8;
+            if (v < 1) v = 1;
+            if (v > H2D_STAGE_SLOTS) v = H2D_STAGE_SLOTS;
+            return v;
+        }();
+        return n;
+    }
+
+    // Explicit budget from GGML_SCHED_STAGE_MAX_MB (MiB), or 0 when unset (auto-sized).
+    static size_t h2d_stage_budget_explicit() {
+        static const size_t budget = []() {
+            const char * e = getenv("GGML_SCHED_STAGE_MAX_MB");
+            const long mb = e ? atol(e) : 0;
+            return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) 0;
+        }();
+        return budget;
+    }
+
+    // fit-slab-accounting revival (G4, issue #117): optional raw device allocations -- the op-offload
+    // H2D staging ring and the FA prefill staging arena -- live OUTSIDE both the compute-graph reserve
+    // and the movable-boundary slab.  When the slab is active, the VRAM outside it (the slab's
+    // GGML_CUDA_SLAB_HEADROOM_MIB) is the only source for the consumers it cannot route: hipBLASLt's
+    // Tensile code objects + workspace, and the MTP draft buffer.  An unbounded optional transient can
+    // consume that reserve, after which the next `ggml_cuda_device_malloc` cannot be satisfied -- the
+    // arena's physical is mapped INTO the slab and ROCm will not unmap a sub-range, so the arena cannot
+    // yield it back -- and the run aborts (`exit 134`) or, on a thin headroom, corrupts silently.
+    // Bound every optional transient to `GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT`% of the currently-free
+    // VRAM (default 50, 0 disables).  A refusal is fail-soft: the caller falls back (serial staging /
+    // native K/V read).  Inert when the slab is inactive (no headroom policy to protect).
+    static int optional_alloc_max_free_pct() {
+        static const int n = []() {
+            const char * e = getenv("GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT");
+            int v = e ? atoi(e) : 50;
+            if (v < 0)   v = 0;
+            if (v > 100) v = 100;
+            return v;
+        }();
+        return n;
+    }
+
+    // Returns true when growing an optional allocation to a total of `new_total` bytes stays within the
+    // cap above.  Slab-inactive devices and a 0 cap always allow (the pre-slab behaviour); a failed
+    // measurement also allows (fail-soft, never invert a working run into a refuse on a driver hiccup).
+    bool optional_alloc_within_free_cap(size_t new_total) const {
+        if (!ggml_cuda_slab_active(device)) {
+            return true;
+        }
+        const int pct = optional_alloc_max_free_pct();
+        if (pct <= 0) {
+            return true;
+        }
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+            return true;
+        }
+        if (new_total <= free_b / 100 * (size_t) pct) {
+            return true;
+        }
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("optional device allocation refused: %.0f MiB total against %.0f MiB free "
+                          "(the movable-boundary slab is active; the cap is %d%%).  The caller falls "
+                          "back.  Raise GGML_CUDA_OPTIONAL_ALLOC_MAX_FREE_PCT to allow.\n",
+                          (double) new_total / (1024 * 1024), (double) free_b / (1024 * 1024), pct);
+        }
+        return false;
+    }
+
+    // Total device budget for the staging ring.  GGML_SCHED_STAGE_MAX_MB (MiB) bounds it explicitly
+    // (A/B and VRAM control).  When it is unset the budget is **auto-sized so the full ring can hold
+    // the largest upload seen**: the old fixed 2048 MiB default held only four 450 MiB expert tables,
+    // so the fifth growth tripped the budget and the scheduler disabled staging for the rest of the run
+    // (issue #93: qwen4exp `-ncmoe`, whose tables are 450 MiB, silently lost the ring).  A growth past
+    // the budget returns null and the scheduler falls back; a failed cudaMalloc is still handled, so
+    // this cannot turn a load into an OOM the explicit path would have avoided.
+    size_t h2d_stage_budget(size_t new_size) {
+        const size_t explicit_budget = h2d_stage_budget_explicit();
+        if (explicit_budget > 0) {
+            return explicit_budget;
+        }
+        size_t max_slot = new_size;
+        for (int s = 0; s < H2D_STAGE_SLOTS; ++s) {
+            if (h2d_stage_size[s] > max_slot) {
+                max_slot = h2d_stage_size[s];
+            }
+        }
+        return (size_t) h2d_stage_slots() * (max_slot + 512);
+    }
+
+    void * h2d_stage_buffer(int slot, size_t size) {
+        GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
+        if (size > h2d_stage_size[slot]) {
+            const size_t old_size = h2d_stage_size[slot];
+            const size_t new_size = size + 512;
+            if (new_size > h2d_stage_max_req) {
+                h2d_stage_max_req = new_size;
+            }
+            if (h2d_stage_total - old_size + new_size > h2d_stage_budget(new_size)) {
+                return nullptr;
+            }
+            // wip/slab-ring-region: serve the slot from the slab's reserved, non-evictable ring hole first.
+            // The slot is allocated ONCE at the full per-slot capacity, so its VA is stable for the life of
+            // the slab (a growing layout does not free/realloc it, so no captured graph is invalidated) and
+            // it does not draw on the free VRAM the G4 cap protects.
+            if (!h2d_stage_slab[slot]) {
+                const size_t cap = ggml_cuda_slab_ring_slot_capacity(device);
+                if (cap >= new_size) {
+                    void * p = ggml_cuda_slab_arena_alloc_transient(device, cap);
+                    if (p != nullptr) {
+                        h2d_stage[slot]      = p;
+                        h2d_stage_size[slot] = cap;
+                        h2d_stage_total     += cap - old_size;
+                        h2d_stage_slab[slot] = true;
+                        return p;
+                    }
+                }
+            }
+            // cudaMalloc fallback: no slab / no ring hole / the hole is exhausted for this capacity.
+            // fit-slab-accounting revival (G4, issue #117): bound the ring by the free VRAM it would still
+            // leave.  See `optional_alloc_within_free_cap` above.
+            if (!optional_alloc_within_free_cap(h2d_stage_total - old_size + new_size)) {
+                return nullptr;
+            }
+            if (h2d_stage_slab[slot]) {
+                // A slab slot cannot hold `new_size` (the hole is sized for `max_table`): drop the slab
+                // view and fall through to cudaMalloc.  The hole block is not reclaimable, so it is left
+                // unused; this is the GGML_SCHED_STAGE_MAX_MB-smaller-than-the-table case.
+                h2d_stage[slot]      = nullptr;
+                h2d_stage_size[slot] = 0;
+                h2d_stage_slab[slot] = false;
+                h2d_stage_total     -= old_size;
+            } else if (h2d_stage[slot] != nullptr) {
+                ggml_cuda_graph_mem_freed(device);   // captured graphs may read the old slot
+                CUDA_CHECK(cudaFree(h2d_stage[slot]));
+                h2d_stage[slot]      = nullptr;
+                h2d_stage_size[slot] = 0;
+            }
+            void * p = nullptr;
+            if (cudaMalloc(&p, new_size) != cudaSuccess) {
+                (void) cudaGetLastError(); // clear the sticky error
+                return nullptr;
+            }
+            h2d_stage[slot]      = p;
+            h2d_stage_size[slot] = new_size;
+            h2d_stage_total     += new_size - old_size;
+        }
+        if (h2d_stage_slab[slot]) {
+            // wip/slab-ring-region: the ring region is reserved only while the WIDE view is (the boundary is
+            // above the narrow floor).  If it is not, this slot's VA belongs to the arena and must not be
+            // read; refuse so the scheduler takes the serial fallback.
+            if (ggml_cuda_slab_ring_slot_capacity(device) == 0) {
+                return nullptr;
+            }
+        }
+        return h2d_stage[slot];
+    }
+
+    void h2d_stage_free() {
+        for (int s = 0; s < H2D_STAGE_SLOTS; ++s) {
+            if (h2d_stage[s] != nullptr) {
+                if (!h2d_stage_slab[s]) {
+                    CUDA_CHECK(cudaFree(h2d_stage[s]));
+                }
+                h2d_stage[s]      = nullptr;
+                h2d_stage_size[s] = 0;
+                h2d_stage_slab[s] = false;
+            }
+            if (h2d_pin[s] != nullptr) {
+                CUDA_CHECK(cudaFreeHost(h2d_pin[s]));
+                h2d_pin[s]      = nullptr;
+                h2d_pin_size[s] = 0;
+            }
+            if (h2d_pin_ev[s] != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(h2d_pin_ev[s]));
+                h2d_pin_ev[s] = nullptr;
+            }
+        }
+        if (h2d_scratch_ptr != nullptr) {
+            CUDA_CHECK(cudaFree(h2d_scratch_ptr));
+            h2d_scratch_ptr  = nullptr;
+            h2d_scratch_size = 0;
+        }
+        h2d_stage_total = 0;
+    }
+
+    // Pinned host staging for a *gathered* upload (wip/tensor-split-expert-split): a split device's
+    // slice is strided in the source weight, so it is gathered on the host into a pinned slot and then
+    // 1-D H2D'd on the copy stream.  A pageable buffer would make that copy block the host (so it could
+    // not be queued); the per-slot event guards reuse until the copy that read it has completed.
+    // Pinned host staging for a *gathered* upload (wip/tensor-split-expert-split): a split device's
+    // slice is strided in the source weight, so it is gathered on the host into a pinned slot and then
+    // 1-D H2D'd on the copy stream.  A pageable buffer would make that copy block the host (so it could
+    // not be queued); the per-slot event guards reuse until the copy that read it has completed.
+    void * h2d_pin[H2D_STAGE_SLOTS]         = {};
+    size_t h2d_pin_size[H2D_STAGE_SLOTS]    = {};
+    cudaEvent_t h2d_pin_ev[H2D_STAGE_SLOTS] = {};
+
+    void * h2d_pin_buffer(int slot, size_t size) {
+        GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
+        if (size > h2d_pin_size[slot]) {
+            if (h2d_pin[slot] != nullptr) {
+                CUDA_CHECK(cudaFreeHost(h2d_pin[slot]));
+                h2d_pin[slot]      = nullptr;
+                h2d_pin_size[slot] = 0;
+            }
+            void * p = nullptr;
+            if (cudaMallocHost(&p, size) != cudaSuccess) {
+                (void) cudaGetLastError(); // clear the sticky error
+                return nullptr;
+            }
+            h2d_pin[slot]      = p;
+            h2d_pin_size[slot] = size;
+        }
+        if (h2d_pin_ev[slot] == nullptr) {
+            if (cudaEventCreateWithFlags(&h2d_pin_ev[slot], cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return nullptr;
+            }
+        }
+        return h2d_pin[slot];
+    }
+
+    // wip/tensor-split-expert-split: one per-device scratch for the *whole range* H2D that a
+    // fine-grained split gather stages through.  `ffn_down_exps` splits on the innermost dim, so its
+    // device slice is 500k+ blocks of a few hundred bytes (a per-block host gather is hundreds of
+    // thousands of `memcpy` calls); instead H2D the contiguous range once and let a device D2D copy do
+    // the compaction.  Bounded (256 MiB) so it can never turn a load into an OOM; a range that does not
+    // fit falls back to the plain spliced path.
+    void * h2d_scratch_ptr  = nullptr;
+    size_t h2d_scratch_size = 0;
+    void * h2d_scratch(size_t size) {
+        if (h2d_scratch_ptr != nullptr && size <= h2d_scratch_size) {
+            return h2d_scratch_ptr;
+        }
+        if (size > 256ull*1024*1024) {
+            return nullptr;
+        }
+        if (h2d_scratch_ptr != nullptr) {
+            CUDA_CHECK(cudaFree(h2d_scratch_ptr));
+            h2d_scratch_ptr  = nullptr;
+            h2d_scratch_size = 0;
+        }
+        void * p = nullptr;
+        if (cudaMalloc(&p, size) != cudaSuccess) {
+            (void) cudaGetLastError(); // clear the sticky error
+            return nullptr;
+        }
+        h2d_scratch_ptr  = p;
+        h2d_scratch_size = size;
+        return h2d_scratch_ptr;
+    }
+
+    cudaStream_t copy_stream() { return stream(device, 1); }
 
     ~ggml_backend_cuda_context();
 
@@ -1706,6 +2282,38 @@ struct ggml_backend_cuda_context {
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
+
+    // Per-graph cache of the BF16 copy that the cuBLAS BF16 matmul makes of an F32 src1 (multi-token graphs).
+    // The hc mixer feeds one normalized [hc_dim, T] tensor to two BF16 GEMMs (hc_down and the 4-wide hc_inject),
+    // which converted all of it twice; the second GEMM now reuses the first copy.  Keyed like the Q8_1 cache
+    // (tensor, data, stream, size), only the most recent conversion is kept, and it is dropped at graph start.
+    // Declared after `pools` so that its pool buffer is released before the pools are destroyed.
+    struct bf16_src1_cache_entry {
+        const ggml_tensor * src1 = nullptr;
+        const void * data = nullptr;
+        int stream_no = 0;
+        int64_t n = 0;
+        std::unique_ptr<ggml_cuda_pool_alloc<nv_bfloat16>> buf;
+    } bf16_src1_cache;
+
+    void bf16_src1_cache_clear() {
+        bf16_src1_cache.buf.reset();
+        bf16_src1_cache.src1 = nullptr;
+        bf16_src1_cache.data = nullptr;
+    }
+
+    // Make `root` (a view root, contiguous, n elements) the cached entry and return its BF16 buffer for the
+    // caller to fill: the cuBLAS BF16 path converts into it, a fused producer (hc_combine_norm) writes it.
+    nv_bfloat16 * bf16_src1_cache_put(const ggml_tensor * root, int64_t n) {
+        auto & c = bf16_src1_cache;
+        c.buf.reset();
+        c.buf       = std::make_unique<ggml_cuda_pool_alloc<nv_bfloat16>>(pool(), n);
+        c.src1      = root;
+        c.data      = root->data;
+        c.stream_no = curr_stream_no;
+        c.n         = n;
+        return c.buf->get();
+    }
 
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
 
@@ -1890,3 +2498,6 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph, const int node_idx, const int node_count, const int * out_nodes, const int out_count, const bool is_topk_moe = false);
+bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up, const ggml_tensor * ffn_gate, const ggml_tensor * glu, const ggml_tensor * ffn_up_bias = nullptr, const ggml_tensor * ffn_gate_bias = nullptr, const ggml_tensor * ffn_up_scale = nullptr, const ggml_tensor * ffn_gate_scale = nullptr);

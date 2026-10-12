@@ -2774,6 +2774,8 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = params.speculative.has_mtp();
 
     auto mparams = common_model_params_to_llama(params);
+    // The draft model's own host-expert placement (`--spec-draft-n-cpu-moe`), not the target's `-ncmoe`.
+    mparams.n_cpu_moe_from_end = params.speculative.draft.n_cpu_moe;
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
@@ -2805,6 +2807,12 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
+        // The separate draft model's own `--spec-draft-n-cpu-moe` / `--spec-draft-cpu-moe` must be
+        // honoured: allow its CPU overrides to match its nextn/MTP head layer.  (The main model's
+        // `-ncmoe` never lands here -- `common_base_params_to_speculative` replaced the overrides with
+        // the draft's -- but this makes the intent explicit.)
+        mparams.allow_nextn_cpu_offload = true;
+
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
@@ -2832,6 +2840,15 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+    }
+
+    // WIP r42 / stage 2 (TODO #42): the MTP draft context reserves its compute buffers at construction,
+    // sized for the target's full -ub (~1.7 GiB per device).  That resident dead weight is what makes
+    // the target's first-prefill compute growth (a contiguous ~11.8 GiB allocation) run out of VRAM on
+    // 2 GPUs.  Release the draft buffers here (before the target's first prefill); the draft is not used
+    // during the target's prefill and re-reserves lazily on its first real (n_max+1-token) graph.
+    if (spec_mtp && pimpl->context) {
+        llama_context_drop_compute_buffers(pimpl->context.get());
     }
 }
 

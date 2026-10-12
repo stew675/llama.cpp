@@ -58,6 +58,11 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // WIP r42 (TODO #42): free the scheduler's compute buffers so the next graph re-reserves them from
+    // that graph (the buffers are otherwise grow-only).  Used to release a wide-prefill layout before
+    // the MoE expert cache arena is sized.
+    void drop_compute_buffers();
+
     void synchronize();
 
     const llama_model   & get_model()   const;
@@ -285,6 +290,9 @@ private:
     // create a new backend scheduler for a graph of the specified size and register the callbacks below
     void sched_new(size_t max_nodes, bool parallel);
 
+    // swap the second scheduler (and its graph-reuse state) in or out of `sched`, creating it on first use
+    void sched_alt_select(bool alt);
+
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
@@ -364,6 +372,10 @@ private:
     uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 
+    // WIP r42 (TODO #42): previous ubatch size, used to detect the prefill -> decode transition and
+    // release the wide-prefill compute buffer before the MoE expert cache arena is sized.
+    uint32_t n_tokens_prev = 0;
+
     std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
 
     struct swap_info {
@@ -374,6 +386,13 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // The MTP draft context alternates a no-output ingest graph and a 1-token draft-step graph every cycle; with
+    // one scheduler each switch re-splits and re-allocates the graph.  The graphs with outputs run on a second
+    // scheduler, so both stay allocated and are reused.  It is swapped into `sched` only while a decode or encode
+    // runs (LLAMA_DRAFT_SCHED2=0: off).
+    ggml_backend_sched_ptr sched_alt;
+    bool                   sched_alt_in_use = false;
 
     bool sched_need_reserve = true;
 
@@ -421,6 +440,7 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+    llm_graph_result * gf_res_prev_active_alt = nullptr; // the reuse state of the scheduler not in `sched`
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
@@ -429,6 +449,13 @@ private:
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
+
+    // OPEN 2: per host-expert device, the size of the movable-boundary slab's WORK region as it stood right
+    // after the last compute-reserve drop.  That is the narrow layout this workload settled on, and the
+    // value the next pass compares the live region against to decide whether the wide reserve is being held
+    // without need (see the drop decision in `process_ubatch`).  Only written when a backend reports a slab
+    // (`ggml_backend_dev_slab_work_size` != 0), so it stays empty on non-slab backends.
+    std::map<ggml_backend_dev_t, size_t> slab_narrow_boundary;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

@@ -88,6 +88,17 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+// wip/fit-slab-accounting (Phase 1): enumerate the REAL devices that own host-resident MoE expert
+// weights (the `moe_host_expert_bytes` map).  Under `-sm tensor` the model's device list is the
+// scheduler's Meta wrapper, so `llama_model_moe_host_expert_bytes()` sees 0 on every device; `--fit`
+// needs the per-real-device bytes to reserve the expert-cache arena and the slab headroom.
+LLAMA_API int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model);
+
+// Fill *dev/*bytes with the i-th host-expert device (map iteration order).  Returns false when i is out
+// of range.  Either out pointer may be null.
+LLAMA_API bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
+                                               ggml_backend_dev_t * dev, size_t * bytes);
+
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
 // Set whether the context outputs nextn embeddings or not

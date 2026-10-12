@@ -1098,3 +1098,38 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+// Pair of L2 norms over two views of the same tensor (the SSM conv output q/k slices).  The view
+// source is an external compute tensor, so the subgraph helper cannot express the pattern.
+// Returns 2 when fused.  GGML_CUDA_DISABLE_L2_NORM_PAIR=1 turns it off.
+int ggml_cuda_l2_norm_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_l2_norm_pair = getenv("GGML_CUDA_DISABLE_L2_NORM_PAIR") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_L2_NORM_PAIR"));
+    if (disable_l2_norm_pair || i + 2 >= cgraph->n_nodes ||
+            cgraph->nodes[i]->op != GGML_OP_L2_NORM ||
+            cgraph->nodes[i + 1]->op != GGML_OP_VIEW ||
+            cgraph->nodes[i + 2]->op != GGML_OP_L2_NORM ||
+            cgraph->nodes[i + 2]->src[0] != cgraph->nodes[i + 1] ||
+            cgraph->nodes[i + 1]->view_src != cgraph->nodes[i]->src[0]->view_src) {
+        return 0;
+    }
+    ggml_tensor * norm0 = cgraph->nodes[i];
+    ggml_tensor * norm1 = cgraph->nodes[i + 2];
+
+    float eps0;
+    float eps1;
+    memcpy(&eps0, norm0->op_params, sizeof(float));
+    memcpy(&eps1, norm1->op_params, sizeof(float));
+
+    const bool ok =
+        (norm0->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+        (norm1->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+        norm0->src[0]->type == GGML_TYPE_F32 && norm1->src[0]->type == GGML_TYPE_F32 &&
+        ggml_are_same_shape(norm0->src[0], norm1->src[0]) &&
+        ggml_are_same_stride(norm0->src[0], norm1->src[0]) &&
+        eps0 == eps1;
+
+    if (ok) {
+        ggml_cuda_op_l2_norm_pair(ctx, norm0->src[0], norm0, norm1->src[0], norm1, eps0);
+        return 2;
+    }
+    return 0;
+}
