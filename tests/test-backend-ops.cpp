@@ -8463,9 +8463,12 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const bool derived; // V3: derive the mask in the kernel from cell_pos/tok_lo/tok_hi instead of a mask tensor
+    const bool derived_hole; // V3 derived + a contiguous interior block of never-visible cells (the mask-skip path)
+    const bool mask_hole; // packed mask with a contiguous interior -INF block (the packed mask-skip path)
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) + VAR_TO_STR(derived) + VAR_TO_STR(derived_hole) + VAR_TO_STR(mask_hole);
     }
 
     double max_nmse_err() override {
@@ -8482,9 +8485,12 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, bool derived = false, bool derived_hole = false, bool mask_hole = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), derived(derived), derived_hole(derived_hole), mask_hole(mask_hole) {}
+
+    // V3: the derived form replaces the mask tensor; both are never used together.
+    bool mask_tensor() const { return mask && !derived; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8531,7 +8537,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_set_name(v, "v");
 
         ggml_tensor * m = nullptr;
-        if (mask) {
+        if (mask_tensor()) {
             m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
@@ -8544,6 +8550,18 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
+        if (derived) {
+            // V3 derived kq mask: the per-cell position (INT32_MIN marks an always-dropped cell) and
+            // the per-token inclusive visibility window [tok_lo, tok_hi].
+            GGML_ASSERT(n_kv_max == 0 && max_bias == 0.0f); // the derived form is dense-only and without ALiBi
+            ggml_tensor * cell_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+            ggml_set_name(cell_pos, "cell_pos");
+            ggml_tensor * tok_lo = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+            ggml_set_name(tok_lo, "tok_lo");
+            ggml_tensor * tok_hi = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, nb);
+            ggml_set_name(tok_hi, "tok_hi");
+            ggml_flash_attn_ext_add_kq_derived(out, cell_pos, tok_lo, tok_hi);
+        }
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_prec_set_acc(out, prec);
         ggml_set_name(out, "out");
@@ -8561,7 +8579,49 @@ struct test_flash_attn_ext : public test_case {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
                 } else {
                     init_tensor_kq_mask(t);
+                    if (mask_hole) {
+                        // Packed-mask counterpart of derived_hole: a contiguous fully-masked interior
+                        // KV block so the packed skip (issue #48) has a whole group to remove.
+                        // Read/modify/write through the backend API: the tensor lives in the
+                        // backend buffer and direct `t->data` access is only valid where the
+                        // allocation happens to be CPU-mapped (fails on Windows, issue #53).
+                        std::vector<ggml_fp16_t> rows(ggml_nelements(t));
+                        ggml_backend_tensor_get(t, rows.data(), 0, rows.size()*sizeof(ggml_fp16_t));
+                        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+                        for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                            for (int64_t i = 1024; i < 1280 && i < t->ne[0]; ++i) {
+                                rows[row*t->ne[0] + i] = neg_inf;
+                            }
+                        }
+                        ggml_backend_tensor_set(t, rows.data(), 0, rows.size()*sizeof(ggml_fp16_t));
+                    }
                 }
+            } else if (strcmp(t->name, "cell_pos") == 0) {
+                // V3 derived kq mask: the cell's position, with every 16th cell "empty" (INT32_MIN).
+                // derived_hole additionally makes cells [1024, 1280) a contiguous never-visible run,
+                // so the kernel's fully-masked-group skip (issue #48) has a run to skip.  Set through
+                // the backend API - the tensor lives in the backend buffer (issue #53).
+                std::vector<int32_t> data((size_t) t->ne[0]);
+                for (int64_t j = 0; j < t->ne[0]; ++j) {
+                    if (derived_hole && j >= 1024 && j < 1280) {
+                        data[j] = INT32_MIN;
+                    } else {
+                        data[j] = j % 16 == 15 ? INT32_MIN : (int32_t) j;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "tok_lo") == 0 || strcmp(t->name, "tok_hi") == 0) {
+                // V3 derived kq mask: a per-token sliding window over the cell positions, so that every
+                // token sees at least one cell but the visible sets differ per token.  The hole case
+                // uses the full window so only the hole (and the every-16th cells) is masked.  Set
+                // through the backend API - the tensor lives in the backend buffer (issue #53).
+                const bool is_lo = strcmp(t->name, "tok_lo") == 0;
+                std::vector<int32_t> data((size_t) t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    data[i] = derived_hole ? (int32_t) (is_lo ? 0 : kv - 1)
+                                           : (int32_t) (is_lo ? (2*i*kv)/(2*nb) : ((i + 1)*kv)/nb);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -11701,7 +11761,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     for (float max_bias : { 0.0f, 8.0f }) {
                         if (!mask && max_bias > 0.0f) continue;
                         for (float logit_softcap : {0.0f, 10.0f}) {
-                            if (hsk != 128 && logit_softcap != 0.0f) continue;
+                            // The mma kernel instantiates logit_softcap for heads 128/256/512 only.
+                            if (hsk != 128 && hsk != 256 && hsk != 512 && logit_softcap != 0.0f) continue;
                             for (int nh : { 1, 4 }) {
                                 if (nh == 1 && hsk != 320 && hsk != 576) continue;
                                 for (int nr3 : { 1, 3, }) {
@@ -11745,6 +11806,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // RDNA4 decode/verify band (fattn-common.cuh: ggml_cuda_fattn_band_wmma_applies): the band
+    // folds the GQA group into ncols2 = 8.  A ratio above 8 (the qwen4exp head-256 gqa 12, issue
+    // #133) takes a partial final group whose unused columns the kernel masks on the Q load and
+    // the dst write; the CPU reference is the oracle for that masking.  nb <= 8 is the band's
+    // decode/verify width range and kv % FATTN_KQ_STRIDE (256) == 0 is its alignment condition.
+    for (int nb : {1, 3, 5, 8}) {
+        for (int kv : {512, 4096}) {
+            for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_flash_attn_ext(
+                            256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+            }
+        }
+    }
+
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -11766,6 +11841,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
+
+    // qwen35 full-attention shape (head 256, GQA 6, quantized K/V) across the decode/verify band
+    // (n_q = 1..8): the RDNA4 band-WMMA path folds the whole GQA group into ncols2 = 8 and splits
+    // the KV round-robin, so every width/type must match the CPU reference (GREEDY-PURITY).
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL}) {
+        for (int kv : { 512, 1024, 4096, 16384 }) {
+            for (int nb : { 1, 2, 3, 4, 5, 8 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type, type));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type, type, {0, 2, 1, 3}));
+            }
+        }
+    }
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
@@ -11862,6 +11949,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // FLASH_ATTN_EXT MMA: non-pow2 head size and MLA K/V view.
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
+
+    // FLASH_ATTN_EXT with the V3 derived kq mask: no mask tensor, the visibility is derived in the
+    // kernel from the cell positions and the per-token window.  The CPU reference implements the same
+    // form, so this compares the CUDA derived path against a real oracle.  nb > 32/ncols2 selects the
+    // MMA kernel (the only one that implements the derived form); kv covers a padded and a ragged K/V.
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4090, 33, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true));
+
+    // FLASH_ATTN_EXT with the V3 derived kq mask and a contiguous interior hole: exercises the
+    // fully-masked-group skip (issue #48).  The window covers the whole KV, so only the hole and the
+    // every-16th cells are invisible; the CPU reference derives the same predicate.
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 32, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true, true));
+    // The n_q = 9..16 band is the wide speculative verify width (n_max 8..15) where the derived form
+    // is still created; the skip must stay exact there too.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096,  9, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 16, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 4096, 12, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, true));
+
+    // FLASH_ATTN_EXT with a packed mask and a contiguous interior -INF block: exercises the packed
+    // fully-masked-group skip (issue #48).  nb > 8 selects the prefill kernel where the skip is on.
+    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 4096, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, false, false, true));
+    // Multi-stream (non-unified) packed mask: the bitmap is per (stream, query tile).
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 2}, 4096, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, false, true));
+    // ALiBi packed mask: visible cells are finite biases and the hole is still -INF.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, 4096, 32, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, false, true));
+    // Odd query count: a partial last query tile over the hole boundary.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 4096, 17, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, false, true));
 
     // FLASH_ATTN_EXT MMA, swizzled K/V tiles, power-of-two stride: nbatch_K2 = 32, 64, 128, 256.
     test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 8, {8, 1}, 4096,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -12119,6 +12243,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // LEAKY_RELU at FFN activation width, for direct comparison with RELU
     for (int64_t n_tokens : {512, 2048}) {
         test_cases.emplace_back(new test_leaky_relu(GGML_TYPE_F32, { 17408, n_tokens, 1, 1 }, 0.1f));
+    }
+
+    // Flash attention perf: head 256 (default-on WMMA) vs 512/320/576 (DKQ != DV).
+    // A/B with GGML_CUDA_FA_WMMA_256=0 (forces the tile kernel for head > 128 on RDNA4).
+    for (const auto & fa : {std::tuple<int,int,int,int,int>{256, 256, 8, 4, 256},
+                            {512, 512, 4, 8, 128},
+                            {320, 256, 4, 32, 128},
+                            {576, 512, 4, 4, 128},
+                            {192, 128, 4, 8, 128},
+                            {512, 512, 4, 8, 1},
+                            {576, 512, 4, 4, 1}}) {
+        const auto [hsk, hsv, nh, nr2, nb] = fa;
+        test_cases.emplace_back(new test_flash_attn_ext(hsk, hsv, nh, {nr2, 1}, 16384, nb, true, false, 0, 0,
+                                                        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+
+    // Band-WMMA A/B: qwen35 (head 256, GQA 6, 4 KV heads) decode/verify widths across KV types.
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL}) {
+        for (int nb : {1, 3, 5, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, nb, true, false, 0, 0,
+                                                            GGML_PREC_F32, type, type));
+        }
     }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance

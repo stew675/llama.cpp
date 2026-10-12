@@ -236,6 +236,14 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // V3 derived kq mask: true when the packed mask for this batch can be replaced by the compact
+    // per-cell state (see set_input_kq_derived).  The predicate is exactly the shape the phase-1
+    // host oracle proved bit-exact against the packed fill - extend it only with new coverage.
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+    void set_input_kq_derived(
+            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+            const llama_ubatch * ubatch, bool causal_attn) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -431,6 +439,12 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // V3 derived kq mask - see llama_kv_cache::kq_mask_derivable
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+    void set_input_kq_derived(
+            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+            const llama_ubatch * ubatch, bool causal_attn) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
