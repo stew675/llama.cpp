@@ -1245,6 +1245,33 @@ struct ggml_cuda_device_info {
 
 const ggml_cuda_device_info & ggml_cuda_info();
 
+// WORKAROUND for the gfx1201 grid-size dispatch stall (ROCm/legacy-rocm-build#6689, ROCm/TheRock#8634): a dispatch
+// whose block count is a multiple of 256, or whose work-item count is a multiple of 65536, waits ~6-10 us before it
+// runs (a 512-row BF16 GEMV: 17.8 us vs 8.8 us at 513 blocks).  A launch site that can take one extra block (the
+// kernel returns at once for a block past its last row) asks this helper and adds that block; the arithmetic is
+// unchanged.  Not the only workaround in the tree: mul_mat_vec_f_vb, hc_mix and the RDNA4 mmvq decode grid size
+// their grids around the same stall.
+// BACKING IT OUT once AMD ships the fix: GGML_CUDA_GRID_STALL_PAD=0 turns it off at run time; to remove it, delete
+// this function and its call sites (grep ggml_cuda_grid_stall_pad) -- the kernels' row guards are harmless left in.
+static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block) {
+#if defined(GGML_USE_HIP)
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!on) {
+        return false;
+    }
+    const int64_t nblk = (int64_t) grid.x * grid.y * grid.z;
+    const int64_t nthr = (int64_t) block.x * block.y * block.z;
+    return nblk > 0 && (nblk % 256 == 0 || (nblk * nthr) % 65536 == 0);
+#else
+    GGML_UNUSED(grid);
+    GGML_UNUSED(block);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
