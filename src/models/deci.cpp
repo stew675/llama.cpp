@@ -27,28 +27,28 @@ void llama_model_deci::load_arch_tensors(llama_model_loader &) {
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
-        const int64_t n_embd_k_gqa  = hparams.n_embd_k_gqa(i);
-        const int64_t n_embd_v_gqa  = hparams.n_embd_v_gqa(i);
-        const int64_t n_ff          = hparams.n_ff(i);
-        const int64_t n_head        = hparams.n_head(i);
-        const int64_t n_head_kv     = hparams.n_head_kv(i);
+        const int64_t n_embd_k_gqa_l  = hparams.n_embd_k_gqa(i);
+        const int64_t n_embd_v_gqa_l  = hparams.n_embd_v_gqa(i);
+        const int64_t n_ff_l          = hparams.n_ff(i);
+        const int64_t n_head_l        = hparams.n_head(i);
+        const int64_t n_head_kv_l     = hparams.n_head_kv(i);
 
-        if (n_head_kv == 0 && n_head > 0) {
+        if (n_head_kv_l == 0 && n_head_l > 0) {
             // linear attention for DeciLMCausalModel
             layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
         }
-        else if (n_head_kv > 0) {
+        else if (n_head_kv_l > 0) {
             layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-            create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
-            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+            create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head_l, n_embd_k_gqa_l, n_embd_v_gqa_l, 0);
+            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head_l, n_embd}, 0);
         }
 
         // optional bias tensors
         layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
 
-        if (n_ff > 0) {
+        if (n_ff_l > 0) {
             layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
         }
 
@@ -60,16 +60,16 @@ void llama_model_deci::load_arch_tensors(llama_model_loader &) {
             layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_rot/2}, TENSOR_NOT_REQUIRED | (i != 0 ? TENSOR_DUPLICATED : 0));
         }
 
-        if (n_ff > 0) {
-            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+        if (n_ff_l > 0) {
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_l}, 0);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff_l, n_embd}, 0);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_l}, 0);
         }
 
         // optional MLP bias
-        layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
+        layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff_l}, TENSOR_NOT_REQUIRED);
         layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
-        layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
+        layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff_l}, TENSOR_NOT_REQUIRED);
     }
 }
 

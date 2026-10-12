@@ -106,8 +106,12 @@ struct llm_graph_params;
 class llm_graph_input_i {
 public:
     llm_graph_input_i() {
-        const char * LLAMA_GRAPH_INPUT_DEBUG = getenv("LLAMA_GRAPH_INPUT_DEBUG");
-        debug = LLAMA_GRAPH_INPUT_DEBUG ? atoi(LLAMA_GRAPH_INPUT_DEBUG) : 0;
+        // read once: a graph input object is constructed on every decode; getenv() is expensive on Windows
+        static const int input_debug = [] {
+            const char * env = getenv("LLAMA_GRAPH_INPUT_DEBUG");
+            return env != nullptr ? atoi(env) : 0;
+        }();
+        debug = input_debug;
     }
 
     virtual ~llm_graph_input_i() = default;

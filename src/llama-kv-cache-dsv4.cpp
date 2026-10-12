@@ -1040,10 +1040,10 @@ void llama_dsv4_comp_state::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_
     sc_info.sdst.push_back((uint32_t) seq_id_dst);
 }
 
-void llama_dsv4_comp_state::apply_copies(const stream_copy_info & sc_info) const {
-    for (size_t i = 0; i < sc_info.ssrc.size(); ++i) {
-        const uint32_t ssrc = sc_info.ssrc[i];
-        const uint32_t sdst = sc_info.sdst[i];
+void llama_dsv4_comp_state::apply_copies(const stream_copy_info & sc_info_l) const {
+    for (size_t i = 0; i < sc_info_l.ssrc.size(); ++i) {
+        const uint32_t ssrc = sc_info_l.ssrc[i];
+        const uint32_t sdst = sc_info_l.sdst[i];
 
         for (const auto & layer : layers) {
             ggml_backend_tensor_copy(layer.kv_stream[ssrc], layer.kv_stream[sdst]);

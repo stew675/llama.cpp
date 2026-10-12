@@ -127,7 +127,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     if (is_empty()) {
         if (n_rs_seq > 0) {
-            n_rs_seq = 0;
+            this->n_rs_seq = 0;
             LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
         }
     }
@@ -138,7 +138,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_p = size_p_bytes();
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB, P (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                (float)(memory_size_r + memory_size_s + memory_size_p) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, this->n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 ggml_type_name(type_r), (float)memory_size_p / (1024.0f * 1024.0f));
@@ -741,12 +741,12 @@ bool llama_memory_recurrent::is_empty() const {
 }
 
 size_t llama_memory_recurrent::total_size() const {
-    size_t size = 0;
+    size_t size_l = 0;
     for (const auto & [_, buf] : ctxs_bufs) {
-        size += ggml_backend_buffer_get_size(buf.get());
+        size_l += ggml_backend_buffer_get_size(buf.get());
     }
 
-    return size;
+    return size_l;
 }
 
 size_t llama_memory_recurrent::size_r_bytes() const {
@@ -908,8 +908,8 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
             io.write(&n_seq_id, sizeof(n_seq_id));
 
             if (n_seq_id) {
-                for (auto seq_id : cell.seq_id) {
-                    io.write(&seq_id, sizeof(seq_id));
+                for (auto seq_id_i : cell.seq_id) {
+                    io.write(&seq_id_i, sizeof(seq_id_i));
                 }
             }
         }

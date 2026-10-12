@@ -723,7 +723,7 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
-    const int64_t t_start_us = ggml_time_us();
+    const int64_t t_start_us_l = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
@@ -750,9 +750,9 @@ void llama_context::sched_reserve() {
     }
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
-    const int n_outputs = n_seqs;
+    const int n_outputs_l = n_seqs;
 
-    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
+    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs_l);
 
     resolve_fused_ops(mctx.get(), n_seqs);
 
@@ -863,7 +863,7 @@ void llama_context::sched_reserve() {
     const int64_t t_end_us = ggml_time_us();
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
-            __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+            __func__, (t_end_us - t_start_us_l)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
 void llama_context::synchronize() {
@@ -1279,12 +1279,12 @@ size_t llama_context::get_sampled_probs_count(int32_t idx) {
 
 
 void llama_context::attach_threadpool(
-           ggml_threadpool_t threadpool,
-           ggml_threadpool_t threadpool_batch) {
+           ggml_threadpool_t threadpool_l,
+           ggml_threadpool_t threadpool_batch_l) {
     LLAMA_LOG_DEBUG("%s: call\n", __func__);
 
-    this->threadpool       = threadpool;
-    this->threadpool_batch = threadpool_batch ? threadpool_batch : threadpool;
+    this->threadpool       = threadpool_l;
+    this->threadpool_batch = threadpool_batch_l ? threadpool_batch_l : threadpool_l;
 }
 
 void llama_context::detach_threadpool() {
@@ -1301,11 +1301,11 @@ void llama_context::set_n_threads(int32_t n_threads, int32_t n_threads_batch) {
     cparams.n_threads_batch = n_threads_batch;
 }
 
-void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data) {
+void llama_context::set_abort_callback(bool (*abort_callback_l)(void * data), void * abort_callback_data_l) {
     LLAMA_LOG_DEBUG("%s: call\n", __func__);
 
-    this->abort_callback      = abort_callback;
-    this->abort_callback_data = abort_callback_data;
+    this->abort_callback      = abort_callback_l;
+    this->abort_callback_data = abort_callback_data_l;
 
     for (auto & backend : backends) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
@@ -1970,7 +1970,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     int64_t n_outputs_prev = 0;
-    int64_t n_tokens_prev  = 0;
+    int64_t n_tokens_prev_l  = 0;
+
+    // complete the async device->host readbacks issued for one ubatch
+    auto sync_readback = [&](ggml_tensor * t) {
+        if (t == nullptr) {
+            return;
+        }
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        if (backend != nullptr) {
+            ggml_backend_synchronize(backend);
+        }
+    };
 
     do {
         const auto & ubatch = mctx->get_ubatch();
@@ -2115,14 +2126,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
-        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev_l, ubatch.n_tokens);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
         {
             const bool masked    = cparams.embeddings_nextn_masked;
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
-            const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+            const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev_l;
 
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
@@ -2139,7 +2150,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         if (extract_all_idxs) {
             GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
-            GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev);
+            GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev_l);
             const auto & batch_idxs = ubatch.data->batch_idxs;
             embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
         }
@@ -2155,8 +2166,42 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         n_outputs_prev += n_outputs;
-        n_tokens_prev  += ubatch.n_tokens;
-    } while (mctx->next());
+        n_tokens_prev_l  += ubatch.n_tokens;
+
+        if (!mctx->next()) {
+            break;
+        }
+
+        // Another ubatch follows and will reuse this graph's output tensors.  The readbacks above
+        // copied them into the persistent host output buffers asynchronously, so make sure those
+        // copies have completed before the next graph overwrites the source.  On backends whose
+        // pinned async device->host copy is not ordered against the compute stream (observed on
+        // ROCm) the next ubatch otherwise overwrites the source before an earlier copy reads it,
+        // and the host rows end up holding a later ubatch's data (multi-ubatch per-token outputs:
+        // perplexity / KLD, and the server's multi-sequence batches).  A single-ubatch decode has
+        // nothing to order against and pays nothing.
+        // The per-token readbacks (the DFlash layer inputs, the unmasked nextn embeddings) also run in a ubatch without
+        // outputs (a prompt chunk that does not end its prompt), so they need the same wait there: the next ubatch's input
+        // upload waits only for this graph's compute, not for the copies queued after it, and was observed (Windows, ROCm)
+        // to overwrite a layer input before its copy had read it.
+        static const bool readback_sync = getenv("GGML_READBACK_SYNC") == nullptr || atoi(getenv("GGML_READBACK_SYNC")) != 0;
+        if (readback_sync && (n_outputs > 0 || extract_all_idxs)) {
+            sync_readback(t_logits);
+            sync_readback(t_embd);
+            sync_readback(t_h_nextn);
+            for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+                if (cparams.embeddings_layer_inp[il]) {
+                    sync_readback(res->get_layer_inp((int) il));
+                }
+            }
+            if (has_samplers) {
+                for (ggml_tensor * t : res->t_sampled)        { sync_readback(t); }
+                for (ggml_tensor * t : res->t_sampled_logits) { sync_readback(t); }
+                for (ggml_tensor * t : res->t_sampled_probs)  { sync_readback(t); }
+                for (ggml_tensor * t : res->t_candidates)     { sync_readback(t); }
+            }
+        }
+    } while (true);
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2218,11 +2263,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
-    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    const int64_t n_outputs_max = std::max<int64_t>(n_outputs_l, n_seq_max());
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
@@ -2613,13 +2658,13 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
-    LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+    LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
+    GGML_ASSERT(n_outputs_l >= 1);
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
-        LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+        LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs_l);
     }
 
     ggml_backend_sched_reset(sched.get());
@@ -2636,12 +2681,12 @@ ggml_cgraph * llama_context::graph_reserve(
     // TODO: not sure if needed, might simplify in the future by removing this
     const auto save_n_outputs = this->n_outputs;
 
-    this->n_outputs = n_outputs;
+    this->n_outputs = n_outputs_l;
 
-    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
-    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
+    llama_batch_allocr balloc_l(model.hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc_l.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
-    ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);
+    ubatch_prepare_reserve(ubatch, n_outputs_l, sampling.samplers, cparams.n_outputs_max_per_seq);
 
     auto * res = gf_res_reserve.get();
 
@@ -3742,12 +3787,12 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
     ggml_set_param(tensor);
 }
 
-void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
+void llama_context::opt_init(struct llama_model * model_l, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
-    model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
-    const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
+    model_l->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
+    const uint32_t n_batch     = std::min(this->n_batch(),  model_l->hparams.n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
-    GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
+    GGML_ASSERT(model_l->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
     if (cparams.flash_attn) {
@@ -3777,22 +3822,22 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     void * param_filter_ud              = lopt_params.param_filter_ud;
 
   //llama_set_param(model->tok_embd,        param_filter, param_filter_ud); // FIXME
-    llama_set_param(model->type_embd,       param_filter, param_filter_ud);
-    llama_set_param(model->pos_embd,        param_filter, param_filter_ud);
-    llama_set_param(model->tok_norm,        param_filter, param_filter_ud);
-    llama_set_param(model->tok_norm_b,      param_filter, param_filter_ud);
-    llama_set_param(model->output_norm,     param_filter, param_filter_ud);
-    llama_set_param(model->output_norm_b,   param_filter, param_filter_ud);
-    llama_set_param(model->output,          param_filter, param_filter_ud);
-    llama_set_param(model->output_b,        param_filter, param_filter_ud);
-    llama_set_param(model->output_norm_enc, param_filter, param_filter_ud);
-    llama_set_param(model->cls,             param_filter, param_filter_ud);
-    llama_set_param(model->cls_b,           param_filter, param_filter_ud);
-    llama_set_param(model->cls_out,         param_filter, param_filter_ud);
-    llama_set_param(model->cls_out_b,       param_filter, param_filter_ud);
-    llama_set_param(model->cls_norm,        param_filter, param_filter_ud);
+    llama_set_param(model_l->type_embd,       param_filter, param_filter_ud);
+    llama_set_param(model_l->pos_embd,        param_filter, param_filter_ud);
+    llama_set_param(model_l->tok_norm,        param_filter, param_filter_ud);
+    llama_set_param(model_l->tok_norm_b,      param_filter, param_filter_ud);
+    llama_set_param(model_l->output_norm,     param_filter, param_filter_ud);
+    llama_set_param(model_l->output_norm_b,   param_filter, param_filter_ud);
+    llama_set_param(model_l->output,          param_filter, param_filter_ud);
+    llama_set_param(model_l->output_b,        param_filter, param_filter_ud);
+    llama_set_param(model_l->output_norm_enc, param_filter, param_filter_ud);
+    llama_set_param(model_l->cls,             param_filter, param_filter_ud);
+    llama_set_param(model_l->cls_b,           param_filter, param_filter_ud);
+    llama_set_param(model_l->cls_out,         param_filter, param_filter_ud);
+    llama_set_param(model_l->cls_out_b,       param_filter, param_filter_ud);
+    llama_set_param(model_l->cls_norm,        param_filter, param_filter_ud);
 
-    for (struct llama_layer & layer : model->layers) {
+    for (struct llama_layer & layer : model_l->layers) {
         for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
             llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
         }

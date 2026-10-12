@@ -96,8 +96,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path, 
         throw std::runtime_error(format("invalid split file: %s", path.c_str()));
     }
 
-    for (int idx = 0; idx < n_split; ++idx) {
-        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), idx, n_split);
+    for (int i = 0; i < n_split; ++i) {
+        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), i, n_split);
         paths.push_back(std::string(buf.data(), ret));
     }
 
@@ -1565,16 +1565,16 @@ bool llama_model_loader::load_all_data(
 
         // If the backend is supported, create pinned memory buffers and events for synchronisation.
         for (size_t idx = 0; idx < n_buffers; ++idx) {
-            auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
+            auto * buf_host = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
 
-            if (!buf) {
+            if (!buf_host) {
                 LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n", func,
                     ggml_backend_dev_name(dev));
                 return nullptr;
             }
 
-            host_buffers.emplace_back(buf);
-            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf));
+            host_buffers.emplace_back(buf_host);
+            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf_host));
 
             auto * event = ggml_backend_event_new(dev);
             if (!event) {

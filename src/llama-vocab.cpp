@@ -29,19 +29,19 @@
 struct naive_trie {
     naive_trie() : has_value(false), value(0) {
     }
-    void insert(const char * key, size_t len, int32_t value = 0) {
+    void insert(const char * key, size_t len, int32_t value_l = 0) {
         if (len == 0) {
             this->has_value = true;
-            this->value = value;
+            this->value = value_l;
             return;
         }
         char c = key[0];
         auto res = children.find(c);
         if (res != children.end()) {
-            res->second.insert(key + 1, len - 1, value);
+            res->second.insert(key + 1, len - 1, value_l);
         } else {
-            auto res = children.insert(std::make_pair(c, naive_trie()));
-            res.first->second.insert(key + 1, len - 1, value);
+            auto ins = children.insert(std::make_pair(c, naive_trie()));
+            ins.first->second.insert(key + 1, len - 1, value_l);
         }
     }
     std::pair<const char *, size_t> get_longest_prefix(const char * key, size_t len, size_t offset = 0) const {
@@ -3217,11 +3217,11 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
         };
 
         std::string model_name;
-        std::string tokenizer_pre;
+        std::string tokenizer_pre_l;
         std::string general_arch;
 
         ml.get_key(LLM_KV_GENERAL_NAME,  model_name,    false);
-        ml.get_key(LLM_KV_TOKENIZER_PRE, tokenizer_pre, false);
+        ml.get_key(LLM_KV_TOKENIZER_PRE, tokenizer_pre_l, false);
         ml.get_key(LLM_KV_GENERAL_ARCHITECTURE, general_arch, false);
 
         // model name to lowercase
@@ -3233,7 +3233,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
 
         // set attributes by model/tokenizer/architecture name
         if (false
-                || _contains_any(tokenizer_pre, {"jina-v2-de", "jina-v2-es", "jina-v2-code", "mmbert"})
+                || _contains_any(tokenizer_pre_l, {"jina-v2-de", "jina-v2-es", "jina-v2-code", "mmbert"})
                 || _contains_any(general_arch, {"nomic-bert-moe", "jina-bert-v3"})
            ) {
             if (token_to_id.count("<mask>") == 0) {
@@ -3343,10 +3343,10 @@ llama_token_attr llama_vocab::impl::token_get_attr(llama_token id) const {
     return id_to_token.at(id).attr;
 }
 
-void llama_vocab::impl::init_tokenizer(enum llama_vocab_type type) {
-    LLAMA_LOG_DEBUG("%s: initializing tokenizer for type %d\n", __func__, type);
+void llama_vocab::impl::init_tokenizer(enum llama_vocab_type type_l) {
+    LLAMA_LOG_DEBUG("%s: initializing tokenizer for type %d\n", __func__, type_l);
 
-    switch (type) {
+    switch (type_l) {
         case LLAMA_VOCAB_TYPE_SPM:
             tokenizer = std::make_unique<llm_tokenizer_spm>(vocab);
             break;
@@ -3814,19 +3814,19 @@ int32_t llama_vocab::impl::token_to_piece(llama_token token, char * buf, int32_t
 
     // copy piece chars to output text buffer
     // skip up to 'lstrip' leading spaces before copying
-    auto _try_copy = [=] (const char * token, size_t size) -> int32_t {
+    auto _try_copy = [=] (const char * token_str, size_t size) -> int32_t {
         if (size >= static_cast<size_t>(std::numeric_limits<int32_t>::max())) {
             GGML_ABORT("invalid token size: %zu exceeds int32_t limit", size);
         }
 
-        for (int32_t i = 0; i < lstrip && size && *token == ' '; ++i) {
-            token++;
+        for (int32_t i = 0; i < lstrip && size && *token_str == ' '; ++i) {
+            token_str++;
             size--;
         }
         if (length < (int32_t)size) {
             return -(int32_t) size;
         }
-        memcpy(buf, token, size);
+        memcpy(buf, token_str, size);
         return (int32_t) size;
     };
 

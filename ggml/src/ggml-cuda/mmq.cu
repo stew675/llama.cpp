@@ -342,13 +342,18 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    // ncols_max is the column-tile grid width: an expert's compact column count can exceed ne12 when ids repeat within a
+    // token's row (every occurrence is its own column).  The non-stream-k kernel keeps the tight ne12 grid and loops over
+    // the remaining column tiles, so it stays fast for the common case; the stream-k kernel derives the tile index from
+    // the flat k-space, so it needs the full worst-case width to visit every column.
+    const bool stream_k = ggml_cuda_mmq_get_config(src0->type, J_best, fallback, cc, prec_src1).stream_k;
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best};
+        stream_k ? ne_get_rows : ne12, J_best};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

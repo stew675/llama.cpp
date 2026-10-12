@@ -548,11 +548,11 @@ struct llama_sampler_backend {
         return name_ext.c_str();
     }
 
-    void init(bool support) {
+    void init(bool support_l) {
         GGML_ASSERT(this->is_init == false);
 
         this->is_init = true;
-        this->support = support;
+        this->support = support_l;
     }
 
     // copy the state that is not tied to the current sampling graph
@@ -671,8 +671,8 @@ static void llama_sampler_chain_accept(struct llama_sampler * smpl, llama_token 
 
     time_meas tm(chain->t_sample_us, chain->params.no_perf);
 
-    for (auto & smpl : chain->samplers) {
-        llama_sampler_accept(smpl.ptr, token);
+    for (auto & smpl_cur : chain->samplers) {
+        llama_sampler_accept(smpl_cur.ptr, token);
     }
 
     chain->n_sample++;
@@ -685,26 +685,26 @@ static void llama_sampler_chain_apply(struct llama_sampler * smpl, llama_token_d
 
     bool is_backend = chain->is_init;
 
-    for (auto & smpl : chain->samplers) {
-        if (is_backend && smpl.is_backend) {
+    for (auto & smpl_cur : chain->samplers) {
+        if (is_backend && smpl_cur.is_backend) {
             continue;
         }
 
         is_backend = false;
 
-        if (smpl.ptr->iface->apply == nullptr) {
+        if (smpl_cur.ptr->iface->apply == nullptr) {
             continue;
         }
 
-        llama_sampler_apply(smpl.ptr, cur_p);
+        llama_sampler_apply(smpl_cur.ptr, cur_p);
     }
 }
 
 static void llama_sampler_chain_reset(struct llama_sampler * smpl) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    for (auto & smpl : chain->samplers) {
-        llama_sampler_reset(smpl.ptr);
+    for (auto & smpl_cur : chain->samplers) {
+        llama_sampler_reset(smpl_cur.ptr);
     }
 }
 
@@ -713,8 +713,8 @@ static struct llama_sampler * llama_sampler_chain_clone(const struct llama_sampl
 
     auto * result = llama_sampler_chain_init(chain_src->params);
 
-    for (const auto & smpl : chain_src->samplers) {
-        llama_sampler_chain_add(result, llama_sampler_clone(smpl.ptr));
+    for (const auto & smpl_cur : chain_src->samplers) {
+        llama_sampler_chain_add(result, llama_sampler_clone(smpl_cur.ptr));
     }
 
     return result;
@@ -723,8 +723,8 @@ static struct llama_sampler * llama_sampler_chain_clone(const struct llama_sampl
 static void llama_sampler_chain_free(struct llama_sampler * smpl) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    for (auto & smpl : chain->samplers) {
-        llama_sampler_free(smpl.ptr);
+    for (auto & smpl_cur : chain->samplers) {
+        llama_sampler_free(smpl_cur.ptr);
     }
 
     delete chain;
@@ -743,22 +743,22 @@ static bool llama_sampler_chain_backend_init(
     bool res = true;
     bool backend_prefix = true;
 
-    for (auto & smpl : chain->samplers) {
+    for (auto & smpl_cur : chain->samplers) {
         bool cur_prefix = backend_prefix;
 
         // to be able to run a sampler on the backend, it has to:
         // - have the .backend_init() API implemented
         // - return true during .backend_init()
         // - support the requested per-sequence output limit
-        if (cur_prefix && smpl.ptr->iface->backend_init) {
-            if (!smpl.ptr->iface->backend_init(smpl.ptr, buft, n_outputs_max_per_seq)) {
+        if (cur_prefix && smpl_cur.ptr->iface->backend_init) {
+            if (!smpl_cur.ptr->iface->backend_init(smpl_cur.ptr, buft, n_outputs_max_per_seq)) {
                 cur_prefix = false;
             }
         } else {
             cur_prefix = false;
         }
 
-        smpl.is_backend = cur_prefix;
+        smpl_cur.is_backend = cur_prefix;
         backend_prefix = cur_prefix;
 
         res = res && cur_prefix;
@@ -777,13 +777,13 @@ static void llama_sampler_chain_backend_accept(
         struct ggml_tensor * selected_token) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    for (auto & smpl : chain->samplers) {
-        if (!smpl.is_backend) {
+    for (auto & smpl_cur : chain->samplers) {
+        if (!smpl_cur.is_backend) {
             break;
         }
 
-        if (smpl.ptr->iface->backend_accept) {
-            smpl.ptr->iface->backend_accept(smpl.ptr, ctx, gf, selected_token);
+        if (smpl_cur.ptr->iface->backend_accept) {
+            smpl_cur.ptr->iface->backend_accept(smpl_cur.ptr, ctx, gf, selected_token);
         }
     }
 }
@@ -797,13 +797,13 @@ static void llama_sampler_chain_backend_apply(
 
     GGML_ASSERT(chain->is_init && "llama_sampler_chain_backend_init() not called");
 
-    for (auto & smpl : chain->samplers) {
-        if (!smpl.is_backend) {
+    for (auto & smpl_cur : chain->samplers) {
+        if (!smpl_cur.is_backend) {
             break;
         }
 
-        if (smpl.ptr->iface->backend_apply) {
-            smpl.ptr->iface->backend_apply(smpl.ptr, ctx, gf, data);
+        if (smpl_cur.ptr->iface->backend_apply) {
+            smpl_cur.ptr->iface->backend_apply(smpl_cur.ptr, ctx, gf, data);
         }
     }
 }
@@ -811,13 +811,13 @@ static void llama_sampler_chain_backend_apply(
 static void llama_sampler_chain_backend_set_input(struct llama_sampler * smpl) {
     auto * chain = (llama_sampler_chain *) smpl->ctx;
 
-    for (auto & smpl : chain->samplers) {
-        if (!smpl.is_backend) {
+    for (auto & smpl_cur : chain->samplers) {
+        if (!smpl_cur.is_backend) {
             break;
         }
 
-        if (smpl.ptr->iface->backend_set_input) {
-            smpl.ptr->iface->backend_set_input(smpl.ptr);
+        if (smpl_cur.ptr->iface->backend_set_input) {
+            smpl_cur.ptr->iface->backend_set_input(smpl_cur.ptr);
         }
     }
 }

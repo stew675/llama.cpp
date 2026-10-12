@@ -69,7 +69,25 @@ target_include_directories(llama PRIVATE . ${CMAKE_CURRENT_BINARY_DIR})
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
+# -Wshadow catches the dangerous "declaration shadows a local variable" class in src/ (the
+# mask-chain bug of 2026-09-11 was one). The shared C/CXX warning list already carries it for C;
+# enable it for the llama C++ target as well.
+
 target_link_libraries(llama PUBLIC ggml)
+
+if (LLAMA_ALL_WARNINGS AND NOT MSVC)
+    # -Wshadow catches the dangerous "declaration shadows a local variable" class in src/ (the
+    # mask-chain bug of 2026-09-11 was one).  GCC's -Wshadow additionally reports the ubiquitous
+    # "declaration shadows a member" constructor idiom and "hides constructor", which the delivery
+    # does not police and which the container build (GCC host compiler) surfaced by the thousand;
+    # -Wshadow=local keeps the dangerous local-shadow class and drops that member/global output.
+    # clang has no =local form, so it keeps plain -Wshadow.
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wshadow=local>)
+    else()
+        target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wshadow>)
+    endif()
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

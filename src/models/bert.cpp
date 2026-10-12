@@ -100,10 +100,10 @@ llama_model_bert::graph::graph(const llama_model & model, const llm_graph_params
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
-        ggml_tensor * cur = inpL;
+        ggml_tensor * cur_l = inpL;
 
         {
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur_l,
                     n_embd_head, n_head, n_head_kv, il);
 
             if (model.layers[il].attn_q_norm) {
@@ -136,35 +136,35 @@ llama_model_bert::graph::graph(const llama_model & model, const llm_graph_params
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            cur = build_attn(inp_attn,
+            cur_l = build_attn(inp_attn,
                     model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
-            cb(cur, "kqv_out", il);
+            cb(cur_l, "kqv_out", il);
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
-            cur  = ggml_get_rows(ctx0, cur, inp_out_ids);
+            cur_l  = ggml_get_rows(ctx0, cur_l, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
 
         // re-add the layer input
-        cur = ggml_add(ctx0, cur, inpL);
+        cur_l = ggml_add(ctx0, cur_l, inpL);
 
         // attention layer norm
-        cur = build_norm(cur, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, il);
+        cur_l = build_norm(cur_l, model.layers[il].attn_out_norm, model.layers[il].attn_out_norm_b, LLM_NORM, il);
 
         if (model.layers[il].attn_norm_2 != nullptr) {
-            cur = ggml_add(ctx0, cur, inpL);  // re-add the layer input
-            cur = build_norm(cur, model.layers[il].attn_norm_2, model.layers[il].attn_norm_2_b, LLM_NORM, il);
+            cur_l = ggml_add(ctx0, cur_l, inpL);  // re-add the layer input
+            cur_l = build_norm(cur_l, model.layers[il].attn_norm_2, model.layers[il].attn_norm_2_b, LLM_NORM, il);
         }
 
-        ggml_tensor * ffn_inp = cur;
+        ggml_tensor * ffn_inp = cur_l;
         cb(ffn_inp, "ffn_inp", il);
 
         // feed-forward network
         if (hparams.moe_every_n_layers > 0 && il % hparams.moe_every_n_layers == 1) {
             // MoE branch
-            cur = build_moe_ffn(cur,
+            cur_l = build_moe_ffn(cur_l,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_up_exps,
                     nullptr,
@@ -175,41 +175,41 @@ llama_model_bert::graph::graph(const llama_model & model, const llm_graph_params
                     hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il);
-            cb(cur, "ffn_moe_out", il);
+            cb(cur_l, "ffn_moe_out", il);
         } else if (model.arch == LLM_ARCH_BERT || model.arch == LLM_ARCH_NOMIC_BERT_MOE ||
                    model.arch == LLM_ARCH_JINA_BERT_V3) {
-            cur = build_ffn(cur,
+            cur_l = build_ffn(cur_l,
                     model.layers[il].ffn_up, model.layers[il].ffn_up_b, NULL,
                     NULL, NULL, NULL,
                     model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL, NULL,
                     LLM_FFN_GELU, LLM_FFN_SEQ, il);
-            cb(cur, "ffn_out", il);
+            cb(cur_l, "ffn_out", il);
         } else if (model.arch == LLM_ARCH_JINA_BERT_V2) {
             const bool up_contains_gate = !model.layers[il].ffn_gate && model.layers[il].ffn_up->ne[1] != hparams.n_ff();
             auto type_op = up_contains_gate ? LLM_FFN_GEGLU : LLM_FFN_GELU;
-            cur = build_ffn(cur,
+            cur_l = build_ffn(cur_l,
                     model.layers[il].ffn_up, model.layers[il].ffn_up_b, NULL,
                     model.layers[il].ffn_gate, NULL, NULL,
                     model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL, NULL,
                     type_op, LLM_FFN_PAR, il);
-            cb(cur, "ffn_out", il);
+            cb(cur_l, "ffn_out", il);
         } else {
-            cur = build_ffn(cur,
+            cur_l = build_ffn(cur_l,
                 model.layers[il].ffn_up, NULL, NULL,
                 model.layers[il].ffn_gate, NULL, NULL,
                 model.layers[il].ffn_down, NULL, NULL,
                 NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
-            cb(cur, "ffn_out", il);
+            cb(cur_l, "ffn_out", il);
         }
 
         // attentions bypass the intermediate layer
-        cur = ggml_add(ctx0, cur, ffn_inp);
+        cur_l = ggml_add(ctx0, cur_l, ffn_inp);
 
         // output layer norm
-        cur = build_norm(cur, model.layers[il].layer_out_norm, model.layers[il].layer_out_norm_b, LLM_NORM, il);
+        cur_l = build_norm(cur_l, model.layers[il].layer_out_norm, model.layers[il].layer_out_norm_b, LLM_NORM, il);
 
         // input for next layer
-        inpL = cur;
+        inpL = cur_l;
     }
 
     cur = inpL;

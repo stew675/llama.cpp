@@ -357,12 +357,6 @@ static __global__ void mul_mat_f_ids(
     const int ncols_expert = expert_end - expert_start;
 
     const int tiles_for_expert = (ncols_expert + cols_per_block - 1) / cols_per_block;
-    const int tile_idx = blockIdx.z;
-    if (tile_idx >= tiles_for_expert) {
-        return;
-    }
-
-    const int col_base = tile_idx * cols_per_block;
 
     GGML_UNUSED(channel_ratio);
 
@@ -383,9 +377,17 @@ static __global__ void mul_mat_f_ids(
 
     //const float2 * y2 = (const float2 *) y;
 
-    tile_C C[ntA][ntB];
-
     T * tile_xy = (T *) compute_base + threadIdx.y*(tile_A::I * tile_k_padded);
+
+    // One block covers a tile per stride: an expert's compact column count can exceed the grid width when ids repeat
+    // within a token's row, so keep the tight grid and loop until the expert's tiles are exhausted.
+    for (int tile_idx = blockIdx.z; tile_idx < tiles_for_expert; tile_idx += gridDim.z) {
+    if (tile_idx != static_cast<int>(blockIdx.z)) {
+        if (nwarps > 1) { __syncthreads(); } else { ggml_cuda_syncwarp(); }
+    }
+    const int col_base = tile_idx * cols_per_block;
+
+    tile_C C[ntA][ntB];
 
     for (int col = threadIdx.y*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
         tile_A A[ntA][warp_size / tile_A::J];
@@ -549,7 +551,7 @@ static __global__ void mul_mat_f_ids(
         const int j = j0 + threadIdx.y;
 
         if (j0 + nwarps > cols_per_block && j >= cols_per_block) {
-            return;
+            continue;
         }
 
         float sum[rows_per_block/warp_size] = {0.0f};
@@ -579,6 +581,7 @@ static __global__ void mul_mat_f_ids(
         }
     }
     }
+    }
 #else
     GGML_UNUSED_VARS(x, y, ids_src_compact, ids_dst_compact, expert_bounds, dst,
         ncols, ncols_dst_total, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
@@ -600,9 +603,12 @@ static inline void mul_mat_f_switch_ids(
         const mmf_ids_data * ids_data) {
     const bool has_ids_data = ids_data && ids_data->ids_src_compact;
 
-    // Use the compact-ids kernel only for larger tiles; for small ncols_dst (< 16)
-    // we prefer the normal mul_mat_f path with has_ids=true.
-    if (has_ids_data && ncols_dst > 16) {
+    // Use the compact-ids kernel for every MUL_MAT_ID: the non-compact mul_mat_f path keeps a single slot per token,
+    // so it cannot represent repeated ids within a token's row.  The compact kernel maps every (token, slot) occurrence
+    // to its own row.  For small ncols_dst the extra expert-bounds read is negligible.
+    if (has_ids_data) {
+        // The grid keeps the tight ncols_dst width; the kernel loops over the extra column tiles that appear when ids
+        // repeat within a token's row (an expert's compact column count can then exceed ncols_dst).
         const int max_tiles = (int) ((ncols_dst + cols_per_block - 1) / cols_per_block);
         if (max_tiles == 0) {
             return;
