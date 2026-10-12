@@ -1662,9 +1662,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml_l) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
+    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
+    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
+    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
+    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
+    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
+    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
+    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
+    // stays host-resident either way (see create_tensor).
+    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
+    if (dev_input_on) {
+        pimpl->dev_input = get_layer_buft_list(n_layer_all);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1866,6 +1878,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml_l) {
         }
     }
 
+    // wip/moe-cache-autosize: host-resident MoE expert bytes for the --fit arena floor reservation
+    moe_host_expert_bytes = ml_l.moe_host_expert_bytes;
+
     // per-tensor activation precision policy
     prec_policy.load(ml_l, *this);
 
@@ -1931,6 +1946,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml_l) {
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
+
+                // record the exact mmap-backed ranges before any data is loaded, so the loader's
+                // per-tensor release never unmaps pages that a host-pointer tensor points into
+                // (a tied embedding is loaded once mmap-backed and once copied to a device)
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    const auto * w = ml_l.get_weight(ggml_get_name(t));
+                    if (w != nullptr && (uint32_t) w->idx == idx) {
+                        ml_l.mark_mmap_used(idx, w->offs, ggml_nbytes(t));
+                    }
+                }
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -3335,6 +3360,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.host_experts_mode           =*/ LLAMA_HOST_EXPERTS_MODE_PINNED,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
@@ -3346,6 +3372,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.allow_nextn_cpu_offload     =*/ false,
     };
 
     return result;
@@ -3769,6 +3796,72 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
     return model->tensors_by_name;
 }
 
+void llama_model_moe_cache_preflight(const llama_model * model, size_t aux_reserve_bytes) {
+    if (model == nullptr) {
+        return;
+    }
+    // wip/slab-ring-region: the largest single host weight tensor sizes the slab's H2D-ring hole.  It is
+    // model-global (the same bound for every device), and it is known here (the model is fully loaded).
+    const size_t max_host_table = model->max_host_weight_tensor_bytes();
+    // Walk the HOST-EXPERT map, not `model->devices`.  The map is keyed by the real device that owns the
+    // host-expert buffer, while `model->devices` holds the scheduler's META device under `-sm tensor`;
+    // looking a meta device up in the map returns 0 for every device, which silently skipped the whole
+    // preflight -- and with it BOTH auto floors (`MOE_EXPERT_CACHE_MIN_MIB` and `_MIN_RES_PCT`) -- in the
+    // `-sm tensor` + host-expert configuration.  That left `alloc_all_locked`'s floor as the only one,
+    // and that one runs AFTER the tables are registered and graphs are planned against them: a late
+    // `g_enabled = false` there plans the MTP draft and the target with different kernels (measured MTP
+    // acceptance 0.00874 instead of the streaming path's 0.89506).  The map's keys are real devices -- the
+    // post-prefill drop already relies on that (`ggml_backend_dev_slab_work_size(kv.first)`).
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (kv.second > 0) {
+            ggml_backend_dev_moe_cache_preflight(kv.first, kv.second, aux_reserve_bytes, max_host_table);
+        }
+    }
+}
+
+bool llama_moe_cache_stats(const llama_model * model, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
+    if (model == nullptr) {
+        return false;
+    }
+    // The arena is one process-global cache, so any MoE-capable device returns the same aggregate.
+    // Under -sm tensor the model's device list is a Meta wrapper, so try the host-expert devices first.
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (ggml_backend_dev_moe_cache_stats(kv.first, hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < model->devices.size(); i++) {
+        if (ggml_backend_dev_moe_cache_stats(llama_model_get_device(model, (uint32_t) i), hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
+    if (model == nullptr || dev_index >= model->devices.size()) {
+        return 0;
+    }
+    const auto it = model->moe_host_expert_bytes.find(llama_model_get_device(model, dev_index));
+    return it != model->moe_host_expert_bytes.end() ? it->second : 0;
+}
+
+int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model) {
+    return model == nullptr ? 0 : (int32_t) model->moe_host_expert_bytes.size();
+}
+
+bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
+                                     ggml_backend_dev_t * dev, size_t * bytes) {
+    if (model == nullptr || i < 0 || i >= (int32_t) model->moe_host_expert_bytes.size()) {
+        return false;
+    }
+    auto it = model->moe_host_expert_bytes.begin();
+    std::advance(it, i);
+    if (dev   != nullptr) { *dev   = it->first;  }
+    if (bytes != nullptr) { *bytes = it->second; }
+    return true;
+}
+
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
@@ -3928,4 +4021,24 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
     }
 
     return (uint32_t) nelements;
+}
+
+size_t llama_model::max_host_weight_tensor_bytes() const {
+    size_t max_bytes = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(t);
+            if (bytes > max_bytes) {
+                max_bytes = bytes;
+            }
+        }
+    }
+    return max_bytes;
 }
