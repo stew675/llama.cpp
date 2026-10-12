@@ -121,6 +121,18 @@ struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
     uint32_t n_tokens_per_seq;
+
+    // number of sequences to reserve the probe graph with (0 = the context's n_seq_max)
+    uint32_t n_seqs = 0;
+
+    // the fused node has to land on a GPU device (used by features that only make sense on a GPU)
+    bool require_gpu = false;
+
+    // ... and specifically on a backend that implements the derived kq mask (CUDA/HIP)
+    bool require_kq_derived = false;
+
+    // the probe graph has to actually contain the fused op - otherwise nothing was verified
+    bool require_observed = false;
 };
 
 static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
@@ -165,6 +177,81 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// V3: the derived kq mask only changes the flash attention prefill path (the packed mask stays for
+// decode and small batches), so the probe is a prefill-shaped single sequence
+static const llm_fused_op_probe llm_fused_op_kq_derived_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_DERIVED,
+    /*.name             =*/ "derived kq mask flash attention",
+    /*.n_tokens_per_seq =*/ 64,
+    /*.n_seqs           =*/ 1,
+    /*.require_gpu      =*/ true,
+    /*.require_kq_derived =*/ true,
+    /*.require_observed =*/ true,
+};
+
+// the derived kq mask is implemented by the CUDA/HIP backend only - any other backend that accepts
+// the flash attention op would silently ignore the derived sources.  An iGPU (APU) is still the
+// CUDA/HIP backend, so it implements the derived path too (the MMA kernel is the same one).
+static bool ggml_backend_dev_is_cuda(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    const auto type = ggml_backend_dev_type(dev);
+    if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return false;
+    }
+
+    const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+
+    return name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0);
+}
+
+// Only a tensor split distributes a single attention op across devices; tell the HIP FA chooser
+// so it can pick a per-GPU-bandwidth-friendly kernel config instead of the whole-card one.
+static void llama_context_set_fa_tensor_parallel_hint(const llama_model & model) {
+    int n_cuda_dev = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_is_cuda(ggml_backend_dev_get(i))) {
+            n_cuda_dev++;
+        }
+    }
+    ggml_set_fa_tensor_parallel(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1);
+}
+
+// true when this build exposes the CUDA/HIP backend at all
+static bool ggml_backend_cuda_family_available() {
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        const char * name = ggml_backend_reg_name(ggml_backend_reg_get(i));
+
+        if (name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// the derived kq mask is only implemented by the CUDA/HIP backend.  A "meta" device (the
+// tensor-parallel wrapper used for multi-GPU tensor split) does not expose its sub-devices here, but
+// its supports_op forwards to all of them - which is exactly how the probed node ended up on it - so
+// accepting it is only safe while this build has the CUDA/HIP backend that the check above enforces.
+static bool ggml_backend_dev_implements_kq_derived(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    switch (ggml_backend_dev_type(dev)) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            return ggml_backend_dev_is_cuda(dev);
+        case GGML_BACKEND_DEVICE_TYPE_META:
+            return ggml_backend_cuda_family_available();
+        default:
+            return false;
+    }
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -182,6 +269,8 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    llama_context_set_fa_tensor_parallel_hint(model);
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -319,6 +408,19 @@ llama_context::llama_context(
 
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+
+    cparams.kq_mask_derived = true;
+    cparams.auto_kq_mask_derived = true;
+    {
+        const char * LLAMA_KQ_MASK_DERIVED = getenv("LLAMA_KQ_MASK_DERIVED");
+        if (LLAMA_KQ_MASK_DERIVED) {
+            // only an explicit 0 forces the packed mask - the probe below stays in charge of whether
+            // the backend can actually run the derived form
+            cparams.kq_mask_derived = atoi(LLAMA_KQ_MASK_DERIVED) != 0;
+            cparams.auto_kq_mask_derived = cparams.kq_mask_derived;
+            LLAMA_LOG_INFO("%s: derived kq mask = %d (env)\n", __func__, cparams.kq_mask_derived);
+        }
+    }
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
@@ -608,18 +710,22 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             return;
         }
 
-        const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
+        const uint32_t n_seqs_probe    = probe.n_seqs > 0 ? probe.n_seqs : n_seqs;
+        const uint32_t n_tokens_probe  = probe.n_tokens_per_seq*n_seqs_probe;
 
-        auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+        auto * gf = graph_reserve(n_tokens_probe, n_seqs_probe, n_tokens_probe, mctx, true);
         if (!gf) {
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
         }
 
         bool device_mismatch = false;
+        bool observed = false;
         for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
             if (node.op != probe.op) {
                 continue;
             }
+
+            observed = true;
 
             GGML_ASSERT(node.il >= 0);
 
@@ -640,11 +746,46 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                 device_mismatch = true;
                 break;
             }
+
+            const auto device_fused_type = ggml_backend_dev_type(device_fused);
+
+            if (probe.require_gpu && device_fused_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    device_fused_type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
+                    device_fused_type != GGML_BACKEND_DEVICE_TYPE_META) {
+                LLAMA_LOG_WARN("%s: %s is not supported on a CPU device\n", func, probe.name);
+                device_mismatch = true;
+                break;
+            }
+
+            if (probe.require_kq_derived && !ggml_backend_dev_implements_kq_derived(device_fused)) {
+                LLAMA_LOG_WARN("%s: %s is assigned to %s, but it is only implemented by the CUDA/HIP backend\n",
+                        func, probe.name,
+                        device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                device_mismatch = true;
+                break;
+            }
+        }
+
+        if (!observed && probe.require_observed) {
+            LLAMA_LOG_WARN("%s: %s was not used in the probe graph, set to disabled\n", func, probe.name);
+            device_mismatch = true;
         }
 
         if (device_mismatch) {
             enabled = false;
             LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", func, probe.name);
+
+            // The derived kq mask is implemented by both kernels that can serve a prefill: the MMA
+            // and the tile flash attention kernel (the vec kernel is decode/verify-only, and the
+            // derived form only exists for prefill-shaped batches).  So a rejection here is no longer
+            // a head-cap or kernel-tuning issue - it means neither kernel served this graph.  The
+            // generic "missing support" text sends people looking at the device instead, hence the
+            // pointer at the kernel selection.
+            if (probe.require_kq_derived) {
+                LLAMA_LOG_WARN("%s: note: the derived kq mask is implemented by the MMA and the tile "
+                        "flash attention kernels; it is disabled here because neither served this "
+                        "graph (or the node did not reach the GPU)\n", func);
+            }
         } else {
             enabled = true;
             LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
@@ -654,6 +795,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fa) {
         resolve(llm_fused_op_flash_attn_probe, cparams.flash_attn);
         cparams.auto_fa = false;
+    }
+
+    // note: after the flash attention probe, so that cparams.flash_attn is already resolved
+    if (cparams.auto_kq_mask_derived) {
+        // The derived form needs a single KV stream: llama_kv_cache::kq_mask_derivable() rejects a
+        // multi-stream cache.  That is `n_seq_max > 1` without kv_unified for the plain cache, and
+        // always `n_seq_max > 1` for deepseek4, which keeps per-sequence streams even in unified
+        // mode (llama_kv_cache_dsv4 pins unified_raw/unified_compressed to false).  Do not run the
+        // probe there - it forces a single-sequence graph, and on a multi-stream cache that is a
+        // shape the cache-layout-driven attention builders reject (deepseek4's lightning indexer
+        // ties its query stream count to the cache K's ne[3] while its mask uses the plan's stream
+        // count, so mask->ne[1] != q->ne[2] and ggml_lightning_indexer asserts).  Derived is dead
+        // in that configuration anyway, so skipping the probe loses nothing.
+        const bool multi_stream = n_seqs > 1 && (!cparams.kv_unified || model.arch == LLM_ARCH_DEEPSEEK4);
+
+        if (multi_stream) {
+            LLAMA_LOG_INFO("%s: derived kq mask disabled (multi-stream KV cache)\n", func);
+            cparams.kq_mask_derived = false;
+        } else {
+            LLAMA_LOG_INFO("%s: resolving derived kq mask support:\n", func);
+            resolve(llm_fused_op_kq_derived_probe, cparams.kq_mask_derived);
+        }
+        cparams.auto_kq_mask_derived = false;
     }
 
     if (cparams.auto_fgdn) {
@@ -717,6 +881,18 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+bool llama_context::kq_mask_packed_reachable() const {
+    if (model.hparams.n_pos_per_embd() > 1) {
+        return true;
+    }
+
+    if (cparams.n_seq_max > 1) {
+        return true;
+    }
+
+    return model.hparams.use_alibi;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -732,6 +908,10 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+
+    // size the compute buffers for the packed kq mask when a batch the derived form cannot serve is
+    // reachable in this context - see kq_mask_packed_reachable()
+    const bool packed_kq_mask = kq_mask_packed_reachable();
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -777,13 +957,14 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr,
+                packed_kq_mask);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched_new(max_nodes, false);
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ false, nullptr, packed_kq_mask);
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -802,7 +983,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -824,10 +1005,10 @@ void llama_context::sched_reserve() {
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc, nullptr, packed_kq_mask);
         };
 
         if (!gf) {
@@ -1000,7 +1181,7 @@ bool llama_context::memory_update(bool optimize) {
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get(), /*split_only =*/ false, nullptr, kq_mask_packed_reachable());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -2663,7 +2844,8 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        bool packed_kq_mask) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
     GGML_ASSERT(n_outputs_l >= 1);
 
@@ -2695,7 +2877,22 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    // The derived kq mask is a *per-batch* optimization, so a batch it cannot serve allocates the
+    // packed mask, n_kv*n_tokens*2 bytes - and at a deep context that is hundreds of MiB, which a
+    // reserve measured with the derived form on does not contain.  The first such batch then has to
+    // *grow* the compute buffer mid-run, and on a --fit server whose target left less free memory than
+    // that the growth fails with cudaMalloc out of memory and the request dies
+    // (github.com/stew675/llama-cpp-rdna-boosts/issues/42).  Building the measure graph with the
+    // packed mask makes the reserve (and therefore --fit) account for it up front, so the growth
+    // cannot happen.  Callers pass kq_mask_packed_reachable(), which is true only when such a batch is
+    // actually reachable in this context - see its definition.  Only the *reserve* changes: every
+    // derivable batch still takes the derived path at runtime, and a non-derivable one takes the
+    // packed-mask kernel upstream ships for it anyway.
+    if (packed_kq_mask) {
+        gparams.cparams.kq_mask_derived = false;
+    }
 
     res->reset();
 

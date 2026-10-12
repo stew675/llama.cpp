@@ -117,6 +117,17 @@ if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
 endif()
 
+# Silence the "loop not unrolled" flood from the FlashAttention kernels.
+# AMDGPU clang's loop-unroll pass reports every bare `#pragma unroll` it cannot
+# honour, and `fattn-mma-f16.cuh` has several on runtime-bounded loops (the
+# K/V staging loop and the sparse combine path).  That is upstream noise, but
+# the delivery's native-KV arms instantiate the whole WMMA kernel once per KV
+# type per instance TU, which multiplies it into ~10k warning lines per clean
+# build.  The pragmas are advisory hints, the pass already failed, and the code
+# is unaffected, so keep `-Wpass-failed` off for the HIP build only (the flag is
+# a Clang/AMDGPU one; the CUDA toolchains do not emit this diagnostic).
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wno-pass-failed")
+
 if (NOT GGML_CUDA_FA)
     add_compile_definitions(GGML_CUDA_NO_FA)
 endif()

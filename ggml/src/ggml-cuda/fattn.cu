@@ -190,6 +190,17 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
 }
 
+// V3 derived kq mask (ggml_flash_attn_ext_add_kq_derived): the mask tensor may be absent while an
+// equivalent visibility still exists (the kernel derives it from compact per-cell state).  Kernel
+// selection is a *policy* decision and must see both forms - a derived op that silently skipped the
+// mask-enabled kernel variants would change the numerics.  Data reads keep using dst->src[3].
+static bool ggml_cuda_flash_attn_ext_has_mask(const ggml_tensor * dst) {
+    return dst->src[3] != nullptr || dst->src[5] != nullptr;
+}
+
+// Band-WMMA (see ggml_cuda_fattn_band_wmma_applies in fattn-common.cuh): the whole decode/verify
+// band (n_q = 1 included) on the WMMA kernel with the GQA group folded into ncols2 = 8.  Kernel
+// selection and the ncols dispatch below both ask the shared predicate, so they cannot disagree.
 template <int DKQ, int DV>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -204,7 +215,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = ggml_cuda_flash_attn_ext_has_mask(dst) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -219,6 +230,25 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+
+    if constexpr (DKQ == 256 && DV == 256) {
+        if (ggml_cuda_fattn_band_wmma_applies(cc, dst)) {
+            // Query widths 5..8 in one 64-column block (see the RDNA4 band rows in fattn-mma-f16.cuh):
+            // bit-identical per column to the 32-column block, but one pass over the KV cache instead
+            // of two (q8_0, gfx1201: -10..-15 % from 4k KV rows, but +2..8 % below 2k, where the 16-warp
+            // block is mostly idle).  Both paths give the same result, so the KV-length gate cannot
+            // change any output.  GGML_HIP_FA_BAND_WIDE=0 restores the two-tile launch.
+            static const bool band_wide = getenv("GGML_HIP_FA_BAND_WIDE") == nullptr || atoi(getenv("GGML_HIP_FA_BAND_WIDE")) != 0;
+            if (band_wide && ggml_cuda_fattn_band_wmma_ncols1(dst) == 4 && Q->ne[1] > 4 && K->ne[1] >= 4096) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8>(ctx, dst);
+            } else if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 4, 8>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 2, 8>(ctx, dst);
+            }
+            return;
+        }
+    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
@@ -245,8 +275,19 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
-    // On RDNA it is preferable to minimize wasted compute vs. duplicate I/O for the mask.
-    if (amd_wmma_available(cc)) {
+    // 2026-09-14: split-aware RDNA ncols2.  Whole-card attention is compute-bound and prefers stock's
+    // AMD rule (minimize wasted compute: ncols2 divides the GQA ratio); tensor-split attention is
+    // per-GPU bandwidth-bound and prefers the wider generic ncols2 (fewer K/V re-reads).  The frontend
+    // sets the hint (llama_context: split_mode == LLAMA_SPLIT_MODE_TENSOR with > 1 GPU).
+    // Measured on 27B head-256: single 703.7 vs 664.8, tensor 1152.3 vs 1219.9 t/s.
+    // 2026-09-18 (issue #30): that split-aware rule is RDNA4-tuned.  On RDNA3_0 (gfx1100) the wider
+    // generic ncols2 loses deep prefill under tensor split (2x RX 7900 XTX, 27B Q8_0 f16 pp100K:
+    // 667.5 vs stock 805.0 t/s = ~17%, crossing stock between 8K and 32K), while decode is
+    // unaffected.  RDNA3_0 therefore keeps the stock AMD rule (minimize wasted compute) regardless
+    // of the tensor-split hint; RDNA4/RDNA3_5 keep the split-aware behaviour.
+    const bool tensor_parallel = ggml_get_fa_tensor_parallel() && !GGML_CUDA_CC_IS_RDNA3_0(cc);
+
+    if (amd_wmma_available(cc) && !tensor_parallel) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
             return;
@@ -319,7 +360,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             GGML_ASSERT(V->ne[0] == 128);
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
-            const bool use_gqa_opt = mask && max_bias == 0.0f;
+            const bool use_gqa_opt = ggml_cuda_flash_attn_ext_has_mask(dst) && max_bias == 0.0f;
             GGML_ASSERT(use_gqa_opt);
             GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
             const int gqa_ratio = Q->ne[2] / K->ne[2];
@@ -341,7 +382,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 float max_bias = 0.0f;
                 memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
-                const bool use_gqa_opt = mask && max_bias == 0.0f;
+                const bool use_gqa_opt = ggml_cuda_flash_attn_ext_has_mask(dst) && max_bias == 0.0f;
                 GGML_ASSERT(use_gqa_opt);
                 GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
                 const int gqa_ratio = Q->ne[2] / K->ne[2];
@@ -360,7 +401,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             float max_bias = 0.0f;
             memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
-            const bool use_gqa_opt = mask && max_bias == 0.0f;
+            const bool use_gqa_opt = ggml_cuda_flash_attn_ext_has_mask(dst) && max_bias == 0.0f;
             GGML_ASSERT(use_gqa_opt);
 
             GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -490,6 +531,24 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
     FATTN_VEC_CASES_ALL_D(BF16, BF16)
 
+    // iq4_nl pairs (not part of upstream's checked-in cross product; shipped with this enablement)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, F16)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q4_0)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q4_1)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q5_0)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q5_1)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q8_0)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, BF16)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, IQ4_NL)
+
+    FATTN_VEC_CASES_ALL_D(F16,  IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q4_0, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q4_1, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q5_0, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q5_1, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q8_0, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(BF16, IQ4_NL)
+
     return nullptr;
 }
 
@@ -521,7 +580,11 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
-// K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
+// KV cache types that at least one of the flash-attention families reachable
+//   below can consume: the tile/mma-f16 kernels stage K/V through
+//   ggml_get_to_fp16_cuda (q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl included), and the
+//   vec kernel reads K/V natively per (K,V) instance selected by
+//   GGML_CUDA_FA_QUANTS (the iq4_nl pairs are shipped alongside this enablement).
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -531,6 +594,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q8_0:
             return true;
         default:
@@ -556,9 +620,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
+    float logit_softcap = 0.0f;
+    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && ggml_cuda_flash_attn_ext_has_mask(dst) && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -697,25 +764,63 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
-    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
-            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
+    // Extended 2026-08-28/29 to heads beyond 128 behind per-arch caps (RDNA4 576, RDNA3_0 256, RDNA3_5 320);
+    // upstream's 2026-09-11 gfx1201 FA tuning (16378d93f) supplies the head>128 batch threshold (16)
+    // and the head-256 config cases; the per-arch cap and softcap guard are kept on top.
+    // RDNA4 WMMA has higher throughput than RDNA3; heads up to 576 (incl. the DKQ != DV shapes)
+    // are enabled by default there. RDNA3_0 (gfx1100-1103) verified 2026-08-28: FLASH_ATTN_EXT
+    // 4568/4568 vs CPU ref, gemma-4-12b head 240 pp2048 2263 vs 2226 (+1.7%), harness +14.2%
+    // at hsk=256/nh=8/nb=256, all other >128 shapes within +/-1% (neutral). 2026-09-18 (issue #30):
+    // the 2026-09-14 RDNA prefill tuning overwrote the RDNA3_0-side config rows with RDNA4 #28102
+    // values, which turned head 512 from the 2026-08-28 'neutral' into a 3.5-10% loss vs the tile
+    // kernel (gemma-4-26B-A4B, head 512, pp2048 @ d98304: f16 791 vs 819 tile, bf16 776 vs 851 tile,
+    // q8_0 784 vs 773 tile) -- and the tile kernel is exactly stock's choice there.  The RDNA3_0 cap
+    // is therefore back at 256 (the head-256 WMMA row is itself a +44-52% deep-prefill win over tile
+    // on gfx1100, so it stays); RDNA4 (576) and RDNA3_5 (320) are untouched. RDNA3_5 (gfx115x)
+    // verified 2026-08-29 on gfx1151 (Strix Halo iGPU): FLASH_ATTN_EXT 4568/4568 vs CPU ref with
+    // the cap lifted; harness wins at hsk=256 (+34%) and hsk=320 (+36%) prefill, but hsk=512
+    // (-5.6%) and hsk=576 (-7.4%) regress, so the default cap is 320 (covers Gemma4 240-head,
+    // Mistral4 MLA 320; DeepSeek-MLA 576 keeps the tile kernel). End-to-end gemma-4-12b head 240
+    // pp2048 +3.6%, pp4096 +6.7%, decode neutral. Set GGML_CUDA_FA_WMMA_256=0 to force
+    // the WMMA path off for heads > 128 (e.g. to compare against the tile kernel), or
+    // GGML_CUDA_FA_WMMA_MAX_HEAD to override the cap.
+    static const char * wmma_256_env = getenv("GGML_CUDA_FA_WMMA_256");
+    const bool wmma_256 = wmma_256_env == nullptr || std::atoi(wmma_256_env) != 0;
+    // GGML_CUDA_FA_WMMA_MAX_HEAD overrides the per-arch cap (experiment/escape hatch).
+    static const char * wmma_max_env = getenv("GGML_CUDA_FA_WMMA_MAX_HEAD");
+    const int wmma_max_head = wmma_max_env ? std::atoi(wmma_max_env) : (wmma_256 && GGML_CUDA_CC_IS_RDNA4(cc) ? 576 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_0(cc) ? 256 : wmma_256 && GGML_CUDA_CC_IS_RDNA3_5(cc) ? 320 : 128);
+    // Whole decode/verify band (n_q = 1 included) on WMMA with the folded GQA group, default on.
+    // GGML_CUDA_FA_WMMA_256=0 / GGML_CUDA_FA_WMMA_MAX_HEAD stay the escape hatches, so they must
+    // disable this exactly like the generic head>128 WMMA band below.
+    if (wmma_256 && Q->ne[0] <= wmma_max_head && ggml_cuda_fattn_band_wmma_applies(cc, dst)) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
-    // If there are no tensor cores available, use the generic tile kernel:
-    if (can_use_vector_kernel) {
-        if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
-            if (Q->ne[1] == 1) {
-                if (!gqa_opt_applies) {
-                    return BEST_FATTN_KERNEL_VEC;
-                }
-            }
-        } else {
-            if (Q->ne[1] <= 2) {
-                return BEST_FATTN_KERNEL_VEC;
-            }
+    // Speculative verify batches (n_q = n_draft+1 <= 8) must stay on the tile
+    // kernel: decode (n_q = 1) never uses WMMA, so a WMMA verify batch would
+    // produce different logits than decode (GREEDY-PURITY band invariant).
+    // Upstream's head>128 gqa-eff threshold (16) is kept on top.
+    if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= wmma_max_head) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16) && Q->ne[1] > 8) {
+        // The kernel instantiates logit_softcap only for heads 128/256/512.
+        if (logit_softcap == 0.0f || Q->ne[0] == 128 || Q->ne[0] == 256 || Q->ne[0] == 512) {
+            return BEST_FATTN_KERNEL_MMA_F16;
         }
     }
+
+    // If there are no tensor cores available, the generic tile kernel is used.
+    //
+    // The former VEC fallback here (upstream: VEC for n_q == 1 with no GQA opt, and for
+    // n_q <= 2 with a quantized K/V) split the decode/verify band across two kernel families:
+    // measured on gfx1201 with q8_0/q4_0 K/V, n_q = 1,2 took VEC and n_q >= 3 took TILE, and
+    // since the two families order the online-softmax/PV reduction differently, n_q = 1
+    // disagreed bit-wise with every verify width -- so plain greedy decode and spec-draft-mtp
+    // verify produced different tokens with a quantized KV cache (greedy-purity invariant,
+    // GREEDY-PURITY.md).  Both conditions are always inside the n_q <= 8 band, so removing
+    // them only changes n_q <= 2 (prefill always fell through to TILE) and makes the whole
+    // band use TILE, matching the WMMA guard above and the ntiles_dst_eff fix in launch_fattn.
+    // Cost, measured 3x gfx1201, q8_0 KV: tg128 -0.5..-0.9%, pp512 -0.2% (within noise on the
+    // 4B, -0.2% on the 27B); MTP acceptance is bit-identical (the verify widths did not move).
     return BEST_FATTN_KERNEL_TILE;
 }
 
@@ -736,17 +841,36 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE: {
-            // The tile kernel reads F16 and BF16 K/V natively; the launcher converts
-            // the remaining types to F16. BF16 K/V needs native BF16 support.
-            const bool use_bf16 = K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 &&
-                bf16_mma_hardware_available(ggml_cuda_info().devices[device].cc);
-            need_f16_K = use_bf16 ? false : K->type != GGML_TYPE_F16;
-            need_f16_V = use_bf16 ? false : V->type != GGML_TYPE_F16;
+            // The tile kernel has ONE K/V type parameter, chosen in this order by
+            // ggml_cuda_flash_attn_ext_tile_case_type: bf16 (only where the hardware reads it
+            // natively), else q8_0, else q4_0, else F16.  Anything that does not match the chosen
+            // type is staged to F16 by the launcher, so the node's scratch exists iff `type_KV != F16`
+            // for that operand.  This must stay in lockstep with the launcher and with that
+            // instantiation, or the scratch is either missing (the kernel then reads the raw cache as
+            // F16 -- see the mixed K/V NaNs) or wasted.  The q4_0 arm was missing here, so a q4_0
+            // cache kept reserving the whole F16 scratch the launcher no longer uses.
+            ggml_type tile_type;
+            if (K->type == GGML_TYPE_BF16 && V->type == GGML_TYPE_BF16 &&
+                    bf16_mma_hardware_available(ggml_cuda_info().devices[device].cc)) {
+                tile_type = GGML_TYPE_BF16;
+            } else {
+                // FATTN_KV_NATIVE_NONE maps to F16, i.e. the staged type.
+                tile_type = ggml_cuda_fattn_native_ggml_type(ggml_cuda_fattn_tile_kv_native_type(K, V));
+            }
+            need_f16_K = K->type != tile_type;
+            need_f16_V = V->type != tile_type;
         } break;
-        case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = true;
-            need_f16_V = true;
-            break;
+        case BEST_FATTN_KERNEL_MMA_F16: {
+            // V4 / block 15: a q8_0 (dequantized) or bf16 (converted) K/V cache is read natively by
+            // the kernel, so the F16 staging copy (and the whole-cache conversion pass) is skipped
+            // for that operand.  Same predicates as the launcher (ggml_cuda_fattn_kv_native_type via
+            // launch_fattn), so the two agree on whether the scratch exists.
+            const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+            const int  kv_native_K = ggml_cuda_fattn_kv_native_type(K);
+            const int  kv_native_V = V_is_K_view ? kv_native_K : ggml_cuda_fattn_kv_native_type(V);
+            need_f16_K = kv_native_K == FATTN_KV_NATIVE_NONE;
+            need_f16_V = kv_native_V == FATTN_KV_NATIVE_NONE;
+        } break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
@@ -780,5 +904,16 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
+    if (kernel == BEST_FATTN_KERNEL_NONE) {
+        return false;
+    }
+    // The derived kq mask is implemented by the MMA and the tile kernels.  The vec kernel has no
+    // derived arm, but it is decode/verify-only (n_tps <= 2) while the derived form only exists for
+    // prefill-shaped batches (kq_mask_derivable() rejects n_tokens <= 8), so it is unreachable there;
+    // the check stays as a guard for the day that stops being true.
+    if (dst->src[5] != nullptr && kernel != BEST_FATTN_KERNEL_MMA_F16 && kernel != BEST_FATTN_KERNEL_TILE) {
+        return false;
+    }
+    return true;
 }

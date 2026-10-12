@@ -8839,6 +8839,21 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// V3 derived kq mask (see ggml_flash_attn_ext_add_kq_derived): the mask tensor is absent and each
+// cell's value is derived from the cell's position and the token's visibility window.  Reference
+// semantics - the packed mask holds exactly these values.
+static inline float kq_derived_mask_value(
+        const struct ggml_tensor * cell_pos,
+        const struct ggml_tensor * tok_lo,
+        const struct ggml_tensor * tok_hi,
+        int64_t cell, int64_t tok) {
+    const int32_t p  = ((const int32_t *) cell_pos->data)[cell];
+    const int32_t lo = ((const int32_t *) tok_lo  ->data)[tok];
+    const int32_t hi = ((const int32_t *) tok_hi  ->data)[tok];
+
+    return p >= lo && p <= hi ? 0.0f : -INFINITY;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8852,6 +8867,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+
+    const ggml_tensor * cell_pos = dst->src[5];
+    const ggml_tensor * tok_lo   = dst->src[6];
+    const ggml_tensor * tok_hi   = dst->src[7];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8964,7 +8983,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
+                    (cell_pos ? slope*kq_derived_mask_value(cell_pos, tok_lo, tok_hi, ic, iq1) : 0.0f);
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9086,6 +9106,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+
+    const ggml_tensor * cell_pos = dst->src[5];
+    const ggml_tensor * tok_lo   = dst->src[6];
+    const ggml_tensor * tok_hi   = dst->src[7];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9224,12 +9248,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, nek1 - ic);
 
             // skip the tile entirely if all the masks are -inf
-            if (mask) {
+            if (mask || cell_pos) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    const ggml_fp16_t * mp_row = mask ? (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        mask32[tq * KV_TILE_SZ + tk] = mp_row
+                            ? slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk])
+                            : slope * kq_derived_mask_value(cell_pos, tok_lo, tok_hi, ic + tk, iq1 + tq);
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }

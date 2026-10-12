@@ -257,8 +257,17 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // packed_kq_mask: build the measure graph with the packed kq mask even when the derived form is
+    //   enabled, so the reserved buffers cover a batch the derived form cannot serve (see the note in
+    //   graph_reserve).  Pass kq_mask_packed_reachable() for a worst-case reserve; the fused-op
+    //   support probes must NOT set it - they verify the derived form is present in the graph.
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool packed_kq_mask = false);
+
+    // true when a batch the derived kq mask cannot serve is reachable at runtime, i.e. when the
+    // compute reserve must be sized for the packed mask - see the definition for the full reasoning
+    bool kq_mask_packed_reachable() const;
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
