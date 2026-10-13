@@ -17,14 +17,15 @@ static_assert(MATRIX_ROW_PADDING % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0, "Risk 
 // tens of millions of tiny 128-thread blocks and is block-dispatch-bound on RDNA3.5; the 2x
 // block-count reduction measured ~1.5x faster per call with byte-identical output (each slice
 // is exactly the work one unchunked block did - per-slice element math is unchanged). GATED:
-// only gfx1151 (cc == GGML_CUDA_CC_RDNA3_5 + 1) enables it. gfx1150 (Strix Point) shares the
+// only the exact validated SKU gfx1151 (Strix Halo) enables it. gfx1150 (Strix Point) shares the
 // RDNA3.5 block dispatcher and likely benefits but is NOT validated; gfx120x/RDNA4 and all
-// non-AMD targets keep n_chunks = 1 = the upstream unchunked launch until validated there
-// (same policy as the RDNA3.5 mmq table). The chunk count is a runtime kernel argument (not a
-// compile-time define): the HIP host pass does not see __gfx*__ macros, so a define would
-// disagree between the host (gridDim.y) and device (loop) passes.
+// non-AMD targets keep n_chunks = 1 = the upstream unchunked launch — RDNA4 A/B measured flat
+// on gfx1201 (2026-09-06, wip 1.2: pp8192/pp16384 r3 ON-vs-OFF within ±1% drift; gfx1201's
+// dispatcher does not share gfx1151's small-block dispatch bottleneck). The chunk count is a
+// runtime kernel argument (not a compile-time define): the HIP host pass does not see __gfx*__
+// macros, so a define would disagree between the host (gridDim.y) and device (loop) passes.
 static inline int ggml_cuda_quantize_mmq_q8_1_n_chunks(const int cc) {
-    return cc == GGML_CUDA_CC_RDNA3_5 + 1 ? 2 : 1;
+    return GGML_CUDA_CC_IS_GFX1151(cc) ? 2 : 1;
 }
 
 static_assert((4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) % QK8_1_MMQ == 0, "Quantization chunks must contain complete Q8_1 MMQ blocks.");

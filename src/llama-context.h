@@ -248,6 +248,28 @@ private:
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+public:
+    // Llama-Frankenstein F1: device-resident layer inputs (target) and device feature injection (draft)
+    void          set_lf_layer_inp_dev(bool enable);
+    ggml_tensor * get_lf_layer_inp_dev(uint32_t lid) const;
+    const int32_t * get_lf_dev_rows(int32_t * n_rows) const;
+    void          set_lf_dev_inject(bool enable);
+    // draft context: mark the target's device layer inputs as read (GPU-side event, no host wait)
+    void          lf_signal_features_consumed();
+    // target context: event the next extraction must wait for before overwriting the buffers
+    void          lf_set_consumed_event(ggml_backend_t backend_reader);
+    ggml_backend_t lf_backend_for(ggml_backend_dev_t dev) const;
+
+private:
+    std::vector<ggml_tensor *> lf_layer_dev;   // [n_layer()+1] F32 [n_embd, n_batch], nullptr if not extracted
+    ggml_context_ptr           lf_layer_ctx;
+    ggml_backend_buffer_ptr    lf_layer_buf;
+    ggml_backend_event_t       lf_consumed_ev      = nullptr;
+    bool                       lf_consumed_pending = false;
+    // F1 with several sequences: the ubatches may reorder the batch (split_equal), the device buffers keep the ubatch
+    // order (output_reorder() only fixes the host buffers): target batch row -> buffer row; empty when the order held
+    std::vector<int32_t>       lf_dev_rows;
+
     //
     // graph
     //

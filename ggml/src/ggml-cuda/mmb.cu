@@ -1275,7 +1275,7 @@ __device__ __forceinline__ void mmb_split2(float x, uint16_t & hi, uint16_t & lo
 // measured *worse* (pp8192 954.8 / 952.3 vs 957.4 at TT=1), so L2 serves the W panels well enough
 // that the extra live registers and reduced block count cost more than the traffic saved.  Kept as
 // a knob because the balance is a property of this cache, not of the algorithm.
-template<int MMAX, int TT>
+template<int MMAX, int TT, bool XBF16 = false>
 __global__ void __launch_bounds__(MMB_NT)
 mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X,
                       float * __restrict__ D, const int M, const int K, const int T) {
@@ -1288,18 +1288,33 @@ mmb_tiny_m_f32_kernel(const float * __restrict__ W, const float * __restrict__ X
     for (int i = 0; i < TT; ++i)
 #pragma unroll
         for (int m = 0; m < MMAX; ++m) acc[i][m] = make_float4(0.f, 0.f, 0.f, 0.f);
-    const float4 * xrow[TT];
+    const float4   * xrow[TT];
+    const uint16_t * xhrow[TT];
 #pragma unroll
     for (int i = 0; i < TT; ++i) {
         const int t = t0 + i;
         // out-of-range tokens get a valid dummy row; their results are dropped on the way out
-        xrow[i] = (const float4 *) (X + (size_t) (t < T ? t : 0) * K);
+        const int tr = t < T ? t : 0;
+        xrow[i]  = (const float4 *) (X + (size_t) tr * K);
+        xhrow[i] = (const uint16_t *) X + (size_t) tr * K;
     }
     for (int k4 = lane; k4 < nk4; k4 += 32) {
         const int k = k4 << 2;
         float4 xv[TT], wv[MMAX];
 #pragma unroll
-        for (int i = 0; i < TT; ++i) xv[i] = xrow[i][k4];
+        for (int i = 0; i < TT; ++i) {
+            if constexpr (XBF16) {
+                // HC16: the producer marked this activation BF16-only, so X is a bf16 buffer (the
+                // F32 tensor was never written).  RNE-rounded on the way in, so the value matches
+                // exactly what the old F32->bf16 conversion produced (a numerics change vs rocBLAS
+                // only in that the GEMM now consumes the same rounded activation as the bf16 path).
+                const uint2 p = *(const uint2 *) (xhrow[i] + k);
+                xv[i] = make_float4(gm_bf2f((uint16_t) p.x), gm_bf2f((uint16_t) (p.x >> 16)),
+                                    gm_bf2f((uint16_t) p.y), gm_bf2f((uint16_t) (p.y >> 16)));
+            } else {
+                xv[i] = xrow[i][k4];
+            }
+        }
 #pragma unroll
         for (int m = 0; m < MMAX; ++m) wv[m] = (m < M) ? *(const float4 *) (W + (size_t) m * K + k) : make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
@@ -1409,9 +1424,44 @@ __global__ void mmb_build_desc2(const int32_t * __restrict__ bounds, uint32_t * 
 }
 
 struct mmb_cache_entry { const ggml_tensor * root; const void * data; size_t n; ggml_cuda_pool_alloc<uint16_t> * buf; };
-static std::vector<mmb_cache_entry> g_mmb_cache;
-static mmb_cache_entry g_mmb_slots[4] = {{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr},{nullptr,nullptr,0,nullptr}};
-static std::unordered_set<const ggml_tensor *> g_mmb_bf16_only;
+// Pinned producer slots (pinned until the next producer of the same slot): 0 = generic MMB-GEMM
+// activation copies, 1 = HC gate, 2 = GLU, 3 = routed MoE output, 4 = HC normalized stream xn.
+// Slot 4 exists because xn is the one activation with *delayed* consumers (dsv4_hc_pre src[0] and
+// the tiny-M inject GEMMs), so its copy cannot share the aggressively-reused generic slot 0 -- and
+// dsv4_hc_pre itself reads x from the slot while writing its own output to slot 0.
+static constexpr int MMB_SLOT_COUNT = 5;
+// All state the MMB BF16-activation machinery needs for one backend context: the per-graph activation
+// cache, the pinned producer slots, the BF16-only/copy marks and their lifetime.  It is per context
+// because two llama_contexts (the MTP target and its draft head, say) interleave their
+// optimise/compute calls; sharing the cache or the marks across them let one context free the
+// other's activation buffers mid-compute or see its marks.  The op implementations run synchronously
+// inside a backend compute, so a single "active context" pointer set by
+// ggml_backend_cuda_graph_optimize / _graph_compute selects the right state without threading ctx
+// through every call site.
+struct mmb_ctx_state {
+    std::vector<mmb_cache_entry> cache;
+    mmb_cache_entry slots[MMB_SLOT_COUNT] = {};
+    size_t slot_cap[MMB_SLOT_COUNT] = {0, 0, 0, 0, 0};
+    std::unordered_set<const ggml_tensor *> bf16_only;
+    // "also emit a BF16 copy" mark: the F32 output stays valid; producers that can emit a BF16 side
+    // copy write it into slot 0 and the MMB activation conversion finds and skips it.
+    std::unordered_set<const ggml_tensor *> bf16_copy;
+    // BF16-only tensors that must not use the generic slot 0 (their copy has to outlive other producers).
+    std::unordered_map<const ggml_tensor *, int> bf16_slot;
+    // Mark lifetime: set after every backend compute, so the next optimize pass for this context
+    // clears and rebuilds the marks.  `first_split` is the first node of the graph whose marks are
+    // current, so re-optimizing the same graph (without an intervening compute, e.g. reserve then
+    // alloc) clears as well.
+    bool after_compute = true;
+    const void * first_split = nullptr;
+};
+static std::unordered_map<const ggml_backend_cuda_context *, mmb_ctx_state> g_mmb_state;
+static const ggml_backend_cuda_context * g_mmb_active_ctx = nullptr;
+static mmb_ctx_state & mmb_state() {
+    static mmb_ctx_state empty;
+    if (g_mmb_active_ctx == nullptr) { return empty; }
+    return g_mmb_state[g_mmb_active_ctx];
+}
 
 // ---------------------------------------------------------------------------------------------
 // Per-arch tuning defaults (S11 of wip/mmb-general/gfx1201-porting.md, §7 point 3).
@@ -1446,7 +1496,7 @@ struct mmb_arch_cfg {
     int  shadow_mode    = 0;     // bf16 weight shadow
     int  shadow_cap_mb  = 6144;
     int  iq3xxs_glu     = 0;     // fused IQ3_XXS routed GLU (measured a net loss on gfx1151)
-    int  hc16           = 1, down16 = 0, gatemix = 0, blk16 = 0, res16 = 0;   // hc16 default ON (policy 2026-09-21; +4-5 % measured on gfx1151)
+    int  hc16           = 1, down16 = 0, gatemix = 1, blk16 = 0, res16 = 0;   // hc16 + gatemix default ON (policy 2026-09-21; gatemix is RDNA3_5-only at its call site)
     int  glu            = 1;     // fused routed gate+up+GLU
     int  bf16w          = 1;     // BF16 dense weights
     int  routed         = 1;     // the routed MoE (MUL_MAT_ID) path + its fused GLU
@@ -1481,6 +1531,11 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
         // wip/mmb-general/gfx1201-s13-f32-hc16.md.
         c.f32split_mode = 1;
         c.tiny_m       = 1;
+        // gatemix: the kernel's arch-aware `mmb_frag_t`/`mmb_wmma_bf16`/`MMB_ACC_M` shim runs on
+        // gfx12 too, and the fusion is bit-identical to the GEMM+sigmoid+mix chain.  Ported to RDNA4
+        // 2026-09-24 (gfx1201): +5.8 %/+5.4 %/+5.3 % qwen4exp IQ4_NL prefill at pp8192/32768/65536,
+        // byte-identical greedy text.  `LLAMA_HC_GATEMIX=0` is the opt-out.
+        c.gatemix      = 1;
     }
     if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
         // gfx1100 S6/S7: the F32 MoE-router split TILE is a loss here (gemma-26B-A4B -3.1 %,
@@ -1489,6 +1544,11 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
         // keeps its default.  NOTE: gfx1100 was only measured to pp32768 -- re-check pp65536+
         // before finalising (see gfx1100-porting.md 14.5).
         c.f32split_mode = 0;
+        // gatemix: the kernel's gfx11 WMMA builtin is shared with gfx1151 (ported 2026-09-23, the
+        // call site now accepts RDNA3), but it stays default OFF on RDNA3_0 -- qwen4exp (the only
+        // model with IQ4_NL HC gates) does not fit on gfx1100, so end-to-end A/B must be done on
+        // gfx1151/gfx1201 first.  LLAMA_HC_GATEMIX=1 is the opt-in.
+        c.gatemix       = 0;
     }
     // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
     // still the gfx1151 values on every arch.  Give RDNA4 its own once they are measured per arch.
@@ -1498,6 +1558,14 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
 static const mmb_arch_cfg & mmb_cfg() {
     static const mmb_arch_cfg c = mmb_arch_defaults(ggml_cuda_info().devices[0].cc);
     return c;
+}
+
+// Diagnostics gate for the "first N hits" prints below: off unless GGML_CUDA_MMB_LOG is set (the file's
+// long-standing gate; 2 prints more).  They used to be unconditional, which put them on stderr in every
+// server log.
+static bool mmb_dbg() {
+    static const int v = getenv("GGML_CUDA_MMB_LOG") ? atoi(getenv("GGML_CUDA_MMB_LOG")) : 0;
+    return v != 0;
 }
 
 // Print the resolved per-arch config + every env override exactly once (GGML_CUDA_MMB_CFG=1, or
@@ -1523,18 +1591,19 @@ static void mmb_cfg_dump_once() {
 static size_t mmb_cache_max() { static const int v = getenv("GGML_CUDA_MMB_CACHE") ? atoi(getenv("GGML_CUDA_MMB_CACHE")) : mmb_cfg().cache_max; return (size_t) v; }
 static const ggml_tensor * mmb_root(const ggml_tensor * t) { return t->view_src ? t->view_src : t; }
 static uint16_t * mmb_cache_insert(ggml_backend_cuda_context & ctx, const ggml_tensor * t, const size_t n) {
-    if (g_mmb_cache.size() >= mmb_cache_max()) { delete g_mmb_cache.front().buf; g_mmb_cache.erase(g_mmb_cache.begin()); }
+    std::vector<mmb_cache_entry> & cache = mmb_state().cache;
+    if (cache.size() >= mmb_cache_max()) { delete cache.front().buf; cache.erase(cache.begin()); }
     auto * buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n);
-    g_mmb_cache.push_back({mmb_root(t), t->data, n, buf});
+    cache.push_back({mmb_root(t), t->data, n, buf});
     return buf->get();
 }
 static const uint16_t * mmb_bf16_activation(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const size_t n, cudaStream_t stream) {
     const ggml_tensor * root = mmb_root(src1);
-    for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
-    for (auto & e : g_mmb_cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    for (auto & e : mmb_state().slots) if (e.buf && e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
+    for (auto & e : mmb_state().cache) if (e.root == root && e.data == src1->data && e.n == n) return e.buf->get();
     uint16_t * buf = mmb_cache_insert(ctx, src1, n);
     { static const int lg = getenv("LLAMA_MMB_CVT_LOG") ? atoi(getenv("LLAMA_MMB_CVT_LOG")) : 0; static unsigned cnt = 0;
-      if (lg && cnt++ < 200) fprintf(stderr, "MMB_CVT %s op=%s ne=[%lld,%lld,%lld,%lld] view_src=%s n=%zu\n", src1->name, ggml_op_name(src1->op), (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3], src1->view_src ? src1->view_src->name : "-", n); }
+      if (lg && (int) cnt++ < (lg > 1 ? lg : 200)) fprintf(stderr, "MMB_CVT %s op=%s ne=[%lld,%lld,%lld,%lld] view_src=%s src0=%s(%s) n=%zu data=%p root=%p\n", src1->name, ggml_op_name(src1->op), (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3], src1->view_src ? src1->view_src->name : "-", src1->src[0] ? src1->src[0]->name : "-", src1->src[0] ? ggml_op_name(src1->src[0]->op) : "-", n, src1->data, (const void *) root); }
     mmb_cvt_f32_bf16<<<(unsigned)((n / 8 + 255) / 256), 256, 0, stream>>>((const float *) src1->data, buf, n);
     return buf;
 }
@@ -1849,31 +1918,77 @@ static bool mmb_wtype_ok_glu(const ggml_type t) { return mmb_wtype_ok(t) && (t !
 
 const uint16_t * ggml_cuda_mmb_cache_lookup(const ggml_tensor * t) {
     const ggml_tensor * root = mmb_root(t);
-    for (auto & e : g_mmb_slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
-    for (auto & e : g_mmb_cache) if (e.root == root && e.data == t->data) return e.buf->get();
+    for (auto & e : mmb_state().slots) if (e.buf && e.root == root && e.data == t->data) return e.buf->get();
+    for (auto & e : mmb_state().cache) if (e.root == root && e.data == t->data) return e.buf->get();
     return nullptr;
 }
-static size_t g_mmb_slot_cap[4] = {0, 0, 0};
 uint16_t * ggml_cuda_mmb_slot_reserve(ggml_backend_cuda_context & ctx, int slot, const ggml_tensor * t, size_t n) {
-    mmb_cache_entry & e = g_mmb_slots[slot];
-    if (e.buf && g_mmb_slot_cap[slot] < n) { delete e.buf; e.buf = nullptr; }
-    if (!e.buf) { e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n); g_mmb_slot_cap[slot] = n; }
+    mmb_cache_entry & e = mmb_state().slots[slot];
+    size_t & cap = mmb_state().slot_cap[slot];
+    if (e.buf && cap < n) { delete e.buf; e.buf = nullptr; }
+    if (!e.buf) { e.buf = new ggml_cuda_pool_alloc<uint16_t>(ctx.pool(), n); cap = n; }
     e.root = mmb_root(t); e.data = t->data; e.n = n;
     return e.buf->get();
 }
-void ggml_cuda_mmb_marks_clear() { g_mmb_bf16_only.clear(); }
-size_t ggml_cuda_mmb_marks_count() { return g_mmb_bf16_only.size(); }
-void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) { g_mmb_bf16_only.insert(t); }
-bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return g_mmb_bf16_only.count(t) > 0; }
-void ggml_cuda_mmb_begin_graph() { for (auto & e : g_mmb_cache) delete e.buf; g_mmb_cache.clear(); for (auto & e : g_mmb_slots) { e.root = nullptr; e.data = nullptr; e.n = 0; } }
+void ggml_cuda_mmb_set_active_ctx(const ggml_backend_cuda_context * ctx) { g_mmb_active_ctx = ctx; }
+// returns true (and clears the marks) when the active context starts a new graph's optimize pass.
+bool ggml_cuda_mmb_optimize_begin(const void * graph_key) {
+    mmb_ctx_state & m = mmb_state();
+    const bool clear = m.after_compute || m.first_split == nullptr || graph_key == m.first_split;
+    if (clear) {
+        m.bf16_only.clear(); m.bf16_copy.clear(); m.bf16_slot.clear();
+        m.first_split = graph_key; m.after_compute = false;
+    }
+    return clear;
+}
+void ggml_cuda_mmb_compute_done() {
+    mmb_state().after_compute = true;
+}
+void ggml_cuda_mmb_marks_clear() {
+    mmb_ctx_state & m = mmb_state();
+    m.bf16_only.clear(); m.bf16_copy.clear(); m.bf16_slot.clear();
+}
+size_t ggml_cuda_mmb_marks_count() { return mmb_state().bf16_only.size(); }
+void ggml_cuda_mmb_mark_bf16_only(const ggml_tensor * t) {
+    static const int lg = getenv("GGML_CUDA_MMB_MARK_LOG") ? atoi(getenv("GGML_CUDA_MMB_MARK_LOG")) : 0;
+    if (lg) fprintf(stderr, "MMB mark bf16_only: %-40s op=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n", t->name, ggml_op_name(t->op),
+        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+    mmb_state().bf16_only.insert(t);
+}
+bool ggml_cuda_mmb_is_bf16_only(const ggml_tensor * t) { return mmb_state().bf16_only.count(t) > 0; }
+void ggml_cuda_mmb_mark_bf16_copy(const ggml_tensor * t) { mmb_state().bf16_copy.insert(t); }
+bool ggml_cuda_mmb_wants_bf16_copy(const ggml_tensor * t) { return mmb_state().bf16_copy.count(t) > 0; }
+void ggml_cuda_mmb_mark_bf16_slot(const ggml_tensor * t, int slot) { mmb_state().bf16_slot[t] = slot; }
+int  ggml_cuda_mmb_bf16_slot(const ggml_tensor * t) { auto & m = mmb_state(); auto it = m.bf16_slot.find(t); return it == m.bf16_slot.end() ? -1 : it->second; }
+// Producer-side reserve for a BF16 copy: honours the graph-assigned dedicated slot (xn) so the copy
+// is not clobbered by the next generic producer, falling back to slot 0.
+uint16_t * ggml_cuda_mmb_reserve_auto(ggml_backend_cuda_context & ctx, const ggml_tensor * t, size_t n) {
+    const int slot = ggml_cuda_mmb_bf16_slot(t);
+    return ggml_cuda_mmb_slot_reserve(ctx, slot >= 0 && slot < MMB_SLOT_COUNT ? slot : 0, t, n);
+}
+
+void ggml_cuda_mmb_begin_graph() {
+    mmb_ctx_state & s = mmb_state();
+    for (auto & e : s.cache) delete e.buf;
+    s.cache.clear();
+    for (auto & e : s.slots) { e.root = nullptr; e.data = nullptr; e.n = 0; }
+}
 void ggml_cuda_mmb_release_all() {
     ggml_cuda_mmb_begin_graph();
-    for (int i = 0; i < 4; ++i) { if (g_mmb_slots[i].buf) delete g_mmb_slots[i].buf; g_mmb_slots[i].buf = nullptr; g_mmb_slot_cap[i] = 0; }
+    // free every context's cache/slots, including any that is not the active one
+    for (auto & kv : g_mmb_state) {
+        mmb_ctx_state & s = kv.second;
+        for (auto & e : s.cache) delete e.buf;
+        s.cache.clear();
+        for (int i = 0; i < MMB_SLOT_COUNT; ++i) { if (s.slots[i].buf) delete s.slots[i].buf; s.slots[i].buf = nullptr; s.slot_cap[i] = 0; }
+    }
+    g_mmb_state.clear();
+    g_mmb_active_ctx = nullptr;
     // the shadow weights are raw cudaMalloc, keyed by data pointer and held for the life of the
     // process. A model has finitely many weights so this never mattered, but a long-lived process
     // that sees many distinct tensors (test-backend-ops) keeps every one of them.
-    for (auto & e : g_mmb_shadow)      { if (e.second) cudaFree(e.second); }
-    for (auto & e : g_mmb_shadow_pair) { if (e.second) cudaFree(e.second); }
+    for (auto & e : g_mmb_shadow)      { if (e.second) { (void) cudaFree(e.second); } }
+    for (auto & e : g_mmb_shadow_pair) { if (e.second) { (void) cudaFree(e.second); } }
     g_mmb_shadow.clear();
     g_mmb_shadow_pair.clear();
     g_mmb_shadow_bytes = 0;
@@ -1926,6 +2041,17 @@ bool ggml_cuda_mmb_supported_mm(const ggml_tensor * src0, const ggml_tensor * sr
     return ggml_nrows(dst) == T;
 }
 
+// True when this MMB GEMM reads its activation through the bf16 activation cache (i.e. the
+// activation's F32 buffer is not required): every weight type except F32 does, and of the F32
+// weights only the tiny-M warp-per-token kernel (the hc *_inject pair) does -- the WMMA f32-split
+// tile reads the F32 tensor directly.  The graph optimizer uses this to decide whether an
+// activation can be marked BF16-only (producer skips its F32 store).
+bool ggml_cuda_mmb_reads_bf16_act(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!ggml_cuda_mmb_supported_mm(src0, src1, dst)) return false;
+    if (src0->type != GGML_TYPE_F32) return true;
+    return mmb_tiny_m_f32_ok(src0->ne[0], src0->ne[1]);
+}
+
 bool ggml_cuda_mmb_supported_mmid(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
     if (!mmb_enabled() || !mmb_routed_flag()) return false;
     const bool wtype = mmb_wtype_ok(src0->type);
@@ -1960,12 +2086,27 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             const int eff  = wide ? 1 : (tt >= 4 ? 4 : (tt == 2 ? 2 : 1));
             dim3 tg((T + NWARPS * eff - 1) / (NWARPS * eff));
             const float * Wf = (const float *) src0->data;
-            const float * Xf = (const float *) src1->data;
+            // HC16: if the producer marked this activation BF16-only, the F32 tensor was never
+            // written; read the bf16 copy out of the activation cache instead.  Walk the whole view
+            // chain: the mark is on the fully-rooted producer output.
+            const ggml_tensor * x_root = src1;
+            while (x_root->view_src) x_root = x_root->view_src;
+            const uint16_t * Xh = ggml_cuda_mmb_is_bf16_only(x_root) ? ggml_cuda_mmb_cache_lookup(x_root) : nullptr;
+            const float * Xf = Xh ? (const float *) Xh : (const float *) src1->data;
             float * Df = (float *) dst->data;
-            if (wide)      mmb_tiny_m_f32_kernel<8, 1><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
-            else if (eff == 4) mmb_tiny_m_f32_kernel<4, 4><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
-            else if (eff == 2) mmb_tiny_m_f32_kernel<4, 2><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
-            else               mmb_tiny_m_f32_kernel<4, 1><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+            if (wide) {
+                if (Xh)  mmb_tiny_m_f32_kernel<8, 1, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+                else     mmb_tiny_m_f32_kernel<8, 1, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+            } else if (eff == 4) {
+                if (Xh)  mmb_tiny_m_f32_kernel<4, 4, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+                else     mmb_tiny_m_f32_kernel<4, 4, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+            } else if (eff == 2) {
+                if (Xh)  mmb_tiny_m_f32_kernel<4, 2, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+                else     mmb_tiny_m_f32_kernel<4, 2, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+            } else {
+                if (Xh)  mmb_tiny_m_f32_kernel<4, 1, true ><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+                else     mmb_tiny_m_f32_kernel<4, 1, false><<<tg, MMB_NT, 0, stream>>>(Wf, Xf, Df, M, K, T);
+            }
             CUDA_CHECK(cudaGetLastError()); return;
         }
         dim3 grid((M + 127) / 128, (T + 127) / 128);
@@ -1986,17 +2127,22 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         if (wide) { dim3 grid(1, (T + 63) / 64); mmb_dense_kernel<384, 64, 96, 32, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
         else      { dim3 grid(1, (T + 31) / 32); mmb_dense_kernel<384, 32, 96, 16, 0><<<grid, MMB_NT, 0, stream>>>(W, xhp, D, (uint16_t *) nullptr, true, M, K, T); }
         CUDA_CHECK(cudaGetLastError());
-        static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_TALL%s dense M=%d K=%d T=%d\n", wide ? "(wide 384x64)" : "(384x32)", M, K, T);
+        static unsigned hits = 0; if (mmb_dbg() && hits++ < 2) fprintf(stderr, "MMB_TALL%s dense M=%d K=%d T=%d\n", wide ? "(wide 384x64)" : "(384x32)", M, K, T);
         return;
     }
     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
     static const int tile_ov = getenv("GGML_CUDA_MMB_TILE") ? atoi(getenv("GGML_CUDA_MMB_TILE")) : -1;
     const bool big = tile_ov >= 0 ? (tile_ov != 0) : ((M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096));
-    uint16_t * Dh = (mmb_hc16() && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
+    // HC gate (K=320, M=10240).  "producer slots ... 1 = HC gate" -- when the graph marks this
+    // output BF16-only, the gate is written ONCE into the pinned slot 1 and the dsv4_hc_pre
+    // consumer reads that BF16 copy instead of round-tripping the F32 tensor.  The mark alone is
+    // enough to allocate the slot; mmb_hc16() keeps the historical "always allocate" behaviour
+    // for A/B (with an F32 store left in place because the mark is what suppresses it).
+    uint16_t * Dh = ((mmb_hc16() || ggml_cuda_mmb_is_bf16_only(dst)) && K == 320 && M == 10240) ? ggml_cuda_mmb_slot_reserve(ctx, 1, dst, (size_t) T * M) : nullptr;
     bool store_f32 = !(Dh && ggml_cuda_mmb_is_bf16_only(dst));
     if (ggml_cuda_mmb_blk16() && !Dh && ggml_cuda_mmb_is_bf16_only(dst) && (M & 7) == 0) {
         Dh = (uint16_t *) dst->data; store_f32 = false;
-        static unsigned h = 0; if (h++ < 2) fprintf(stderr, "MMB_BLK16 dense BF16 in place: M=%d K=%d T=%d\n", M, K, T);
+        static unsigned h = 0; if (mmb_dbg() && h++ < 2) fprintf(stderr, "MMB_BLK16 dense BF16 in place: M=%d K=%d T=%d\n", M, K, T);
     }
     dim3 grid((M + 127) / 128, big ? (T + 255) / 256 : (T + 127) / 128);
     const uint16_t * shadow = shadow_pre;
@@ -2099,11 +2245,23 @@ bool ggml_cuda_mmb_blk16() { static const int v = getenv("LLAMA_HC_BLK16") ? ato
 bool ggml_cuda_mmb_res16()  { static const int v = getenv("LLAMA_HC_RES16") ? atoi(getenv("LLAMA_HC_RES16")) : mmb_cfg().res16; return v != 0; }
 bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * lo, const ggml_tensor * xn, ggml_tensor * dst,
         const int hc, const float scale, const float bias) {
-    if (!mmb_gatemix_flag() || hc != 4 || w->type != GGML_TYPE_IQ4_NL || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) return false;
+    static const int gdbg = getenv("LLAMA_HC_GATEMIX_DEBUG") ? atoi(getenv("LLAMA_HC_GATEMIX_DEBUG")) : 0;
+    if (!mmb_gatemix_flag() || hc != 4 || w->type != GGML_TYPE_IQ4_NL || lo->type != GGML_TYPE_F32 || !ggml_is_contiguous(lo) || !ggml_is_contiguous(dst)) {
+        if (gdbg) fprintf(stderr, "HC_GATEMIX reject head: flag=%d hc=%d wtype=%s lotype=%s\n", (int) mmb_gatemix_flag(), hc, ggml_type_name(w->type), ggml_type_name(lo->type));
+        return false;
+    }
     const int K = (int) w->ne[0], M = (int) w->ne[1], E = (int) dst->ne[0]; const int T = (int) ggml_nrows(dst);
-    if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) return false;
+    if (K % MMB_BK != 0 || M != hc * E || E % 32 != 0 || lo->ne[0] != K || ggml_nrows(lo) != T || xn->ne[0] != M || ggml_nrows(xn) != T || T < mmb_min_t()) {
+        if (gdbg) fprintf(stderr, "HC_GATEMIX reject shape: K=%d M=%d E=%d T=%d lo=[%lld,%lld] xn=[%lld,%lld] min_t=%d\n",
+                K, M, E, T, (long long) lo->ne[0], (long long) ggml_nrows(lo), (long long) xn->ne[0], (long long) ggml_nrows(xn), mmb_min_t());
+        return false;
+    }
     const uint16_t * xn16 = ggml_cuda_mmb_cache_lookup(xn);
-    if (!xn16) return false;
+    if (!xn16) {
+        if (gdbg) fprintf(stderr, "HC_GATEMIX reject cache: xn=%s not in the BF16 activation cache (HC16 marks absent?)\n", xn->name);
+        return false;
+    }
+    if (gdbg) fprintf(stderr, "HC_GATEMIX FIRED xn=%s w=%s K=%d M=%d E=%d T=%d\n", xn->name, w->name, K, M, E, T);
     cudaStream_t stream = ctx.stream();
     const uint16_t * lo16 = mmb_bf16_activation(ctx, lo, (size_t) T * K, stream);
     uint16_t * outh = ggml_cuda_mmb_slot_reserve(ctx, 3, dst, (size_t) T * E);
@@ -2111,7 +2269,6 @@ bool ggml_cuda_hc_gate_mix(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     dim3 grid(E / 32, (T + 127) / 128);
     hc_gate_mix_kernel<4><<<grid, MMB_NT, 0, stream>>>((const uint8_t *) w->data, lo16, xn16, (float *) dst->data, outh, store_f32, E, K, T, scale, bias);
     CUDA_CHECK(cudaGetLastError());
-    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "HC_GATEMIX fused gate GEMM + sigmoid + mix: E=%d K=%d T=%d\n", E, K, T);
     return true;
 }
 
@@ -2202,7 +2359,7 @@ void ggml_cuda_mul_mat_id_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor
     const uint8_t * W = (const uint8_t *) src0->data; float * D = (float *) dst->data; const size_t eb = (size_t) src0->nb[2];
     uint16_t * Dh = (mmb_down16_flag() && ggml_cuda_mmb_is_bf16_only(dst)) ? (uint16_t *) dst->data : nullptr;
     const bool store_f32 = Dh == nullptr;
-    if (Dh) { static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_DOWN16 routed down BF16 in place: M=%d K=%d rows=%d\n", M, K, n_rows); }
+    if (Dh) { static unsigned hits = 0; if (mmb_dbg() && hits++ < 2) fprintf(stderr, "MMB_DOWN16 routed down BF16 in place: M=%d K=%d rows=%d\n", M, K, n_rows); }
     dim3 gbig((M + 127) / 128, nbig_max), gsmall((M + 127) / 128, nsmall_max);
     mmb_routed_kernel_dispatch(src0, gbig, gsmall, stream, W, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), desc_small.get(), M, K, BN, BN_SMALL);
     CUDA_CHECK(cudaGetLastError());
@@ -2305,7 +2462,7 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
     uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
     const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(glu);
-    static unsigned hits = 0; if (hits++ < 2) fprintf(stderr, "MMB_GLU fused gate/up+swiglu: M=%d K=%d rows=%d store_f32=%d\n", M, K, n_rows, (int) store_f32);
+    static unsigned hits = 0; if (mmb_dbg() && hits++ < 2) fprintf(stderr, "MMB_GLU fused gate/up+swiglu: M=%d K=%d rows=%d store_f32=%d\n", M, K, n_rows, (int) store_f32);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
     dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
     mmb_routed_glu_kernel_dispatch(gw, gbig, gsmall, stream, Wg, Wu, eb, xhp, D, Dh, store_f32, ids_src1.get(), ids_dst.get(), bounds.get(), desc_big.get(), desc_small.get(), M, K, BN, BN_SMALL);
@@ -2347,5 +2504,5 @@ void ggml_cuda_mmb_shadow_prepare(ggml_backend_cuda_context & ctx, const ggml_te
     }
     CUDA_CHECK(cudaGetLastError());
     g_mmb_shadow_bytes += bytes;
-    static unsigned hits = 0; if (hits++ < 3 || (hits % 50) == 0) fprintf(stderr, "MMB_SHADOW %s [%lld x %lld] -> BF16 (%.1f MB total)\n", w->name, (long long) w->ne[0], (long long) w->ne[1], g_mmb_shadow_bytes / 1048576.0);
+    static unsigned hits = 0; if (mmb_dbg() && (hits++ < 3 || (hits % 50) == 0)) fprintf(stderr, "MMB_SHADOW %s [%lld x %lld] -> BF16 (%.1f MB total)\n", w->name, (long long) w->ne[0], (long long) w->ne[1], g_mmb_shadow_bytes / 1048576.0);
 }

@@ -79,7 +79,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                     bool   v_enabled) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -228,7 +229,7 @@ llama_kv_cache::llama_kv_cache(
         }
 
         const bool has_k = true;
-        const bool has_v = !is_mla;
+        const bool has_v = !is_mla && v_enabled;
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
@@ -1285,7 +1286,10 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // LLAMA_KV_N_PAD_MIN raises the 256-cell floor: n_kv - and with it the graph layout - then stays constant for longer,
+    // so fewer captured graphs are invalidated as the context grows (-sm tensor splits each token into ~100 graphs)
+    static const uint32_t n_pad_min = getenv("LLAMA_KV_N_PAD_MIN") ? (uint32_t) atoi(getenv("LLAMA_KV_N_PAD_MIN")) : 256u;
+    const uint32_t n_pad_cur = std::max(n_pad, n_pad_min);
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];

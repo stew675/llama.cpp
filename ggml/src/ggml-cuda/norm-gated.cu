@@ -126,3 +126,33 @@ void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_no
             (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
     }
 }
+
+// Narrow-row RMS norm (+ sigmoid-gated form) fusion entry point.  Returns the number of graph
+// nodes to skip when fused, 0 otherwise.  A/B / bisect kill switch: GGML_CUDA_DISABLE_NORM_ROWS=1.
+int ggml_cuda_norm_rows_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_norm_rows = getenv("GGML_CUDA_DISABLE_NORM_ROWS") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_NORM_ROWS"));
+    if (disable_norm_rows) {
+        return 0;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_RMS_NORM) {
+        return 0;
+    }
+    ggml_cuda_norm_gated_match nm;
+    int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
+    if (sk > 0) {
+        if (nm.pre >= 0) {
+            if (!ggml_cuda_compute_forward(ctx, cgraph->nodes[nm.pre])) {
+                GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed");
+            }
+        }
+        ggml_cuda_op_norm_gated(ctx, nm);
+        return sk;
+    }
+    sk = ggml_cuda_norm_rows_match_at(cgraph, i, nm);
+    if (sk > 0) {
+        ggml_cuda_op_norm_gated(ctx, nm);
+        return sk;
+    }
+    return 0;
+}

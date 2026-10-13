@@ -11,7 +11,9 @@
 // single-device graphs only.  GGML_CUDA_CONV_FUSION_MULTI=1 forces it back on (A/B / fix validation)
 // and GGML_CUDA_DISABLE_CONV_FUSION=1 is the explicit off switch.
 static bool gdn_conv_enabled() {
-    if (getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr) return false;
+    // Cache the switches: this runs once per conv launch, and getenv() is expensive on Windows.
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr;
+    if (disabled) return false;
     static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
     return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
 }
@@ -64,7 +66,11 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) return false;
     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) return false;
-    if (T < 256 || C % 256 != 0) return false;
+    // On RDNA4 the 2..255-token batches (the speculative verify step) take the fused path too; otherwise their CONCAT is a
+    // generic non-contiguous copy per layer.  Same kernels, bit-identical.  GGML_CUDA_FUSE_GDN_CONV_VERIFY=0 turns it off.
+    static const bool conv_verify = getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY")) != 0;
+    const bool verify_ok = conv_verify && T >= 2 && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    if ((T < 256 && !verify_ok) || C % 256 != 0) return false;
     if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
     int64_t tail_from = T + 3; int conv = -1;
     for (int n = i + 1; n < cgraph->n_nodes && n < i + 64; ++n) {
@@ -132,4 +138,27 @@ void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
     gdn_conv_direct_kernel<true, TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
         (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Depthwise causal conv1d fusion entry point (GDN).  Returns the number of graph nodes to skip
+// when fused, 0 otherwise.  A/B / bisect kill switch: GGML_CUDA_DISABLE_CONV_FUSION=1.
+int ggml_cuda_gdn_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_conv_fusion = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_CONV_FUSION"));
+    if (disable_conv_fusion) {
+        return 0;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_CONCAT && node->op != GGML_OP_SSM_CONV) {
+        return 0;
+    }
+    ggml_cuda_gdn_conv_match gm;
+    if (node->op == GGML_OP_CONCAT && ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+        ggml_cuda_gdn_conv_write_tail(ctx, gm);
+        return 1;
+    }
+    if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
+        ggml_cuda_gdn_conv_direct(ctx, gm);
+        return 1;
+    }
+    return 0;
 }

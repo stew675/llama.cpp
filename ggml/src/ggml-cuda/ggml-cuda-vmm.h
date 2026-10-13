@@ -85,3 +85,10 @@ void   ggml_cuda_slab_ring_set(int device, bool arm);
 // model preflight, before the slab is created, from the largest host-resident weight table.
 void   ggml_cuda_slab_set_ring_region(size_t bytes);
 void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
+
+// Phase-2 (item 6b): slab state accessors used by the device wrappers in ggml-cuda.cu.
+void   ggml_cuda_slab_arm();
+bool   ggml_cuda_slab_compute_enabled();
+void   ggml_cuda_slab_set_compute_narrow2(bool enable);
+size_t ggml_cuda_slab_headroom_bytes();
+void   ggml_cuda_slab_set_narrow_floor(int device, size_t bytes);

@@ -36,83 +36,8 @@ static __device__ __forceinline__ void mmvq_prefetch_l2(const void * p) {
 }
 #endif
 
-typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
-
-// The wide-VDR MoE expert entry points (mul_mat_vec_q_moe) are a RDNA4/RDNA3_0
-// (gfx12xx / gfx1100) optimisation.  Every other target -- notably RDNA3_5
-// (gfx115x), where the wide chunk never verified -- uses the dense VDR, so the
-// MoE expert matmul reduces exactly like the rest of that arch.  Scope it here,
-// once, for both selectors below: a per-quant gate is how the Q4_K/Q6_K arms
-// (the Q4_K_M expert types) once leaked onto gfx1151.
-#if !(defined(RDNA4) || defined(RDNA3_0))
-#define GGML_CUDA_MMVQ_MOE_DENSE 1
-#endif
-
-static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type, bool moe = false) {
-#ifdef GGML_CUDA_MMVQ_MOE_DENSE
-    moe = false;
-#endif
-    switch (type) {
-        case GGML_TYPE_Q1_0:    return vec_dot_q1_0_q8_1;
-        case GGML_TYPE_Q2_0:    return vec_dot_q2_0_q8_1;
-        case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
-        case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
-        case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
-        case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
-        case GGML_TYPE_Q8_0:    return moe ? vec_dot_q8_0_q8_1_moe : vec_dot_q8_0_q8_1;
-        case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
-        case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
-        case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
-        case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
-        case GGML_TYPE_Q4_K:    return moe ? vec_dot_q4_K_q8_1_vdr4 : vec_dot_q4_K_q8_1;
-        case GGML_TYPE_Q5_K:    return moe ? vec_dot_q5_K_q8_1_vdr4 : vec_dot_q5_K_q8_1;
-#if defined(RDNA4) || defined(RDNA3_0)
-        case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1_vdr2;
-#else
-        case GGML_TYPE_Q6_K:    return moe ? vec_dot_q6_K_q8_1_vdr2 : vec_dot_q6_K_q8_1;
-#endif
-        case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
-        case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
-        case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
-        case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
-        case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
-        case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
-        case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
-        case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
-        case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
-        default:                return nullptr;
-    }
-}
-
-static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type, bool moe = false) {
-#ifdef GGML_CUDA_MMVQ_MOE_DENSE
-    moe = false;
-#endif
-    switch (type) {
-        case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q2_0:    return VDR_Q2_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
-        case GGML_TYPE_Q8_0:    return moe ? VDR_Q8_0_Q8_1_MMVQ_MOE : VDR_Q8_0_Q8_1_MMVQ;
-        case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
-        case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
-        case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q4_K:    return moe ? VDR_Q4_K_Q8_1_MMVQ_MOE : VDR_Q4_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q5_K:    return moe ? VDR_Q5_K_Q8_1_MMVQ_MOE : VDR_Q5_K_Q8_1_MMVQ;
-        case GGML_TYPE_Q6_K:    return moe ? VDR_Q6_K_Q8_1_MMVQ_MOE : VDR_Q6_K_Q8_1_MMVQ;
-        case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
-        case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
-        case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
-        case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
-        case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
-        case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
-        case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
-        default:                return 1;
-    }
-}
+#include "mmvq-vecdot.cuh"
+#include "mmvq-moe.cuh"
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
@@ -317,12 +242,21 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 // 1-token decode and an (n_draft + 1)-token speculative verify batch of the same MoE matmul to be
 // bit-identical, and MUL_MAT_ID mmvq (mul_mat_vec_q_moe, one warp per token) and MMQ reduce in
 // different orders, so no cap may split the band.  The cap still applies above the band.
-static constexpr __host__ __device__ int mmvq_mmid_max_batch_band(int cap) {
-    return cap > MMVQ_MAX_BATCH_SIZE ? cap : MMVQ_MAX_BATCH_SIZE;
+//
+// The extended (16-wide) band is an RDNA4 win only.  On RDNA3_5 (gfx1151) the gfx1151-tuned
+// routed-compact MMQ (mmq_rdna3_5_id_get_J) beats the one-warp-per-token MoE MMVQ kernel for
+// n_tokens 9..16 on every routed type measured (Q3_K/Q4_K/Q4_1/Q5_K/IQ4_NL/IQ4_XS, -2..-8 % at
+// B = 9..12).  On RDNA3_0 (gfx1100) the extended band is not merely untuned but incorrect:
+// test-backend-ops -o MUL_MAT_ID fails 23/929 cases (all n_tokens = 16, every routed type, any
+// weight K) on gfx1100 with the band on, and passes 929/929 once it is floored back to 8.  Both
+// RDNA3 parts therefore keep the pre-extension 8-wide band and routed MoE returns to MMQ above it;
+// `floor_band` carries the arch decision at the call site.
+static constexpr __host__ __device__ int mmvq_mmid_max_batch_band(int cap, int floor_band) {
+    return cap > floor_band ? cap : floor_band;
 }
 
 // Host function: returns the max batch size for the current arch+type at runtime.
-int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+static int get_mmvq_mmid_max_batch_impl(ggml_type type, int cc) {
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_PASCAL || cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -337,22 +271,33 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // AMD
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_RDNA4(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type), MMVQ_MOE_MAX_BATCH_SIZE);
         }
         if (GGML_CUDA_CC_IS_RDNA3(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
+            // gfx1100 (RDNA3_0) and gfx1151 (RDNA3_5): the routed-expert 16-wide band is not used.
+            const int floor_band = MMVQ_MAX_BATCH_SIZE;
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), floor_band);
         }
         if (GGML_CUDA_CC_IS_RDNA1(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type));
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type), MMVQ_MOE_MAX_BATCH_SIZE);
         }
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type));
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type), MMVQ_MOE_MAX_BATCH_SIZE);
         }
         if (GGML_CUDA_CC_IS_GCN(cc)) {
-            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type));
+            return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type), MMVQ_MOE_MAX_BATCH_SIZE);
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+// Kill-switch for the extended routed-expert band (bisect / A-B only; the extended band is the
+// default).  Setting it clamps every MUL_MAT_ID mmvq cap back to the dense MMVQ band, i.e. the
+// pre-extension behaviour (routed MoE falls back to MMQ above 8 columns).
+int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    const int cap = get_mmvq_mmid_max_batch_impl(type, cc);
+    static const bool legacy_band = getenv("GGML_CUDA_DISABLE_MMVQ_MOE_BAND") != nullptr;
+    return (legacy_band && cap > MMVQ_MAX_BATCH_SIZE) ? MMVQ_MAX_BATCH_SIZE : cap;
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
@@ -471,15 +416,17 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
 template <ggml_type type>
 static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #if defined(RDNA4)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna4(type), MMVQ_MOE_MAX_BATCH_SIZE);
+#elif defined(RDNA3_5)
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), MMVQ_MAX_BATCH_SIZE);
 #elif defined(RDNA3)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna3(type), MMVQ_MAX_BATCH_SIZE);
 #elif defined(RDNA2) || defined(RDNA1)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_rdna1_rdna2(type), MMVQ_MOE_MAX_BATCH_SIZE);
 #elif defined(CDNA)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_cdna(type), MMVQ_MOE_MAX_BATCH_SIZE);
 #elif defined(GCN)
-    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type));
+    return mmvq_mmid_max_batch_band(get_mmvq_mmid_max_batch_gcn(type), MMVQ_MOE_MAX_BATCH_SIZE);
 #elif !defined(GGML_USE_MUSA) && (__CUDA_ARCH__ == GGML_CUDA_CC_PASCAL || __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
     return MMVQ_MAX_BATCH_SIZE;
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
@@ -1339,217 +1286,6 @@ static __global__ void mul_mat_vec_q_ksplit(
     }
 }
 
-// Dedicated MoE multi-token kernel.
-// Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
-// Block: (warp_size, ncols_dst) - each warp handles one token independently.
-// No shared memory reduction needed since each warp works alone.
-// The block is (warp_size, ncols_dst) and ncols_dst spans the whole decode/verify band, and this
-// kernel is the one that keeps the band on a single accumulation order (see the has_ids branch in
-// mul_mat_vec_q_switch_ncols_dst), so its launch bound must cover the band rather than the per-type
-// cap -- otherwise a launch with ncols_dst > cap fails outright.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
-__launch_bounds__(MMVQ_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void mul_mat_vec_q_moe(
-        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
-        float * dst_ptr,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
-        const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
-        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t nchannels_dst,
-        const void * cold_base, const uint32_t n_res_cold,
-        const uint32_t cold_channel_stride, const uint32_t cold_row_stride,
-        const void * cold_gate_base, const uint32_t cold_gate_n_res,
-        const uint32_t cold_gate_channel_stride, const uint32_t cold_gate_row_stride) {
-    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
-    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
-    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
-    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
-
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type, true);
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type, true);
-
-    const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
-    if (shared_expert) {
-        vx = fusion.shared_up;
-        dst = fusion.shared_dst;
-        stride_col_dst = fusion.shared_stride_col_dst;
-    }
-
-    // fuse gate, bias, scales, and glu_op into the up projection
-    bool use_gate = false;
-    const void  * vgate      = nullptr;
-    const float * x_bias     = nullptr;
-    const float * gate_bias  = nullptr;
-    const float * x_scale    = nullptr;
-    const float * gate_scale = nullptr;
-    ggml_glu_op   active_glu = GGML_GLU_OP_SWIGLU;
-    float         glu_limit  = 0.0f;
-
-    if constexpr (has_fusion) {
-        use_gate   = fusion.gate != nullptr;
-        vgate      = shared_expert ? fusion.shared_gate : fusion.gate;
-        x_bias     = (const float *) fusion.x_bias;
-        gate_bias  = (const float *) fusion.gate_bias;
-        active_glu = fusion.glu_op;
-        glu_limit  = fusion.glu_limit;
-        if constexpr (type == GGML_TYPE_NVFP4) {
-            x_scale    = (const float *) fusion.x_scale;
-            gate_scale = (const float *) fusion.gate_scale;
-        }
-        // Per-(expert, token) MoE scale (down x topk weights). Indexed by
-        // channel_dst + token_idx*nchannels_dst, one scalar per (expert, token).
-        if (fusion.x_scale_channel_dst) {
-            x_scale = (const float *) fusion.x_scale;
-        }
-    }
-
-    const uint32_t token_idx   = threadIdx.y;
-    const int      row0        = c_rows_per_block*blockIdx.x;
-    if (row0 >= (int) nrows_x) {
-        return;   // the padding block of ggml_cuda_grid_stall_pad (never block 0)
-    }
-    const int      blocks_per_row_x = ncols_x / qk;
-
-    const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
-
-    if (token_idx >= ncols_dst) {
-        return;
-    }
-
-    ggml_cuda_pdl_sync();
-    // The shared-expert lane reads its own table at channel 0; its routing id is not in `ids`,
-    // so the cache slot lookup and the UVA cold seam apply to the routed lanes only.
-    const int32_t raw_id = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
-    // The cache serves the routed lane through a materialized slot-remapped id (or the raw id for an
-    // identity table); the shared-expert lane reads its own table at channel 0.
-    const uint32_t channel_x_raw = (uint32_t) raw_id;
-    // Phase 1b/3 UVA cold read.  An id >= n_res_cold is not a VRAM slot but host expert `id - n_res_cold`,
-    // read in place from the pinned host alias.  The host geometry (per-expert stride `cold_channel_stride`,
-    // per-row stride `cold_row_stride`) is returned by `moe_cache_get_cold`: for an unsplit or contiguous
-    // axis-1 slice the row stride matches the arena (`cold_row_stride == 0`), while a strided axis-0 slice
-    // uses the host pitch.  The default (cold_base == nullptr, n_res_cold == 0) leaves the resident-only
-    // 1a contract untouched.
-    const bool     cold      = !shared_expert && cold_base != nullptr && channel_x_raw >= n_res_cold;
-    const void *   vx_use    = cold ? cold_base : vx;
-    const uint32_t channel_x = shared_expert ? 0u : (cold ? (channel_x_raw - n_res_cold) : channel_x_raw);
-    const uint32_t stride_channel_x_use = cold ? cold_channel_stride : stride_channel_x;
-    const uint32_t stride_row_x_use     = (cold && cold_row_stride != 0) ? cold_row_stride : stride_row_x;
-    // The fused gate lane is a SEPARATE expert table with its own host geometry (same raw routing id,
-    // but its own slot count and pinned host master), so resolve it independently of the up lane.
-    const bool     gate_cold        = !shared_expert && cold_gate_base != nullptr && channel_x_raw >= cold_gate_n_res;
-    const void *   vgate_use        = gate_cold ? cold_gate_base : vgate;
-    const uint32_t gate_channel_x   = shared_expert ? 0u : (gate_cold ? (channel_x_raw - cold_gate_n_res) : channel_x_raw);
-    const uint32_t gate_channel_x_st = gate_cold ? cold_gate_channel_stride : stride_channel_x;
-    const uint32_t gate_row_x_st     = (gate_cold && cold_gate_row_stride != 0) ? cold_gate_row_stride : stride_row_x;
-    const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
-
-    const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset      = channel_x*stride_channel_x_use + row0*stride_row_x_use;
-    const int kbx_offset_gate = gate_channel_x*gate_channel_x_st + row0*gate_row_x_st;
-
-    // partial sum for each thread
-    float tmp[c_rows_per_block] = {0.0f};
-    float tmp_gate[c_rows_per_block] = {0.0f};
-
-    // split (row, kblock) items across the 8 thread groups: the K-split loop
-    // leaves most groups idle on short-K MoE GEMMs (down K=512 -> 2 K-blocks)
-    //
-    // Row-loop clamp: the last row-block may hold fewer than `c_rows_per_block` valid rows, but the loop
-    // below used to read all of them (only the write was guarded).  The dead loads walk `rpb - rem` rows
-    // past the expert's last row -- into the next expert, and off the end of the tensor for the last
-    // expert of the last host tensor (a cold read sources the pinned master in place).  Clamping the item
-    // count skips them and leaves the valid-row accumulation order unchanged.
-    const int rows_left  = row0 < (int) nrows_x ? (int) nrows_x - row0 : 0;
-    const int rows_valid = rows_left < c_rows_per_block ? rows_left : c_rows_per_block;
-    const int n_items    = rows_valid * blocks_per_row_x;
-    const int n_groups = warp_size / (qi/vdr);
-    const int kqs      = vdr * (threadIdx.x % (qi/vdr));
-    // IQ2_XS is ALU/latency bound here: two items in flight per thread (-9 %); the other types lose from it
-#pragma unroll type == GGML_TYPE_IQ2_XS ? 2 : 1
-    for (int it = threadIdx.x / (qi/vdr); it < n_items; it += n_groups) {
-        const int i   = it / blocks_per_row_x;
-        const int kbx = it % blocks_per_row_x;
-        const int kby = kbx * (qk/QK8_1);
-        tmp[i] += vec_dot_q_cuda(vx_use, &y[kby], kbx_offset + i*stride_row_x_use + kbx, kqs);
-        if constexpr (has_fusion) {
-            if (use_gate) {
-                tmp_gate[i] += vec_dot_q_cuda(vgate_use, &y[kby], kbx_offset_gate + i*gate_row_x_st + kbx, kqs);
-            }
-        }
-    }
-
-    ggml_cuda_pdl_lc();
-
-    // Warp-level reduction only - no shared memory needed
-#pragma unroll
-    for (int i = 0; i < c_rows_per_block; ++i) {
-        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
-        if constexpr (has_fusion) {
-            if (use_gate) {
-                tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
-            }
-        }
-    }
-
-    // Write results
-    if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
-        float result = tmp[threadIdx.x];
-        if constexpr (has_fusion) {
-            const uint32_t bias_idx = channel_x*stride_channel_dst + row0 + threadIdx.x;
-
-            if constexpr (type == GGML_TYPE_NVFP4) {
-                if (x_scale) {
-                    result *= x_scale[channel_x];
-                }
-            }
-            if (fusion.x_scale_channel_dst) {
-                result *= x_scale[channel_dst + token_idx * nchannels_dst];
-            }
-            if (x_bias) {
-                result += x_bias[bias_idx];
-            }
-            if (use_gate) {
-                float gate_value = tmp_gate[threadIdx.x];
-                if constexpr (type == GGML_TYPE_NVFP4) {
-                    if (gate_scale) {
-                        gate_value *= gate_scale[channel_x];
-                    }
-                }
-                if (gate_bias) {
-                    gate_value += gate_bias[bias_idx];
-                }
-                switch (active_glu) {
-                    case GGML_GLU_OP_SWIGLU:
-                        result *= ggml_cuda_op_silu_single(gate_value);
-                        break;
-                    case GGML_GLU_OP_GEGLU:
-                        result *= ggml_cuda_op_gelu_single(gate_value);
-                        break;
-                    case GGML_GLU_OP_SWIGLU_OAI:
-                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
-                        break;
-                    case GGML_GLU_OP_SWIGLU_CLAMP:
-                        result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
-                        break;
-                    default:
-                        result = result * gate_value;
-                        break;
-                }
-            }
-        }
-        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
-    }
-
-    if constexpr (!has_fusion) {
-        GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
-    } else if constexpr (type != GGML_TYPE_NVFP4) {
-        GGML_UNUSED_VARS(x_scale, gate_scale);
-    }
-}
 
 template<ggml_type type, bool weight_rule = false>
 static std::pair<dim3, dim3> calc_launch_params(
@@ -1629,98 +1365,6 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, nrows_loop);
 }
 
-template <ggml_type type>
-static void mul_mat_vec_q_moe_launch(
-        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
-        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
-        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
-
-    // Phase 1b/3 UVA cold seam.  The slot-remap consumer redirects the op's `src0` to the cache arena, so
-    // `vx` IS the arena base here; look the table up by it and, when it serves cold experts
-    // (MOE_EXPERT_CACHE_COLD=uva), pass the pinned host alias + resident slot count + host geometry to the
-    // kernel.  The default lookup misses and the kernel gets (nullptr, 0, 0, 0): the resident-only 1a
-    // contract, unchanged.  The fused gate lane is a different table/arena, so resolve its cold geometry
-    // too (without it the fused kernel would index the compact gate arena with a cold (host) expert id).
-    void *  cold_base  = nullptr;
-    int64_t n_res_cold = 0;
-    size_t  cold_channel_bytes = 0;
-    size_t  cold_row_bytes     = 0;
-    void *  cold_gate_base     = nullptr;
-    int64_t cold_gate_n_res    = 0;
-    size_t  cold_gate_channel_bytes = 0;
-    size_t  cold_gate_row_bytes     = 0;
-    // Cold (host-resident) expert reads (the UVA cold seam).
-    if (moe_cache_enabled()) {
-        (void) moe_cache_get_cold(vx, &cold_base, &n_res_cold, &cold_channel_bytes, &cold_row_bytes);
-        if (cold_base != nullptr && fusion.gate != nullptr) {
-            (void) moe_cache_get_cold(fusion.gate, &cold_gate_base, &cold_gate_n_res,
-                                      &cold_gate_channel_bytes, &cold_gate_row_bytes);
-        }
-    }
-    // The kernel indexes in type-block units; the cold geometry is reported in bytes.
-    const size_t   ts = ggml_type_size(type);
-    const uint32_t cold_channel_stride      = cold_channel_bytes      > 0 ? (uint32_t) (cold_channel_bytes      / ts) : 0;
-    const uint32_t cold_row_stride          = cold_row_bytes          > 0 ? (uint32_t) (cold_row_bytes          / ts) : 0;
-    const uint32_t cold_gate_channel_stride = cold_gate_channel_bytes > 0 ? (uint32_t) (cold_gate_channel_bytes / ts) : 0;
-    const uint32_t cold_gate_row_stride     = cold_gate_row_bytes     > 0 ? (uint32_t) (cold_gate_row_bytes     / ts) : 0;
-
-    // rows_per_block scaled for short-K expert GEMMs: the item-split loop in
-    // mul_mat_vec_q_moe spreads (row, kblock) items over the 8 thread groups,
-    // so pick rows_per_block to fill them (e.g. the down K=512 -> rpb=4).
-    const int blocks_per_row_x = ncols_x / ggml_cuda_type_traits<type>::qk;
-    int rpb = 2;
-    if (blocks_per_row_x > 0 && blocks_per_row_x < 8) {
-        rpb = std::min((8 + blocks_per_row_x - 1) / blocks_per_row_x, 8);
-    }
-    // mul_mat_vec_q_moe is only instantiated for RPB 2/4/8, and nblocks_rows below must be sized with
-    // the value the kernel actually launches with.  ceil(8/blocks_per_row_x) is 3 for
-    // blocks_per_row_x == 3 (k == 3*qk), which armed the grid for RPB 3 and then fell through the
-    // switch to the RPB 2 default: only the first 2/3 of the rows were computed and the rest of the
-    // output was left unwritten (test-backend-ops MUL_MAT_ID, m=64/n=16/k=96, ERR ~0.5).  Snap to a
-    // supported value before sizing the grid.
-    if (rpb != 4 && rpb != 8) {
-        rpb = 2;
-    }
-    const int64_t nblocks_rows = (nrows_x + rpb - 1) / rpb;
-    // Upstream's fused shared-expert lane is the last blockIdx.y column.
-    dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
-    const dim3 block_dims(warp_size, ncols_dst);
-    if (ggml_cuda_grid_stall_pad(block_nums, block_dims)) {
-        block_nums.x++;   // the kernel returns for row0 >= nrows_x
-    }
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
-
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst;
-
-    const auto launch = [&](auto rpb_c, auto fusion_c) {
-        constexpr int  RPB   = decltype(rpb_c)::value;
-        constexpr bool CFUSE = decltype(fusion_c)::value;
-        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, RPB, CFUSE>, launch_params,
-            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
-            stride_row_x, stride_col_y, stride_col_dst,
-            stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, nchannels_dst,
-            cold_base, (uint32_t) n_res_cold, cold_channel_stride, cold_row_stride,
-            cold_gate_base, (uint32_t) cold_gate_n_res, cold_gate_channel_stride, cold_gate_row_stride);
-    };
-    const auto launch_rpb = [&](auto rpb_c) {
-        if (has_fusion) {
-            launch(rpb_c, std::true_type{});
-        } else {
-            launch(rpb_c, std::false_type{});
-        }
-    };
-    switch (rpb) {
-        case 2:  launch_rpb(std::integral_constant<int, 2>{});  break;
-        case 4:  launch_rpb(std::integral_constant<int, 4>{});  break;
-        case 8:  launch_rpb(std::integral_constant<int, 8>{});  break;
-        default: launch_rpb(std::integral_constant<int, 2>{});  break;
-    }
-}
 
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
@@ -1733,7 +1377,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    // The MUL_MAT_ID routed-expert kernel is token-generic and covers the whole verify range; the
+    // RDNA4 dense fallback-row band is extended to the same width (see ggml_cuda_mul_mat).
+    GGML_ASSERT(ncols_dst <= MMVQ_MOE_MAX_BATCH_SIZE);
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
@@ -1830,7 +1476,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
     }
 
     switch (ncols_dst) {
-        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: {
+        case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8:
+        case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16: {
             // dispatch per ncols with a compile-time tag
             const auto dispatch = [&](auto ncols_tag) {
                 constexpr int c_ncols_dst = decltype(ncols_tag)::value;
@@ -2079,6 +1726,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
             // item-split accumulator layout is register-bound at ncols_dst > 1.
             launch_ksplit(std::integral_constant<int, 8>{});
         } break;
+        // Dense rows at ncols_dst 9..16 keep the same ksplit kernel as the 2..8 band.  The RDNA4
+        // dense dispatch only reaches these when the MMQ path would take its slow non-128-row
+        // "fallback" config (see ggml_cuda_mul_mat), so the reduction-order band 2..16 matches.
+        case 9:  launch_ksplit(std::integral_constant<int, 9>{});  break;
+        case 10: launch_ksplit(std::integral_constant<int, 10>{}); break;
+        case 11: launch_ksplit(std::integral_constant<int, 11>{}); break;
+        case 12: launch_ksplit(std::integral_constant<int, 12>{}); break;
+        case 13: launch_ksplit(std::integral_constant<int, 13>{}); break;
+        case 14: launch_ksplit(std::integral_constant<int, 14>{}); break;
+        case 15: launch_ksplit(std::integral_constant<int, 15>{}); break;
+        case 16: launch_ksplit(std::integral_constant<int, 16>{}); break;
                 default: GGML_ABORT("fatal error"); break;
             }
         } break;
@@ -2260,7 +1918,9 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    // Dense ncols_dst is ne1, MUL_MAT_ID ncols_dst is ne2 (== ne12); both now cover the full
+    // verify band (MMVQ_MOE_MAX_BATCH_SIZE), so assert on whichever one is the column count.
+    GGML_ASSERT((ids ? ne12 : ne1) <= MMVQ_MOE_MAX_BATCH_SIZE);
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
@@ -3144,6 +2804,329 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
             (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
     }
 }
+
+
+// moved out of ggml-cuda.cu (Phase-2 self-contained extraction; see PHASE2-REFACTOR.md)
+bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band) {
+    ggml_tensor *       src0 = tensor->src[0];
+    ggml_tensor *       src1 = tensor->src[1];
+    const ggml_tensor * dst  = tensor;
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                   src0->view_src;
+
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+
+    // fusion is not universally faster on Pascal
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (cc <= GGML_CUDA_CC_PASCAL) {
+        return false;
+    }
+    //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
+    static const bool q8_1_verify = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
+            !(verify_band && q8_1_verify && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
+        return false;
+    }
+
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+        return false;
+    }
+
+    return use_mul_mat_vec_q;
+}
+
+// qwen4exp IQ4_NL/Q8_0 routed down projection followed by the 10-expert weighted sum: compute all
+// selected experts for one output row in a wave and apply their routing weights immediately,
+// avoiding the [n_embd, n_used] intermediate and its separate reduction launch.  Single-token only
+// (n_tokens == 1, gate in ggml_cuda_mul_mat_id_weighted_rdna3_5_ok).  GGML_CUDA_DISABLE_WEIGHTED_DOWN=1
+// turns it off.  Not redirect-safe while the MoE expert cache is active, so it stands down then.
+int ggml_cuda_mul_mat_id_weighted_down_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_weighted_down = getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN"));
+    ggml_tensor * node = cgraph->nodes[i];
+    if (disable_weighted_down || moe_cache_enabled() || node->op != GGML_OP_MUL_MAT_ID ||
+            i + 20 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_MUL) {
+        return 0;
+    }
+    constexpr int n_used = 10;
+    constexpr int n_ops  = 2 + n_used + (n_used - 1);
+    ggml_tensor * mul = cgraph->nodes[i + 1];
+    const ggml_tensor * experts = ggml_are_same_shape(mul, mul->src[0]) ? mul->src[0] : mul->src[1];
+    const ggml_tensor * weights = experts == mul->src[0] ? mul->src[1] : mul->src[0];
+    const int output_idx = i + n_ops - 1;
+    ggml_tensor * output = cgraph->nodes[output_idx];
+    bool valid = experts == node && node->ne[1] == n_used &&
+        ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(experts, weights, output);
+
+    for (int j = 0; valid && j < n_used; ++j) {
+        const ggml_tensor * view = cgraph->nodes[i + 2 + j];
+        valid = view->op == GGML_OP_VIEW && view->src[0] == mul &&
+            view->ne[0] == mul->ne[0] && view->ne[1] == mul->ne[2] && view->ne[2] == 1 && view->ne[3] == 1 &&
+            view->nb[0] == sizeof(float) && view->nb[1] == mul->nb[2] && view->view_offs == size_t(j) * mul->nb[1];
+    }
+    const int add_start = i + 2 + n_used;
+    if (valid) {
+        const ggml_tensor * first = cgraph->nodes[add_start];
+        valid = first->op == GGML_OP_ADD && first->src[0] == cgraph->nodes[i + 2] && first->src[1] == cgraph->nodes[i + 3];
+    }
+    for (int j = 2; valid && j < n_used; ++j) {
+        const ggml_tensor * add = cgraph->nodes[add_start + j - 1];
+        valid = add->op == GGML_OP_ADD && add->src[0] == cgraph->nodes[add_start + j - 2] && add->src[1] == cgraph->nodes[i + 2 + j];
+    }
+    if (valid) {
+        std::vector<ggml_op> ops = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL };
+        ops.insert(ops.end(), n_used, GGML_OP_VIEW);
+        ops.insert(ops.end(), n_used - 1, GGML_OP_ADD);
+        const int out_nodes[] = { output_idx };
+        if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops.data(), out_nodes, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
+            ggml_cuda_mul_mat_id_weighted_rdna3_5(ctx, experts, weights, output);
+            return n_ops - 1;
+        }
+    }
+    return 0;
+}
+
+// SSM conv-input fusion: the qkv_mixed MUL_MAT output feeds the last row of an interleaved
+// [conv_kernel_size, channels] conv input (via view nodes and a dim-0 CONCAT); fold the concat into
+// the mmvq epilogue.  Returns the number of nodes to skip (j - i), 0 otherwise.
+// GGML_CUDA_DISABLE_SSM_CONV_IN=1 turns it off.
+int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_ssm_conv_in = getenv("GGML_CUDA_DISABLE_SSM_CONV_IN") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_SSM_CONV_IN"));
+    ggml_tensor * node = cgraph->nodes[i];
+    if (disable_ssm_conv_in || node->op != GGML_OP_MUL_MAT || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
+        return 0;
+    }
+    const int scan_end = std::min(cgraph->n_nodes, i + 8);
+    for (int j = i + 1; j < scan_end; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op != GGML_OP_CONCAT || n->op_params[0] != 0) {
+            continue;
+        }
+        if (n->type != GGML_TYPE_F32) {
+            continue;
+        }
+        const ggml_tensor * s1 = n->src[1];
+        while (s1 != nullptr && s1->view_src != nullptr) {
+            s1 = s1->view_src;
+        }
+        if (s1 != node) {
+            continue;
+        }
+        const ggml_tensor * s0 = n->src[0];
+        while (s0 != nullptr && s0->view_src != nullptr) {
+            s0 = s0->view_src;
+        }
+        if (s0 == nullptr || s0->op != GGML_OP_GET_ROWS || s0->type != GGML_TYPE_F32) {
+            continue;
+        }
+        // conv_input [cs, C] = states [(cs-1)*C] + qkv [C], dim 0
+        const int64_t C = n->ne[1] * n->ne[2] * n->ne[3];
+        const int64_t cs = n->ne[0];
+        if (cs < 2 || n->ne[1] != s1->ne[0]) {
+            continue;
+        }
+        const int64_t src0_elems = s0->ne[0] * s0->ne[1] * s0->ne[2];
+        const int64_t src1_elems = s1->ne[0] * s1->ne[1] * s1->ne[2];
+        if (src0_elems != (cs - 1) * C || src1_elems != C) {
+            continue;
+        }
+        int out_nodes[] = { j };
+        if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, j - i + 1, out_nodes, 1)) {
+            continue;
+        }
+        // the conv states GET_ROWS must be scheduled before this matmul so the epilogue reads
+        // fresh states (the read is not a graph edge)
+        bool states_ready = false;
+        for (int k = 0; k < i; ++k) {
+            if (cgraph->nodes[k] == s0) {
+                states_ready = true;
+                break;
+            }
+        }
+        if (!states_ready) {
+            continue;
+        }
+        ggml_cuda_mm_fusion_args_host fusion_data{};
+        fusion_data.conv_input       = n;
+        fusion_data.conv_states      = s0;
+        fusion_data.conv_kernel_size = cs;
+        ggml_cuda_mul_mat_vec_q(ctx, node->src[0], node->src[1], node->src[2], node, &fusion_data);
+        return j - i;
+    }
+    return 0;
+}
+
+// Fuse the SSM pre-scan chain: conv+silu, l2_norm(q,k) and the gate/beta projections (decode only).
+// One kernel instead of ssm_conv, l2_norm_pair and ssm_gate_beta.  Returns 15 when fused.
+// GGML_CUDA_DISABLE_SSM_PRESCAN=1 turns it off.
+int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_ssm_prescan = getenv("GGML_CUDA_DISABLE_SSM_PRESCAN") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_SSM_PRESCAN"));
+    ggml_tensor * node = cgraph->nodes[i];
+    if (disable_ssm_prescan || node->op != GGML_OP_SSM_CONV || node->type != GGML_TYPE_F32 || node->ne[1] != 1 ||
+            i + 15 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * silu     = cgraph->nodes[i + 1];
+    const ggml_tensor * q_view   = cgraph->nodes[i + 2];
+    const ggml_tensor * q_norm   = cgraph->nodes[i + 3];
+    const ggml_tensor * k_view   = cgraph->nodes[i + 4];
+    const ggml_tensor * k_norm   = cgraph->nodes[i + 5];
+    const ggml_tensor * v_view   = cgraph->nodes[i + 6];
+    const ggml_tensor * alpha_w  = cgraph->nodes[i + 7];
+    const ggml_tensor * alpha_v  = cgraph->nodes[i + 8];
+    const ggml_tensor * bias     = cgraph->nodes[i + 9];
+    const ggml_tensor * softplus = cgraph->nodes[i + 10];
+    const ggml_tensor * gate_mul = cgraph->nodes[i + 11];
+    const ggml_tensor * gate_v   = cgraph->nodes[i + 12];
+    const ggml_tensor * beta_w   = cgraph->nodes[i + 13];
+    const ggml_tensor * beta_v   = cgraph->nodes[i + 14];
+    const ggml_tensor * beta_sig = cgraph->nodes[i + 15];
+
+    const bool wiring_ok =
+        silu->op == GGML_OP_UNARY && ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == node &&
+        q_view->op == GGML_OP_VIEW && q_view->view_src == silu &&
+        q_norm->op == GGML_OP_L2_NORM && q_norm->src[0] == q_view &&
+        k_view->op == GGML_OP_VIEW && k_view->view_src == silu &&
+        k_norm->op == GGML_OP_L2_NORM && k_norm->src[0] == k_view &&
+        v_view->op == GGML_OP_VIEW && v_view->view_src == silu &&
+        alpha_w->op == GGML_OP_MUL_MAT &&
+        alpha_v->op == GGML_OP_RESHAPE && alpha_v->src[0] == alpha_w &&
+        bias->op == GGML_OP_ADD && (bias->src[0] == alpha_v || bias->src[1] == alpha_v) &&
+        softplus->op == GGML_OP_UNARY && ggml_get_unary_op(softplus) == GGML_UNARY_OP_SOFTPLUS && softplus->src[0] == bias &&
+        gate_mul->op == GGML_OP_MUL && (gate_mul->src[0] == softplus || gate_mul->src[1] == softplus) &&
+        gate_v->op == GGML_OP_RESHAPE && gate_v->src[0] == gate_mul &&
+        beta_w->op == GGML_OP_MUL_MAT &&
+        beta_v->op == GGML_OP_RESHAPE && beta_v->src[0] == beta_w &&
+        beta_sig->op == GGML_OP_UNARY && ggml_get_unary_op(beta_sig) == GGML_UNARY_OP_SIGMOID && beta_sig->src[0] == beta_v &&
+        alpha_w->src[1] == beta_w->src[1];
+
+    const ggml_tensor * dt    = nullptr;
+    const ggml_tensor * ssm_a = nullptr;
+    if (wiring_ok) {
+        if (bias->src[0] == alpha_v) {
+            dt = bias->src[1];
+        } else if (bias->src[1] == alpha_v) {
+            dt = bias->src[0];
+        }
+        if (gate_mul->src[0] == softplus) {
+            ssm_a = gate_mul->src[1];
+        } else if (gate_mul->src[1] == softplus) {
+            ssm_a = gate_mul->src[0];
+        }
+    }
+
+    // the conv output is split into q [head_k_dim, n_qk_heads], k and v; the
+    // channel bases and dims must match the kernel layout
+    const int64_t n_qk_ch = q_view->ne[0] * q_view->ne[1];
+    const bool type_ok =
+        dt && ssm_a &&
+        node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+        node->src[1]->ne[0] >= 2 && node->src[1]->ne[0] <= 15 &&
+        q_norm->type == GGML_TYPE_F32 && k_norm->type == GGML_TYPE_F32 &&
+        silu->type == GGML_TYPE_F32 &&
+        alpha_w->src[0]->type == GGML_TYPE_Q8_0 && beta_w->src[0]->type == GGML_TYPE_Q8_0 &&
+        alpha_w->src[1]->type == GGML_TYPE_F32 && alpha_w->src[1]->ne[1] == 1 &&
+        gate_mul->type == GGML_TYPE_F32 && beta_sig->type == GGML_TYPE_F32 &&
+        alpha_w->src[0]->ne[0] == beta_w->src[0]->ne[0] &&
+        alpha_w->src[0]->ne[1] == beta_w->src[0]->ne[1] &&
+        q_view->ne[0] == 128 && k_view->ne[0] == 128 && v_view->ne[0] == 128 &&
+        q_view->ne[1] == k_view->ne[1] &&
+        q_view->view_offs == 0 && k_view->view_offs == n_qk_ch*sizeof(float) &&
+        v_view->view_offs == 2*n_qk_ch*sizeof(float) &&
+        silu->ne[0] == 2*n_qk_ch + v_view->ne[0]*v_view->ne[1];
+
+    if (wiring_ok && type_ok) {
+        const int out_nodes[] = { i + 1, i + 3, i + 5, i + 11, i + 15 };
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 16, out_nodes, 5)) {
+            float eps;
+            memcpy(&eps, q_norm->op_params, sizeof(float));
+            ggml_cuda_op_ssm_conv_l2_gatebeta(ctx,
+                node->src[0], node->src[1],
+                alpha_w->src[0], beta_w->src[0], alpha_w->src[1], dt, ssm_a,
+                (ggml_tensor *) q_norm, (ggml_tensor *) k_norm, (ggml_tensor *) silu,
+                (ggml_tensor *) gate_mul, (ggml_tensor *) beta_sig,
+                q_view->ne[0], q_view->ne[1], v_view->ne[0], v_view->ne[1], eps);
+            return 15;
+        }
+    }
+    return 0;
+}
+
+// Dual-output mmvq fusion: two matmuls over the same activation with the same output shape (e.g. the
+// K and V projections of an attention layer).  The first matmul computes both results; the gate
+// result is written to the second matmul's destination.  Returns j - i when fused.
+int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    ggml_tensor * mm_a = cgraph->nodes[i];
+    if (!(mm_a->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_cuda_should_fuse_mul_mat_vec_q(mm_a)) {
+        return 0;
+    }
+    for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 8); ++j) {
+        ggml_tensor * mid = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(mid)) {
+            continue;
+        }
+        if (mid->op != GGML_OP_MUL_MAT || !(mid->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                mid->src[1] != mm_a->src[1] || mid->ne[0] != mm_a->ne[0] ||
+                mid->ne[1] != mm_a->ne[1] || mid->ne[2] != mm_a->ne[2] ||
+                mid->src[0] == mm_a->src[0] || mid->src[0]->type != mm_a->src[0]->type ||
+                !ggml_cuda_should_fuse_mul_mat_vec_q(mid)) {
+            break;
+        }
+        ggml_cuda_mm_fusion_args_host fusion_data{};
+        fusion_data.gate     = mid->src[0];
+        fusion_data.dst_gate = mid;
+        ggml_cuda_mul_mat_vec_q(ctx, mm_a->src[0], mm_a->src[1], mm_a->src[2], mm_a, &fusion_data);
+        return j - i;
+    }
+    return 0;
+}
+
+// MoE down fold: ffn_moe_weighted = moe_down * topk_weights.  Fold the MUL into the matmul epilogue
+// via the x_scale_channel_dst path.  Returns 1 when fused.  GGML_CUDA_DISABLE_MOE_DOWN_FOLD=1 off.
+int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_moe_down_fold = getenv("GGML_CUDA_DISABLE_MOE_DOWN_FOLD") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MOE_DOWN_FOLD"));
+    if (disable_moe_down_fold || i + 1 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    ggml_tensor * mm_node  = cgraph->nodes[i];
+    ggml_tensor * mul_node = cgraph->nodes[i + 1];
+
+    const int out_nodes[] = { i + 1 };
+    if (mul_node->op == GGML_OP_MUL &&
+            mul_node->src[0] == mm_node &&
+            (mm_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            (mul_node->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+        const ggml_tensor * weights = mul_node->src[1];
+        if (weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights) &&
+                weights->ne[0] == 1 && weights->ne[1] == mm_node->ne[1] &&
+                weights->ne[2] == mm_node->ne[2] &&
+                ggml_are_same_shape(mm_node, mul_node) &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.x_scale             = weights;
+            fusion_data.x_scale_channel_dst = true;
+            // the down table may be cache-managed; redirect the weight table and the routing onto
+            // the compact arena/remap exactly as the gate+up+GLU site does.
+            ggml_tensor src0_c, ids_c;
+            if (moe_cache_redirect_fused(mm_node, mm_node->src[0], nullptr, mm_node->src[2],
+                                         ctx.device, ctx.stream(), &src0_c, &ids_c, nullptr)) {
+                ggml_cuda_mul_mat_vec_q(ctx, &src0_c, mm_node->src[1], &ids_c, mul_node, &fusion_data);
+            } else {
+                ggml_cuda_mul_mat_vec_q(ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
 // SSM gated delta net: gate = softplus(alpha*x + dt) * a, beta = sigmoid(beta*x).  Two Q8_0
 // projections plus the gating chain into one kernel.  Returns 8 when fused.
 // GGML_CUDA_FUSE_GATE_BETA_VERIFY=0 turns the verify band off.
@@ -3272,39 +3255,9 @@ int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const gg
     return 0;
 }
 
-
-// moved out of ggml-cuda.cu (Phase-2 self-contained extraction)
-bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band) {
-    ggml_tensor *       src0 = tensor->src[0];
-    ggml_tensor *       src1 = tensor->src[1];
-    const ggml_tensor * dst  = tensor;
-
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
-                                   src0->view_src;
-
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
-
-    // fusion is not universally faster on Pascal
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (cc <= GGML_CUDA_CC_PASCAL) {
-        return false;
-    }
-    //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
-    static const bool q8_1_verify = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
-            !(verify_band && q8_1_verify && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
-        return false;
-    }
-
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
-        return false;
-    }
-
-    return use_mul_mat_vec_q;
-}
-
+// Match the upstream fused shared-expert subgraph (routed pair + shared pair).  Structure-only
+// (graph_optimize must produce the same topology for every ubatch size); the MMVQ batch-size check
+// is done in the fusion site.
 bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
     if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
         return false;
@@ -3354,6 +3307,8 @@ bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, in
     return true;
 }
 
+// Upstream fused shared-expert MMVQ: the routed gate/up pair + the shared gate/up pair in one launch.
+// Returns 5 when fused, 0 otherwise.
 int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || !ctx.stream_context().concurrent_events.empty() ||
             !ggml_cuda_match_shared_expert(cgraph, i, i + 3) ||
@@ -3378,6 +3333,9 @@ int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, cons
     return 5;
 }
 
+// GLU -> Q8_1: mark an F32 GLU whose consumer is a verify-band mmvq matmul so the GLU launcher also
+// writes the matmul's Q8_1 blocks into the quantize cache.  GGML_CUDA_FUSE_GLU_Q8_1=0 turns it off.
+// Always runs (it clears the marking on the context).
 void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     static const bool fuse_glu_q8_1 = getenv("GGML_CUDA_FUSE_GLU_Q8_1") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GLU_Q8_1")) != 0;
     ggml_tensor * node = cgraph->nodes[i];
