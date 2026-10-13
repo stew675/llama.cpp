@@ -240,7 +240,7 @@ static int ggml_backend_cpu_moe_offload_cap(void) {
         def = 1;
     }
 
-    const char * env = getenv("GGML_CPU_MOE_OFFLOAD_THREADS");
+    static const char * env = getenv("GGML_CPU_MOE_OFFLOAD_THREADS");
     if (env != nullptr) {
         const int v = atoi(env);
         if (v <= 0) {
@@ -382,6 +382,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .event_wait              = */ NULL,
     /* .stage_buffer            = */ NULL,
     /* .stage_upload            = */ NULL,
+    /* .stage_gather            = */ NULL,
     /* .stage_wait              = */ NULL,
     /* .stage_d2d               = */ NULL,
     /* .stage_h2d_gbps          = */ NULL,
@@ -699,6 +700,16 @@ static const struct ggml_backend_device_i ggml_backend_cpu_device_i = {
     /* .slab_headroom_bytes  = */ nullptr,
     /* .slab_ring_set        = */ nullptr,
     /* .slab_narrow_floor    = */ nullptr,
+    /* .slab_reserve_wide    = */ nullptr,
+    /* .slab_narrow2_floor   = */ nullptr,
+    /* .slab_compute_narrow2 = */ nullptr,
+    /* .moe_cache_set_host_pool   = */ nullptr,
+    /* .moe_cache_set_host_source = */ nullptr,
+    /* .slab_compute_plain   = */ nullptr,
+    /* .slab_ring_region     = */ nullptr,
+    /* .slab_set_ring_cap    = */ nullptr,
+    /* .slab_enabled         = */ nullptr,
+    /* .slab_ring_slots      = */ nullptr,
 };
 
 // CPU backend - backend (reg)

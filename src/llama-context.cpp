@@ -310,6 +310,11 @@ llama_context::llama_context(
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
+    for (const int32_t lid : model.embeddings_layer_inp_preset) {
+        if (lid >= 0 && (size_t) lid < cparams.embeddings_layer_inp.size()) {
+            cparams.embeddings_layer_inp[lid] = true;
+        }
+    }
 
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
@@ -705,7 +710,107 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
+        // wip/slab-ring-region (issue #164): auto-size the H2D staging ring (per GPU).  The ring only has to
+        // keep the prefill staging fed; too large and it evicts more arena on each wide pass.  Measured
+        // knees on gfx1201 (GSQ -ncmoe 48, 31.5k prompt): n=1 ub2048 ~3 GiB, n=1 ub8192 ~6 GiB, n=2 ub8192
+        // ~1.5 GiB, n=3 ub8192 <1 GiB -- i.e. the per-device need scales with 1/n (slices shrink) and
+        // 1/n^2 (each device feeds a smaller share of the prefill).  1800/n + ub/(1.7 n^2) fits those.
+        // Capped at 1/4 of the smallest staging device's VRAM so it scales down on a small card, and the
+        // ring is one global region, so the smallest cap wins.  `GGML_CUDA_SLAB_RING_MIB` is a verbatim
+        // per-GPU override and always wins.  Runs before `sched_reserve`, i.e. before the slab exists.
+        // issue #164: `GGML_CUDA_SLAB_RING_MIB` is a verbatim per-GPU override and always wins, but a value
+        // below the slice floor makes the H2D staging fall back to a cudaMalloc buffer -- which the
+        // optional-allocation cap may then refuse -- so say so (non-fatal: the override is still honoured).
+        const char * ring_env = getenv("GGML_CUDA_SLAB_RING_MIB");
+        // Only the target context actually streams host-resident expert tables through the H2D staging
+        // ring, so only it may size the ring.  The MTP draft context is built against the same model
+        // (`moe_host_expert_bytes` is non-empty) but its weights are fully resident and it never stages a
+        // table; running the auto-size here would overwrite the shared global region with the draft's
+        // (smaller, ubatch-derived) value -- last-writer-wins -- and, before the carve-follows fix, moved
+        // the wide compute buffer inside the target's carved ring.  Same MTP exclusion as the narrow-floor
+        // pin and the ring-arm blocks below.
+        if (!model.moe_host_expert_bytes.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            const ggml_backend_dev_t stage_dev = model.moe_host_expert_bytes.begin()->first;
+            const bool slab_enabled = ggml_backend_dev_slab_enabled(stage_dev);
+            // issue #164: the knee above only balances prefill speed against arena retention; it
+            // assumes the ring can hold one staged upload per slot.  A model whose per-device
+            // expert-table slice is larger than ring/slots quietly falls back to a cudaMalloc staging
+            // buffer, and once the arena has grown that fallback is refused by the optional-allocation
+            // cap -- a large prefill after a decode then streams at ~half speed (measured 1462 -> 755
+            // t/s on Qwen3.8-Flash-Next IQ4_NL `-ncmoe 46`).  Require room for `ring_slots` slices of
+            // the largest staged table; the throughput knee is the floor, this is the fit requirement.
+            // `llama_model::max_host_expert_slice_bytes` and `ggml_backend_meta_stage_input` share the rule.
+            size_t slice = 0, n_slots = 0, slice_floor = 0;
+            if (slab_enabled) {
+                slice = model.max_host_expert_slice_bytes();
+                if (slice > 0) {
+                    n_slots = ggml_backend_dev_slab_ring_slots(stage_dev);
+                    if (n_slots == 0) {
+                        n_slots = 8;
+                    }
+                    slice_floor = n_slots * (slice + 512);
+                }
+            }
+            if (ring_env == nullptr) {
+                const double n_stage = (double) model.moe_host_expert_bytes.size();
+                if (n_stage > 0.0) {
+                    size_t ring_bytes = (size_t) ((1800.0 / n_stage +
+                            (double) cparams.n_ubatch / (1.7 * n_stage * n_stage)) * 1024.0 * 1024.0);
+                    if (slice_floor > ring_bytes) {
+                        ring_bytes = slice_floor;
+                    }
+                    size_t vram_cap = (size_t) -1;
+                    for (const auto & kv : model.moe_host_expert_bytes) {
+                        size_t free_b = 0, total_b = 0;
+                        ggml_backend_dev_memory(kv.first, &free_b, &total_b);
+                        if (total_b > 0) {
+                            vram_cap = std::min(vram_cap, total_b / 4);
+                        }
+                    }
+                    if (vram_cap != (size_t) -1) {
+                        ring_bytes = std::min(ring_bytes, vram_cap);
+                    }
+                    ggml_backend_dev_slab_set_ring_cap(stage_dev, ring_bytes);
+                }
+            } else if (slab_enabled && slice_floor > 0) {
+                const size_t env_bytes = (size_t) atoll(ring_env) << 20;
+                if (env_bytes < slice_floor) {
+                    LLAMA_LOG_ERROR("%s: GGML_CUDA_SLAB_RING_MIB=%zu MiB is below the H2D staging slice floor of "
+                            "%zu MiB (%zu slots x (%zu MiB largest per-device expert slice + 512 B)); the H2D "
+                            "staging ring falls back to a cudaMalloc buffer, which the optional-allocation cap "
+                            "may refuse, so a large prefill can stream at roughly half speed.  Raise it to at "
+                            "least %zu MiB, or unset it to auto-size.\n",
+                            __func__, env_bytes >> 20, slice_floor >> 20, n_slots, slice >> 20,
+                            (slice_floor + (1u << 20) - 1) >> 20);
+                }
+            }
+        }
+
         sched_reserve();
+
+        // wip/first-prefill-latency: reserve the wide prefill work region in the slab BEFORE the MoE
+        // cache's priming sizing (during the warmup) places the arena.  `sched_reserve` has just measured
+        // the widest compute layout, so its largest compute buffer is the wide view; pinning that much
+        // above the narrow floor + ring keeps the load-time arena above the region the first wide prefill
+        // will use, instead of taking it and being evicted back on the first request.
+        if (!model.moe_host_expert_bytes.empty()) {
+            size_t wide_bytes = 0;
+            for (size_t i = 0; i < backend_buf_exp_size.size(); ++i) {
+                if (backend_buf_exp_size[i] > wide_bytes) {
+                    wide_bytes = backend_buf_exp_size[i];
+                }
+            }
+            if (wide_bytes > 0) {
+                for (const auto & kv : model.moe_host_expert_bytes) {
+                    ggml_backend_dev_slab_reserve_wide(kv.first, wide_bytes);
+                }
+                for (size_t d = 0; d < model.devices.size(); ++d) {
+                    if (!model.devices[d].is_meta) {
+                        ggml_backend_dev_slab_reserve_wide(model.devices[d].dev, wide_bytes);
+                    }
+                }
+            }
+        }
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -1670,6 +1775,12 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     GGML_ASSERT(lid <= model.hparams.n_layer());
 
+    if (cparams.embeddings_layer_inp[lid] == enable) {
+        // unchanged (preset at context creation): the reserved graph has it already, and a reserve would free and
+        // allocate all compute buffers again
+        return;
+    }
+
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
@@ -1886,6 +1997,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // wip/slab-ring-region (early narrow floor): the ring is one meta-unit with the WIDE (prefill) work
+    // view, and the slab can only place it once the always-resident NARROW (decode/verify) floor is pinned.
+    // That used to happen only inside the `drop_now` block below (the prefill -> decode transition), so
+    // the FIRST prefill -- exactly the pass the ring exists for -- ran with `ring_region == 0` and fell
+    // back to a raw cudaMalloc bounded by the slab's optional-allocation cap (measured: the 70K-token
+    // IQ4_NL prefill runs `WORK_ALLOC ... narrow_floor=0.0 ring=0.0`, and the ring is only carved
+    // afterwards).  Measure the narrow layout once with a size-only reserve and pin the floor BEFORE the
+    // first wide view is placed, so the ring is carved for that prefill too.  The size-only reserve is
+    // the same probe the `drop_now` path already uses (`split_only`, no allocation).
+    if (!slab_narrow_pinned && !model.moe_host_expert_bytes.empty() &&
+            cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        slab_narrow_pinned = true;
+        const uint32_t n_rs_seqs = std::max<uint32_t>(1, ubatch.n_seqs);
+        size_t narrow_sizes[16] = {0};
+        if (graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, /*split_only=*/true,
+                          narrow_sizes, kq_mask_packed_reachable()) != nullptr) {
+            size_t narrow_bytes = 0;
+            for (int i = 0; i < 16; i++) {
+                if (narrow_sizes[i] > narrow_bytes) {
+                    narrow_bytes = narrow_sizes[i];
+                }
+            }
+            if (narrow_bytes > 0) {
+                for (const auto & kv : model.moe_host_expert_bytes) {
+                    ggml_backend_dev_slab_narrow_floor(kv.first, narrow_bytes);
+                }
+                for (size_t d = 0; d < model.devices.size(); ++d) {
+                    if (!model.devices[d].is_meta) {
+                        ggml_backend_dev_slab_narrow_floor(model.devices[d].dev, narrow_bytes);
+                    }
+                }
+            }
+        }
+    }
+
     // wip/slab-ring-region: the H2D staging ring is one meta-unit with the WIDE (prefill) compute layout.
     // It is armed for a wide pass (>= the staging gate floor, 64 tokens) and disarmed for a narrow one, so
     // a decode-only stretch returns its hole to the arena.  This runs BEFORE the drop's cache re-arm, so a
@@ -1894,13 +2040,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // while the ring is used on every wide pass.  `ring_set` is a no-op when the state already matches.
     if (!model.moe_host_expert_bytes.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
         const bool ring_arm = ubatch.n_tokens >= 64;
+        // wip/slab-ring-region (issue #164): the narrow -> wide drop below exists only to force the wide
+        // view to re-place ABOVE a carved ring hole so the ring arms.  When the slab carved no hole
+        // (`ring_region == 0`; e.g. the requested hole does not fit under `mapped`), the drop has nothing
+        // to arm and merely churns the compute layout -- measured ~13-16 % decode on a pinned-host-expert
+        // MoE config, where the replayed HIP graph lost its replay benefit.  Only drop when a hole exists.
+        bool ring_carved = false;
         for (const auto & kv : model.moe_host_expert_bytes) {
             ggml_backend_dev_slab_ring_set(kv.first, ring_arm);
+            ring_carved = ring_carved || ggml_backend_dev_slab_ring_region(kv.first) > 0;
         }
         for (size_t d = 0; d < model.devices.size(); ++d) {
             if (!model.devices[d].is_meta) {
                 ggml_backend_dev_slab_ring_set(model.devices[d].dev, ring_arm);
+                ring_carved = ring_carved || ggml_backend_dev_slab_ring_region(model.devices[d].dev) > 0;
             }
+        }
+        // wip/slab-ring-region (prefill arming): the WIDE (prefill) view is what places the ring -- the
+        // slab arms it when `boundary >= narrow_floor + ring_region` -- but the scheduler REUSES the
+        // previous compute buffer whenever the new layout fits, and for these models the prefill and the
+        // narrow (decode/verify) layout are the same size.  A prefill that follows a decode therefore
+        // reused the narrow buffer at base 0, never re-placed a wide view, and the carved ring stayed
+        // unarmed (`ring_slot_capacity() == 0`) -- the H2D staging fell back to a capped cudaMalloc and
+        // the prefill streamed.  Release the narrow layout on a narrow -> wide transition so the prefill
+        // re-reserves above the ring (`ring_set` has already marked the request wide).  Symmetric with the
+        // `drop_now` wide -> narrow transition below; consecutive prefill ubatches (`n_tokens_prev >= 64`)
+        // keep the wide buffer.
+        if (ring_carved && ring_arm && n_tokens_prev < 64) {
+            ggml_backend_sched_drop_buffers(sched.get());
         }
     }
     if (drop_now) {
@@ -3676,9 +3843,57 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        // Each ggml_backend_tensor_get is a synchronous device copy with a fixed cost (tens of us on ROCm), and a sequence's
+        // KV cells are often many short ranges (concurrent decoding interleaves the slots' cells a few tokens at a time), so
+        // the deferred reads of one tensor whose gaps are at most LLAMA_STATE_GET_MERGE_GAP bytes (default 256 KiB, 0 = off)
+        // are read as one span and scattered on the host.  The bytes written are the same.
+        static const size_t max_gap = [] {
+            const char * e = getenv("LLAMA_STATE_GET_MERGE_GAP");
+            return e != nullptr ? (size_t) strtoull(e, nullptr, 10) : (size_t) 256*1024;
+        }();
+        if (max_gap == 0) {
+            for (const auto & winfo : winfos) {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
+        } else {
+            std::vector<uint8_t> span_buf;
+            for (size_t i = 0; i < winfos.size(); ) {
+                // [i, j): consecutive reads of one tensor, each starting at or after the previous one's end
+                const write_info & first = winfos[i];
+                size_t end = first.offset + first.size;
+                bool   dst_contiguous = true;
+                size_t j = i + 1;
+                for (; j < winfos.size(); ++j) {
+                    const write_info & w = winfos[j];
+                    if (w.tensor != first.tensor || w.offset < end || w.offset - end > max_gap) {
+                        break;
+                    }
+                    dst_contiguous = dst_contiguous && w.offset == end && w.ptr == winfos[j - 1].ptr + winfos[j - 1].size;
+                    end = w.offset + w.size;
+                }
+                bool merged = j - i == 1 || dst_contiguous;
+                if (merged) {
+                    ggml_backend_tensor_get(first.tensor, first.ptr, first.offset, end - first.offset);
+                } else {
+                    try {
+                        span_buf.resize(end - first.offset);
+                        merged = true;
+                    } catch (const std::bad_alloc &) {
+                        // no host memory for the span (a destructor must not throw): read the pieces one by one
+                    }
+                    if (merged) {
+                        ggml_backend_tensor_get(first.tensor, span_buf.data(), first.offset, end - first.offset);
+                        for (size_t k = i; k < j; ++k) {
+                            memcpy(winfos[k].ptr, span_buf.data() + (winfos[k].offset - first.offset), winfos[k].size);
+                        }
+                    } else {
+                        for (size_t k = i; k < j; ++k) {
+                            ggml_backend_tensor_get(winfos[k].tensor, winfos[k].ptr, winfos[k].offset, winfos[k].size);
+                        }
+                    }
+                }
+                i = j;
+            }
         }
     }
 

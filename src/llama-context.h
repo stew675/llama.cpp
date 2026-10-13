@@ -478,6 +478,10 @@ private:
     // without need (see the drop decision in `process_ubatch`).  Only written when a backend reports a slab
     // (`ggml_backend_dev_slab_work_size` != 0), so it stays empty on non-slab backends.
     std::map<ggml_backend_dev_t, size_t> slab_narrow_boundary;
+    // wip/slab-ring-region: the narrow (decode/verify) work floor was pinned before the first wide view
+    // was placed, so the slab could carve the H2D staging ring for the first prefill (not only after the
+    // first prefill -> decode transition).
+    bool slab_narrow_pinned = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

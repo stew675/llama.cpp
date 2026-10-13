@@ -2508,6 +2508,42 @@ size_t llama_model::max_host_weight_tensor_bytes() const {
     return max_bytes;
 }
 
+size_t llama_model::max_host_expert_slice_bytes() const {
+    // issue #164: the per-device slice of a host expert table is not the table divided by the device count
+    // -- the meta split is granularity-rounded and came out 180 MiB / 270 MiB on a 450 MiB table with two
+    // devices.  Ask the split-state callback (the same one the meta backend uses for the staging copies)
+    // and the shared size rule, so this and the staging always agree.
+    const size_t n_devs = get_split_state_ud.n_devices;
+    const bool   split  = n_devs > 1 && n_devs <= GGML_BACKEND_META_MAX_DEVICES && get_split_state_ud.model != nullptr;
+    size_t max_slice = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            if (std::string(t->name).find("exps") == std::string::npos) {
+                continue;
+            }
+            if (split) {
+                const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(t, const_cast<void *>(static_cast<const void *>(&get_split_state_ud)));
+                for (size_t d = 0; d < n_devs; d++) {
+                    const size_t b = ggml_backend_meta_split_dev_bytes(t, &ss, n_devs, d);
+                    if (b > max_slice) {
+                        max_slice = b;
+                    }
+                }
+            } else if (ggml_nbytes(t) > max_slice) {
+                max_slice = ggml_nbytes(t);
+            }
+        }
+    }
+    return max_slice;
+}
+
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
@@ -4088,6 +4124,14 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
+}
+
+void llama_model_set_embeddings_layer_inp_preset(struct llama_model * model, const int32_t * lids, uint32_t n) {
+    if (n == 0) {
+        model->embeddings_layer_inp_preset.clear();
+    } else {
+        model->embeddings_layer_inp_preset.assign(lids, lids + n);
+    }
 }
 
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {

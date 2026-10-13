@@ -48,6 +48,7 @@ static ggml_backend_i ggml_backend_remoting_interface = {
     /* .event_wait              = */ NULL,
     /* .stage_buffer            = */ NULL,
     /* .stage_upload            = */ NULL,
+    /* .stage_gather            = */ NULL,
     /* .stage_wait              = */ NULL,
     /* .stage_d2d               = */ NULL,
     /* .stage_h2d_gbps          = */ NULL,
