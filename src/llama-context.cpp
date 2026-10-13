@@ -310,6 +310,11 @@ llama_context::llama_context(
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
+    for (const int32_t lid : model.embeddings_layer_inp_preset) {
+        if (lid >= 0 && (size_t) lid < cparams.embeddings_layer_inp.size()) {
+            cparams.embeddings_layer_inp[lid] = true;
+        }
+    }
 
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
@@ -1648,6 +1653,12 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
     GGML_ASSERT(lid <= model.hparams.n_layer());
+
+    if (cparams.embeddings_layer_inp[lid] == enable) {
+        // unchanged (preset at context creation): the reserved graph has it already, and a reserve would free and
+        // allocate all compute buffers again
+        return;
+    }
 
     cparams.embeddings_layer_inp[lid] = enable;
 
@@ -3616,9 +3627,57 @@ public:
             uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
-        for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+        // Each ggml_backend_tensor_get is a synchronous device copy with a fixed cost (tens of us on ROCm), and a sequence's
+        // KV cells are often many short ranges (concurrent decoding interleaves the slots' cells a few tokens at a time), so
+        // the deferred reads of one tensor whose gaps are at most LLAMA_STATE_GET_MERGE_GAP bytes (default 256 KiB, 0 = off)
+        // are read as one span and scattered on the host.  The bytes written are the same.
+        static const size_t max_gap = [] {
+            const char * e = getenv("LLAMA_STATE_GET_MERGE_GAP");
+            return e != nullptr ? (size_t) strtoull(e, nullptr, 10) : (size_t) 256*1024;
+        }();
+        if (max_gap == 0) {
+            for (const auto & winfo : winfos) {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
+        } else {
+            std::vector<uint8_t> span_buf;
+            for (size_t i = 0; i < winfos.size(); ) {
+                // [i, j): consecutive reads of one tensor, each starting at or after the previous one's end
+                const write_info & first = winfos[i];
+                size_t end = first.offset + first.size;
+                bool   dst_contiguous = true;
+                size_t j = i + 1;
+                for (; j < winfos.size(); ++j) {
+                    const write_info & w = winfos[j];
+                    if (w.tensor != first.tensor || w.offset < end || w.offset - end > max_gap) {
+                        break;
+                    }
+                    dst_contiguous = dst_contiguous && w.offset == end && w.ptr == winfos[j - 1].ptr + winfos[j - 1].size;
+                    end = w.offset + w.size;
+                }
+                bool merged = j - i == 1 || dst_contiguous;
+                if (merged) {
+                    ggml_backend_tensor_get(first.tensor, first.ptr, first.offset, end - first.offset);
+                } else {
+                    try {
+                        span_buf.resize(end - first.offset);
+                        merged = true;
+                    } catch (const std::bad_alloc &) {
+                        // no host memory for the span (a destructor must not throw): read the pieces one by one
+                    }
+                    if (merged) {
+                        ggml_backend_tensor_get(first.tensor, span_buf.data(), first.offset, end - first.offset);
+                        for (size_t k = i; k < j; ++k) {
+                            memcpy(winfos[k].ptr, span_buf.data() + (winfos[k].offset - first.offset), winfos[k].size);
+                        }
+                    } else {
+                        for (size_t k = i; k < j; ++k) {
+                            ggml_backend_tensor_get(winfos[k].tensor, winfos[k].ptr, winfos[k].offset, winfos[k].size);
+                        }
+                    }
+                }
+                i = j;
+            }
         }
     }
 

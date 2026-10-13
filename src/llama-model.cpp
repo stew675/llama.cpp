@@ -4089,6 +4089,14 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
 }
 
+void llama_model_set_embeddings_layer_inp_preset(struct llama_model * model, const int32_t * lids, uint32_t n) {
+    if (n == 0) {
+        model->embeddings_layer_inp_preset.clear();
+    } else {
+        model->embeddings_layer_inp_preset.assign(lids, lids + n);
+    }
+}
+
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
     if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
         return 0;

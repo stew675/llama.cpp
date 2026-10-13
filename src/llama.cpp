@@ -375,6 +375,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+        // TODO #58: a DFlash2 drafter with a selector builds `ggml_top_k` over the draft logits, which
+        // `-sm tensor` vocab-splits (axis 0); the Meta backend cannot reduce a per-row op across a split
+        // axis and aborts in `ggml-backend-meta.cpp`.  Reject cleanly with a `-sm layer` hint instead of
+        // aborting mid-load.  A real Meta distributed-top-k / split-to-mirrored gather is tracked in
+        // `wip/dflash-meta-split/`.
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && model->arch == LLM_ARCH_DFLASH &&
+            model->hparams.dflash_selector_rank > 0) {
+            throw std::runtime_error("LLAMA_SPLIT_MODE_TENSOR is not supported for a DFlash2 drafter with a "
+                                     "selector: its per-row TOP_K over the vocab-split draft logits has no "
+                                     "tensor-split path -- use -sm layer for that config");
+        }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }

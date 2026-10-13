@@ -164,6 +164,12 @@ LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_mode
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
 
+// layers whose input embeddings contexts created from this model extract from the start (as if
+// llama_set_embeddings_layer_inp(ctx, lid, true) had been called before the context's first graph reserve).
+// For a target whose draft will turn the extraction on (DFlash): the compute buffers are then sized for it once,
+// instead of being freed and allocated again, larger, at the first decode after the draft attaches.
+LLAMA_API void llama_model_set_embeddings_layer_inp_preset(struct llama_model * model, const int32_t * lids, uint32_t n);
+
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out

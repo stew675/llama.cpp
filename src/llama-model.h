@@ -764,6 +764,9 @@ struct llama_model {
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 
+    // layers whose input embeddings new contexts extract from the start (llama_model_set_embeddings_layer_inp_preset)
+    std::vector<int32_t> embeddings_layer_inp_preset;
+
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma

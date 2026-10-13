@@ -1114,6 +1114,9 @@ static ggml_backend_buffer_type_i ggml_backend_rpc_buffer_type_interface = {
     /* .get_alloc_size      = */ ggml_backend_rpc_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ NULL,
     /* .is_host             = */ NULL,
+    /* .get_compute_margin_pct = */ NULL,
+    /* .alloc_buffer_usage  = */ NULL,
+    /* .get_compute_chunk_bytes = */ NULL,
 };
 
 static const char * ggml_backend_rpc_name(ggml_backend_t backend) {
@@ -1293,6 +1296,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .event_wait              = */ ggml_backend_rpc_event_wait,
     /* .stage_buffer            = */ NULL,
     /* .stage_upload            = */ NULL,
+    /* .stage_gather            = */ NULL,
     /* .stage_wait              = */ NULL,
     /* .stage_d2d               = */ NULL,
     /* .stage_h2d_gbps          = */ NULL,
@@ -2918,6 +2922,10 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .slab_headroom_bytes  = */ nullptr,
     /* .slab_ring_set        = */ nullptr,
     /* .slab_narrow_floor    = */ nullptr,
+    /* .slab_narrow2_floor   = */ nullptr,
+    /* .slab_compute_narrow2 = */ nullptr,
+    /* .moe_cache_set_host_pool   = */ nullptr,
+    /* .moe_cache_set_host_source = */ nullptr,
 };
 
 // backend reg interface
