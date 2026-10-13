@@ -91,6 +91,15 @@ endif()
 
 add_compile_definitions(GGML_USE_HIP)
 
+# GGML_USE_HIP must also be visible to the main libraries: src/llama-arch.cpp's
+# qwen4exp tensor-split gate reads it.  ggml_add_backend() only publishes the
+# GGML_USE_<backend> macro on the `ggml` target when GGML_BACKEND_DL is OFF, so
+# a dynamic-backend build (e.g. the published containers) would otherwise
+# compile that gate as HIP-absent and reject `-sm tensor` for qwen4exp even
+# though the HIP backend is built.  Publishing it here covers both cases; the
+# static build already got it from ggml_add_backend(HIP).
+target_compile_definitions(ggml PUBLIC GGML_USE_HIP)
+
 if (GGML_CUDA_FORCE_MMQ)
     add_compile_definitions(GGML_CUDA_FORCE_MMQ)
 endif()

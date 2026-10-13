@@ -62,6 +62,29 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+// LLAMA_KV_N_PAD_PREFILL: a coarser pad for prompt-sized ubatches (see get_n_kv).  The env value is rounded
+// up to a power of two (GGML_PAD is a bit mask); 0 (or an unset value on a single device) turns it off.
+// Default-on only when more than one GPU is in use: a single GPU rebuilds its graph cheaply and the
+// coarser pad only adds masked attention work there (-0.35 % measured on a dense 27B), so the default
+// stays inactive for that shape.  Under -sm tensor the model can be a single Meta device, hence the
+// split-state count as well as the device list.
+static uint32_t kv_n_pad_prefill_default(const llama_model & model) {
+    if (const char * env = getenv("LLAMA_KV_N_PAD_PREFILL")) {
+        const int e = atoi(env);
+        if (e <= 0 || e > (1 << 24)) {
+            return 0;
+        }
+        uint32_t p2 = 1;
+        while (p2 < (uint32_t) e) {
+            p2 <<= 1;
+        }
+        return p2;
+    }
+
+    const bool multi_device = model.get_split_state_ud.n_devices > 1 || model.n_devices() > 1;
+    return multi_device ? 8192u : 0u;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -79,9 +102,11 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                     bool   v_enabled) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad),
+    n_pad_prefill(kv_n_pad_prefill_default(model)), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
@@ -228,7 +253,7 @@ llama_kv_cache::llama_kv_cache(
         }
 
         const bool has_k = true;
-        const bool has_v = !is_mla;
+        const bool has_v = !is_mla && v_enabled;
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
@@ -1280,17 +1305,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    // LLAMA_KV_N_PAD_MIN raises the 256-cell floor: n_kv - and with it the graph layout - then stays constant for longer,
+    // so fewer captured graphs are invalidated as the context grows (-sm tensor splits each token into ~100 graphs)
+    static const uint32_t n_pad_min = getenv("LLAMA_KV_N_PAD_MIN") ? (uint32_t) atoi(getenv("LLAMA_KV_N_PAD_MIN")) : 256u;
+    // LLAMA_KV_N_PAD_PREFILL: a coarser pad for prompt-sized ubatches (> 64 tokens) once the cache is past
+    // LLAMA_KV_N_PAD_PREFILL_FROM cells (default 4096; compared with the decode-padded occupancy).  Every prompt ubatch grows the cache by its own size, so with the
+    // decode pad n_kv - and the graph - changes at every ubatch and the whole graph is rebuilt (split state, allocation);
+    // a pad several ubatches wide lets consecutive ubatches reuse one graph.  Below the threshold the decode pad stays, so
+    // a model's small-context shortcuts keyed on n_kv (qwen4exp's dense attention for the first ~2051 tokens) still apply.
+    // Decode and verify batches keep the decode pad (a coarse pad there slows every step and changes its numerics).
+    // Default: 8192 on a multi-device split, 0 (off) on a single device; the value is rounded up to a power of two.
+    // Not for training (its graphs assert n_kv == n_tokens).
+    static const uint32_t n_pad_prefill_from = getenv("LLAMA_KV_N_PAD_PREFILL_FROM") ? (uint32_t) atoi(getenv("LLAMA_KV_N_PAD_PREFILL_FROM")) : 4096u;
+    const uint32_t n_pad_cur = std::max(n_pad, n_pad_min);
+    const bool     prefill   = n_tokens > 64 && n_pad_prefill > n_pad_cur;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        const uint32_t used = cells.used_max_p1();
+        const uint32_t pad  = prefill && GGML_PAD(used, n_pad_cur) > n_pad_prefill_from ? n_pad_prefill : n_pad_cur;
+
+        result = std::max(std::min(cells.size(), std::max(pad, GGML_PAD(used, pad))), result);
     }
 
     return result;
@@ -3039,7 +3080,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
 
     return true;
 }

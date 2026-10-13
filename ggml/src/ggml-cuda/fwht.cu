@@ -5,9 +5,11 @@
 // wide FWHT blocks use one row per thread block with this many threads
 #define GGML_CUDA_FWHT_BLOCK_NT 256
 
-template <int N, typename T>
+// has_q8_1: also write the rows as Q8_1 blocks to y (the quantize cache of an mmvq matmul over dst, whose rows the
+// FWHT rows tile), with the same reduction and rounding as quantize_q8_1
+template <int N, typename T, bool has_q8_1 = false>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
-__global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale) {
+__global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale, block_q8_1 * y) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
@@ -24,41 +26,35 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
     const int lane = threadIdx.x;
 
     ggml_cuda_pdl_sync();
-#pragma unroll
-    for (int i = 0; i < el_w; ++i) {
-        reg[i] = ggml_cuda_cast<float>(src[i * warp_size + lane]) * scale;
-    }
-
-#pragma unroll
-    for (int h = 1; h < warp_size; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < el_w; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, warp_size);
-
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-
-#pragma unroll
-    for (int h = warp_size; h < N; h *= 2) {
-        const int step = h / warp_size;
-#pragma unroll
-        for (int j = 0; j < el_w; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float x = reg[j + k];
-                const float y = reg[j + k + step];
-
-                reg[j + k]        = x + y;
-                reg[j + k + step] = x - y;
-            }
-        }
-    }
+    ggml_cuda_fwht_warp<N, warp_size>(src, scale, reg, lane);
 
 #pragma unroll
     for (int i = 0; i < el_w; ++i) {
         dst[i * warp_size + lane] = reg[i];
+    }
+
+    if constexpr (has_q8_1) {
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            const int64_t i_cont = r * N + i * warp_size + lane;
+            const int64_t ib     = i_cont / QK8_1;
+            const int     iqs    = i_cont % QK8_1;
+
+            const float xi = reg[i];
+            float amax = fabsf(xi);
+            float sum  = xi;
+
+            amax = warp_reduce_max<QK8_1>(amax);
+            sum  = warp_reduce_sum<QK8_1>(sum);
+
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+            y[ib].qs[iqs] = q;
+            if (iqs == 0) {
+                y[ib].ds = make_half2(d, sum);
+            }
+        }
     }
 }
 
@@ -144,7 +140,7 @@ __global__ void fwht_cuda_block(const T * src, float * dst, const int64_t n_rows
 }
 
 template <typename T>
-static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
+static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, block_q8_1 * y) {
     const int     n    = src->ne[0];
     const int64_t rows = ggml_nrows(src);
 
@@ -166,22 +162,39 @@ static bool ggml_cuda_op_fwht_impl(ggml_backend_cuda_context & ctx, const ggml_t
 
     switch (n) {
         case 64:
-            ggml_cuda_kernel_launch(fwht_cuda<64, T>, launch_params, src_d, dst_d, rows, scale);
+            if (y != nullptr) {
+                ggml_cuda_kernel_launch(fwht_cuda<64, T, true>, launch_params, src_d, dst_d, rows, scale, y);
+            } else {
+                ggml_cuda_kernel_launch(fwht_cuda<64, T>, launch_params, src_d, dst_d, rows, scale, y);
+            }
             return true;
         case 128:
-            ggml_cuda_kernel_launch(fwht_cuda<128, T>, launch_params, src_d, dst_d, rows, scale);
+            if (y != nullptr) {
+                ggml_cuda_kernel_launch(fwht_cuda<128, T, true>, launch_params, src_d, dst_d, rows, scale, y);
+            } else {
+                ggml_cuda_kernel_launch(fwht_cuda<128, T>, launch_params, src_d, dst_d, rows, scale, y);
+            }
             return true;
         case 256:
-            ggml_cuda_kernel_launch(fwht_cuda<256, T>, launch_params, src_d, dst_d, rows, scale);
+            if (y != nullptr) {
+                ggml_cuda_kernel_launch(fwht_cuda<256, T, true>, launch_params, src_d, dst_d, rows, scale, y);
+            } else {
+                ggml_cuda_kernel_launch(fwht_cuda<256, T>, launch_params, src_d, dst_d, rows, scale, y);
+            }
             return true;
         case 512:
-            ggml_cuda_kernel_launch(fwht_cuda<512, T>, launch_params, src_d, dst_d, rows, scale);
+            if (y != nullptr) {
+                ggml_cuda_kernel_launch(fwht_cuda<512, T, true>, launch_params, src_d, dst_d, rows, scale, y);
+            } else {
+                ggml_cuda_kernel_launch(fwht_cuda<512, T>, launch_params, src_d, dst_d, rows, scale, y);
+            }
             return true;
         default:
             break;
     }
 
     // wide blocks: one row per thread block
+    GGML_ASSERT(y == nullptr);
     {
         constexpr int nt = GGML_CUDA_FWHT_BLOCK_NT;
 
@@ -222,7 +235,7 @@ bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op) {
            ggml_are_same_shape(b, op);
 }
 
-bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
+bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst, void * q8_1) {
     GGML_ASSERT(ggml_are_same_shape(src, dst));
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
         return false;
@@ -233,9 +246,9 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 
     switch (src->type) {
         case GGML_TYPE_F32:
-            return ggml_cuda_op_fwht_impl<float>(ctx, src, dst);
+            return ggml_cuda_op_fwht_impl<float>(ctx, src, dst, (block_q8_1 *) q8_1);
         case GGML_TYPE_F16:
-            return ggml_cuda_op_fwht_impl<half>(ctx, src, dst);
+            return ggml_cuda_op_fwht_impl<half>(ctx, src, dst, (block_q8_1 *) q8_1);
         default:
             return false;
     }

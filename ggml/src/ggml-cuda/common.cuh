@@ -102,6 +102,7 @@ static inline bool ggml_cuda_cache_geom_debug() {
 #define GGML_CUDA_CC_IS_RDNA3_5(cc) (cc >= GGML_CUDA_CC_RDNA3_5 && cc < GGML_CUDA_CC_RDNA4)
 #define GGML_CUDA_CC_IS_RDNA3(cc)   (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc))
 #define GGML_CUDA_CC_IS_RDNA4(cc)   (cc >= GGML_CUDA_CC_RDNA4)
+#define GGML_CUDA_CC_IS_GFX1151(cc)  (cc == (GGML_CUDA_CC_OFFSET_AMD + 0x1151))
 #define GGML_CUDA_CC_IS_GCN_APU(cc) ((cc) == GGML_CUDA_CC_GFX909 || (cc) == GGML_CUDA_CC_GFX90C)
 #define GGML_CUDA_CC_IS_GCN(cc)     ((cc > GGML_CUDA_CC_OFFSET_AMD && cc < GGML_CUDA_CC_CDNA1) || GGML_CUDA_CC_IS_GCN_APU(cc))
 #define GGML_CUDA_CC_IS_CDNA(cc)    (!GGML_CUDA_CC_IS_GCN_APU(cc) && cc >= GGML_CUDA_CC_CDNA1 && cc < GGML_CUDA_CC_RDNA1)
@@ -410,6 +411,14 @@ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignm
            tensor->nb[1] % alignment == 0 &&
            tensor->nb[2] % alignment == 0 &&
            tensor->nb[3] % alignment == 0;
+}
+
+// A view/no-op node between a producer and its consumer: it does not read differently, so a fusion
+// window may step over it (the consumer still reads the same physical data).  Shared by the
+// extracted fusion helpers (GDN/HC/SSM).
+static inline bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+    return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
+           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
@@ -1324,33 +1333,6 @@ struct ggml_cuda_device_info {
 
 const ggml_cuda_device_info & ggml_cuda_info();
 
-// WORKAROUND for the gfx1201 grid-size dispatch stall (ROCm/legacy-rocm-build#6689, ROCm/TheRock#8634): a dispatch
-// whose block count is a multiple of 256, or whose work-item count is a multiple of 65536, waits ~6-10 us before it
-// runs (a 512-row BF16 GEMV: 17.8 us vs 8.8 us at 513 blocks).  A launch site that can take one extra block (the
-// kernel returns at once for a block past its last row) asks this helper and adds that block; the arithmetic is
-// unchanged.  Not the only workaround in the tree: mul_mat_vec_f_vb, hc_mix and the RDNA4 mmvq decode grid size
-// their grids around the same stall.
-// BACKING IT OUT once AMD ships the fix: GGML_CUDA_GRID_STALL_PAD=0 turns it off at run time; to remove it, delete
-// this function and its call sites (grep ggml_cuda_grid_stall_pad) -- the kernels' row guards are harmless left in.
-static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block) {
-#if defined(GGML_USE_HIP)
-    static const bool on = [] {
-        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD");
-        return e == nullptr || atoi(e) != 0;
-    }();
-    if (!on) {
-        return false;
-    }
-    const int64_t nblk = (int64_t) grid.x * grid.y * grid.z;
-    const int64_t nthr = (int64_t) block.x * block.y * block.z;
-    return nblk > 0 && (nblk % 256 == 0 || (nblk * nthr) % 65536 == 0);
-#else
-    GGML_UNUSED(grid);
-    GGML_UNUSED(block);
-    return false;
-#endif // defined(GGML_USE_HIP)
-}
-
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
@@ -1644,6 +1626,12 @@ void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size);
 size_t ggml_cuda_slab_ring_slot_capacity(int device);
 void   ggml_cuda_slab_ring_set(int device, bool arm);
 
+// wip/slab-ring-region (issue #164): the H2D staging-ring cap (bytes).  `GGML_CUDA_SLAB_RING_MIB` is a
+// verbatim per-GPU override; otherwise `llama_context` auto-sizes it from the ubatch and the host-expert
+// device count and calls `ggml_cuda_h2d_ring_cap_set` before the slab is created.
+size_t ggml_cuda_h2d_ring_cap_bytes();
+void   ggml_cuda_h2d_ring_cap_set(size_t bytes);
+
 // The per-operand cap GGML_CUDA_FA_STAGE_MAX_MB resolves to (0 = unbounded): a staging request
 // larger than this is not staged at all.  Shared by launch_fattn and the --fit accounting of the
 // staging arena (ggml_backend_cuda_fattn_stage_bound).
@@ -1655,15 +1643,58 @@ static inline size_t ggml_cuda_fattn_stage_max_bytes() {
     return stage_max_bytes;
 }
 
+// WORKAROUND for the gfx1201 grid-size dispatch stall (ROCm/legacy-rocm-build#6689, ROCm/TheRock#8634): a dispatch
+// whose block count is a multiple of 256, or whose work-item count is a multiple of 65536, waits ~6-10 us before it
+// runs (a 512-row BF16 GEMV: 17.8 us vs 8.8 us at 513 blocks).  A launch site that can take one extra block (the
+// kernel returns at once for a block past its last row) asks this helper and adds that block; the arithmetic is
+// unchanged.  Not the only workaround in the tree: mul_mat_vec_f_vb, hc_mix and the RDNA4 mmvq decode grid size
+// their grids around the same stall.
+// BACKING IT OUT once AMD ships the fix: GGML_CUDA_GRID_STALL_PAD=0 turns it off at run time; to remove it, delete
+// this function and its call sites (grep ggml_cuda_grid_stall_pad) -- the kernels' row guards are harmless left in.
+static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block) {
+#if defined(GGML_USE_HIP)
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!on) {
+        return false;
+    }
+    const int64_t nblk = (int64_t) grid.x * grid.y * grid.z;
+    const int64_t nthr = (int64_t) block.x * block.y * block.z;
+    return nblk > 0 && (nblk % 256 == 0 || (nblk * nthr) % 65536 == 0);
+#else
+    GGML_UNUSED(grid);
+    GGML_UNUSED(block);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
 // Issue/TODO #42: the shared device-allocation helper (defined in ggml-cuda.cu).  It yields the
 // lowest-priority MoE expert-cache arena when an allocation cannot otherwise be satisfied, so every
 // device allocation inherits the same fail-soft policy.
 cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
 
+#define GGML_CUDA_HC_Q8_CNT 1024
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // Host-pinned ring for the strided splice H2D (see `ggml_backend_cuda_set_tensor_2d_async`,
+    // `stride_tensor == size && n_copies > 1`).  Owned by the context so the events and pinned
+    // buffers are torn down with its streams.  A function-local static ring outlived a *temporary*
+    // backend's streams -- the loader's `-lm none` async uploader creates its own meta backend and
+    // frees it after the load -- so a later decode reuse of a slot recorded by that backend failed
+    // `hipEventSynchronize` with `hipErrorUnknown`.
+    struct splice_pin_slot {
+        void *      buf = nullptr;
+        size_t      sz  = 0;
+        cudaEvent_t ev  = nullptr;
+    };
+    std::vector<splice_pin_slot> splice_pin_ring;
+    int                          splice_pin_idx = 0;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1763,6 +1794,17 @@ struct ggml_backend_cuda_context {
     size_t q8_1_arena_size = 0;
     std::vector<char *> q8_1_arena_retired;
 
+    // hc_mix_bf16_up_collapse2 Q8_1 epilogue: per-group row counters, one slice per stream (zeroed once, the
+    // kernel resets every counter it completes)
+    int * hc_q8_cnt = nullptr;
+    int * hc_q8_counters() {
+        if (hc_q8_cnt == nullptr) {
+            CUDA_CHECK(ggml_cuda_device_malloc((void **) &hc_q8_cnt, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_Q8_CNT*sizeof(int), device));
+            CUDA_CHECK(cudaMemsetAsync(hc_q8_cnt, 0, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_Q8_CNT*sizeof(int), stream()));
+        }
+        return hc_q8_cnt + curr_stream_no*GGML_CUDA_HC_Q8_CNT;
+    }
+
     // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
     // launcher when the next matmul over its output takes the mmvq path; the GLU launcher then also writes that
     // matmul's Q8_1 activation into the quantize cache.  Reset on every try_fuse call, so they never outlive the node.
@@ -1779,13 +1821,53 @@ struct ggml_backend_cuda_context {
     // Returns the cached buffer for (src1, stream_no, layout) if present,
     // otherwise allocates a new one from the arena and records it. The buffer
     // is valid until the next q8_1_cache_clear().
+    // Canonical row layout of a (ne11, ne12, ne13) x (s11, s12, s13) activation: size-1 dims dropped, a dim merged
+    // into the previous one when it continues it contiguously; out = (n, s) pairs, padded with (1, 0).
+    static void q8_1_rows_canon(int64_t ne11, int64_t ne12, int64_t ne13, int64_t s11, int64_t s12, int64_t s13, int64_t out[6]) {
+        const int64_t ne[3] = { ne11, ne12, ne13 };
+        const int64_t st[3] = { s11, s12, s13 };
+        int k = 0;
+        for (int i = 0; i < 3; i++) {
+            if (ne[i] == 1) {
+                continue;
+            }
+            if (k > 0 && st[i] == out[2*(k - 1)]*out[2*(k - 1) + 1]) {
+                out[2*(k - 1)] *= ne[i];
+                continue;
+            }
+            out[2*k] = ne[i];
+            out[2*k + 1] = st[i];
+            k++;
+        }
+        for (; k < 3; k++) {
+            out[2*k] = 1;
+            out[2*k + 1] = 0;
+        }
+    }
+
     void * q8_1_cache_get(const ggml_tensor * src1, int stream_no, size_t size,
                           int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
                           int64_t s11, int64_t s12, int64_t s13, bool & found) {
+        // Match on the row layout rather than the raw shape: the quantized buffer holds the rows in (i13, i12, i11)
+        // order, so two descriptions with the same canonical rows (size-1 dims dropped, contiguous dims merged) are
+        // byte-identical -- e.g. the MUL_MAT_ID view [K, 1, n] and the MUL_MAT view [K, n] of one activation.
+        // GGML_CUDA_Q8_1_CACHE_EXACT=1 restores the exact-shape match (A/B).
+        static const bool exact = getenv("GGML_CUDA_Q8_1_CACHE_EXACT") != nullptr;
+        int64_t c[6];
+        q8_1_rows_canon(ne11, ne12, ne13, s11, s12, s13, c);
         for (const auto & e : q8_1_cache) {
-            if (e.src1 == src1 && e.data == src1->data && e.stream_no == stream_no &&
-                e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
-                e.s11 == s11 && e.s12 == s12 && e.s13 == s13) {
+            if (e.src1 != src1 || e.data != src1->data || e.stream_no != stream_no || e.ne10 != ne10) {
+                continue;
+            }
+            bool same;
+            if (exact) {
+                same = e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 && e.s11 == s11 && e.s12 == s12 && e.s13 == s13;
+            } else {
+                int64_t ce[6];
+                q8_1_rows_canon(e.ne11, e.ne12, e.ne13, e.s11, e.s12, e.s13, ce);
+                same = memcmp(c, ce, sizeof(c)) == 0;
+            }
+            if (same) {
                 found = true;
                 return q8_1_arena + e.offset;
             }
@@ -1973,10 +2055,10 @@ struct ggml_backend_cuda_context {
         // Qwen3.8-Flash-Next where the largest staged slice is 270 MiB.  Cap the auto hole so it stays
         // proportional to a real table (GGML_CUDA_SLAB_RING_MIB); a staged request larger than a slot falls
         // back to cudaMalloc, the pre-change path.  An explicit GGML_SCHED_STAGE_MAX_MB still wins.
-        static const size_t cap = []() {
-            const char * e = getenv("GGML_CUDA_SLAB_RING_MIB");
-            return (size_t) (e ? atoll(e) : 6144) << 20;
-        }();
+        // wip/slab-ring-region (issue #164): the cap is the explicit per-GPU override when set, else the
+        // context's auto-size (1800/n + ub/(1.7 n^2) MiB, capped at 1/4 of the smallest staging device's
+        // VRAM, computed at context reserve); 6144 MiB is the fallback for a consumer that never auto-sizes.
+        const size_t cap = ggml_cuda_h2d_ring_cap_bytes();
         if (bound > cap) {
             bound = cap;
         }
@@ -2100,12 +2182,18 @@ struct ggml_backend_cuda_context {
             // it does not draw on the free VRAM the G4 cap protects.
             if (!h2d_stage_slab[slot]) {
                 const size_t cap = ggml_cuda_slab_ring_slot_capacity(device);
-                if (cap >= new_size) {
-                    void * p = ggml_cuda_slab_arena_alloc_transient(device, cap);
+                // issue #164: when the ring is armed, serve the slot at its real size (bump-allocated, so
+                // its VA is still stable) rather than only when it fits the even per-slot capacity.  A
+                // model whose largest staged slice exceeds `ring_region / slots` would otherwise fall
+                // back to cudaMalloc even though the region has room.  The region bound is enforced in
+                // `ggml_cuda_slab_arena_alloc_transient`.
+                if (cap > 0) {
+                    const size_t want = cap >= new_size ? cap : new_size;
+                    void * p = ggml_cuda_slab_arena_alloc_transient(device, want);
                     if (p != nullptr) {
                         h2d_stage[slot]      = p;
-                        h2d_stage_size[slot] = cap;
-                        h2d_stage_total     += cap - old_size;
+                        h2d_stage_size[slot] = want;
+                        h2d_stage_total     += want - old_size;
                         h2d_stage_slab[slot] = true;
                         return p;
                     }
@@ -2329,6 +2417,40 @@ struct ggml_backend_cuda_context {
     }
 };
 
+// Main per-op CUDA dispatch (defined in ggml-cuda.cu); exposed so extracted fusion
+// helpers (e.g. norm-gated.cu) can dispatch a preceding op before their fused kernel.
+int  ggml_cuda_get_physical_device(int device);
+
+bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
+
+// BF16 src1 cache (GGML_CUDA_BF16_SRC1_CACHE=0: off), shared by the MMB / HC producers.
+static inline bool ggml_cuda_bf16_src1_cache_on() {
+    static const bool on = getenv("GGML_CUDA_BF16_SRC1_CACHE") == nullptr || atoi(getenv("GGML_CUDA_BF16_SRC1_CACHE")) != 0;
+    return on;
+}
+
+// Fusion-window alias check (defined in ggml-cuda.cu): true when none of the output nodes alias
+// an input that is not produced inside the window.  Shared by the extracted fusion helpers.
+bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+                                          const int           node_idx,
+                                          const int           node_count,
+                                          const int *         out_nodes,
+                                          const int           out_count,
+                                          const bool          is_topk_moe = false);
+
+// Whether a dense MUL_MAT over a quantized src0 will run as MMQ (defined in ggml-cuda.cu).
+bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
+// Upstream gate+up+GLU / shared-expert matcher predicate (defined in ggml-cuda.cu).
+bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
+                                   const ggml_tensor * ffn_gate,
+                                   const ggml_tensor * glu,
+                                   const ggml_tensor * ffn_up_bias = nullptr,
+                                   const ggml_tensor * ffn_gate_bias = nullptr,
+                                   const ggml_tensor * ffn_up_scale = nullptr,
+                                   const ggml_tensor * ffn_gate_scale = nullptr);
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -2498,6 +2620,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-
-bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph, const int node_idx, const int node_count, const int * out_nodes, const int out_count, const bool is_topk_moe = false);
-bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up, const ggml_tensor * ffn_gate, const ggml_tensor * glu, const ggml_tensor * ffn_up_bias = nullptr, const ggml_tensor * ffn_gate_bias = nullptr, const ggml_tensor * ffn_up_scale = nullptr, const ggml_tensor * ffn_gate_scale = nullptr);

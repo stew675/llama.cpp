@@ -1084,6 +1084,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "FLASH_ATTN_QSA",
+    "INDEXER_TOPK",
+    "INDEXER_SCORE",
+    "INDEXER_FILL",
+    "HC_MIX",
+    "HC_COMBINE",
 
     "UNARY",
 
@@ -1101,7 +1107,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 108");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1155,6 +1161,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "diag_mask_zero(x)",
     "soft_max(x)",
     "soft_max_back(x)",
+    "indexer_score(k, blk, pos, q, w, bias)",
     "rope(x)",
     "rope_back(x)",
     "clamp(x)",
@@ -1199,6 +1206,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "flash_attn_qsa(q, k, v, idx, mask)",
+    "indexer_topk(q, k, weights, mask)",
+    "indexer_fill(k, blk, pos, w, rng, pool)",
+    "hc_mix(x, w_norm, w_down, w_up)",
+    "hc_combine(residual, x, inject)",
 
     "unary(x)",
 
@@ -1216,7 +1228,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 108");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5632,6 +5644,339 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+// ggml_flash_attn_qsa: qwen4exp sparse attention over the indexer-selected cells.
+// Attends only over the n_top_k cells that the QSA indexer picked (idx),
+// instead of the whole KV cache.  The mask is the base kq_mask and is
+// gathered in-kernel at the idx positions.
+struct ggml_tensor * ggml_flash_attn_qsa(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 logit_softcap,
+        struct ggml_tensor  * cell_vis,
+        struct ggml_tensor  * q_vis) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+
+    GGML_ASSERT(idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(idx->ne[1] == q->ne[1]);   // n_tps
+    GGML_ASSERT(idx->ne[3] == q->ne[3]);   // n_stream
+
+    // the mask is optional: when the compact visibility keys are given, the kernel derives the
+    // per-cell value from them instead (cell_vis[cell] in [0, q_vis[token]] means visible)
+    GGML_ASSERT(mask != NULL || (cell_vis != NULL && q_vis != NULL));
+
+    if (mask != NULL) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[0] == k->ne[1]);  // n_kv
+        GGML_ASSERT(mask->ne[1] == q->ne[1]);
+        GGML_ASSERT(mask->ne[3] == q->ne[3]);
+    }
+
+    if (cell_vis != NULL) {
+        GGML_ASSERT(q_vis != NULL);
+        GGML_ASSERT(cell_vis->type == GGML_TYPE_I32 && q_vis->type == GGML_TYPE_I32);
+        GGML_ASSERT(cell_vis->ne[0] == k->ne[1] && cell_vis->ne[1] == q->ne[3]);
+        GGML_ASSERT(q_vis->ne[0]    == q->ne[1] && q_vis->ne[1]    == q->ne[3]);
+    }
+
+    // permute(0, 2, 1, 3)
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_QSA;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = idx;
+    result->src[4] = mask;
+    result->src[5] = cell_vis;
+    result->src[6] = q_vis;
+
+    return result;
+}
+
+// attach (or clear) the natural contiguous F16 K/V views the qsa3 prefill launcher packs into the
+// packed-block layouts it consumes (ggml/src/ggml-cuda/fattn-qsa3.cu)
+void ggml_hc_mix_set_planar(struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_HC_MIX);
+    GGML_ASSERT(a->src[4] != NULL);   // only the mixer with an inject tail has two outputs
+    ggml_set_op_params_i32(a, 2, 1);
+}
+
+void ggml_flash_attn_qsa_set_packed(
+        struct ggml_tensor * a,
+        struct ggml_tensor * packed_keys,
+        struct ggml_tensor * packed_values) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_QSA);
+
+    if (packed_keys == NULL || packed_values == NULL) {
+        a->src[7] = NULL;
+        a->src[8] = NULL;
+        return;
+    }
+
+    const struct ggml_tensor * k = a->src[1];   // permuted [D, n_kv, n_head_kv]
+    GGML_ASSERT(packed_keys->type   == GGML_TYPE_F16);
+    GGML_ASSERT(packed_values->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(packed_keys) && ggml_is_contiguous(packed_values));
+    // the natural view swaps k's dims 1 and 2: [D, n_head_kv, n_kv]
+    GGML_ASSERT(packed_keys->ne[0]   == k->ne[0] && packed_keys->ne[1]   == k->ne[2] && packed_keys->ne[2]   == k->ne[1] && packed_keys->ne[3]   == 1);
+    GGML_ASSERT(packed_values->ne[0] == k->ne[0] && packed_values->ne[1] == k->ne[2] && packed_values->ne[2] == k->ne[1] && packed_values->ne[3] == 1);
+
+    a->src[7] = packed_keys;
+    a->src[8] = packed_values;
+}
+
+void ggml_flash_attn_qsa_set_prec(
+        struct ggml_tensor * a,
+        enum ggml_prec       prec) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_QSA);
+
+    int32_t prec_i32 = (int32_t) prec;
+    ggml_set_op_params_i32(a, 2, prec_i32);
+}
+
+enum ggml_prec ggml_flash_attn_qsa_get_prec(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_QSA);
+
+    const int32_t prec_i32 = ggml_get_op_params_i32(a, 2);
+
+    return (enum ggml_prec) prec_i32;
+}
+
+// ggml_indexer_top_k
+
+struct ggml_tensor * ggml_indexer_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * cell_blk,
+        struct ggml_tensor  * additive,
+        struct ggml_tensor  * cell_pos,
+        struct ggml_tensor  * q_pos,
+        struct ggml_tensor  * blk_idx,
+        struct ggml_tensor  * blk_tail,
+        struct ggml_tensor  * blk_cells,
+        int                   k) {
+    GGML_ASSERT(score->type   == GGML_TYPE_F32);
+    GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
+    GGML_ASSERT(score->ne[0] > 0);
+    GGML_ASSERT(cell_blk->ne[1] == score->ne[2]);
+    GGML_ASSERT(k > 0);
+    GGML_ASSERT(k <= (int) cell_blk->ne[0]);
+
+    // the per-cell additive is optional: the compact position srcs derive it in-kernel
+    if (additive != NULL) {
+        GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
+        GGML_ASSERT(cell_blk->ne[0] == additive->ne[0]);
+        GGML_ASSERT(additive->ne[1] == score->ne[1]);
+        // the additive is the kq mask [n_kv, n_tps, 1, n_stream] (the size-1 dim is a
+        // no-op stride the kernel reads as 3D) or a 3D bias [n_kv, n_tps, n_stream]
+        GGML_ASSERT(additive->ne[2] == score->ne[2] ||
+                (additive->ne[2] == 1 && additive->ne[3] == score->ne[2]));
+    }
+
+    if (cell_pos != NULL) {
+        GGML_ASSERT(q_pos != NULL && cell_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32);
+        GGML_ASSERT(cell_pos->ne[0] == cell_blk->ne[0]);
+        GGML_ASSERT(cell_pos->ne[1] == cell_blk->ne[1]);
+        GGML_ASSERT(q_pos->ne[0] == score->ne[1]);
+        GGML_ASSERT(q_pos->ne[1] == score->ne[2]);
+    }
+
+    if (blk_idx != NULL) {
+        GGML_ASSERT(blk_tail != NULL && blk_idx->type == GGML_TYPE_I32 && blk_tail->type == GGML_TYPE_I32);
+        GGML_ASSERT(blk_idx->ne[0] == score->ne[0]);
+        GGML_ASSERT(blk_idx->ne[1] == score->ne[2]);
+        GGML_ASSERT(blk_tail->ne[0] == score->ne[1]);
+        GGML_ASSERT(blk_tail->ne[1] == score->ne[2]);
+    }
+
+    // the block -> cell map: [ratio*n_blocks, n_stream].  optional (the block-level fast
+    // path); when present it must divide evenly into per-block slots so ratio = ne[0]/n_blocks.
+    if (blk_cells != NULL) {
+        GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
+        GGML_ASSERT(blk_cells->ne[1] == score->ne[2]);
+        GGML_ASSERT(blk_cells->ne[0] > 0 && blk_cells->ne[0] % score->ne[0] == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, k, score->ne[1], 1, score->ne[2]);
+
+    result->op     = GGML_OP_INDEXER_TOPK;
+    result->src[0] = score;
+    result->src[1] = cell_blk;
+    result->src[2] = additive;
+    result->src[3] = cell_pos;
+    result->src[4] = q_pos;
+    result->src[5] = blk_idx;
+    result->src[6] = blk_tail;
+    result->src[7] = blk_cells;
+    ggml_set_op_params_i32(result, 0, k);
+
+    return result;
+}
+
+// ggml_indexer_score
+
+struct ggml_tensor * ggml_indexer_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * blk_cells,
+        struct ggml_tensor  * blk_pos,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * bias,
+        int                   r,
+        float                 eps,
+        int                   n_dims,
+        const int           * sections,
+        int                   mode,
+        int                   n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        struct ggml_tensor  * pool,
+        struct ggml_tensor  * rng) {
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(blk_pos->type  == GGML_TYPE_I32);
+    GGML_ASSERT(q->type        == GGML_TYPE_F32);
+    GGML_ASSERT(w->type        == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type     == GGML_TYPE_F32);
+    GGML_ASSERT(blk_cells->ne[0] % r == 0);
+    GGML_ASSERT(k->ne[0] == w->ne[0]);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(n_dims <= k->ne[0] && n_dims % 2 == 0);
+    GGML_ASSERT(mode == GGML_ROPE_TYPE_IMROPE);   // the fused kernel's rope path
+    GGML_ASSERT(blk_pos->ne[0] == 4 * (blk_cells->ne[0] / r) * k->ne[2]);
+    GGML_ASSERT(bias->ne[0] == blk_cells->ne[0] / r);
+    GGML_ASSERT(q->ne[1] <= 8);                   // mmvf F32 oracle bound
+    GGML_ASSERT(q->ne[2] == k->ne[2]);
+    // derived-cache path: both or neither; the pool must match the block geometry and the
+    // range leaf must carry 2*n_stream per-stream limits
+    GGML_ASSERT((pool == NULL) == (rng == NULL));
+    if (pool != NULL) {
+        GGML_ASSERT(pool->type == GGML_TYPE_F32);
+        GGML_ASSERT(pool->ne[0] == k->ne[0] && pool->ne[1] == blk_cells->ne[0] / r && pool->ne[2] == k->ne[2]);
+        GGML_ASSERT(rng->type == GGML_TYPE_I32 && rng->ne[0] == 2 * k->ne[2]);
+    }
+
+    const int64_t n_blocks = blk_cells->ne[0] / r;
+
+    // the fused path is decode-only (n_tokens == 1 -> n_tps == 1); ne[1] is the token-per-stream count
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, 1, k->ne[2]);
+
+    result->op     = GGML_OP_INDEXER_SCORE;
+    result->src[0] = k;
+    result->src[1] = blk_cells;
+    result->src[2] = blk_pos;
+    result->src[3] = q;
+    result->src[4] = w;
+    result->src[5] = bias;
+    if (pool != NULL) {
+        result->src[6] = pool;
+        result->src[7] = rng;
+    }
+    ggml_set_op_params_i32(result, 0, r);
+    ggml_set_op_params_i32(result, 1, n_dims);
+    ggml_set_op_params_i32(result, 2, mode);
+    ggml_set_op_params_i32(result, 3, n_ctx_orig);
+    ggml_set_op_params_f32(result,  4, freq_base);
+    ggml_set_op_params_f32(result,  5, freq_scale);
+    ggml_set_op_params_f32(result,  6, ext_factor);
+    ggml_set_op_params_f32(result,  7, attn_factor);
+    ggml_set_op_params_f32(result,  8, beta_fast);
+    ggml_set_op_params_f32(result,  9, beta_slow);
+    ggml_set_op_params_i32(result, 10, sections[0]);
+    ggml_set_op_params_i32(result, 11, sections[1]);
+    ggml_set_op_params_i32(result, 12, sections[2]);
+    ggml_set_op_params_i32(result, 13, sections[3]);
+    ggml_set_op_params_f32(result, 14, eps);
+
+    return result;
+}
+
+// ggml_indexer_fill
+
+struct ggml_tensor * ggml_indexer_fill(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * blk_cells,
+        struct ggml_tensor  * blk_pos,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * rng,
+        struct ggml_tensor  * pool,
+        int                   r,
+        float                 eps,
+        int                   n_dims,
+        const int           * sections,
+        int                   mode,
+        int                   n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(blk_pos->type  == GGML_TYPE_I32);
+    GGML_ASSERT(w->type        == GGML_TYPE_F32);
+    GGML_ASSERT(rng->type      == GGML_TYPE_I32);
+    GGML_ASSERT(pool->type     == GGML_TYPE_F32);
+    GGML_ASSERT(blk_cells->ne[0] % r == 0);
+    GGML_ASSERT(k->ne[0] == w->ne[0]);
+    GGML_ASSERT(n_dims <= k->ne[0] && n_dims % 2 == 0);
+    GGML_ASSERT(mode == GGML_ROPE_TYPE_IMROPE);   // the fused kernel's rope path
+    GGML_ASSERT(blk_pos->ne[0] == 4 * (blk_cells->ne[0] / r) * k->ne[2]);
+    GGML_ASSERT(rng->ne[0] == 2 * k->ne[2]);      // [from_s..., lim_s...]
+    GGML_ASSERT(pool->ne[0] == k->ne[0] && pool->ne[2] == k->ne[2]);
+    GGML_ASSERT(pool->ne[1] == blk_cells->ne[0] / r);
+
+    // write through a view of the caller's pool buffer (the derived-cache rows)
+    struct ggml_tensor * result = ggml_view_tensor(ctx, pool);
+    ggml_format_name(result, "%s (indexer_fill)", pool->name);
+
+    result->op     = GGML_OP_INDEXER_FILL;
+    result->src[0] = k;
+    result->src[1] = blk_cells;
+    result->src[2] = blk_pos;
+    result->src[3] = w;
+    result->src[4] = rng;
+    result->src[5] = pool;
+    ggml_set_op_params_i32(result, 0, r);
+    ggml_set_op_params_i32(result, 1, n_dims);
+    ggml_set_op_params_i32(result, 2, mode);
+    ggml_set_op_params_i32(result, 3, n_ctx_orig);
+    ggml_set_op_params_f32(result,  4, freq_base);
+    ggml_set_op_params_f32(result,  5, freq_scale);
+    ggml_set_op_params_f32(result,  6, ext_factor);
+    ggml_set_op_params_f32(result,  7, attn_factor);
+    ggml_set_op_params_f32(result,  8, beta_fast);
+    ggml_set_op_params_f32(result,  9, beta_slow);
+    ggml_set_op_params_i32(result, 10, sections[0]);
+    ggml_set_op_params_i32(result, 11, sections[1]);
+    ggml_set_op_params_i32(result, 12, sections[2]);
+    ggml_set_op_params_i32(result, 13, sections[3]);
+    ggml_set_op_params_f32(result, 14, eps);
+
+    return result;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
@@ -6655,6 +7000,90 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_hc_mix
+
+struct ggml_tensor * ggml_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_norm,
+        struct ggml_tensor  * w_down,
+        struct ggml_tensor  * w_up,
+        struct ggml_tensor  * w_inject,
+        int64_t               hc,
+        float                 eps) {
+    GGML_ASSERT(x->type        == GGML_TYPE_F32);
+    GGML_ASSERT(w_norm->type   == GGML_TYPE_F32);
+    // Q8_0 down/up (inject F32 or Q8_0), or BF16 down/up/inject (Flash-Next GSQ-RCO keeps the hc weights in BF16)
+    const bool hc_bf16 = w_down->type == GGML_TYPE_BF16;
+    GGML_ASSERT(w_down->type   == GGML_TYPE_Q8_0 || hc_bf16);
+    GGML_ASSERT(w_up->type     == w_down->type);
+    GGML_ASSERT(w_inject == NULL || (hc_bf16 ? w_inject->type == GGML_TYPE_BF16 :
+                                     (w_inject->type == GGML_TYPE_F32 || w_inject->type == GGML_TYPE_Q8_0)));
+    GGML_ASSERT(hc > 0);
+
+    const int64_t n_embd    = x->ne[0];
+    const int64_t hc_dim    = n_embd * hc;
+    const int64_t n_tokens  = x->ne[2];
+
+    GGML_ASSERT(x->ne[1] == hc);
+    GGML_ASSERT(ggml_nelements(w_norm) == hc_dim);
+    GGML_ASSERT(w_down->ne[0] == hc_dim);
+    GGML_ASSERT(w_up->ne[1] == hc_dim && w_up->ne[0] == w_down->ne[1]);
+    GGML_ASSERT(w_inject == NULL || (w_inject->ne[0] == hc_dim && w_inject->ne[1] == hc));
+    GGML_ASSERT(x->ne[3] == 1);
+
+    // w_inject == NULL (the head call): no inject tail in the output
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,
+            n_embd + (w_inject ? hc : 0), n_tokens);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) hc);
+    ggml_set_op_params_f32(result, 1, eps);
+
+    result->op     = GGML_OP_HC_MIX;
+    result->src[0] = x;
+    result->src[1] = w_norm;
+    result->src[2] = w_down;
+    result->src[3] = w_up;
+    result->src[4] = w_inject;
+
+    return result;
+}
+
+// ggml_hc_combine
+
+struct ggml_tensor * ggml_hc_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * block_out,
+        struct ggml_tensor  * inject,
+        int64_t               hc) {
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type == GGML_TYPE_F32);
+    GGML_ASSERT(hc > 0);
+
+    const int64_t n_embd   = residual->ne[0];
+    const int64_t n_tokens = residual->ne[2];
+
+    GGML_ASSERT(residual->ne[1] == hc);
+    GGML_ASSERT(block_out->ne[0] == n_embd);
+    GGML_ASSERT(block_out->ne[1] == n_tokens || block_out->ne[1] == 1);
+    GGML_ASSERT(inject->ne[0] == hc);
+    GGML_ASSERT(inject->ne[1] == n_tokens || inject->ne[1] == 1);
+    GGML_ASSERT(residual->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) hc);
+
+    result->op     = GGML_OP_HC_COMBINE;
+    result->src[0] = residual;
+    result->src[1] = block_out;
+    result->src[2] = inject;
 
     return result;
 }
@@ -7815,19 +8244,29 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
                                 const int *                outputs,
                                 int                        num_outputs) {
     GGML_ASSERT(outputs && num_outputs > 0);
+    // Read the diagnostic flag once: this predicate runs on every candidate fusion window (millions
+    // of calls per pass), and getenv() takes a lock and rescans the environment block on Windows.
+    static int dbg_state = -1;   // C requires a constant initializer, so cache the lookup by hand
+    if (dbg_state < 0) {
+        dbg_state = getenv("LLAMA_HC_CN_DEBUG") != NULL;
+    }
+    const bool dbg = dbg_state != 0;
 
     for (int i = 0; i < count; ++i) {
         if (node_idxs[i] >= cgraph->n_nodes) {
+            if (dbg) fprintf(stderr, "canf: i=%d idx>=n_nodes\n", i);
             return false;
         }
 
         const struct ggml_tensor * node = cgraph->nodes[node_idxs[i]];
 
         if (node->op != ops[i]) {
+            if (dbg) fprintf(stderr, "canf: i=%d op mismatch %s vs %s\n", i, ggml_op_name(node->op), ggml_op_name(ops[i]));
             return false;
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (dbg) fprintf(stderr, "canf: i=%d %s not COMPUTE\n", i, ggml_op_name(node->op));
             return false;
         }
 
@@ -7836,6 +8275,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         }
 
         if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            if (dbg) fprintf(stderr, "canf: i=%d %s is OUTPUT but not declared\n", i, ggml_op_name(node->op));
             return false;
         }
 
@@ -7850,6 +8290,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         }
 
         if (subgraph_uses != ggml_node_get_use_count(cgraph, node_idxs[i])) {
+            if (dbg) fprintf(stderr, "canf: i=%d %s uses %d != count %d\n", i, ggml_op_name(node->op), subgraph_uses, ggml_node_get_use_count(cgraph, node_idxs[i]));
             return false;
         }
 
@@ -7858,6 +8299,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         struct ggml_tensor * view_src = node->view_src;
         while (view_src) {
             if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1 && !ggml_is_constant(view_src)) {
+                if (dbg) fprintf(stderr, "canf: i=%d %s external view_src %s\n", i, ggml_op_name(node->op), view_src->name);
                 return false;
             }
             view_src = view_src->view_src;

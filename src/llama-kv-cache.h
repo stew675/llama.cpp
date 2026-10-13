@@ -114,7 +114,10 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+        // set to false for keys-only caches (e.g. the qwen4exp QSA indexer store):
+        // no V tensor is allocated, and no V-side op may be issued against the cache
+                         bool   v_enabled = true);
 
     ~llama_kv_cache() = default;
 
@@ -190,7 +193,7 @@ public:
     // graph_build API
     //
 
-    uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens = 0) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -281,6 +284,9 @@ private:
 
     // required padding
     const uint32_t n_pad = 1;
+
+    // env: LLAMA_KV_N_PAD_PREFILL (0 when inactive)
+    const uint32_t n_pad_prefill = 0;
 
     // SWA
     const uint32_t n_swa = 0;

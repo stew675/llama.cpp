@@ -1,5 +1,7 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "mmb.cuh"
+#include "mmvq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -421,6 +423,14 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const int64_t s1 = dst_i->nb[1] / sizeof(float);
         const int64_t s2 = dst_i->nb[2] / sizeof(float);
         const int64_t s3 = dst_i->nb[3] / sizeof(float);
+        // ncols_opt drives the MMQ tile-size heuristic (smaller ntiles_x wins, the loop stops at
+        // the first J that covers the row).  It must be set like ggml_cuda_mul_mat_q does; leaving
+        // it 0 made every J give ntiles_x == 0, so the loop picked J=8 (the slowest tile).
+        int64_t ncols_opt = ne12;
+        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // each expert only sees ne12*n_expert_used/ne02 tokens on average
+            ncols_opt = (ne12*dst_i->ne[1] + src0_i->ne[2] - 1) / src0_i->ne[2];
+        }
         const mmq_args args = {
             (const char *) src0_i->data, src0_i->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), (float *) dst_i->data,
             nullptr,
@@ -836,4 +846,135 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+}
+
+// Two consecutive MUL_MAT(_ID) nodes sharing src1/ids (the qwen4exp sparse-MoE gate+up pair or the
+// shared-expert up+gate pair): merge into one shared activation quantize + one mm_ids_helper.
+// Returns 1 when fused, 0 otherwise.  GGML_PAIR_OFF / GGML_PAIR_DENSE_OFF are the A/B kill switches.
+int ggml_cuda_mul_mat_q_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool pair_off          = getenv("GGML_PAIR_OFF") != nullptr;
+    static const bool disable_pair_dense = getenv("GGML_PAIR_DENSE_OFF") != nullptr;
+    ggml_tensor * node = cgraph->nodes[i];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    // Stand the pair fusion down only when MMB will actually take BOTH muls (checklist #5).
+    const bool mmb_pair_taken = ggml_cuda_mmb_active() && i + 1 < cgraph->n_nodes && node->src[0] && cgraph->nodes[i + 1]->src[0] &&
+        (node->op == GGML_OP_MUL_MAT_ID
+            ? (ggml_cuda_mmb_routed_will_take(node->src[0]) && ggml_cuda_mmb_routed_will_take(cgraph->nodes[i + 1]->src[0]))
+            : (ggml_cuda_mmb_dense_will_take(node->src[0])  && ggml_cuda_mmb_dense_will_take(cgraph->nodes[i + 1]->src[0])));
+    if (pair_off || mmb_pair_taken ||
+            !(node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT && !disable_pair_dense)) ||
+            i + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * next = cgraph->nodes[i + 1];
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src0_next = next->src[0];
+    const bool has_ids = node->op == GGML_OP_MUL_MAT_ID;
+    const bool valid_sources = next->op == node->op && src0 && src0_next && node->src[1] && next->src[1] &&
+        (!has_ids || (node->src[2] && next->src[2]));
+    const bool shared_inputs = valid_sources && node->src[1] == next->src[1] &&
+        // The MUL_MAT_ID arm assumes the standard sparse-MoE activation layout with more than one
+        // routed expert; require the preconditions here too so other layouts fall back.
+        (!has_ids || (node->src[2] == next->src[2] &&
+                      node->src[1]->ne[1] == 1 && node->src[2]->ne[0] > 1));
+    const int64_t mmq_cols = shared_inputs ? (has_ids ? node->src[1]->ne[2] : node->src[1]->ne[1]) : 0;
+    const int64_t n_experts = shared_inputs && has_ids ? src0->ne[2] : 0;
+    const bool use_mmq = shared_inputs && node->src[1]->type == GGML_TYPE_F32 &&
+        node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 &&
+        src0->type != GGML_TYPE_NVFP4 && src0->type != GGML_TYPE_MXFP4 &&
+        src0_next->type != GGML_TYPE_NVFP4 && src0_next->type != GGML_TYPE_MXFP4 &&
+        ggml_are_same_shape(src0, src0_next) && ggml_are_same_shape(node, next) &&
+        ggml_cuda_should_use_mmq(src0->type, cc, mmq_cols, n_experts) &&
+        ggml_cuda_should_use_mmq(src0_next->type, cc, mmq_cols, n_experts) &&
+        mmq_get_q8_1_ds_layout(src0->type) == mmq_get_q8_1_ds_layout(src0_next->type);
+    const int64_t ncols_dst = has_ids ? node->ne[2] : node->ne[1];
+    static const bool dense_band_off = getenv("GGML_CUDA_DISABLE_MMVQ_DENSE_BAND") != nullptr;
+    const bool mmvq_extended_rows = !dense_band_off && !has_ids && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && src0->ne[1] % 128 != 0;
+    const int64_t mmvq_band = (has_ids || mmvq_extended_rows) ? MMVQ_MOE_MAX_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE;
+    const bool use_mmvq = ncols_dst <= mmvq_band &&
+        (!has_ids || ncols_dst <= get_mmvq_mmid_max_batch(src0->type, cc) ||
+                     ncols_dst <= get_mmvq_mmid_max_batch(src0_next->type, cc));
+    if (use_mmq && !use_mmvq) {
+        ggml_cuda_mul_mat_q_pair(ctx, node, next);
+        return 1;
+    }
+    return 0;
+}
+
+// Routed (MUL_MAT_ID) SWIGLU -> MMQ: fold silu(gate)*up into the mmq activation quantize (the
+// qwen4exp MoE down feed; the GLU output is never materialized).  Returns 1 when fused.
+int ggml_cuda_mul_mat_q_swiglu_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_GLU || i + 1 >= cgraph->n_nodes || ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU || !node->src[1]) {
+        return 0;
+    }
+    // MMB's fused GLU covers the IQ4_NL experts only; stand down then (checklist #5).
+    const bool mmb_glu_taken = ggml_cuda_mmb_active() &&
+        cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[i + 1]->src[0] &&
+        ggml_cuda_mmb_routed_will_take(cgraph->nodes[i + 1]->src[0]);
+    if (mmb_glu_taken) {
+        return 0;
+    }
+    ggml_tensor * next = cgraph->nodes[i + 1];
+    const bool has_ids = next->op == GGML_OP_MUL_MAT_ID;
+    if (!(has_ids || next->op == GGML_OP_MUL_MAT)) {
+        return 0;
+    }
+    const ggml_tensor * weights = next->src[0];
+    const ggml_tensor * ids = has_ids ? next->src[2] : nullptr;
+    const ggml_tensor * gate = node->src[0];
+    const ggml_tensor * up = node->src[1];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int64_t mmq_cols = has_ids ? node->ne[2] : node->ne[1];
+    const int64_t n_experts = has_ids ? weights->ne[2] : 0;
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(weights->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(weights) != ggml_backend_buffer_get_alloc_size(weights->buffer, weights) && weights->view_src;
+
+    const bool target_qwen36 = node->ne[0] == 512 && next->ne[0] == 2048 &&
+        (!has_ids || (gate->ne[1] == 8 && weights->ne[2] == 256));
+    const bool target_qwen4exp = node->ne[0] == 640 && next->ne[0] == 2560 &&
+        (!has_ids || (gate->ne[1] == 10 && weights->ne[2] == 512));
+    const bool target_shape = target_qwen36 || target_qwen4exp;
+    const bool weight_type_ok = weights->type == GGML_TYPE_Q8_0 ||
+        (target_qwen4exp && weights->type == GGML_TYPE_IQ4_NL);
+    const bool shape_ok = target_shape && next->src[1] == node && gate->type == GGML_TYPE_F32 && up->type == GGML_TYPE_F32 &&
+        node->type == GGML_TYPE_F32 && next->type == GGML_TYPE_F32 && weight_type_ok &&
+        ggml_are_same_shape(gate, up) && ggml_are_same_shape(gate, node) && gate->nb[0] == sizeof(float) && up->nb[0] == sizeof(float) &&
+        gate->ne[3] == 1 && (has_ids ? gate->ne[1] == ids->ne[0] && gate->ne[2] == ids->ne[1] : gate->ne[2] == 1);
+    const bool use_mmq = shape_ok && !bad_padding_clear && GGML_CUDA_CC_IS_RDNA3_5(cc) &&
+        ggml_cuda_should_use_mmq(weights->type, cc, mmq_cols, n_experts);
+
+    if (use_mmq && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, next->op }, { i + 1 })) {
+        ggml_cuda_mul_mat_q_swiglu(ctx, weights, ids, next, node);
+        return 1;
+    }
+    return 0;
+}
+
+// Dense SWIGLU -> MUL_MAT that runs as mmq (prefill FFN down projection, any weight type): the mmq
+// activation quantize computes silu(gate) * up itself.  GGML_CUDA_FUSE_SWIGLU_MMQ=0 turns it off.
+int ggml_cuda_mul_mat_q_swiglu_dense_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool fuse_swiglu_mmq = getenv("GGML_CUDA_FUSE_SWIGLU_MMQ") == nullptr || atoi(getenv("GGML_CUDA_FUSE_SWIGLU_MMQ")) != 0;
+    ggml_tensor * node = cgraph->nodes[i];
+    if (!fuse_swiglu_mmq || node->op != GGML_OP_GLU || ggml_get_glu_op(node) != GGML_GLU_OP_SWIGLU ||
+            i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_MUL_MAT ||
+            cgraph->nodes[i + 1]->src[1] != node) {
+        return 0;
+    }
+    ggml_tensor * next = cgraph->nodes[i + 1];
+    const ggml_tensor * a = node->src[0];
+    const ggml_tensor * b = node->src[1];
+    const auto rows_ok = [](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->nb[1] % 16 == 0 &&
+               ((uintptr_t) t->data) % 16 == 0 && t->ne[2] == 1 && t->ne[3] == 1;
+    };
+    const bool shape_ok = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->ne[0] % 4 == 0 &&
+        node->ne[2] == 1 && node->ne[3] == 1 && rows_ok(a) && (b == nullptr || (rows_ok(b) && ggml_are_same_shape(a, b))) &&
+        a->ne[0] == (b ? node->ne[0] : 2*node->ne[0]) && a->ne[1] == node->ne[1];
+    if (shape_ok && ggml_is_quantized(next->src[0]->type) && ggml_cuda_mul_mat_takes_mmq(ctx, next->src[0], node, next) &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
+        ggml_cuda_mul_mat_q_swiglu_dense(ctx, next->src[0], next, node);
+        return 1;
+    }
+    return 0;
 }

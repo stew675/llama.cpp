@@ -7,7 +7,9 @@
 // See gdn-conv.cu: the direct conv kernel diverges from the reference under a multi-device tensor
 // split, so keep the fusion on single-device graphs only until that is root-caused.
 static bool ple_conv_enabled() {
-    if (getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr) return false;
+    // Cache the switches: this runs once per conv launch, and getenv() is expensive on Windows.
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr;
+    if (disabled) return false;
     static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
     return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
 }
@@ -192,4 +194,27 @@ void ggml_cuda_ple_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_
             (const half *) m.w->data, (float *) m.out->data, (int) m.C, (int) m.T);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Depthwise causal conv1d fusion entry point (PLE / qwen4exp).  Returns the number of graph
+// nodes to skip when fused, 0 otherwise.  A/B / bisect kill switch: GGML_CUDA_DISABLE_CONV_FUSION=1.
+int ggml_cuda_ple_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_conv_fusion = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_CONV_FUSION"));
+    if (disable_conv_fusion) {
+        return 0;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_CONCAT && node->op != GGML_OP_CONT) {
+        return 0;
+    }
+    ggml_cuda_ple_conv_match pm;
+    if (node->op == GGML_OP_CONCAT && ggml_cuda_ple_conv_match_at_concat(cgraph, i, pm)) {
+        ggml_cuda_ple_conv_write_tail(ctx, pm);
+        return 1;
+    }
+    if (node->op == GGML_OP_CONT && ggml_cuda_ple_conv_match_at_tap(cgraph, i, pm)) {
+        ggml_cuda_ple_conv_direct(ctx, pm);
+        return pm.silu_idx - i;
+    }
+    return 0;
 }

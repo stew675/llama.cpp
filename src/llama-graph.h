@@ -907,6 +907,11 @@ struct llm_graph_params {
             return false;
         }
 
+        // Llama-Frankenstein F1: a device-feature injection graph is not a drafting graph
+        if (cparams.lf_dev_inject != other.cparams.lf_dev_inject) {
+            return false;
+        }
+
         if (!samplers_equal(samplers, other.samplers)) {
             return false;
         }

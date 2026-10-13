@@ -77,6 +77,9 @@ void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size);
 // Per-slot capacity of the slab's ring hole (0 when there is none).  The op-offload H2D ring allocates one
 // full-capacity slot so every slot gets a stable VA and the ring never reallocs a slot.
 size_t ggml_cuda_slab_ring_slot_capacity(int device);
+// The ring hole's reserved size (0 when the slab carved none): `llama_context` uses it to skip the
+// narrow -> wide compute-buffer drop when there is no ring to arm.  wip/slab-ring-region (issue #164).
+size_t ggml_cuda_slab_ring_region(int device);
 // Arm/disarm the ring hole: armed during prefill (excluded from the arena), disarmed at the
 // prefill -> decode transition (returned to the arena, so a decode-only stretch gets the VRAM back).
 // Arming evicts the arena tables the hole had picked up; called with NO lock held.
@@ -85,3 +88,15 @@ void   ggml_cuda_slab_ring_set(int device, bool arm);
 // model preflight, before the slab is created, from the largest host-resident weight table.
 void   ggml_cuda_slab_set_ring_region(size_t bytes);
 void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
+
+// Phase-2 (item 6b): slab state accessors used by the device wrappers in ggml-cuda.cu.
+void   ggml_cuda_slab_arm();
+void   ggml_cuda_slab_disarm();
+bool   ggml_cuda_slab_compute_enabled();
+void   ggml_cuda_slab_set_compute_narrow2(bool enable);
+void   ggml_cuda_slab_set_compute_plain(bool enable);
+bool   ggml_cuda_slab_compute_plain();
+size_t ggml_cuda_slab_headroom_bytes();
+void   ggml_cuda_slab_set_narrow_floor(int device, size_t bytes);
+void   ggml_cuda_slab_reserve_wide(int device, size_t bytes);
+size_t ggml_cuda_slab_seed_floor(int device);

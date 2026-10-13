@@ -1518,27 +1518,94 @@ void launch_fattn(
         (kv_native_kernel != FATTN_KV_NATIVE_PER_OPERAND ? kv_native_kernel :
          (V_is_K_view ? kv_native_K : ggml_cuda_fattn_kv_native_type(V)));
 
-    // The native read removes the whole-cache F16 conversion that a quantized source would otherwise
-    // pay on *every* step (cost ~ n_kv, so it grows with depth) at the price of dequantizing each
-    // tile in-kernel (cost ~ n_q * n_kv / ncols, amortised at prefill but not at decode).  This is
-    // the pre-arena behaviour: a native-capable operand is read natively at every width, and the F16
-    // staging copy (with its per-ubatch conversion pass) is skipped for it.  The prefill band split
-    // plus the per-context staging arena are a memory optimisation that lands with the
-    // movable-boundary slab (block 10, slab-moe); until then the staged copy is the node's scratch
-    // (see ggml_cuda_flash_attn_ext_get_f16_extra_data), which is what a non-native type uses below.
-    const bool use_native_K = kv_native_K != FATTN_KV_NATIVE_NONE;
-    const bool use_native_V = kv_native_V != FATTN_KV_NATIVE_NONE;
+    // The native read is a decode/verify win: it removes the whole-cache F16 conversion that a
+    // quantized source otherwise pays on *every* step (cost ~ n_kv, so it grows with depth) at the
+    // price of dequantizing each tile in-kernel (cost ~ n_q * n_kv / ncols, amortised at prefill but
+    // not at decode).  A prefill therefore stages instead -- the conversion is paid once for many
+    // query rows and the tiles feed the cp_async pipeline -- and only the <= 8-row band reads the
+    // raw cache.  The staging scratch for a native-capable operand is deliberately NOT part of the
+    // node allocation (see ggml_cuda_flash_attn_ext_get_alloc_size, whose scratch is sized for the
+    // reserve graph's n_kv = n_ctx), so it comes from the per-context arena instead; that is safe
+    // because a multi-token graph is never CUDA-graph captured (see the prefill skip in
+    // ggml_backend_cuda_graph_compute), while the captured decode graph is native and needs no
+    // scratch at all.  A very deep prefill can bound the transient with GGML_CUDA_FA_STAGE_MAX_MB
+    // (MiB per operand, 0 = unbounded); above it the native read is used.
+    const size_t stage_max_bytes = ggml_cuda_fattn_stage_max_bytes();
+    // Per-operand static cap: a transient larger than the cap is not staged at all (native read).
+    const size_t stage_bytes_K = (size_t) ggml_nelements(K)*sizeof(half);
+    const size_t stage_bytes_V = (size_t) ggml_nelements(V)*sizeof(half);
+    const bool stage_cap_K = stage_max_bytes == 0 || stage_bytes_K <= stage_max_bytes;
+    const bool stage_cap_V = stage_max_bytes == 0 || stage_bytes_V <= stage_max_bytes;
+    // Prefill stages only where that actually wins.  On RDNA4/RDNA3_0 the whole-prefix F16 conversion
+    // is paid once per ubatch and the tiles then feed the cp_async pipeline, which beats
+    // re-dequantizing each tile once per query block (gfx1201 q8_0: pp150k 691 vs 661 native, pp32k
+    // 1087 vs 1073).  RDNA3_5 (Strix Halo, unified LPDDR5) is the other way round at every depth, the
+    // gap growing with it (gfx1151 9B q8_0 pp16k 1405 vs 1410, pp20k 1359 vs 1369, pp32k 1253 vs
+    // 1266, pp65k 1043 vs 1059), so it keeps the native read at prefill too.
+    const bool prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc);
+    const bool native_width = Q->ne[1] <= 8 || !prefill_stages;
 
-    // The kernel reads what the launcher staged: when an operand is not read natively it must be
-    // told FATTN_KV_NATIVE_NONE so it reads the F16 copy instead of the raw cache (otherwise the
-    // conversion pass is paid *and* the tiles are dequantized).
+    // A native-capable operand that stages takes its scratch from the per-context, per-stream arena
+    // rather than the generic CUDA pool.  The pool grows by exact fit and *retains* every distinct
+    // size (the leg pool caches up to 256 buffers), and this request grows with the prefix, so a
+    // long prefill would leave ~150 distinct buffers cached; the arena bounds the retained memory to
+    // ~1.25x the largest requested size.  (The growth policy itself is not a performance lever --
+    // measured pp150k 691.0 with an exact-fit realloc vs 691.4 with 25% growth.)
+    //
+    // The arena is grown on demand and its growth can fail when the device is nearly full -- e.g. a
+    // llama-server --fit run whose target left less free memory than the deep-prefill transient needs
+    // (the scratch is deliberately outside the compute-graph reserve, so the fit does not count it).
+    // Rather than abort on that OOM, fall back to the native read for the operand(s) that would have
+    // been staged: it is the same arithmetic the decode/verify band already uses, so this is a
+    // prefill slowdown, never a correctness change, and it keeps the run inside the memory the fit
+    // reserved.  The request covers both operands because they share the one arena buffer.
+    const bool stage_wants_K = !native_width && stage_cap_K && kv_native_K != FATTN_KV_NATIVE_NONE;
+    const bool stage_wants_V = !native_width && stage_cap_V && kv_native_V != FATTN_KV_NATIVE_NONE && !V_is_K_view;
+    const size_t stage_req = (stage_wants_K ? stage_bytes_K : 0) + (stage_wants_V ? stage_bytes_V : 0);
+    // Issue #138: the eventual full size of the staging arena is known from the F16 size of the K/V
+    // view roots, capped per operand by GGML_CUDA_FA_STAGE_MAX_MB exactly as the request is.  Passing
+    // it lets the arena allocate once instead of climbing its 1.25x growth ladder, which on
+    // Windows/WDDM strands every freed step against the process (~5x the final arena over a deep
+    // prefill).  With an unbounded cap (=0) no hint is passed: the full root can be many GiB and the
+    // ladder stays the safer growth path there.
+    size_t stage_hint = 0;
+    if (stage_req != 0 && stage_max_bytes != 0) {
+        auto full_bytes = [stage_max_bytes](const ggml_tensor * t) {
+            const ggml_tensor * root = t->view_src != nullptr ? t->view_src : t;
+            return std::min((size_t) ggml_nelements(root)*sizeof(half), stage_max_bytes);
+        };
+        stage_hint = (stage_wants_K ? full_bytes(K) : 0) + (stage_wants_V ? full_bytes(V) : 0);
+    }
+    char * stage_buf = stage_req != 0 ? (char *) ctx.fattn_stage_try_get(ctx.curr_stream_no, stage_req, stage_hint) : nullptr;
+    const bool stage_ok = stage_buf != nullptr;
+
+    const bool use_native_K = (native_width || !stage_ok || !stage_cap_K) && kv_native_K != FATTN_KV_NATIVE_NONE;
+    // A V that is a view of K is the same cache data: it must follow K's staging decision rather than
+    // take its own (stage_V below is then false and K_f16_stage is reused).
+    const bool use_native_V = V_is_K_view ? use_native_K :
+        ((native_width || !stage_ok || !stage_cap_V) && kv_native_V != FATTN_KV_NATIVE_NONE);
+    const bool stage_K = kv_native_K != FATTN_KV_NATIVE_NONE && !use_native_K;
+    const bool stage_V = kv_native_V != FATTN_KV_NATIVE_NONE && !use_native_V && !V_is_K_view;
+
+    // The kernel reads what the launcher staged: when an operand is staged (a native-capable type
+    // above the decode/verify band), it must be told FATTN_KV_NATIVE_NONE so it reads the F16 copy
+    // instead of the raw cache (otherwise the staging pass is paid *and* the tiles are dequantized).
     const int kv_native_kernel_K = use_native_K ? kv_native_K : FATTN_KV_NATIVE_NONE;
     const int kv_native_kernel_V = use_native_V ? kv_native_V : FATTN_KV_NATIVE_NONE;
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV,
-            need_f16_K && !use_native_K,
-            need_f16_V && !use_native_V);
+            need_f16_K && !use_native_K && !stage_K,
+            need_f16_V && !use_native_V && !stage_V);
+
+    half * K_f16_stage = nullptr;
+    half * V_f16_stage = nullptr;
+    if (stage_K || stage_V) {
+        GGML_ASSERT(stage_buf != nullptr);
+        const size_t nK = stage_K ? stage_bytes_K : 0;
+        K_f16_stage = (half *) stage_buf;
+        V_f16_stage = (half *) (stage_buf + nK);
+    }
 
     // The pool buffers are freed in reverse declaration order, and the VMM pool (GGML_HIP_NO_VMM=OFF / CUDA)
     // requires that to be the reverse of the allocation order: declare them in the order they are allocated
@@ -1564,8 +1631,13 @@ void launch_fattn(
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
-        GGML_ASSERT(f16_extra.K != 0);
-        half * K_f16 = (half *) f16_extra.K;
+        half * K_f16;
+        if (stage_K) {
+            K_f16 = K_f16_stage;
+        } else {
+            GGML_ASSERT(f16_extra.K != 0);
+            K_f16 = (half *) f16_extra.K;
+        }
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
@@ -1598,8 +1670,13 @@ void launch_fattn(
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
 
-            GGML_ASSERT(f16_extra.V != 0);
-            half * V_f16 = (half *) f16_extra.V;
+            half * V_f16;
+            if (stage_V) {
+                V_f16 = V_f16_stage;
+            } else {
+                GGML_ASSERT(f16_extra.V != 0);
+                V_f16 = (half *) f16_extra.V;
+            }
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);

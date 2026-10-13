@@ -301,11 +301,16 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .slab_headroom_bytes  = */ nullptr,
     /* .slab_ring_set        = */ nullptr,
     /* .slab_narrow_floor    = */ nullptr,
+    /* .slab_reserve_wide    = */ nullptr,
     /* .slab_narrow2_floor   = */ ggml_backend_meta_device_slab_narrow2_floor,
     /* .slab_compute_narrow2 = */ ggml_backend_meta_device_slab_compute_narrow2,
     /* .moe_cache_set_host_pool   = */ nullptr,
     /* .moe_cache_set_host_source = */ nullptr,
     /* .slab_compute_plain   = */ ggml_backend_meta_device_slab_compute_plain,
+    /* .slab_ring_region     = */ nullptr,
+    /* .slab_set_ring_cap    = */ nullptr,
+    /* .slab_enabled         = */ nullptr,
+    /* .slab_ring_slots      = */ nullptr,
 };
 
 bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -323,6 +328,42 @@ ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev,
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
     return meta_dev_ctx->simple_devs[index];
+}
+
+// issue #164: the byte size of device `dev`'s slice of a tensor under the meta split.  THIS is the
+// definition of the per-device split size.  `ggml_backend_meta_stage_input` sizes the H2D ring slot with
+// it, and `llama_model::max_host_expert_slice_bytes` sizes the slab ring hole from the same rule, so the
+// ring can always hold the largest upload the staging will ask for.  `extent` is the same per-segment sum
+// `ggml_backend_meta_buffer_init_tensor_impl` uses to build each device's tensor (the split is
+// granularity-rounded, so it need not be even), and the byte size scales linearly with it because the
+// tensor is contiguous.
+size_t ggml_backend_meta_split_dev_bytes(const struct ggml_tensor * tensor,
+        const struct ggml_backend_meta_split_state * split_state, size_t n_devs, size_t dev) {
+    if (tensor == nullptr || split_state == nullptr || dev >= n_devs) {
+        return 0;
+    }
+    if (split_state->axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return ggml_nbytes(tensor);
+    }
+    if (split_state->axis < 0 || split_state->axis >= GGML_MAX_DIMS) {
+        return 0;
+    }
+    const int64_t ne_axis = tensor->ne[split_state->axis];
+    if (ne_axis <= 0) {
+        return 0;
+    }
+    int64_t extent = 0;
+    for (uint32_t s = 0; s < split_state->n_segments; s++) {
+        extent += split_state->ne[s*n_devs + dev] * split_state->nr[s];
+    }
+    if (extent <= 0) {
+        return 0;
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes % (size_t) ne_axis != 0) {
+        return nbytes;   // non-contiguous tensor: the whole tensor is the safe bound
+    }
+    return (nbytes / (size_t) ne_axis) * (size_t) extent;
 }
 
 ggml_backend_dev_t ggml_backend_meta_device(
@@ -1256,6 +1297,40 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_FLASH_ATTN_EXT: {
                 split_state = handle_flash_attn_ext(src_ss);
             } break;
+            case GGML_OP_FLASH_ATTN_QSA: {
+                split_state = handle_flash_attn_qsa(src_ss);
+            } break;
+            case GGML_OP_INDEXER_TOPK: {
+                // like TOP_K: the row (tps, stream) is the independent unit.  every src is
+                // mirrored: the cell map plus the optional derived position/bias compact srcs
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (tensor->src[i] != nullptr) {
+                        GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    }
+                }
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
+            case GGML_OP_INDEXER_SCORE: {
+                // like INDEXER_TOPK: mirrored indexer cache view + cell map + positions +
+                // query + norm weights + bias (each device holds full mirrored copies);
+                // the optional derived-cache pool view + range leaf are mirrored too
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (tensor->src[i] != nullptr) {
+                        GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    }
+                }
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
+            case GGML_OP_INDEXER_FILL: {
+                // mirrored like the other indexer ops: raw cache view + cell map + positions + norm
+                // weights + the host range leaf + the pool buffer it writes
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (tensor->src[i] != nullptr) {
+                        GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                    }
+                }
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -1283,6 +1358,29 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_PRE:
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_HC_MIX: {
+                // the hc weights and the per-token tensors are mirrored per
+                // device (verified on the qwen4exp decode graph); each device
+                // runs the full op and produces its own local copy. The output
+                // carries both mixed and the inject scatter (the combine views
+                // the tail), all mirrored. src[4] (w_inject) is null at the
+                // head call (il = -1), which the splitter marks UNKNOWN.
+                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            } break;
+            case GGML_OP_HC_COMBINE: {
+                // the hc weights and the per-token tensors are mirrored per
+                // device (verified on the qwen4exp decode graph); each device
+                // runs the full op and produces its own local copy.
+                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -2562,7 +2660,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor * 
         if (chunk_size_j == 0) {
             continue;
         }
-        const size_t copy_bytes = gather ? n_chunks * chunk_size_j : chunk_size_j;
+        // The ring slot request comes from the shared split-size rule, so the slab hole (sized from the
+        // same rule, `llama_model::max_host_expert_slice_bytes`) always holds it.
+        const size_t copy_bytes = ggml_backend_meta_split_dev_bytes(input_cpy, &split_state, n_backends, j);
+        GGML_ASSERT(copy_bytes == (gather ? n_chunks * chunk_size_j : chunk_size_j));
         void * slot_ptr = simple_backend->iface.stage_buffer(simple_backend, slot, copy_bytes);
         if (slot_ptr == nullptr) {
             return false;
