@@ -1789,6 +1789,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
     mparams.host_experts_mode = params.host_experts_mode;
+    // `-ncmoe N` hosts the LAST N trunk layers (the tail placement, the default).
+    // `LLAMA_HOST_EXPERTS_FROM_END=0` is the kill switch that restores the historical first-N placement.
+    {
+        const char * env = getenv("LLAMA_HOST_EXPERTS_FROM_END");
+        const bool from_end = env == nullptr || atoi(env) != 0;
+        mparams.n_cpu_moe_from_end = from_end ? params.n_cpu_moe : 0;
+    }
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;

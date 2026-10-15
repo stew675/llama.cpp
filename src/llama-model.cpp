@@ -3462,6 +3462,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.host_experts_mode           =*/ LLAMA_HOST_EXPERTS_MODE_PINNED,
         /*.main_gpu                    =*/ 0,
+        /*.n_cpu_moe_from_end          =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,

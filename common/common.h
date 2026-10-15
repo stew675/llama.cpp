@@ -347,6 +347,9 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
+    // `--spec-draft-n-cpu-moe N`: see `common_params::n_cpu_moe`
+    int n_cpu_moe = 0;
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
@@ -504,6 +507,11 @@ struct common_params {
 
     // how host-resident expert weights (`-ncmoe`/`-cmoe`) are backed when the model is mmap'd
     enum llama_host_experts_mode host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
+
+    // `-ncmoe N` count, kept so `common_model_params_to_llama` can set
+    // `llama_model_params.n_cpu_moe_from_end` and the loader can host the LAST N trunk layers
+    // (`LLAMA_HOST_EXPERTS_FROM_END=0` restores the historical first-N placement).
+    int n_cpu_moe = 0;
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -1275,55 +1283,9 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
 inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
     // keep strings alive and avoid leaking memory by storing them in a static list
     static std::list<std::string> buft_override_strings;
-    // WIP moe-layer-stagger: select WHICH layers take the host-expert path.  Default is the historical
-    // contiguous `0..n-1`.  Selection knobs (experimental, never ship as-is):
-    //   LLAMA_NCMOE_LAYERS=1,3,5,...  explicit layer index list (overrides the count from -ncmoe)
-    //   LLAMA_NCMOE_STRIDE=S          layers `offset + k*S` for k in 0..n-1
-    //   LLAMA_NCMOE_OFFSET=O          phase shift for the stride form
-    //   LLAMA_NCMOE_DEBUG=1           print the selected set to stderr
-    std::vector<int> layers;
-    const char * env_layers = getenv("LLAMA_NCMOE_LAYERS");
-    if (env_layers != nullptr && env_layers[0] != '\0') {
-        const char * p = env_layers;
-        while (*p != '\0') {
-            char * end = nullptr;
-            const long v = strtol(p, &end, 10);
-            if (end == p) {
-                break;
-            }
-            layers.push_back((int) v);
-            p = end;
-            while (*p == ',' || *p == ' ') {
-                ++p;
-            }
-        }
-    } else {
-        int stride = 1;
-        int offset = 0;
-        if (const char * e = getenv("LLAMA_NCMOE_STRIDE")) {
-            const int v = atoi(e);
-            if (v > 0) {
-                stride = v;
-            }
-        }
-        if (const char * e = getenv("LLAMA_NCMOE_OFFSET")) {
-            const int v = atoi(e);
-            if (v >= 0) {
-                offset = v;
-            }
-        }
-        for (int k = 0; k < n; ++k) {
-            layers.push_back(offset + k * stride);
-        }
-    }
-    if (getenv("LLAMA_NCMOE_DEBUG") != nullptr) {
-        std::string sel;
-        for (int i : layers) {
-            sel += std::to_string(i) + " ";
-        }
-        fprintf(stderr, "llm_add_n_cpu_ffn_overrides: host layers (n=%d) = [%s]\n", n, sel.c_str());
-    }
-    for (int i : layers) {
+    // The forward `blk.0..n-1` patterns.  When `llama_model_params.n_cpu_moe_from_end` is set (the
+    // default for `-ncmoe`), the model loader ignores these and hosts the LAST n trunk layers instead.
+    for (int i = 0; i < n; ++i) {
         buft_override_strings.push_back(llm_ffn_block_regex(i, ffn_regex));
         overrides.push_back({buft_override_strings.back().c_str(), ggml_backend_cpu_buffer_type()});
     }

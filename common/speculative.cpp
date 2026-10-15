@@ -2857,6 +2857,8 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = params.speculative.has_mtp();
 
     auto mparams = common_model_params_to_llama(params);
+    // The draft model's own host-expert placement (`--spec-draft-n-cpu-moe`), not the target's `-ncmoe`.
+    mparams.n_cpu_moe_from_end = params.speculative.draft.n_cpu_moe;
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {

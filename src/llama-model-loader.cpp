@@ -568,6 +568,7 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         bool allow_nextn_cpu_offload,
+        int  n_cpu_moe_from_end,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
@@ -584,6 +585,7 @@ llama_model_loader::llama_model_loader(
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
     this->allow_nextn_cpu_offload = allow_nextn_cpu_offload;
+    this->n_cpu_moe_from_end      = n_cpu_moe_from_end;
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
@@ -1312,36 +1314,36 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = nullptr;
 
-        // WIP moe-upload-overlap: host the LAST N trunk layers' MoE experts instead of the first N.
-        // `LLAMA_NCMOE_FROM_END=<N>` re-targets the `-ncmoe` CPU-expert overrides to the tail.  The
-        // bound is strictly `[n_layer - N, n_layer)` -- the appended nextn/MTP head (`tn.bid >=
-        // n_layer`) is excluded by construction, so an embedded MTP layer is never offloaded.
-        static const char * dbg_ncmoe_end_env = getenv("LLAMA_NCMOE_FROM_END");
-        static const int  dbg_ncmoe_end = dbg_ncmoe_end_env ? atoi(dbg_ncmoe_end_env) : -1;
-        llama_model_tensor_buft_override dbg_tail_ov[2] = { { nullptr, nullptr }, { nullptr, nullptr } };
-        const llama_model_tensor_buft_override * dbg_tb_ov = tensor_buft_overrides;
-        if (dbg_ncmoe_end > 0 && op == GGML_OP_MUL_MAT_ID && hparams.n_layer() > 0 &&
-                tn.bid >= (int) hparams.n_layer() - dbg_ncmoe_end &&
+        // `-ncmoe N` tail placement (the default): host the LAST N trunk layers' MoE experts instead of
+        // the caller's forward `blk.0..N-1` patterns.  The bound is strictly `[n_layer - N, n_layer)` --
+        // the appended nextn/MTP head (`tn.bid >= n_layer`) is excluded by construction, so an embedded
+        // MTP layer is never offloaded.  `LLAMA_HOST_EXPERTS_FROM_END=0` (handled in common) leaves
+        // `n_cpu_moe_from_end == 0`, which keeps the historical forward placement.
+        llama_model_tensor_buft_override tail_ov[2] = { { nullptr, nullptr }, { nullptr, nullptr } };
+        const llama_model_tensor_buft_override * tb_ov = tensor_buft_overrides;
+        if (n_cpu_moe_from_end > 0 && op == GGML_OP_MUL_MAT_ID && hparams.n_layer() > 0 &&
+                tn.bid >= (int) hparams.n_layer() - n_cpu_moe_from_end &&
                 tn.bid <  (int) hparams.n_layer()) {
             if (getenv("GGML_STAGE_TRACE")) {
-                fprintf(stderr, "NCMOE_TAIL host blk.%d (n_layer=%d N=%d)\n", (int) tn.bid, (int) hparams.n_layer(), dbg_ncmoe_end);
+                fprintf(stderr, "NCMOE_TAIL host blk.%d (n_layer=%d N=%d)\n", (int) tn.bid, (int) hparams.n_layer(), n_cpu_moe_from_end);
                 fflush(stderr);
             }
-            dbg_tail_ov[0].pattern = ".*";
-            dbg_tail_ov[0].buft    = ggml_backend_cpu_buffer_type();
-            dbg_tb_ov = dbg_tail_ov;
+            tail_ov[0].pattern = ".*";
+            tail_ov[0].buft    = ggml_backend_cpu_buffer_type();
+            tb_ov = tail_ov;
         }
 
         // check overrides
-        if (dbg_tb_ov) {
+        if (tb_ov) {
             std::string tensor_name = tn.str();
-            for (const auto * overrides = dbg_tb_ov; overrides->pattern != nullptr; ++overrides) {
+            for (const auto * overrides = tb_ov; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
-                    // WIP: the per-layer `blk.<i>` `-ncmoe` patterns are re-targeted to the tail above;
-                    // skip them so the front layers are not also hosted.  (Strictly `blk.`-prefixed +
-                    // `_exps`, so the all-layers `--cpu-moe` override and `--override-tensor` are kept.)
-                    if (dbg_ncmoe_end > 0 && overrides->buft == ggml_backend_cpu_buffer_type() &&
+                    // The per-layer `blk.<i>` `-ncmoe` patterns were re-targeted to the tail above;
+                    // skip them so the front layers are not also hosted.  (Strictly `blk.`-prefixed, so
+                    // the all-layers `--cpu-moe` override and `--override-tensor` are kept.)  An
+                    // explicit `--override-tensor` / `--cpu-moe` list is left alone.
+                    if (n_cpu_moe_from_end > 0 && overrides->buft == ggml_backend_cpu_buffer_type() &&
                             std::string(overrides->pattern).rfind("blk\\.", 0) == 0) {
                         continue;
                     }

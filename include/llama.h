@@ -344,6 +344,14 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // `-ncmoe N` placement.  0 (default): host the FIRST N trunk layers (historical).  N > 0: host the
+        // LAST N trunk layers `[n_layer - N, n_layer)` instead -- the tail carries the colder expert
+        // routing and has preceding resident compute to overlap the expert upload with, so it measures
+        // better on both prefill and (with the expert cache) decode.  The loader synthesizes the tail
+        // CPU overrides from this count and ignores the caller's forward `blk.<i>` `-ncmoe` patterns.
+        // `LLAMA_HOST_EXPERTS_FROM_END=0` is the kill switch that restores the forward placement.
+        int32_t n_cpu_moe_from_end;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 

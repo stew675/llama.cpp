@@ -145,6 +145,9 @@ struct llama_model_loader {
     // for the main model so `-ncmoe`/`-cmoe` cannot offload the head; true for a separately loaded MTP
     // draft model so its own `--spec-draft-n-cpu-moe` is honoured.
     bool allow_nextn_cpu_offload = false;
+    // `-ncmoe N` tail placement: N > 0 hosts the LAST N trunk layers `[n_layer - N, n_layer)` instead of
+    // the caller's forward `blk.<i>` patterns (`LLAMA_HOST_EXPERTS_FROM_END=0` keeps N == 0).
+    int  n_cpu_moe_from_end       = 0;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -221,6 +224,7 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         bool allow_nextn_cpu_offload,
+        int  n_cpu_moe_from_end,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 
