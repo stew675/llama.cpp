@@ -1748,6 +1748,20 @@ bool llama_model_loader::load_all_data(
             return nullptr;
         }
 
+        // The Meta device (under `-sm tensor`) splits a tensor across its simple devices.  Its async
+        // uploader handles row-aligned writes (and the scheduler's <=512-byte MMQ tail pad) but a
+        // mid-row write is either accumulated in full (segmented tensors) or dispatched per device; the
+        // chunked pinned-upload pipeline below reads fixed 1 MiB pieces that are NOT row-aligned for a
+        // quantized tensor (e.g. blk.0.ssm_out.weight, q8_0, row stride 4352 B).  A non-mmap load
+        // (`--load-mode none`) therefore aborted in `ggml_backend_meta_buffer_set_tensor`.  For a Meta
+        // device read the whole tensor and write it once (always aligned); the async overlap is lost
+        // only on the non-mmap `-sm tensor` path.
+        if (ggml_backend_dev_is_meta(dev)) {
+            LLAMA_LOG_DEBUG("%s: device %s is a Meta device; using whole-tensor uploads\n", func,
+                ggml_backend_dev_name(dev));
+            return nullptr;
+        }
+
         if (buft != ggml_backend_dev_buffer_type(dev)) {
             LLAMA_LOG_DEBUG("%s: buffer type %s is not the default buffer type for device %s for async uploads\n", func,
                 ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));

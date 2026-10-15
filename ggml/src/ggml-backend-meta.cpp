@@ -2330,8 +2330,18 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             row_stride = tensor->nb[2];
         }
         if (row_stride > 0 && offset % row_stride == 0) {
-            ggml_backend_tensor_set(tensor, data, offset, size);
-            return;
+            // Only the sync setter's expressible shapes may take this fast path: whole rows (axis 0/1),
+            // or whole rows plus the scheduler's <=512-byte MMQ tail pad (axis 1).  A mid-row range
+            // with an arbitrary size -- the loader's pinned async-upload chunks -- must fall through to
+            // the accumulator below, or `ggml_backend_meta_buffer_set_tensor`'s `size % row_stride`
+            // assert fires (axis 0) / the axis-1 tail path writes the remainder as a bogus pad.
+            const bool whole_rows = (size % row_stride == 0);
+            const bool tail_pad   = (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1) &&
+                                    (size % row_stride > 0) && (size % row_stride <= 512);
+            if (whole_rows || tail_pad) {
+                ggml_backend_tensor_set(tensor, data, offset, size);
+                return;
+            }
         }
         if (offset == 0 && size == total) {
             ggml_backend_tensor_set(tensor, data, 0, size);
