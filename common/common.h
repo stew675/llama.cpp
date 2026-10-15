@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstdio>
+#include <cstdlib>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -1274,7 +1275,55 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
 inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
     // keep strings alive and avoid leaking memory by storing them in a static list
     static std::list<std::string> buft_override_strings;
-    for (int i = 0; i < n; ++i) {
+    // WIP moe-layer-stagger: select WHICH layers take the host-expert path.  Default is the historical
+    // contiguous `0..n-1`.  Selection knobs (experimental, never ship as-is):
+    //   LLAMA_NCMOE_LAYERS=1,3,5,...  explicit layer index list (overrides the count from -ncmoe)
+    //   LLAMA_NCMOE_STRIDE=S          layers `offset + k*S` for k in 0..n-1
+    //   LLAMA_NCMOE_OFFSET=O          phase shift for the stride form
+    //   LLAMA_NCMOE_DEBUG=1           print the selected set to stderr
+    std::vector<int> layers;
+    const char * env_layers = getenv("LLAMA_NCMOE_LAYERS");
+    if (env_layers != nullptr && env_layers[0] != '\0') {
+        const char * p = env_layers;
+        while (*p != '\0') {
+            char * end = nullptr;
+            const long v = strtol(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            layers.push_back((int) v);
+            p = end;
+            while (*p == ',' || *p == ' ') {
+                ++p;
+            }
+        }
+    } else {
+        int stride = 1;
+        int offset = 0;
+        if (const char * e = getenv("LLAMA_NCMOE_STRIDE")) {
+            const int v = atoi(e);
+            if (v > 0) {
+                stride = v;
+            }
+        }
+        if (const char * e = getenv("LLAMA_NCMOE_OFFSET")) {
+            const int v = atoi(e);
+            if (v >= 0) {
+                offset = v;
+            }
+        }
+        for (int k = 0; k < n; ++k) {
+            layers.push_back(offset + k * stride);
+        }
+    }
+    if (getenv("LLAMA_NCMOE_DEBUG") != nullptr) {
+        std::string sel;
+        for (int i : layers) {
+            sel += std::to_string(i) + " ";
+        }
+        fprintf(stderr, "llm_add_n_cpu_ffn_overrides: host layers (n=%d) = [%s]\n", n, sel.c_str());
+    }
+    for (int i : layers) {
         buft_override_strings.push_back(llm_ffn_block_regex(i, ffn_regex));
         overrides.push_back({buft_override_strings.back().c_str(), ggml_backend_cpu_buffer_type()});
     }

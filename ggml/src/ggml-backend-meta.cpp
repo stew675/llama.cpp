@@ -6,6 +6,8 @@
 #include "ggml-cpp.h"
 #include "ggml-moe-weighted-reduction.h"
 
+#include <cstdio>
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -2522,7 +2524,20 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor * 
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
 
+    // WIP moe-upload-overlap prototype: the scheduler's prefetch pre-pass may already have staged this
+    // tensor; a second staging would overwrite its slot.  Idempotent when the prefetch flag is on.
+    static const bool prefetch_enabled = getenv("GGML_SCHED_STAGE_PREFETCH") != nullptr;
+    if (prefetch_enabled) {
+        for (const auto & e : backend_ctx->stage_pending) {
+            if (e.tensor == input_cpy) {
+                return true;
+            }
+        }
+    }
+    const bool dbg_stage = getenv("GGML_STAGE_TRACE") != nullptr;
+
     if (!ggml_backend_buffer_is_meta(input_cpy->buffer) || !ggml_is_contiguous(input_cpy)) {
+        if (dbg_stage) { fprintf(stderr, "STAGE_FAIL name=%s reason=not_meta_or_contig\n", input_cpy->name); fflush(stderr); }
         return false;
     }
 
@@ -2573,6 +2588,7 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor * 
             simple_backend->iface.stage_upload == nullptr ||
             simple_backend->iface.stage_wait == nullptr ||
             (gather && simple_backend->iface.stage_gather == nullptr)) {
+            if (dbg_stage) { fprintf(stderr, "STAGE_FAIL name=%s reason=dev%d_cap simple=%p\n", input_cpy->name, (int) j, (void *) simple_tensor); fflush(stderr); }
             return false;
         }
         const size_t chunk_size_j = mirrored ? ggml_nbytes(simple_tensor) : simple_tensor->nb[split_state.axis + 1];
@@ -2598,6 +2614,7 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor * 
         }
     }
     if (entry.chunks.empty() || (!mirrored && offset_j != chunk_size_full)) {
+        if (dbg_stage) { fprintf(stderr, "STAGE_FAIL name=%s reason=offset_j=%zu chunk_full=%zu\n", input_cpy->name, offset_j, chunk_size_full); fflush(stderr); }
         return false;
     }
     for (auto & chunk : entry.chunks) {
@@ -2637,7 +2654,9 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor * 
                                               chunk.size, backend_ctx->stage_done_ev[chunk.device][slot]);
         }
     }
+    const size_t dbg_nchunks = entry.chunks.size();
     backend_ctx->stage_pending.push_back(std::move(entry));
+    if (dbg_stage) { fprintf(stderr, "STAGE_OK t=%lld name=%s chunks=%zu slot=%d\n", (long long) ggml_time_us(), input_cpy->name, dbg_nchunks, slot); fflush(stderr); }
     return true;
 }
 
@@ -2724,12 +2743,14 @@ static void ggml_backend_meta_graph_optimize(ggml_backend_t backend,
 // lets a later upload reuse the slot through `stage_wait`.
 struct ggml_backend_meta_stage_guard {
     ggml_backend_meta_context * ctx;
-    explicit ggml_backend_meta_stage_guard(ggml_backend_meta_context * ctx) : ctx(ctx) {}
+    std::vector<ggml_backend_meta_context::stage_entry> * drained;
+    ggml_backend_meta_stage_guard(ggml_backend_meta_context * ctx,
+            std::vector<ggml_backend_meta_context::stage_entry> * drained) : ctx(ctx), drained(drained) {}
     ~ggml_backend_meta_stage_guard() {
         // A/B: `GGML_STAGE_NO_RESTORE=1` leaves `simple_tensor->data` pointing at the ring slot.  If the
         // output then becomes coherent, the restore was clobbering the pointer before the kernels read it.
         static const bool no_restore = getenv("GGML_STAGE_NO_RESTORE") != nullptr;
-        for (auto & entry : ctx->stage_pending) {
+        for (auto & entry : *drained) {
             for (auto & chunk : entry.chunks) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(entry.tensor, chunk.device);
                 if (simple_tensor != nullptr && !no_restore) {
@@ -2738,7 +2759,8 @@ struct ggml_backend_meta_stage_guard {
                 ggml_backend_event_record(ctx->stage_free_ev[chunk.device][entry.slot], chunk.backend);
             }
         }
-        ctx->stage_pending.clear();
+        // Only the entries this split consumed are freed; prefetched entries for later splits stay in
+        // `ctx->stage_pending` (WIP moe-upload-overlap).
     }
 };
 
@@ -2746,6 +2768,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    const int64_t dbg_t0 = ggml_time_us();
+    if (getenv("GGML_STAGE_TRACE")) {
+        fprintf(stderr, "GC_ENTER t=%lld nnodes=%d uid=%d pending=%zu\n", (long long) dbg_t0, cgraph->n_nodes, cgraph->uid, backend_ctx->stage_pending.size());
+        fflush(stderr);
+    }
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
@@ -2821,7 +2848,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // happen before any child graph is launched, and the guard below undoes them once they all
         // are.  The lookup is redone here rather than cached because a rebuild replaces the simple
         // tensors.
-        for (auto & entry : backend_ctx->stage_pending) {
+        // WIP moe-upload-overlap prototype: drain only the entries this split consumes; a prefetched
+        // entry for a later split stays pending.  Without the prefetch flag `stage_pending` holds only
+        // the current split's entry, so this partition is a no-op.
+        std::vector<ggml_backend_meta_context::stage_entry> stage_drained;
+        for (auto it = backend_ctx->stage_pending.begin(); it != backend_ctx->stage_pending.end(); ) {
+            bool belongs = false;
+            for (int i = 0; i < cgraph->n_nodes && !belongs; i++) {
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (cgraph->nodes[i]->src[s] == it->tensor) {
+                        belongs = true;
+                        break;
+                    }
+                }
+            }
+            if (belongs) {
+                stage_drained.push_back(std::move(*it));
+                it = backend_ctx->stage_pending.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto & entry : stage_drained) {
             for (auto & chunk : entry.chunks) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(entry.tensor, chunk.device);
                 GGML_ASSERT(simple_tensor != nullptr);
@@ -2846,7 +2894,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
-        const ggml_backend_meta_stage_guard stage_guard(backend_ctx);
+        const ggml_backend_meta_stage_guard stage_guard(backend_ctx, &stage_drained);
 
         {
             // For MoE models it may make sense to delay the AllReduce in order to reduce I/O:
@@ -3319,6 +3367,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+    if (getenv("GGML_STAGE_TRACE")) {
+        fprintf(stderr, "GC_END t=%lld uid=%d total_us=%lld\n", (long long) ggml_time_us(), cgraph->uid, (long long)(ggml_time_us() - dbg_t0));
+        fflush(stderr);
     }
     return GGML_STATUS_SUCCESS;
 }

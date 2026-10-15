@@ -88,6 +88,7 @@ void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
 
 // Phase-2 (item 6b): slab state accessors used by the device wrappers in ggml-cuda.cu.
 void   ggml_cuda_slab_arm();
+void   ggml_cuda_slab_disarm();
 bool   ggml_cuda_slab_compute_enabled();
 void   ggml_cuda_slab_set_compute_narrow2(bool enable);
 size_t ggml_cuda_slab_headroom_bytes();

@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 void * ggml_backend_cuda_stage_buffer(ggml_backend_t backend, int slot, size_t size) {
@@ -55,6 +57,18 @@ bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
     const size_t total = width * n_copies;                 // the device's compacted slice
+    if (getenv("GGML_STAGE_TRACE")) {
+        fprintf(stderr, "GATHER dev=%d total=%zu n_copies=%zu width=%zu stride=%zu\n",
+                cuda_ctx->device, total, n_copies, width, stride_src);
+        fflush(stderr);
+    }
+    // WIP moe-upload-overlap timing-only switch: keep the staging structure but move no bytes, to
+    // separate the transfer cost from the graph-fragmentation / D2D / sync overhead.  NOT correct.
+    if (getenv("GGML_STAGE_NOCOPY") != nullptr) {
+        cudaStream_t s0 = cuda_ctx->copy_stream();
+        CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s0));
+        return true;
+    }
     void * dst = cuda_ctx->h2d_stage_buffer(slot, total);
     if (dst == nullptr) {
         return false;

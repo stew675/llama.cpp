@@ -1324,10 +1324,42 @@ struct cmd_params_instance {
             }
             merged.insert(merged.end(), first, last);
 
-            patterns.reserve((size_t) n_cpu_moe);
-            merged.reserve(merged.size() + (size_t) n_cpu_moe + 1);
-
-            for (int i = 0; i < n_cpu_moe; ++i) {
+            // WIP moe-upload-overlap / moe-layer-stagger: honor LLAMA_NCMOE_LAYERS / _STRIDE / _OFFSET
+            // so llama-bench can actually place the host layers (inert unless set).
+            std::vector<int> host_layers;
+            const char * env_layers = getenv("LLAMA_NCMOE_LAYERS");
+            if (env_layers != nullptr && env_layers[0] != '\0') {
+                const char * p = env_layers;
+                while (*p != '\0') {
+                    char * end = nullptr;
+                    const long v = strtol(p, &end, 10);
+                    if (end == p) {
+                        break;
+                    }
+                    host_layers.push_back((int) v);
+                    p = end;
+                    while (*p == ',' || *p == ' ') {
+                        ++p;
+                    }
+                }
+            } else {
+                int stride = 1, offset = 0;
+                if (const char * e = getenv("LLAMA_NCMOE_STRIDE")) { const int v = atoi(e); if (v > 0) stride = v; }
+                if (const char * e = getenv("LLAMA_NCMOE_OFFSET")) { const int v = atoi(e); if (v >= 0) offset = v; }
+                for (int k = 0; k < n_cpu_moe; ++k) {
+                    host_layers.push_back(offset + k*stride);
+                }
+            }
+            if (getenv("LLAMA_NCMOE_DEBUG") != nullptr) {
+                std::string sel;
+                for (int i : host_layers) {
+                    sel += std::to_string(i) + " ";
+                }
+                fprintf(stderr, "llama-bench: host layers (ncmoe=%d) = [%s]\n", n_cpu_moe, sel.c_str());
+            }
+            patterns.reserve(host_layers.size());
+            merged.reserve(merged.size() + host_layers.size() + 1);
+            for (int i : host_layers) {
                 patterns.push_back(llm_ffn_block_regex(i, LLM_FFN_EXPS_REGEX));
                 merged.push_back({ patterns.back().c_str(),
                                 ggml_backend_cpu_buffer_type() });

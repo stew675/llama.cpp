@@ -1097,6 +1097,22 @@ void ggml_cuda_slab_arm() {
     g_slab_armed = true;
 }
 
+// Undo a previous arm.  The MoE preflight runs at MODEL LOAD (universal, aux 0) and again from `common`
+// with the draft/MTP aux; if the second, better-informed call declines the cache (auto floor), the slab
+// must not stay armed for a cache that is off (it would withhold the VRAM the decline was protecting).
+// Safe only before a slab exists; a live slab is left alone.
+void ggml_cuda_slab_disarm() {
+    {
+        std::lock_guard<std::mutex> lock(g_slab_mutex);
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
+            if (g_slabs[d].inited) {
+                return;   // a live slab owns its mappings; do not yank the gate out from under it
+            }
+        }
+    }
+    g_slab_armed = false;
+}
+
 bool ggml_cuda_slab_compute_enabled() {
     return g_slab_compute_enabled;
 }

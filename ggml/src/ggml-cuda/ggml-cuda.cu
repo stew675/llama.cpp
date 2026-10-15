@@ -2428,6 +2428,55 @@ static bool    g_cgc_reg = false;
 static const bool g_cgc_on       = getenv("GGML_CUDA_GCDBG") != nullptr;
 static const bool g_op_timing_on = getenv("GGML_CUDA_OP_TIMING") != nullptr;
 static const bool g_stream_dbg_on = getenv("GGML_STREAMDBG") != nullptr;
+// WIP moe-upload-overlap: non-serializing GPU time of large child graphs (env GGML_CUDA_BIGTIME).
+// Records an event pair on the stream around each large graph_compute; a static destructor syncs once
+// and prints the sum.  No per-call host sync, so the async pipeline and the copy-stream overlap are
+// preserved (unlike GGML_CUDA_OP_TIMING, which syncs per call).
+#ifdef GGML_USE_HIP
+#define BIG_EV_CREATE(e)      hipEventCreate(e)
+#define BIG_EV_ELAPSED(m,a,b) hipEventElapsedTime(m,a,b)
+#define BIG_EV_DESTROY(e)     hipEventDestroy(e)
+#else
+#define BIG_EV_CREATE(e)      cudaEventCreate(e)
+#define BIG_EV_ELAPSED(m,a,b) cudaEventElapsedTime(m,a,b)
+#define BIG_EV_DESTROY(e)     cudaEventDestroy(e)
+#endif
+struct big_gpu_timer {
+    std::vector<cudaEvent_t> starts, ends;
+    void dump() {
+        if (starts.empty()) { fprintf(stderr, "BIGGPU (none)\n"); return; }
+        cudaDeviceSynchronize();
+        double total = 0;
+        for (size_t i = 0; i < starts.size(); i++) {
+            float ms = 0.0f;
+            if (BIG_EV_ELAPSED(&ms, starts[i], ends[i]) == cudaSuccess) total += ms;
+            BIG_EV_DESTROY(starts[i]);
+            BIG_EV_DESTROY(ends[i]);
+        }
+        fprintf(stderr, "BIGGPU total_ms=%.2f calls=%zu\n", total, starts.size());
+    }
+};
+static big_gpu_timer g_big_gpu_timer;
+static bool g_big_gpu_reg = false;
+static const bool g_big_gpu_on = getenv("GGML_CUDA_BIGTIME") != nullptr;
+struct big_gpu_guard {
+    cudaStream_t s;
+    cudaEvent_t a = nullptr, b = nullptr;
+    bool on;
+    big_gpu_guard(cudaStream_t s, bool on) : s(s), on(on) {
+        if (on) {
+            if (!g_big_gpu_reg) { g_big_gpu_reg = true; atexit([]() { g_big_gpu_timer.dump(); }); }
+            BIG_EV_CREATE(&a); BIG_EV_CREATE(&b); cudaEventRecord(a, s);
+        }
+    }
+    ~big_gpu_guard() {
+        if (on) {
+            cudaEventRecord(b, s);
+            g_big_gpu_timer.starts.push_back(a);
+            g_big_gpu_timer.ends.push_back(b);
+        }
+    }
+};
 static const int  g_mmb_mark_log = getenv("GGML_CUDA_MMB_MARK_LOG") ? atoi(getenv("GGML_CUDA_MMB_MARK_LOG")) : 0;
 // Meta/op-offload A/B switch.  This sits on the per-copy staging path (thousands of calls per pass
 // under -sm tensor), so it is resolved once instead of per call.
@@ -4448,6 +4497,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    const big_gpu_guard big_gpu_guard_inst(cuda_ctx->stream(), g_big_gpu_on && cgraph->n_nodes > 0);
     ggml_cuda_async_input_wait(cuda_ctx->device, cuda_ctx->stream());
     const ggml_cuda_async_input_done_guard async_input_done { cuda_ctx->device, cuda_ctx->stream() };
 
@@ -6154,6 +6204,11 @@ static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev,
         // Dense models never reach here (`llama_model_moe_cache_preflight` skips an empty host-expert map),
         // which is what keeps the slab off them.  Runs before the context, so before any compute buffer.
         ggml_cuda_slab_arm();
+    } else {
+        // The preflight now runs once at model load (universal, aux 0) and again from `common` with the
+        // draft/MTP aux; if the better-informed call declines the cache, undo the earlier arm so a
+        // cache-off run does not still withhold VRAM for an arena it will never use.
+        ggml_cuda_slab_disarm();
     }
     return on;
 }

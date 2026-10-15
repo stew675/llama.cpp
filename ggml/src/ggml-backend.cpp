@@ -2890,18 +2890,72 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    const int64_t dbg_cs0 = ggml_time_us();
     struct ggml_backend_sched_split * splits = sched->splits;
 
     int prev_backend_id = -1;
     ggml_backend_sched_copy_state st;
+    int64_t dbg_t_issue = 0, dbg_t_copy = 0, dbg_t_gc = 0;
+
+    // WIP moe-upload-overlap prototype (GGML_SCHED_STAGE_PREFETCH=1): issue every host-weight upload
+    // for the pass at the top, so the per-device copy streams fill while the device-resident layers'
+    // compute runs and the host tables are already in their slots by the time their split is reached.
+    // Requires GGML_SCHED_STAGE_SLOTS >= the number of host tables (no intra-pass slot reuse), because
+    // a slot's free event only fires once its consumer has drained it.  A backend that owns staging via
+    // `stage_input` (the meta backend) is driven here; the ring path is unchanged.
+    {
+        static const bool prefetch = getenv("GGML_SCHED_STAGE_PREFETCH") != nullptr && atoi(getenv("GGML_SCHED_STAGE_PREFETCH")) != 0;
+        if (prefetch && sched->stage_enabled) {
+            const int64_t dbg_pre0 = ggml_time_us();
+            // GGML_SCHED_STAGE_PREFETCH_N limits the pre-stage to the LAST N host tables (default: all).
+            const char * depth_env = getenv("GGML_SCHED_STAGE_PREFETCH_N");
+            const int depth = depth_env != nullptr ? atoi(depth_env) : 0;
+            struct dbg_item { ggml_backend_t backend; ggml_tensor * input; ggml_tensor * input_cpy; };
+            std::vector<dbg_item> items;
+            for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+                struct ggml_backend_sched_split * split = &splits[split_id];
+                ggml_backend_t split_backend = sched->backends[split->backend_id];
+                if (split_backend->iface.stage_input == NULL) {
+                    continue;
+                }
+                for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                    struct ggml_tensor * input = split->inputs[input_id];
+                    if (!ggml_backend_sched_is_host_weight(input)) {
+                        continue;
+                    }
+                    struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+                    if (sched_input_gatherable(sched, split, input_cpy)) {
+                        continue;
+                    }
+                    items.push_back({ split_backend, input, input_cpy });
+                }
+            }
+            const int first = (depth > 0 && depth < (int) items.size()) ? (int) items.size() - depth : 0;
+            int dbg_true = 0, dbg_false = 0;
+            for (int k = first; k < (int) items.size(); k++) {
+                if (items[k].backend->iface.stage_input(items[k].backend, items[k].input, items[k].input_cpy)) {
+                    dbg_true++;
+                } else {
+                    dbg_false++;
+                }
+            }
+            if (getenv("GGML_STAGE_TRACE")) {
+                fprintf(stderr, "PREFETCH pass n_splits=%d total=%zu staged_true=%d staged_false=%d depth=%d us=%lld\n",
+                        sched->n_splits, items.size(), dbg_true, dbg_false, depth, (long long)(ggml_time_us() - dbg_pre0));
+                fflush(stderr);
+            }
+        }
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        const int64_t dbg_ti0 = ggml_time_us();
         sched_stage_issue(sched, split);
-
+        dbg_t_issue += ggml_time_us() - dbg_ti0;
+        const int64_t dbg_tc0 = ggml_time_us();
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
@@ -2924,9 +2978,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], st);
             }
         }
+        dbg_t_copy += ggml_time_us() - dbg_tc0;
 
         if (!sched->callback_eval) {
+            const int64_t dbg_b = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            dbg_t_gc += ggml_time_us() - dbg_b;
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -2980,6 +3037,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    const int64_t dbg_t_wall = ggml_time_us() - dbg_cs0;
+    if (getenv("GGML_STAGE_TRACE")) {
+        fprintf(stderr, "COMPUTE_SPLITS wall_us=%lld issue_us=%lld copy_us=%lld gc_us=%lld other_us=%lld\n",
+            (long long) dbg_t_wall, (long long) dbg_t_issue, (long long) dbg_t_copy, (long long) dbg_t_gc,
+            (long long)(dbg_t_wall - dbg_t_issue - dbg_t_copy - dbg_t_gc));
+        fflush(stderr);
+    }
     return GGML_STATUS_SUCCESS;
 }
 
