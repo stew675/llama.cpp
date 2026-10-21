@@ -1,6 +1,11 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+// Dedicated MUL_MAT_ID MoE kernel band (mul_mat_vec_q_moe).  That kernel is one warp per token and
+// its per-token reduction does not depend on the column count, so it covers the whole speculative
+// verify range (--spec-draft-n-max <= 15 -> n_tokens <= 16) on a single accumulation order.  The
+// dense MMVQ band above stays at 8; only the MUL_MAT_ID (routed expert) path uses this one.
+#define MMVQ_MOE_MAX_BATCH_SIZE 16
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
@@ -47,3 +52,10 @@ bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const
 void ggml_cuda_mul_mat_id_weighted_rdna3_5(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
+int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false);
+bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx);
+int  ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

@@ -61,9 +61,15 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh")
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
+# The 512-head flash-attn MMA instances are by far the longest single compiles (~130 s each);
+# list them first so make's FIFO dispatch starts them at t=0 instead of leaving them as the tail
+# of the build (the same as the generated per-head/per-type split -- this is build order only).
+file(GLOB   SRCS_FA_HEAVY "../ggml-cuda/template-instances/fattn-mma*-dkq512-*.cu")
+list(INSERT GGML_SOURCES_ROCM 0 ${SRCS_FA_HEAVY})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
+list(REMOVE_ITEM SRCS ${SRCS_FA_HEAVY})
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
