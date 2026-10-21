@@ -327,7 +327,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+            params.host_experts_mode, params.check_tensors, params.no_alloc, params.load_mtp, params.allow_nextn_cpu_offload, params.n_cpu_moe_from_end, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.lazy.mode = params.lazy_mode;
 
@@ -449,6 +449,20 @@ static struct llama_model * llama_model_load_from_file_impl(
             llama_model_free(model);
         }
         return nullptr;
+    }
+
+    // Preflight the MoE expert cache / movable-boundary slab HERE so every consumer arms it.  This used
+    // to run only from `common_init_from_params`, which `llama-bench` (and tests, and API users) bypass,
+    // so llama-bench never armed the slab for ANY host-layer placement.  The draft/MTP aux estimate is
+    // only known from `common`, which calls the preflight again with the real value (the floor re-runs
+    // when the aux grows); the embedded MTP head is known here via `params.load_mtp`.
+    if (model != nullptr) {
+        size_t aux_bytes = 0;
+        if (params.load_mtp) {
+            const char * e = getenv("MOE_EXPERT_CACHE_AUX_RESERVE_MIB");
+            aux_bytes = (size_t) (e != nullptr ? atoll(e) : LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT) * 1024 * 1024;
+        }
+        llama_model_moe_cache_preflight(model, aux_bytes);
     }
 
     return model;
