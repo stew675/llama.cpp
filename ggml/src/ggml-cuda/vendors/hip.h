@@ -64,6 +64,7 @@
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
+#define cudaEventQuery hipEventQuery
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy
 #define cudaFree hipFree
@@ -79,12 +80,18 @@
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
 #define cudaHostRegister hipHostRegister
 #define cudaHostRegisterPortable hipHostRegisterPortable
+#define cudaHostRegisterMapped hipHostRegisterMapped
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaHostUnregister hipHostUnregister
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaMalloc hipMalloc
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
+#define cudaMemoryTypeDevice hipMemoryTypeDevice
+#define cudaMemoryTypeHost hipMemoryTypeHost
+#define cudaMemoryTypeManaged hipMemoryTypeManaged
+#define cudaPointerAttributes hipPointerAttribute_t
+#define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
 #define cudaMemcpy hipMemcpy
@@ -97,7 +104,13 @@
 #define cudaMemcpyKind hipMemcpyKind
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
+#if defined(_WIN32)
+// hipMemGetInfo does not count other processes' memory on Windows; this one also asks WDDM (wddm-mem.cu)
+hipError_t ggml_hip_mem_get_info(size_t * free, size_t * total);
+#define cudaMemGetInfo ggml_hip_mem_get_info
+#else
 #define cudaMemGetInfo hipMemGetInfo
+#endif
 #define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
 #define cudaSetDevice hipSetDevice
 #define cuDeviceGet hipDeviceGet

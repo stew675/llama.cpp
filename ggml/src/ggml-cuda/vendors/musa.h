@@ -69,6 +69,7 @@
 #define cudaGetLastError musaGetLastError
 #define cudaHostRegister musaHostRegister
 #define cudaHostRegisterPortable musaHostRegisterPortable
+#define cudaHostRegisterMapped musaHostRegisterMapped
 #define cudaHostRegisterReadOnly musaHostRegisterReadOnly
 #define cudaHostUnregister musaHostUnregister
 #define cudaLaunchCooperativeKernel musaLaunchCooperativeKernel
