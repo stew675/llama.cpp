@@ -16,3 +16,34 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+void ggml_cuda_op_ssm_gate_beta(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0_alpha, const ggml_tensor * src0_beta, const ggml_tensor * src1,
+    const ggml_tensor * dt, const ggml_tensor * ssm_a,
+    ggml_tensor * dst_gate, ggml_tensor * dst_beta);
+
+void ggml_cuda_op_ssm_conv_l2_gatebeta(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * conv_input, const ggml_tensor * conv_w,
+    const ggml_tensor * src0_alpha, const ggml_tensor * src0_beta, const ggml_tensor * src1,
+    const ggml_tensor * dt, const ggml_tensor * ssm_a,
+    ggml_tensor * q_norm, ggml_tensor * k_norm, ggml_tensor * v_raw,
+    ggml_tensor * dst_gate, ggml_tensor * dst_beta,
+    const int head_k_dim, const int n_qk_heads,
+    const int head_v_dim, const int n_v_heads, const float eps);
+
+void ggml_cuda_op_shexp_down_gate(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * w_down, const ggml_tensor * swiglu,
+    const ggml_tensor * w_gate, const ggml_tensor * x_gate,
+    const ggml_tensor * moe_out, const ggml_tensor * ffn_residual,
+    ggml_tensor * dst);
+
+// qwen4exp IQ4_NL/Q8_0 routed down projection fused with the 10-expert weighted sum (RDNA3.5,
+// single-token): ggml_cuda_mul_mat_id_weighted_rdna3_5_ok returns whether the graph pattern's
+// experts/weights/dst match the specialized kernel's shape fingerprint.
+bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst);
+void ggml_cuda_mul_mat_id_weighted_rdna3_5(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
