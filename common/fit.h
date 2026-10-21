@@ -19,6 +19,13 @@ struct common_fit_extra_model {
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
+    // wip/slab-transient-absorption (step 2): per-device VRAM reserve to use when the extra model cannot be
+    // MEASURED.  That is the MTP case: its context cannot be created during fitting (`qwen4exp requires
+    // ctx_other to be set`, and during fitting there is no target context to point it at), so the
+    // measurement fails and fit used to silently size the main model as if the draft did not exist -- the
+    // draft's whole footprint then came out of the slab reserve and the outside cushion collapsed.
+    // `draft-reserve.h` derives this value from the draft's own GGUF; 0 keeps the old behaviour.
+    size_t reserve_bytes;
 };
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)

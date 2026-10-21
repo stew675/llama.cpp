@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "moe-expert-cache.h"   // Phase 1b: moe_cache_enabled/moe_cache_get_cold (the UVA cold seam)
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1713,8 +1714,14 @@ static void mul_mat_vec_q_moe_launch(
     int64_t cold_gate_n_res    = 0;
     size_t  cold_gate_channel_bytes = 0;
     size_t  cold_gate_row_bytes     = 0;
-    // Cold (host-resident) expert reads are a slab-moe feature; without the cache engine every
-    // expert is resident, so the kernel gets (nullptr, 0, 0, 0): the resident-only contract.
+    // Cold (host-resident) expert reads (the UVA cold seam).
+    if (moe_cache_enabled()) {
+        (void) moe_cache_get_cold(vx, &cold_base, &n_res_cold, &cold_channel_bytes, &cold_row_bytes);
+        if (cold_base != nullptr && fusion.gate != nullptr) {
+            (void) moe_cache_get_cold(fusion.gate, &cold_gate_base, &cold_gate_n_res,
+                                      &cold_gate_channel_bytes, &cold_gate_row_bytes);
+        }
+    }
     // The kernel indexes in type-block units; the cold geometry is reported in bytes.
     const size_t   ts = ggml_type_size(type);
     const uint32_t cold_channel_stride      = cold_channel_bytes      > 0 ? (uint32_t) (cold_channel_bytes      / ts) : 0;
@@ -3255,5 +3262,269 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
             w->data, y_q8.get(), (const int32_t *) ids->data, (const float *) weights->data, (float *) dst->data,
             nrows, nblocks, (int) (w->nb[1] / ggml_type_size(w->type)),
             (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
+    }
+}
+// SSM gated delta net: gate = softplus(alpha*x + dt) * a, beta = sigmoid(beta*x).  Two Q8_0
+// projections plus the gating chain into one kernel.  Returns 8 when fused.
+// GGML_CUDA_FUSE_GATE_BETA_VERIFY=0 turns the verify band off.
+int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool fuse_gate_beta_verify = getenv("GGML_CUDA_FUSE_GATE_BETA_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GATE_BETA_VERIFY")) != 0;
+    if (i + 8 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_op ops[9] = {
+        GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
+        GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY
+    };
+    const int out_nodes[] = { i + 5, i + 8 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 9, ops, out_nodes, 2)) {
+        return 0;
+    }
+    ggml_tensor * alpha_w  = cgraph->nodes[i];
+    ggml_tensor * alpha_v  = cgraph->nodes[i + 1];
+    ggml_tensor * bias     = cgraph->nodes[i + 2];
+    ggml_tensor * softplus = cgraph->nodes[i + 3];
+    ggml_tensor * gate_mul = cgraph->nodes[i + 4];
+    ggml_tensor * beta_w   = cgraph->nodes[i + 6];
+    ggml_tensor * beta_v   = cgraph->nodes[i + 7];
+    ggml_tensor * beta_sig = cgraph->nodes[i + 8];
+
+    const bool wiring_ok =
+        alpha_v->src[0] == alpha_w &&
+        softplus->src[0] == bias &&
+        cgraph->nodes[i + 5]->src[0] == gate_mul &&
+        beta_v->src[0] == beta_w &&
+        beta_sig->src[0] == beta_v &&
+        alpha_w->src[1] == beta_w->src[1];
+
+    const ggml_tensor * dt    = nullptr;
+    const ggml_tensor * ssm_a = nullptr;
+    if (wiring_ok) {
+        if (bias->src[0] == alpha_v) {
+            dt = bias->src[1];
+        } else if (bias->src[1] == alpha_v) {
+            dt = bias->src[0];
+        }
+        if (gate_mul->src[0] == softplus) {
+            ssm_a = gate_mul->src[1];
+        } else if (gate_mul->src[1] == softplus) {
+            ssm_a = gate_mul->src[0];
+        }
+    }
+
+    const bool type_ok =
+        dt && ssm_a &&
+        dt->type == GGML_TYPE_F32 && ssm_a->type == GGML_TYPE_F32 &&
+        ggml_get_unary_op(softplus) == GGML_UNARY_OP_SOFTPLUS &&
+        ggml_get_unary_op(beta_sig)  == GGML_UNARY_OP_SIGMOID &&
+        alpha_w->src[0]->type == GGML_TYPE_Q8_0 && beta_w->src[0]->type == GGML_TYPE_Q8_0 &&
+        alpha_w->src[1]->type == GGML_TYPE_F32 &&
+        alpha_w->src[0]->ne[0] == beta_w->src[0]->ne[0] &&
+        alpha_w->src[0]->ne[1] == beta_w->src[0]->ne[1] &&
+        // decode, and the verify band unless GGML_CUDA_FUSE_GATE_BETA_VERIFY=0
+        alpha_w->src[1]->ne[2] == 1 && alpha_w->src[1]->ne[3] == 1 &&
+        (alpha_w->src[1]->ne[1] == 1 || (fuse_gate_beta_verify && alpha_w->src[1]->ne[1] <= MMVQ_MAX_BATCH_SIZE)) &&
+        ggml_is_contiguous(gate_mul) && ggml_is_contiguous(beta_sig) &&
+        ggml_nelements(gate_mul) == alpha_w->src[0]->ne[1]*alpha_w->src[1]->ne[1] &&
+        ggml_nelements(beta_sig) == alpha_w->src[0]->ne[1]*alpha_w->src[1]->ne[1];
+
+    if (wiring_ok && type_ok) {
+        ggml_cuda_op_ssm_gate_beta(ctx, alpha_w->src[0], beta_w->src[0], alpha_w->src[1], dt, ssm_a, gate_mul, beta_sig);
+        return 8;
+    }
+    return 0;
+}
+
+// Shared-expert output chain: down + gate + gating + residual adds.  Returns 5 when fused.
+// GGML_CUDA_DISABLE_SHEXP_DOWN_GATE=1 turns it off.
+int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_shexp_down_gate =
+        getenv("GGML_CUDA_DISABLE_SHEXP_DOWN_GATE") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_SHEXP_DOWN_GATE"));
+    if (disable_shexp_down_gate || i + 5 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_op ops[6] = {
+        GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD
+    };
+    const int out_nodes[] = { i + 5 };
+    if (!ggml_can_fuse_subgraph(cgraph, i, 6, ops, out_nodes, 1)) {
+        return 0;
+    }
+    ggml_tensor * down_mm = cgraph->nodes[i];
+    ggml_tensor * gate_mm = cgraph->nodes[i + 1];
+    ggml_tensor * sigmoid = cgraph->nodes[i + 2];
+    ggml_tensor * gated   = cgraph->nodes[i + 3];
+    ggml_tensor * ffn_out = cgraph->nodes[i + 4];
+    ggml_tensor * l_out   = cgraph->nodes[i + 5];
+
+    const bool wiring_ok =
+        sigmoid->src[0] == gate_mm &&
+        ggml_get_unary_op(sigmoid) == GGML_UNARY_OP_SIGMOID &&
+        ((gated->src[0] == down_mm && gated->src[1] == sigmoid) ||
+         (gated->src[0] == sigmoid && gated->src[1] == down_mm)) &&
+        ((ffn_out->src[0] == gated && ffn_out->src[1] != gated) ||
+         (ffn_out->src[1] == gated && ffn_out->src[0] != gated)) &&
+        l_out->src[0] == ffn_out && l_out->src[1] != ffn_out;
+
+    const ggml_tensor * moe_out = nullptr;
+    const ggml_tensor * ffn_residual = nullptr;
+    if (wiring_ok) {
+        moe_out = ffn_out->src[0] == gated ? ffn_out->src[1] : ffn_out->src[0];
+        ffn_residual = l_out->src[1];
+    }
+
+    const bool type_ok =
+        wiring_ok && moe_out && ffn_residual &&
+        down_mm->src[0]->type == GGML_TYPE_Q8_0 &&
+        down_mm->src[1]->type == GGML_TYPE_F32 &&
+        gate_mm->src[0]->type == GGML_TYPE_F32 &&
+        gate_mm->src[1]->type == GGML_TYPE_F32 &&
+        down_mm->src[1]->ne[1] >= 1 && down_mm->src[1]->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+        down_mm->src[1]->ne[1] == gate_mm->src[1]->ne[1] &&
+        ggml_is_contiguous(moe_out) && ggml_is_contiguous(ffn_residual) && ggml_is_contiguous(l_out);
+
+    if (wiring_ok && type_ok) {
+        ggml_cuda_op_shexp_down_gate(ctx,
+            down_mm->src[0], down_mm->src[1], gate_mm->src[0], gate_mm->src[1],
+            moe_out, ffn_residual, l_out);
+        return 5;
+    }
+    return 0;
+}
+
+
+// moved out of ggml-cuda.cu (Phase-2 self-contained extraction)
+bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band) {
+    ggml_tensor *       src0 = tensor->src[0];
+    ggml_tensor *       src1 = tensor->src[1];
+    const ggml_tensor * dst  = tensor;
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                   src0->view_src;
+
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
+                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+
+    // fusion is not universally faster on Pascal
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (cc <= GGML_CUDA_CC_PASCAL) {
+        return false;
+    }
+    //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
+    static const bool q8_1_verify = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
+            !(verify_band && q8_1_verify && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
+        return false;
+    }
+
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+        return false;
+    }
+
+    return use_mul_mat_vec_q;
+}
+
+bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
+    if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
+        return false;
+    }
+    const int nodes[] = { routed_idx, routed_idx + 1, routed_idx + 2, shared_idx, shared_idx + 1, shared_idx + 2 };
+    const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
+                           GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+    const int outputs[] = { routed_idx + 2, shared_idx + 2 };
+    if (!ggml_can_fuse_subgraph_ext(graph, nodes, 6, ops, outputs, 2)) {
+        return false;
+    }
+
+    const ggml_tensor * routed = graph->nodes[routed_idx + 2];
+    const ggml_tensor * shared = graph->nodes[shared_idx + 2];
+    const ggml_tensor * gate = routed->src[0];
+    const ggml_tensor * up = routed->src[1];
+    const ggml_tensor * shared_gate = shared->src[0];
+    const ggml_tensor * shared_up = shared->src[1];
+    const auto is_pair = [&](const ggml_tensor * a, const ggml_tensor * b, int idx) {
+        return (a == graph->nodes[idx] && b == graph->nodes[idx + 1]) ||
+               (b == graph->nodes[idx] && a == graph->nodes[idx + 1]);
+    };
+    if (!is_pair(gate, up, routed_idx) || !is_pair(shared_gate, shared_up, shared_idx) ||
+            !ggml_cuda_should_fuse_mul_mat(up, gate, routed) ||
+            !ggml_cuda_should_fuse_mul_mat(shared_up, shared_gate, shared) ||
+            !up->src[0]->buffer ||
+            !ggml_is_quantized(up->src[0]->type)) {
+        return false;
+    }
+    const ggml_tensor * input = up->src[1];
+    const ggml_tensor * weight = up->src[0];
+    const ggml_tensor * shared_weight = shared_up->src[0];
+    if (input->op != GGML_OP_RESHAPE || input->src[0] != shared_up->src[1] ||
+            input->ne[1] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
+            !ggml_is_contiguous(shared_up->src[1]) || !ggml_is_matrix(shared_up->src[1]) ||
+            weight->type != shared_weight->type || weight->ne[0] != shared_weight->ne[0] ||
+            weight->ne[1] != shared_weight->ne[1] || weight->nb[1] != shared_weight->nb[1] || weight->ne[3] != 1 ||
+            !ggml_is_matrix(shared_weight) || !ggml_is_contiguous(shared_weight) ||
+            !ggml_is_contiguous(shared_gate->src[0]) || !ggml_is_contiguous(routed) || !ggml_is_contiguous(shared)) {
+        return false;
+    }
+    if (shared_weight->op != GGML_OP_NONE || shared_gate->src[0]->op != GGML_OP_NONE ||
+            ggml_get_glu_op(routed) != ggml_get_glu_op(shared) ||
+            ggml_get_op_params_f32(routed, 3) != ggml_get_op_params_f32(shared, 3)) {
+        return false;
+    }
+    return true;
+}
+
+int ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID || !ctx.stream_context().concurrent_events.empty() ||
+            !ggml_cuda_match_shared_expert(cgraph, i, i + 3) ||
+            !ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+        return 0;
+    }
+    const int outputs[] = { i + 2, i + 5 };
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {
+        return 0;
+    }
+    ggml_tensor * routed = cgraph->nodes[i + 2];
+    ggml_tensor * shared = cgraph->nodes[i + 5];
+    const ggml_tensor * up = routed->src[1];
+    ggml_cuda_mm_fusion_args_host fusion{};
+    fusion.gate = routed->src[0]->src[0];
+    fusion.glu_op = ggml_get_glu_op(routed);
+    fusion.glu_limit = ggml_get_op_params_f32(routed, 3);
+    fusion.shared_up = shared->src[1]->src[0];
+    fusion.shared_gate = shared->src[0]->src[0];
+    fusion.shared_dst = shared;
+    ggml_cuda_mul_mat_vec_q(ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
+    return 5;
+}
+
+void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool fuse_glu_q8_1 = getenv("GGML_CUDA_FUSE_GLU_Q8_1") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GLU_Q8_1")) != 0;
+    ggml_tensor * node = cgraph->nodes[i];
+    ctx.glu_q8_1_node = nullptr;
+    ctx.glu_q8_1_mm   = nullptr;
+    if (node->op != GGML_OP_GLU || !fuse_glu_q8_1 || node->type != GGML_TYPE_F32 ||
+            node->src[0]->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || node->ne[0] % QK8_1 != 0) {
+        return;
+    }
+    const ggml_tensor * mm = nullptr;
+    if (i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT) {
+        mm = cgraph->nodes[i + 1];
+    } else if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE &&
+               cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT) {
+        mm = cgraph->nodes[i + 2];
+    }
+    if (mm == nullptr) {
+        return;
+    }
+    const ggml_tensor * a = mm->src[1];
+    const ggml_tensor * a_root = a;
+    while (a_root->view_src != nullptr) {
+        a_root = a_root->view_src;
+    }
+    if (a_root == node && ggml_is_contiguous(a) && a->ne[0] % QK8_1 == 0 && ggml_nelements(a) == ggml_nelements(node) &&
+            a->ne[1] >= 2 && ggml_is_quantized(mm->src[0]->type) && ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
+        ctx.glu_q8_1_node = node;
+        ctx.glu_q8_1_mm   = mm;
     }
 }
