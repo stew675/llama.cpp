@@ -1014,7 +1014,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         // (upstream #30927 lands the same collapse as hc_stream_mean).  Gated, so a graph that taps
         // nothing (plain decode, MTP, QSA) gains no node at all.
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-            res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
+            res->set_layer_inp(il, hc_stream_mean(ctx0, res_hc));
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }

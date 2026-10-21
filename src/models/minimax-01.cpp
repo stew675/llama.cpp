@@ -239,7 +239,7 @@ llama_model_minimax_01::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * slopes = la->inp_slopes;
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = inpL;
+        res->set_layer_inp(il, inpL);
 
         ggml_tensor * inpSA = inpL;
 

@@ -1537,6 +1537,8 @@ common_init_result::common_init_result(common_params & params, bool model_only, 
     // A device-resident model, or one whose host experts are computed on the CPU, reports no band and is
     // never clamped either: there the wide draft is the win (144.7 -> 378.7 t/s measured on the same model
     // fully resident).  `LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0` keeps the uncapped draft (A/B and bisect only).
+    // (TODO #117: a band is only reported for a model with HOST-RESIDENT experts, so a dense single-GPU or
+    // `-sm layer` run answers 0 however `moe_cache_enabled()` happens to be set.)
     //
     // The deferral is free: nothing between here and the speculator's construction reads the draft length.
     // What must NOT be deferred is `cparams.n_rs_batch`, which stays the UNCLAMPED safety bound from
@@ -1956,6 +1958,15 @@ void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, lla
     if (ctx_dft) {
         common_context_seq_cp(ctx_dft, seq_id_src, seq_id_dst, p0, p1);
     }
+}
+
+bool common_memory::seq_park(llama_seq_id seq_id, bool park) const {
+    llama_synchronize(ctx_tgt);
+    return llama_memory_seq_park(llama_get_memory(ctx_tgt), seq_id, park);
+}
+
+bool common_memory::can_park() const {
+    return llama_memory_can_park(llama_get_memory(ctx_tgt));
 }
 
 void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const {

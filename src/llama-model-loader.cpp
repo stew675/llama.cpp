@@ -40,9 +40,30 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
         }
-        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: bounded pinned host pool enabled "
-                       "(MOE_HOST_POOL_MIB, default 25%% of the MoE host expert bytes)\n", func);
+        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: NO pinned master; the host experts stay in the model "
+                       "mapping and every GPU read is served through a bounded pinned pool "
+                       "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80%% of the host expert bytes, "
+                       "O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n", func);
     }
+}
+
+// wip/host-expert-master-drop (TODO #55): POOL mode drops the FULL PINNED host expert master.  The
+// tensors are placed in the read-only model mapping (page cache / GGUF on disk) instead, and every GPU
+// read of them goes through the bounded pinned pool, so the non-swappable part of the host expert set
+// becomes the pool budget rather than the whole set -- which is what lets a model whose expert set does
+// not fit in RAM run at all (the page cache is reclaimable; the pool is the only pinned tier).
+ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev) const {
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    static const bool pin_master = getenv("LLAMA_HOST_MASTER_PINNED") != nullptr;
+    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL && use_mmap && !pin_master) {
+        ggml_backend_buffer_type_t master = ggml_backend_dev_moe_host_master_buft(dev);
+        if (master != nullptr) {
+            return master;
+        }
+    }
+    return ggml_backend_dev_host_buffer_type(dev);
 }
 
 const char * llama_file_version_name(llama_fver version) {
@@ -593,10 +614,19 @@ llama_model_loader::llama_model_loader(
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
-    // Host-resident expert weights are always pinned (`ROCm_Host`): the GPU reads the host master in
+    // Host-resident expert weights are pinned by default (`ROCm_Host`): the GPU reads the host master in
     // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
     // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
+    this->host_experts_mode = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP ? LLAMA_HOST_EXPERTS_MODE_PINNED : host_experts_mode;
     llama_host_experts_mode_apply(host_experts_mode, __func__);
+    if (this->host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL && !this->use_mmap) {
+        // The pool-backed master is a MODEL MAPPING: without mmap there is no mapping to place the tensors in,
+        // so the full pinned master has to stay (a pageable full copy would be no better than pinned, and the
+        // pool would still read the GGUF).
+        LLAMA_LOG_WARN("%s: --host-experts pool without mmap (--load-mode none/dio): the full pinned host "
+                       "expert master is kept, because the pool-backed master is the read-only model mapping.  "
+                       "Use the default mmap load mode (or MOE_HOST_POOL_DIO=1 with mmap) to drop it.\n", __func__);
+    }
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -1428,8 +1458,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         // the device this layer is assigned to.
                         if (op == GGML_OP_MUL_MAT_ID && buft_list_layer != nullptr && !buft_list_layer->empty()) {
                             ggml_backend_dev_t layer_dev = buft_list_layer->front().first;
-                            ggml_backend_buffer_type_t layer_host_buft =
-                                layer_dev != nullptr ? ggml_backend_dev_host_buffer_type(layer_dev) : nullptr;
+                            ggml_backend_buffer_type_t layer_host_buft = host_expert_buft(layer_dev);
                             if (layer_host_buft != nullptr &&
                                     weight_buft_supported(hparams, t_meta, op, layer_host_buft, layer_dev)) {
                                 buft = layer_host_buft;
@@ -1449,7 +1478,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         if (buft == nullptr && tensor_host_buft && op == GGML_OP_MUL_MAT_ID) {
                             for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
                                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                                ggml_backend_buffer_type_t hb = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+                                ggml_backend_buffer_type_t hb = host_expert_buft(dev);
                                 if (hb == nullptr || hb == ggml_backend_cpu_buffer_type()) {
                                     continue;
                                 }

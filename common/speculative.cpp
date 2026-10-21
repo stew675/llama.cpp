@@ -1031,6 +1031,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
 
+    // Llama-Frankenstein F1 (default on, GGML_LF_DFLASH_DEV=0 turns it off): the target keeps its extracted layer inputs on
+    // the device and the injection batch carries the target rows as token ids, so the features never leave the GPU. Any
+    // number of sequences: the rows are positions in the target batch, the same offsets the host path reads, and each
+    // sequence is injected with its own seq_id. If the target cannot allocate its device buffers, it keeps the host path
+    // and so does the draft.
+    bool        lf_dev = false;
+    llama_batch batch_inject_tok = {};
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -1065,6 +1073,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // block-internal attention
     bool causal_attn = false;
+
+    // every layer of the draft attends over a sliding window of n_swa positions: a prompt row older than the last n_swa
+    // positions of the prompt never reaches a draft, so it is not ingested (LLAMA_DFLASH_INGEST_TAIL=0: every row).
+    // Exact because DFlash sets LLAMA_SWA_TYPE_STANDARD unconditionally (src/models/dflash.cpp): the mask is
+    // p1 - p0 >= n_swa, so a prompt's last n_swa positions are exactly the rows a first generation row can attend to.
+    // (A LLAMA_SWA_TYPE_CHUNKED window reaches back to the chunk start -- up to 2*n_swa-1 -- and would need a wider tail.)
+    int32_t                ingest_window = 0;
+    std::vector<llama_pos> ingest_from;
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
@@ -1121,6 +1137,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
+        {
+            const char *  e     = getenv("LLAMA_DFLASH_INGEST_TAIL");
+            const int32_t n_swa = llama_model_n_swa(model_dft);
+            if ((e == nullptr || atoi(e) != 0) && n_swa > 0 && llama_model_n_layer_swa(model_dft) == llama_model_n_layer(model_dft)) {
+                ingest_window = n_swa;
+            }
+            ingest_from.assign(n_seq, 0);
+        }
+
         if (is_dspark && this->params.p_min > 0.0f) {
             char buf[16] = {};
             const bool has_conf =
@@ -1135,6 +1160,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
+        if (ingest_window > 0) {
+            LOG_INF("%s: - every layer has a %d-position window: a prompt is ingested from its last %d positions\n", __func__,
+                    ingest_window, ingest_window);
+        }
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
@@ -1183,6 +1212,29 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        {
+            const char * lf_env = getenv("GGML_LF_DFLASH_DEV");
+            const bool   lf_on  = lf_env == nullptr || atoi(lf_env) != 0;
+            // several sequences keep the host path when the target has host-resident MoE experts (-ncmoe/-cmoe): the
+            // movable-boundary slab armed for them was observed to break the draft's device reads there (draft
+            // acceptance near 0 with two or more slots; one sequence, or GGML_CUDA_SLAB=0, is fine)
+            const bool host_experts = llama_model_moe_host_expert_dev_count(llama_get_model(ctx_tgt)) > 0;
+            lf_dev = lf_on && (n_seq == 1 || !host_experts);
+            if (lf_on && !lf_dev) {
+                LOG_WRN("%s: F1: %d sequences with host-resident MoE experts, using the host path\n", __func__, (int) n_seq);
+            }
+            if (lf_dev) {
+                llama_lf_set_layer_inp_dev(ctx_tgt, true);
+                batch_inject_tok = llama_batch_init(llama_n_ubatch(ctx_dft), 0, n_seq);
+                if (is_mrope) {
+                    free(batch_inject_tok.pos);
+                    batch_inject_tok.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
+                }
+                LOG_INF("%s: F1: target features stay on the device (n_seq = %d; default on, GGML_LF_DFLASH_DEV=0 turns it off)\n",
+                        __func__, (int) n_seq);
+            }
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1200,6 +1252,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+
+        if (lf_dev) {
+            llama_batch_free(batch_inject_tok);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1220,6 +1276,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
+        }
+    }
+
+    void set_prompt_end(llama_seq_id seq_id, llama_pos n_prompt) override {
+        if (ingest_window > 0 && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            ingest_from[seq_id] = std::max<llama_pos>(0, n_prompt - ingest_window);
         }
     }
 
@@ -1254,16 +1316,83 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        // prompt rows before the draft's window of the prompt's end are never attended to; a batch left with none (a
+        // long prompt's leading ubatches) returns before the wait on the target, so the target's ubatches stay queued
+        if (ingest_window > 0) {
+            bool any = false;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                while (i_batch_beg[seq_id] >= 0 && i_batch_beg[seq_id] <= i_batch_end[seq_id] &&
+                       batch_in.tokens[i_batch_beg[seq_id]].pos[0] < ingest_from[seq_id]) {
+                    i_batch_beg[seq_id]++;
+                }
+                if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
+                    i_batch_beg[seq_id] = -1;
+                }
+                // generation reached (a row at the prompt end or later): later position shifts never skip rows
+                if (i_batch_end[seq_id] >= 0 && batch_in.tokens[i_batch_end[seq_id]].pos[0] >= ingest_from[seq_id] + ingest_window) {
+                    ingest_from[seq_id] = 0;
+                }
+                any = any || i_batch_beg[seq_id] >= 0;
+            }
+            if (!any) {
+                return true;
+            }
+        }
+
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
+
+        // F1: the target wrote its layer inputs to device buffers on its own stream; the draft reads them on its
+        // stream, and the target must not overwrite them before the draft is done
+        // the target falls back to the host path when its device buffers could not be allocated
+        const bool use_dev = lf_dev && has_tokens && llama_lf_get_layer_inp_dev(ctx_tgt, (uint32_t) target_layer_ids[0]) != nullptr;
+        // with several sequences the target's ubatches may have reordered the batch: its device rows are then found
+        // through the row map (nullptr = same order, always the case for one sequence)
+        int32_t         lf_n_rows = 0;
+        const int32_t * lf_rows   = nullptr;
+        if (use_dev) {
+            llama_synchronize(ctx_tgt);
+            lf_rows = llama_lf_get_dev_rows(ctx_tgt, &lf_n_rows);
+            GGML_ASSERT(lf_rows == nullptr || lf_n_rows == n_tokens);
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+            if (use_dev) {
+                for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+                    const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+                    batch_inject_tok.n_tokens = n_chunk;
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const int32_t   row = i_batch_beg[seq_id] + offset + i;
+                        const llama_pos p   = batch_in.tokens[row].pos[0];
+                        batch_inject_tok.token[i] = lf_rows ? lf_rows[row] : row; // device row (see llama_lf_set_dev_inject)
+                        batch_inject_tok.pos[i]   = p;
+                        if (is_mrope) {
+                            batch_inject_tok.pos[1 * n_chunk + i] = p;
+                            batch_inject_tok.pos[2 * n_chunk + i] = p;
+                            batch_inject_tok.pos[3 * n_chunk + i] = 0;
+                        }
+                        batch_inject_tok.n_seq_id[i]  = 1;
+                        batch_inject_tok.seq_id[i][0] = seq_id;
+                        batch_inject_tok.logits[i]    = false;
+                    }
+                    llama_lf_set_dev_inject(ctx_dft, true);
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject_tok);
+                    llama_lf_set_dev_inject(ctx_dft, false);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (F1, n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                }
+                continue;
+            }
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
             // cache cannot free cells for it - skip it, the draft can jump over the gap
@@ -1321,6 +1450,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
             }
+        }
+
+        if (use_dev) {
+            llama_lf_signal_features_consumed(ctx_dft);
         }
 
         return true;
@@ -3041,7 +3174,10 @@ common_speculative_init_result::common_speculative_init_result(
     llama_context * ctx_tgt,
     llama_model * model_dft_pre) :
     pimpl(new impl{}) {
-    const bool has_draft = params.speculative.has_dft();
+    // `has_dft()` only means `-md` was given: a type that never drafts with a model
+    // (`--spec-type none`, the n-gram types) must not create a context for it -- its warm-up needs the
+    // target's hidden state (gemma4-assistant) and aborts.
+    const bool has_draft = params.speculative.has_dft() && params.speculative.uses_dft();
     const bool spec_mtp = params.speculative.has_mtp();
 
     auto mparams = common_model_params_to_llama(params);
@@ -3066,6 +3202,20 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+
+    // MTP draft compute-buffer cap (TODO #42 / OPEN 1): the draft's encoder injection is fed in
+    // `n_ubatch` chunks, so its compute buffer during the target's first prefill is sized for that
+    // chunk (~1.6-1.7 GiB/device at the target's full `-ub`).  The draft only drafts `n_max+1` tokens
+    // and the injection is fast in small chunks, so cap it at 512 by default; the freed VRAM goes to
+    // the MoE expert arena (the `-ub 8192` decode DoD).  `MTP_DRAFT_N_UBATCH=0` restores the target's
+    // `-ub`; a positive value overrides the 512 default.
+    if (spec_mtp) {
+        const char * e = getenv("MTP_DRAFT_N_UBATCH");
+        const int64_t draft_ub = e != nullptr ? atoll(e) : 512;   // 0 = no cap (use the target's -ub)
+        if (draft_ub > 0) {
+            cparams.n_ubatch = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(draft_ub, (int64_t) cparams.n_ubatch));
+        }
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?

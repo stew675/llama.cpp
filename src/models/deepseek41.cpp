@@ -853,7 +853,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
         // DSpark target features: mean over the hc copies of the layer input
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-            res->t_layer_inp[il] = build_hc_mean(inpL);
+            res->set_layer_inp(il, build_hc_mean(inpL));
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }

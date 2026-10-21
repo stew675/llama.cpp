@@ -67,6 +67,12 @@ GGML_API bool ggml_gallocr_reserve_n(
     const int * node_buffer_ids,
     const int * leaf_buffer_ids);
 
+// WIP r42 (TODO #42): free every compute buffer and invalidate the layout, so the next reserve/realloc
+// sizes the buffers from the *current* graph instead of the (grow-only) previous peak.  Used to release
+// the wide-prefill compute buffer before the decode MoE arena is sized.  The caller must ensure no
+// in-flight graph still reads the freed buffers (the reserve path synchronizes again before realloc).
+GGML_API void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc);
+
 // Compute and store the layout of graph without allocating or modifying the existing buffers.
 // Returns true if the buffers would need to be grown (reallocated) to hold the graph; in that case
 // the caller must ensure that no in-flight work is using the buffers (synchronize) and call
@@ -83,7 +89,6 @@ GGML_API bool ggml_gallocr_reserve_n_probe(
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
-GGML_API void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 

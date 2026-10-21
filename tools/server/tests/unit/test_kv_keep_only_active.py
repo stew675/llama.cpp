@@ -30,6 +30,7 @@ def create_server():
     fd, server.log_path = tempfile.mkstemp(suffix='.log')
     os.close(fd)
     yield
+    os.environ.pop("LLAMA_SERVER_LAZY_IDLE_SLOTS", None)
 
 
 LONG_PROMPT = (
@@ -40,15 +41,58 @@ LONG_PROMPT = (
     "and wizards who helped him on his noble quest to save the kingdom."
 )
 
+# the tiny test model has a 512-token unified cache for both slots, so these two prompts
+# together do not fit: the second one has to make room in the KV cache
+PROMPT_A = LONG_PROMPT * 2
+PROMPT_B = "Meanwhile, " + LONG_PROMPT * 2
 
-# idle slot cleared on launch should restore from cache-ram
-def test_clear_and_restore():
+
+# by default an idle slot keeps its KV; the KV-full path saves it to cache-ram before clearing it
+def test_idle_slots_stay_resident():
     global server
     server.start()
     log = LogReader(server.log_path)
 
     # verify feature is enabled
     assert "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__" in log.drain()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": PROMPT_A,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    original_prompt_n = res.body["timings"]["prompt_n"]
+
+    # the idle slot is not saved and cleared when another task starts
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
+
+    # overflow the unified KV cache: the idle slot is saved to cache-ram and only then cleared
+    res = server.make_request("POST", "/completion", data={
+        "prompt": PROMPT_B,
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert "making room in the KV cache: saving and clearing idle slot" in log.drain()
+
+    # the cleared conversation comes back from cache-ram instead of being recomputed
+    res = server.make_request("POST", "/completion", data={
+        "prompt": PROMPT_A,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 0
+    assert res.body["timings"]["prompt_n"] < original_prompt_n
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
+
+
+# LLAMA_SERVER_LAZY_IDLE_SLOTS=0: the eager behaviour (save and clear every idle slot on a new task)
+def test_idle_slots_eager_kill_switch():
+    global server
+    os.environ["LLAMA_SERVER_LAZY_IDLE_SLOTS"] = "0"
+    server.start()
+    log = LogReader(server.log_path)
 
     res = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT,
@@ -58,10 +102,10 @@ def test_clear_and_restore():
     assert res.status_code == 200
     original_prompt_n = res.body["timings"]["prompt_n"]
 
-    # Slot 0 is the only slot with KV — should NOT be cleared
+    # slot 0 is the only slot with KV — should NOT be cleared
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
 
-    # Launching slot 1 clears idle slot 0
+    # launching slot 1 saves and clears idle slot 0
     res = server.make_request("POST", "/completion", data={
         "prompt": "The quick brown fox",
         "id_slot": 1,
@@ -70,23 +114,14 @@ def test_clear_and_restore():
     assert res.status_code == 200
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" in log.drain()
 
-    # Re-send same prompt — should restore from cache-ram
+    # re-send the same prompt — should restore from cache-ram
     res = server.make_request("POST", "/completion", data={
         "prompt": LONG_PROMPT,
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    assert "updating prompt cache" in log.drain()
     assert res.body["timings"]["cache_n"] > 0
     assert res.body["timings"]["prompt_n"] < original_prompt_n
-
-    # Follow-up — slot 0 kept its KV, no clearing needed
-    res = server.make_request("POST", "/completion", data={
-        "prompt": LONG_PROMPT + " The knight finally reached the castle gates.",
-        "cache_prompt": True,
-    })
-    assert res.status_code == 200
-    assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
 
 
 def test_disabled_with_flag():
@@ -113,3 +148,4 @@ def test_disabled_with_flag():
     })
     assert res.status_code == 200
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
+    assert "making room in the KV cache" not in log.drain()

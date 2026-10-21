@@ -79,6 +79,13 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // Parking (llama_memory_seq_park).  The indexer cache is a cell-for-cell mirror of the attention cache - cell j
+    // is the same token in both, and the model asserts that the two ranges agree - so a park has to move both or
+    // neither.  can_park() asks both caches; seq_park() moves both and refuses (leaving everything where it is) when
+    // they no longer mirror each other, which sends the caller to its save-and-clear fallback.
+    bool can_park() const;
+    bool seq_park(llama_seq_id seq_id, bool park);
+
     // The model's indexer pool size.
     uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
 
@@ -162,6 +169,9 @@ private:
 
     // the position an edit at p0 stales the sequence from
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
+
+    // whether the indexer cache still holds the attention cache's cells, (position, cell) pair for pair
+    bool attn_idx_in_step(llama_seq_id seq_id) const;
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
     //
