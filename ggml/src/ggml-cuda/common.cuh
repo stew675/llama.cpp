@@ -40,6 +40,33 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+// RMS-norm reduction selector (issue #229) -- a NUMERICS switch, not a tuning knob.  The RMS sum's
+// partial-sum grouping decides its last bits; every layer then differs by ~1 ulp and greedy MTP draft
+// acceptance is a discrete function of that, so the grouping is part of the delivery's reference.
+//
+// Default: the strided scalar reduction upstream used before ggml-org/llama.cpp#29720.  Every recorded
+// MTP/acceptance number, the adaptive-MTP controller's tuning and the decode-band norm fusions
+// (`rms_norm_q8_1_f32`, gdn-conv's folded q/k norms, the GDN norm gate, `rms_norm_scale_pair_f32`) are
+// built on it, and those kernels are documented bit-identical to `rms_norm_f32`, which only holds while
+// both use the same grouping.
+//
+// `GGML_CUDA_RMS_NORM_VEC=1` opts into #29720's float4 grouping: a lane owns the four columns
+// 4*i .. 4*i+3 of i = tid + k*block_size instead of one strided column per step.  Measured on gfx1201
+// (Qwen3.8-27B UD-Q4_K_XL, 1 GPU): +1.0-2.7 % prefill, ~0 % plain decode, and a payload-dependent change
+// in greedy text and MTP draft acceptance -- +0.7..+1.3 points of acceptance on the default arm (94k and
+// 5k contexts), but 0.611 vs 0.792 acceptance (-18 % t/s) with the SSM decode fusions disabled (the
+// shape issue #229 reports) and -7..-9 % tg on the reporter's own box.  With it on, the fused norm
+// kernels above are *approximate* relative to the chain they replace (0.0005 mean KLD at `-ub 1`;
+// measured exactly 0.000000 / 100.000 % on the default).  Every kernel documented as bit-identical to
+// rms_norm_f32 consults this, so an arm stays coherent.
+// GREEDY-PURITY.md §60, ENVIRONMENT.md, patches/README.md (block 08).
+static inline bool ggml_cuda_rms_norm_vec() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_RMS_NORM_VEC");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -1591,6 +1618,132 @@ struct ggml_backend_cuda_context {
         name(GGML_CUDA_NAME + std::to_string(device)) {
     }
 
+    // Per-graph cache of quantized Q8_1 matmul inputs.
+    // The decode mmvq launcher quantizes src1 to Q8_1 before every matmul.
+    // Matmuls sharing the same src1 data (e.g. the qkv/z/alpha/beta projections
+    // of one layer, or views of the same tensor) quantize it once and reuse the
+    // result. Entries are keyed by the view root of src1 (the tensor that owns
+    // the data) plus the data pointer and the quantize layout, so strided views
+    // never collide and stack-allocated per-expert slices of the mul_mat_id
+    // fallback (same tensor address, distinct data) never reuse each other's
+    // quantized tokens. The cache is valid only within one graph execution: a
+    // tensor is written once and its data is immutable until the next graph.
+    // Cleared at graph start; entries are also keyed by the stream they were
+    // quantized on, so forked streams never read unsynchronized data.
+    struct q8_1_cache_entry {
+        const ggml_tensor * src1 = nullptr;
+        const void * data = nullptr;
+        int stream_no = 0;
+        int64_t ne10 = 0;
+        int64_t ne11 = 0;
+        int64_t ne12 = 0;
+        int64_t ne13 = 0;
+        int64_t s11 = 0;
+        int64_t s12 = 0;
+        int64_t s13 = 0;
+        size_t offset = 0;
+        size_t size   = 0;
+    };
+    char * q8_1_arena = nullptr;
+    size_t q8_1_arena_size = 0;
+    std::vector<char *> q8_1_arena_retired;
+    std::vector<q8_1_cache_entry> q8_1_cache;
+    size_t q8_1_arena_pos = 0;
+
+    void q8_1_cache_clear() {
+        q8_1_cache.clear();
+        q8_1_arena_pos = 0;
+    }
+
+    // Returns the cached buffer for (src1, stream_no, layout) if present,
+    // otherwise allocates a new one from the arena and records it. The buffer
+    // is valid until the next q8_1_cache_clear().
+    void * q8_1_cache_get(const ggml_tensor * src1, int stream_no, size_t size,
+                          int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+                          int64_t s11, int64_t s12, int64_t s13, bool & found) {
+        for (const auto & e : q8_1_cache) {
+            if (e.src1 == src1 && e.data == src1->data && e.stream_no == stream_no &&
+                e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
+                e.s11 == s11 && e.s12 == s12 && e.s13 == s13) {
+                found = true;
+                return q8_1_arena + e.offset;
+            }
+        }
+        found = false;
+        if (q8_1_arena_pos + size > q8_1_arena_size) {
+            const size_t new_size = std::max(size_t(1) << 25, 2*(q8_1_arena_pos + size)); // 32 MiB min
+            char * new_arena = nullptr;
+            CUDA_CHECK(cudaMalloc(&new_arena, new_size));
+            if (q8_1_arena != nullptr) {
+                CUDA_CHECK(cudaMemcpy(new_arena, q8_1_arena, q8_1_arena_pos, cudaMemcpyDeviceToDevice));
+                // Captured CUDA/HIP graphs keep pointers into the old arena, and the multi-token graph that
+                // grows it is never captured, so the next decode replay would write to freed memory (page fault
+                // in quantize_q8_1 under -sm tensor -ub 2048).  Keep it until the context is destroyed.
+                // GGML_CUDA_Q8_1_ARENA_FREE_OLD=1 restores the immediate free (A/B / bisect only).
+                static const bool free_old = getenv("GGML_CUDA_Q8_1_ARENA_FREE_OLD") != nullptr;
+                if (free_old) {
+                    CUDA_CHECK(cudaFree(q8_1_arena));
+                } else {
+                    q8_1_arena_retired.push_back(q8_1_arena);
+                }
+            }
+            q8_1_arena = new_arena;
+            q8_1_arena_size = new_size;
+        }
+        void * data = q8_1_arena + q8_1_arena_pos;
+        q8_1_cache.push_back({ src1, src1->data, stream_no, ne10, ne11, ne12, ne13, s11, s12, s13, q8_1_arena_pos, size });
+        q8_1_arena_pos += size;
+        return data;
+    }
+
+    // Stale-source-pointer guard for the on-the-fly Q8_1 quantize / fused-write launches: the
+    // source read range (the tensor's own ne/nb extent) must lie within the root tensor's
+    // buffer allocation.  A compute buffer that is reallocated while a cache entry still
+    // matches keeps the stored identity true but leaves the source pointer stale; without
+    // this the kernel faults (MEMORY_APERTURE_VIOLATION) or silently reads reused memory.
+    // Log the layout and return false so the caller aborts.  A pointer fully outside the
+    // buffer is not this fault class (some buffer types keep the data elsewhere): let it run.
+    static bool q8_1_src_range_ok(const ggml_tensor * src, const void * src_d) {
+        if (src == nullptr || src_d == nullptr) {
+            return true;
+        }
+        const ggml_tensor * root = src;
+        while (root->view_src != nullptr) {
+            root = root->view_src;
+        }
+        if (root->buffer == nullptr) {
+            return true;
+        }
+        const char * base  = reinterpret_cast<const char *>(ggml_backend_buffer_get_base(root->buffer));
+        const size_t  bsize = ggml_backend_buffer_get_size(root->buffer);
+        if (base == nullptr || bsize == 0) {
+            return true;
+        }
+        const char * p = reinterpret_cast<const char *>(src_d);
+        if (p < base || p >= base + bsize) {
+            return true;
+        }
+        if (src->ne[0] <= 0 || src->ne[1] <= 0 || src->ne[2] <= 0 || src->ne[3] <= 0) {
+            return true;
+        }
+        const size_t bytes = (size_t) src->ne[0] * ggml_element_size(src) +
+                             (size_t) ((src->ne[1] - 1) * src->nb[1] +
+                                       (src->ne[2] - 1) * src->nb[2] +
+                                       (src->ne[3] - 1) * src->nb[3]);
+        if (p + bytes > base + bsize) {
+            GGML_LOG_ERROR("%s: q8_1 source out of range (stale pointer?): tensor '%s' data=%p, root '%s' "
+                         "data=%p, buffer=[%p, %p), bytes=%zu, ne=(%lld, %lld, %lld, %lld), "
+                         "nb=(%llu, %llu, %llu, %llu)\n",
+                         __func__, src->name, (const void *) src_d, root->name, (const void *) root->data,
+                         (const void *) base, (const void *) (base + bsize), bytes,
+                         (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3],
+                         (unsigned long long) src->nb[0], (unsigned long long) src->nb[1], (unsigned long long) src->nb[2],
+                         (unsigned long long) src->nb[3]);
+            return false;
+        }
+        return true;
+    }
+
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();
@@ -1648,6 +1801,20 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    // when set (with glu_op == GGML_GLU_OP_NONE), the gate result is written
+    // to this separate destination instead of being combined into the main output
+    const ggml_tensor * dst_gate = nullptr;
+    // SSM conv-input fusion: the matmul output is the last row of an
+    // interleaved [conv_kernel_size, channels] conv input. The kernel writes
+    // conv_input[cs*c + cs-1] = result and copies the (cs-1) conv states rows
+    // from conv_states (a contiguous [(cs-1)*channels] GET_ROWS output) into
+    // conv_input[cs*c + k], k < cs-1. The separate CONCAT kernel is skipped.
+    const ggml_tensor * conv_input = nullptr;
+    const ggml_tensor * conv_states = nullptr;
+    int conv_kernel_size = 0;
+    // Index x_scale by the destination channel (token), not the source channel
+    // (expert). Used for the MoE down x topk-weights fusion.
+    bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
     const ggml_tensor * shared_up = nullptr;
@@ -1660,6 +1827,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    const void * dst_gate = nullptr;
+    const void * conv_input = nullptr;
+    const void * conv_states = nullptr;
+    int conv_kernel_size = 0;
+    bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
     const void * shared_up = nullptr;
