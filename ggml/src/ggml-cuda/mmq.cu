@@ -138,7 +138,17 @@ static int ggml_cuda_mmq_get_J_best(
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    // GGML_CUDA_MMQ_J_MAX caps the maximum tile width considered (block 04's A/B perf knob;
+    // a value < 8 is ignored).  Both call sites select through this helper.
+    int J_cap = 128;
+    if (const char * env = getenv("GGML_CUDA_MMQ_J_MAX")) {
+        const int v = atoi(env);
+        if (v >= 8) {
+            J_cap = std::min(J_cap, v);
+        }
+    }
+
+    for (int J = 8; J <= J_cap && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
@@ -497,6 +507,23 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 case GGML_TYPE_Q2_K:
                     return ne11 <= 128;
                 case GGML_TYPE_Q6_K:
+                    // OPT-IN (GGML_CUDA_Q6K_MMQ=1, issue #374): on RDNA3_0 extend MMQ up to block 06's MMB dense floor
+                    // (mmb_min_t, 512) where upstream's 128 cap instead dequantises Q6_K and hands the GEMM to rocBLAS
+                    // (297 ms against 161 ms of mul_mat_q<Q6_K> on a reporter's 7900 GRE, +6.2 % prefill).  At and
+                    // above that floor MMB's dense tile already takes Q6_K (GGML_CUDA_GCDBG=1 at ub 512/1024 shows 0
+                    // cublas GEMMs), so the switch reaches only the 129..511 band (or an MMB-off build).  On this
+                    // repo's gfx1100 (7900 XTX) the swap is a wash -- pp4096 at ub 256 1028.2 vs 1027.1 t/s, ub 384
+                    // 1093.4 vs 1091.2 -- and mean KLD 0.005112 / same top-1 96.01 % against the rocBLAS arm at
+                    // ub 256 (a family switch at a point the model is not confident about, GREEDY-PURITY.md §46).
+                    // Hence OPT-IN, not the default.  ENVIRONMENT.md carries it.
+                    if (GGML_CUDA_CC_IS_RDNA3_0(cc) && ne11 <= 512) {
+                        static const bool q6k_mmq = [] {
+                            const char * e = getenv("GGML_CUDA_Q6K_MMQ"); return e != nullptr && atoi(e) != 0;
+                        }();
+                        if (q6k_mmq) {
+                            return true;
+                        }
+                    }
                     return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:

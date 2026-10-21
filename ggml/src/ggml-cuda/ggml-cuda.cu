@@ -37,6 +37,7 @@
 #include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-wmma.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/mmf32.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -6716,13 +6717,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
+    // op timing instruments each node with stream events, which is not possible during capture
+    const bool op_timing = getenv("GGML_CUDA_OP_TIMING") != nullptr;
+
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (!op_timing && graph->is_enabled()) {
         // graph->uid is set only for a compatible graph (see ggml_cuda_graph_update_required), so a reused graph needs no new check
         const bool graph_reused     = cgraph->uid != 0 && cgraph->uid == graph->uid;
         const bool graph_compatible = graph_reused || ggml_cuda_graph_check_compability(cgraph);
@@ -8178,6 +8182,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_comm_init_rank;
     }
 #endif // GGML_USE_NCCL
+    // block 07 (r290): the verify-band WMMA iu8 floor (`--wmma-verify N`, opt-in, 0 = off).  Reached through
+    // the registry so libllama/common need no CUDA symbol and no new cross-backend interface member.
+    if (strcmp(name, "ggml_cuda_mmvq_wmma_set_min_cols") == 0) {
+        return (void *) ggml_cuda_mmvq_wmma_set_min_cols;
+    }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
     }
