@@ -633,6 +633,12 @@ struct common_params {
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded
 
+    // block 07 (r290): the verify band's WMMA iu8 floor in columns -- the first verify width that takes the
+    // tensor-core family instead of the K-split mmvq kernel (0 = off, the default; -1 = `auto`, the measured
+    // PER-TYPE crossing resolved in ggml: 5 columns for Q4_K/Q5_K, 8 for Q6_K/IQ4_XS/Q8_0).  Below its own
+    // crossing the family is SLOWER (see ENVIRONMENT.md §7.6 and GREEDY-PURITY.md §91).
+    int32_t wmma_verify = 0;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)
