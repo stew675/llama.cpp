@@ -1329,6 +1329,64 @@ struct ggml_cuda_device_info {
 
 const ggml_cuda_device_info & ggml_cuda_info();
 
+// WORKAROUND for the gfx1201 grid-size dispatch stall (ROCm/legacy-rocm-build#6689, ROCm/TheRock#8634): a dispatch
+// whose block count is a multiple of 256, or whose work-item count is a multiple of 65536, waits ~6-10 us before it
+// runs (a 512-row BF16 GEMV: 17.8 us vs 8.8 us at 513 blocks).  A launch site that can take one extra block (the
+// kernel returns at once for a block past its last row) asks this helper and adds that block; the arithmetic is
+// unchanged.  Not the only workaround in the tree: mul_mat_vec_f_vb, hc_mix and the RDNA4 mmvq decode grid size
+// their grids around the same stall.
+// BACKING IT OUT once AMD ships the fix: GGML_CUDA_GRID_STALL_PAD=0 turns it off at run time; to remove it, delete
+// this function and its call sites (grep ggml_cuda_grid_stall_pad) -- the kernels' row guards are harmless left in.
+//
+// `site` names the launch in the GGML_CUDA_GRID_STALL_PAD_DEBUG line (`-lv 4`, or plain stderr), which is how a gate
+// observes that a given site really padded instead of trusting it.  `pad_blocks` is how many blocks the caller's
+// one-step pad ADDS: a grid whose x dimension is the row/tile count adds one block per extra y row, but a grid whose
+// x dimension is a token count adds that many (issue #277, get_rows).  The pad is refused when it would land on
+// another multiple of 256 -- launching an extra empty block row that cannot leave the condition is pure waste.
+static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block,
+                                            const char * site = nullptr, const int64_t pad_blocks = 1) {
+#if defined(GGML_USE_HIP)
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!on) {
+        return false;
+    }
+    const int64_t nblk = (int64_t) grid.x * grid.y * grid.z;
+    const int64_t nthr = (int64_t) block.x * block.y * block.z;
+    if (nblk <= 0 || (nblk % 256 != 0 && (nblk * nthr) % 65536 != 0)) {
+        return false;
+    }
+    static const bool debug = [] {
+        const char * e = getenv("GGML_CUDA_GRID_STALL_PAD_DEBUG");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    const int64_t nblk_pad = nblk + pad_blocks;
+    if (nblk_pad % 256 == 0 || (nblk_pad * nthr) % 65536 == 0) {
+        // A one-step pad adds a multiple of 256 blocks (a grid.x that is itself one): this launch cannot be padded
+        // off the stall without adding a dimension, so do not spend an empty block row on it.
+        if (debug) {
+            GGML_LOG_INFO("grid-stall-pad: %s grid=(%u,%u,%u) %lld blocks: NO pad possible (+%lld keeps the multiple)\n",
+                          site ? site : "?", grid.x, grid.y, grid.z, (long long) nblk, (long long) pad_blocks);
+        }
+        return false;
+    }
+    if (debug) {
+        GGML_LOG_INFO("grid-stall-pad: %s grid=(%u,%u,%u) block=(%u,%u,%u): %lld -> %lld blocks\n",
+                      site ? site : "?", grid.x, grid.y, grid.z,
+                      block.x, block.y, block.z, (long long) nblk, (long long) nblk_pad);
+    }
+    return true;
+#else
+    GGML_UNUSED(grid);
+    GGML_UNUSED(block);
+    GGML_UNUSED(site);
+    GGML_UNUSED(pad_blocks);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
