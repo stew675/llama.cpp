@@ -54,6 +54,10 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // ggml_cuda_graph_mem_gen() of the graph's device when it was captured: a captured graph bakes in
+    // the addresses of pool temporaries and per-context scratch buffers, so it is recaptured once any
+    // of that memory has been freed (see ggml_cuda_graph_mem_freed)
+    uint64_t mem_gen = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];

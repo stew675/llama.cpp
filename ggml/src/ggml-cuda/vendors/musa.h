@@ -72,6 +72,7 @@ typedef uint32_t ggml_cuda_thread_mask_t;
 #define cudaGetLastError musaGetLastError
 #define cudaHostRegister musaHostRegister
 #define cudaHostRegisterPortable musaHostRegisterPortable
+#define cudaHostRegisterMapped musaHostRegisterMapped
 #define cudaHostRegisterReadOnly musaHostRegisterReadOnly
 #define cudaHostUnregister musaHostUnregister
 #define cudaLaunchCooperativeKernel musaLaunchCooperativeKernel

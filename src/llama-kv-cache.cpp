@@ -455,6 +455,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
+        // upstream #32380's kv-cells API: seq_rm() walks the per-sequence position index
+        // (`seq_pos[seq_id]`) instead of the delivery's linear scan over the used range, and returns the
+        // smallest cell index it freed.  Same result, strictly less work -- adopted rather than kept.
         const uint32_t new_head = cells.seq_rm(seq_id, p0, p1);
 
         // If we freed up a slot, set head to it so searching can start there.
@@ -469,7 +472,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
             uint32_t new_head = cells.size();
 
-            for (uint32_t i = 0; i < cells.size(); ++i) {
+            const uint32_t i_end = cells.used_max_p1();
+            for (uint32_t i = cells.used_min(); i < i_end; ++i) {
                 if (!cells.pos_in(i, p0, p1)) {
                     continue;
                 }
