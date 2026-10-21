@@ -375,6 +375,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+        // TODO #58/#78: a DFlash2 drafter with a selector builds `ggml_top_k` over its draft logits, and
+        // `-sm tensor` vocabulary-splits those (the lm_head is the target's, placed by the target's split
+        // policy).  `build_dflash2_selector()` all-gathers the logits on the meta backend before the
+        // selector runs, so the combination is supported: no rejection here any more.
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }

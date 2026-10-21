@@ -77,7 +77,7 @@ llama_model_muse_glimmer::graph::graph(const llama_model & model, const llm_grap
 
     for (int il = 0; il < n_layer; ++il) {
         // expose per-layer residual for speculative drafts (see LLM_KV_TARGET_LAYERS).
-        res->t_layer_inp[il] = inpL;
+        res->set_layer_inp(il, inpL);
 
         const float freq_base_l  = model.get_rope_freq_base (cparams, il);
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);

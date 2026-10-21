@@ -77,6 +77,14 @@ struct llama_cparams {
     bool lf_layer_inp_dev = false;
     bool lf_dev_inject    = false;
 
+    // F1 (issue #240): the target's persistent per-layer device stores, in the index space of
+    // `embeddings_layer_inp`.  Non-empty only while they are armed, which is what tells the target graph to
+    // write a layer input into its store (GGML_OP_SET_ROWS) instead of keeping it alive as a graph output.
+    std::vector<struct ggml_tensor *> lf_layer_inp_dev_store;
+
+    // F1: the row of this ubatch's first token in the decode batch, i.e. where its layer inputs go in the store
+    int32_t lf_row_offset = 0;
+
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

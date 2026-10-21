@@ -105,6 +105,20 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
+// Parking (unified KV cache).  park = true moves the cells of an idle sequence to the top of the attention cache(s) of
+// mem: the sequences that are decoded keep the low cells, and attend over the same range at the same cell indices as
+// in a cache that holds nothing else, so their results no longer depend on what is parked.  park = false moves a
+// parked sequence back to the lowest free cells.  Returns false, changing nothing, when the move is not possible
+// (a split cache, shared or fragmented cells, no room); a memory without an attention cache returns true.  The K/V data
+// are copied on the device, so synchronize the context first.  A memory whose second cache mirrors the attention cells
+// (the qwen4exp/glm5-next indexer) moves both, or neither.
+LLAMA_API bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park);
+
+// Whether the attention cache(s) of mem support parking at all (see llama_memory_seq_park): a unified cache whose cells
+// no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
+// attention cells, that cache as well.  A memory without an attention cache: true.
+LLAMA_API bool llama_memory_can_park(llama_memory_t mem);
+
 // Turn the KV cache attention rotation on or off for the contexts created from this model.
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
@@ -175,6 +189,9 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 //
 
 LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
+
+// number of layers that attend over a sliding window of llama_model_n_swa() positions
+LLAMA_API int32_t llama_model_n_layer_swa(const struct llama_model * model);
 
 // returns pointer to the target-model layer indices
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
