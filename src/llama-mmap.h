@@ -72,6 +72,18 @@ struct llama_mlock {
     void init(void * ptr);
     void grow_to(size_t target_size);
 
+    // bytes actually locked (0 if the last grow_to failed); a short value means the range is not
+    // held resident and the pages are ordinary reclaimable page cache
+    size_t size() const;
+
+    // munlock the range but KEEP it resident: the pages stay in the page cache (hot) and become
+    // reclaimable again.  Used to let a multi-GiB `--lazy-mode mlock` table squeeze the rest of the box
+    // once, while it is being populated, and then not hold the memory hostage for the whole run.
+    void release();
+
+    // the granularity mlock()/VirtualLock() works at: the address must be a multiple of it
+    static size_t granularity();
+
     static const bool SUPPORTED;
 
 private:

@@ -60,9 +60,9 @@ void llama_model_step35::load_arch_tensors(llama_model_loader & ml) {
     auto load_block_trunk = [&](int i, int flags) {
         auto & layer = layers[i];
 
-        const uint32_t n_head_l      = hparams.n_head(i);
-        const uint32_t n_embd_k_gqa  = hparams.n_embd_k_gqa(i);
-        const uint32_t n_embd_v_gqa  = hparams.n_embd_v_gqa(i);
+        const uint32_t n_head_l        = hparams.n_head(i);
+        const uint32_t n_embd_k_gqa_l  = hparams.n_embd_k_gqa(i);
+        const uint32_t n_embd_v_gqa_l  = hparams.n_embd_v_gqa(i);
 
         layer.attn_norm   = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, TENSOR_NOT_REQUIRED);
@@ -76,7 +76,7 @@ void llama_model_step35::load_arch_tensors(llama_model_loader & ml) {
             layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_rot_max/2}, TENSOR_NOT_REQUIRED | (i != 0 ? TENSOR_DUPLICATED : 0));
         }
 
-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head_l, n_embd_k_gqa, n_embd_v_gqa, flags);
+        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head_l, n_embd_k_gqa_l, n_embd_v_gqa_l, flags);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_v * n_head_l, n_embd}, flags);
 
         // head-wise attention gate (Step35 self_attn.g_proj)
@@ -106,9 +106,9 @@ void llama_model_step35::load_arch_tensors(llama_model_loader & ml) {
     auto load_block_mtp = [&](int i) {
         auto & layer = layers[i];
 
-        const uint32_t n_head_l      = hparams.n_head(i);
-        const uint32_t n_embd_k_gqa  = hparams.n_embd_k_gqa(i);
-        const uint32_t n_embd_v_gqa  = hparams.n_embd_v_gqa(i);
+        const uint32_t n_head_l        = hparams.n_head(i);
+        const uint32_t n_embd_k_gqa_l  = hparams.n_embd_k_gqa(i);
+        const uint32_t n_embd_v_gqa_l  = hparams.n_embd_v_gqa(i);
 
         // The MTP block is a full Step3p5 decoder layer (mtp_block) plus the
         // NextN-specific wiring (enorm/hnorm/eh_proj + optional shared head).
@@ -128,7 +128,7 @@ void llama_model_step35::load_arch_tensors(llama_model_loader & ml) {
             layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_rot_max/2}, TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED);
         }
 
-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head_l, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
+        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head_l, n_embd_k_gqa_l, n_embd_v_gqa_l, mtp_flags);
         layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_v * n_head_l, n_embd}, mtp_flags);
 
         layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head_l}, TENSOR_NOT_REQUIRED);

@@ -598,9 +598,10 @@ static inline void mul_mat_f_switch_ids(
         const mmf_ids_data * ids_data) {
     const bool has_ids_data = ids_data && ids_data->ids_src_compact;
 
-    // Use the compact-ids kernel only for larger tiles; for small ncols_dst (< 16)
-    // we prefer the normal mul_mat_f path with has_ids=true.
-    if (has_ids_data && ncols_dst > 16) {
+    // Use the compact-ids kernel for every MUL_MAT_ID: the non-compact mul_mat_f path keeps a single slot per token,
+    // so it cannot represent repeated ids within a token's row.  The compact kernel maps every (token, slot) occurrence
+    // to its own row.  For small ncols_dst the extra tile_spec read is negligible.
+    if (has_ids_data) {
         if (ids_data->max_tiles == 0) {
             return;
         }

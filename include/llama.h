@@ -218,9 +218,18 @@ extern "C" {
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
     enum llama_lazy_mode {
-        LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
-        LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
-        LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+        LLAMA_LAZY_MODE_OFF   = 0, // always read the whole tensor up front, even under a mapped load
+        LLAMA_LAZY_MODE_AUTO  = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_LAZY_MODE_ON    = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+        LLAMA_LAZY_MODE_MLOCK = 3, // like ON, and every marked table is populated and pinned in the
+                                   // page cache at load (mlock); the lock is released at process exit
+        LLAMA_LAZY_MODE_MLOCKR = 4, // like MLOCK, but the pin is RELEASED as soon as loading is done: the
+                                    // tables are pulled in (and squeeze everything else out of RAM while
+                                    // they arrive) and then stay hot in the page cache as ordinary
+                                    // reclaimable pages.  Intended for a box where a full expert arena
+                                    // auto-sizes into every free byte: an unevictable multi-GiB lazy table
+                                    // then leaves the model mapping as the only reclaimable memory, and its
+                                    // misses start coming from disk (see `llama_mlock::release`)
     };
 
     enum llama_context_type {

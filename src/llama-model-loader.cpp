@@ -98,8 +98,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path, 
         throw std::runtime_error(format("invalid split file: %s", path.c_str()));
     }
 
-    for (int idx = 0; idx < n_split; ++idx) {
-        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), idx, n_split);
+    for (int i = 0; i < n_split; ++i) {
+        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), i, n_split);
         paths.push_back(std::string(buf.data(), ret));
     }
 
@@ -1103,9 +1103,11 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
         return false;
     }
 
-    // do not lazy-read small tensors, it has significant overhead and is not worth it
+    // do not lazy-read small tensors, it has significant overhead and is not worth it.
+    // MLOCK is deliberately not filtered: its whole point is to pin the marked set, whatever each
+    // table weighs, so it behaves like ON here (no 4 GiB threshold).
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (mode == LLAMA_LAZY_MODE_AUTO && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
@@ -1116,24 +1118,145 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     }
 
     if (w) {
-        ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
         tensors.insert(name);
 
-        LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+        if (mode == LLAMA_LAZY_MODE_MLOCK || mode == LLAMA_LAZY_MODE_MLOCKR) {
+            // Deliberately NOT added to `ranges`: that set is handed to llama_mmap, which applies
+            // POSIX_MADV_RANDOM to it -- readahead is exactly what the one bulk population of this
+            // table needs.  mlock_ranges() pins it (populate + mlock) once the mapping exists.
+            auto & rs = pin[w->idx];
+            bool seen = false;
+            for (const auto & r : rs) {
+                seen = seen || (r.first == w->offs && r.second == w->offs + ggml_nbytes(t));
+            }
+            if (!seen) {
+                rs.emplace_back(w->offs, w->offs + ggml_nbytes(t));
+            }
+            LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled, to be populated in the page cache (--lazy-mode %s)\n",
+                    __func__, name.c_str(), ggml_nbytes(t)/1024/1024,
+                    mode == LLAMA_LAZY_MODE_MLOCKR ? "mlockr" : "mlock");
+        } else {
+            ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
+            LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
+                    __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+        }
     }
 
     return true;
+}
+
+void llama_model_loader::lazy_read::mlock_ranges(const llama_mmaps & mappings) {
+    if (pin.empty()) {
+        return;
+    }
+
+    if (!llama_mlock::SUPPORTED) {
+        LLAMA_LOG_WARN("%s: --lazy-mode mlock is not supported on this system, so the tables are NOT pinned: "
+                "they stay on the on-demand path and their pages are reclaimable page cache\n", __func__);
+        return;
+    }
+
+    const size_t gran = llama_mlock::granularity();
+    if (gran == 0) {
+        LLAMA_LOG_WARN("%s: page size is unknown, cannot pin the tables\n", __func__);
+        return;
+    }
+
+    size_t n_pinned  = 0;
+    size_t sz_pinned = 0;
+
+    for (const auto & it : pin) {
+        const uint32_t idx = it.first;
+
+        if (idx >= mappings.size() || mappings[idx] == nullptr) {
+            LLAMA_LOG_WARN("%s: no mapping for file %u, its tables are left on the page-cache path\n", __func__, idx);
+            continue;
+        }
+
+        auto * const base     = (uint8_t *) mappings[idx]->addr();
+        const size_t map_size = (mappings[idx]->size() + gran - 1) & ~(gran - 1);
+
+        for (const auto & r : it.second) {
+            const size_t first = r.first & ~(gran - 1);
+            const size_t last  = std::min((r.second + gran - 1) & ~(gran - 1), map_size);
+            if (last <= first) {
+                continue;
+            }
+
+            // Pull the WHOLE table into the page cache and pin it.  mlock() is specified to leave
+            // every page of the range resident, so this call is the populate (nothing else is
+            // needed, and nothing is copied); the madvise first is a bulk readahead hint so the
+            // pages arrive by the sequential path instead of one fault at a time.
+            llama_prefetch({{ base + first, last - first }});
+
+            auto lock = std::make_unique<llama_mlock>();
+            lock->init(base + first);
+            lock->grow_to(last - first);
+
+            const size_t locked = lock->size();
+            if (locked < last - first) {
+                LLAMA_LOG_WARN("%s: could not pin the %zu MiB table at file %u offset %zu (%zu MiB locked): "
+                        "it stays on the on-demand page-cache path and may be reclaimed.  "
+                        "Raise RLIMIT_MEMLOCK ('ulimit -l') to pin it\n",
+                        __func__, (last - first)/1024/1024, idx, first, locked/1024/1024);
+            } else {
+                n_pinned++;
+                sz_pinned += locked;
+            }
+
+            locks.emplace_back(std::move(lock));
+        }
+    }
+
+    // `--lazy-mode mlockr`: use mlock as a POPULATE, not as a residency guarantee.  The tables are pulled in
+    // and squeeze everything else exactly as `mlock` does, and then the pin is dropped: `munlock` only clears
+    // VM_LOCKED, so the pages stay hot in the page cache and become reclaimable again.  Motivation: on a box
+    // where the expert arena auto-sizes into every free byte, a 26.8 GiB unevictable lazy table leaves the
+    // model mapping as the only memory the kernel can take back, so the host-expert misses intermittently come
+    // from disk.  Measured (Qwen3.8-Flash-Next GSQ-RCO-IQ3_S, 2 devices `-sm tensor -ncmoe 48`, `-p 512`):
+    // `mlock` 1070-1282 t/s with a 13 t/s rep in one run and `MemAvailable` bottoming at 1.0 GiB (VmRSS
+    // 76.1 GiB); `mlockr` 1250-1286 t/s flat, every rep.  `-lzm off` is the other stable arm (1263-1296).
+    const bool release_pin = mode == LLAMA_LAZY_MODE_MLOCKR;
+    if (release_pin && !locks.empty()) {
+        size_t sz_released = 0;
+        for (auto & l : locks) {
+            sz_released += l->size();
+            l->release();
+        }
+        locks.clear();
+        GGML_UNUSED(sz_released);
+        LLAMA_LOG_INFO("%s: released the pin on %zu MiB of populated tables (--lazy-mode mlockr); "
+                "they stay in the page cache and are reclaimable again\n", __func__, sz_released/1024/1024);
+    }
+
+    if (n_pinned > 0) {
+        GGML_UNUSED(sz_pinned);
+        GGML_UNUSED(release_pin);
+        LLAMA_LOG_INFO("%s: pinned %zu table(s), %zu MiB in the page cache (--lazy-mode %s)\n",
+                __func__, n_pinned, sz_pinned/1024/1024, release_pin ? "mlockr" : "mlock");
+    }
+}
+
+void llama_model_loader::lazy_read::add_resident(const std::string & name, const llama_tensor_weight & w) {
+    // Deliberately NOT added to `ranges`: that set gets POSIX_MADV_RANDOM, which disables
+    // readahead on the mapping.  The tensor is not served from the mapping at all -- the
+    // loader reads it straight into its own host buffer -- and the direct read is the fast
+    // path (measured ~3.9 GB/s here vs ~0.2 GB/s for a MADV_RANDOM fault-in + copy).
+    resident.insert(name);
+
+    LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) kept resident (--lazy-mode off, not mapped)\n",
+            __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
 }
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
-    bool is_lazy = false;
+    bool is_lazy     = false;
+    bool is_resident = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, is_resident };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1354,7 +1477,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     if (flags & TENSOR_READ_LAZY) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        // note: the user path (llama_model_init_from_user) is not handled here yet; the
+        //   files-empty guard arrives with the managed reader (block 11).
+        const llama_tensor_weight * w = no_alloc ? nullptr : &require_weight(tn.str().c_str());
+        is_lazy = lazy.add(tn.str(), cur, w);
+
+        // an explicit `--lazy-mode off` overrides the mmap-backed buffer for these tensors, so
+        // `--load-mode mmap` keeps its fast mapped load for the bulk of the model while the
+        // PLE/engram table is still read into host RAM.  Only the explicit OFF does this: AUTO
+        // below its 4 GiB threshold stays on the normal (mapped) path, so default loads do not
+        // change.
+        if (!is_lazy && w != nullptr && lazy.mode == LLAMA_LAZY_MODE_OFF && use_mmap) {
+            lazy.add_resident(tn.str(), *w);
+            is_resident = true;
+        }
     }
 
     ggml_tensor t_meta = *cur;
@@ -1578,8 +1714,8 @@ bool llama_model_loader::load_all_data(
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
-    // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
-    // NVMe raid configurations might require more / larger buffers.
+    // 4 staging buffers for async uploads, each sized `buffer_size` below (LLAMA_LOAD_STAGE_MB,
+    // default 4 MiB).  NVMe raid configurations might require more / larger buffers.
     constexpr size_t n_buffers = 4;
 
     size_t alignment = 1;
@@ -1587,8 +1723,17 @@ bool llama_model_loader::load_all_data(
         alignment = std::max(file->read_alignment(), alignment);
     }
 
-    // Buffer size: balance between memory usage and I/O efficiency
-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+    // Buffer size: balance between memory usage and I/O efficiency.  `n_buffers` slots are
+    // allocated (4), so the staging ring holds n_buffers * buffer_size of pinned host memory.
+    // 4 MiB per slot measured best on gfx1201 + NVMe (Flash-Next, `-sm tensor --load-mode none`:
+    // 1 MiB 15.7 s, 2 MiB 13.7, 4 MiB 13.7, 8 MiB 14.8, 32 MiB 16.3, 64 MiB 16.8); larger slots
+    // scale better on faster disks at 4x the pinned footprint.  LLAMA_LOAD_STAGE_MB overrides.
+    static const size_t stage_size = [] {
+        const char * e = getenv("LLAMA_LOAD_STAGE_MB");
+        const long mb = e != nullptr ? strtol(e, nullptr, 10) : 0;
+        return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) 4 * 1024 * 1024;
+    }();
+    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : stage_size;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
@@ -1637,16 +1782,16 @@ bool llama_model_loader::load_all_data(
 
         // If the backend is supported, create pinned memory buffers and events for synchronisation.
         for (size_t idx = 0; idx < n_buffers; ++idx) {
-            auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
+            auto * buf_host = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
 
-            if (!buf) {
+            if (!buf_host) {
                 LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n", func,
                     ggml_backend_dev_name(dev));
                 return nullptr;
             }
 
-            host_buffers.emplace_back(buf);
-            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf));
+            host_buffers.emplace_back(buf_host);
+            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf_host));
 
             auto * event = ggml_backend_event_new(dev);
             if (!event) {
@@ -1710,7 +1855,7 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        const bool from_mapping = (use_mmap || lazy.has(cur)) && !lazy.is_resident(cur);
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);

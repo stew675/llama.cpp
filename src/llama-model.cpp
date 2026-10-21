@@ -1355,6 +1355,10 @@ struct llama_model::impl {
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
+    // `--lazy-mode mlock`: the pinned on-demand tables (page-cache residency).  Declared after
+    // `mappings` so the locks are gone before the mapping is unmapped; the kernel also releases
+    // them when the process exits, which returns the pages to ordinary reclaimable page cache.
+    llama_mlocks mlock_lazy;
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
@@ -1988,6 +1992,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     prec_policy.load(ml, *this);
 
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+
+    // `--lazy-mode mlock`: the tables are on the lazy (mapped, on-demand) data path, so their whole
+    // extent is populated and pinned in the page cache now that the mapping exists.  The locks live
+    // in the model, not the loader (which is a temporary), and the kernel drops them at exit.
+    ml.lazy.mlock_ranges(ml.mappings);
+    pimpl->mlock_lazy = std::move(ml.lazy.locks);
+
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2024,10 +2035,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         std::vector<ggml_backend_buffer_ptr> bufs;
 
-        // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
+        // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing.
+        // a resident context (explicit `--lazy-mode off` under a mapped load) must NOT be turned into
+        // a host-pointer buffer over the mapping -- that is the whole point of `off` -- so it takes
+        // the plain host-buffer path below and the loader reads its tensors into RAM.
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+        const bool is_resident    = ctx_key.resident;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !is_resident) {
             GGML_ASSERT(!ml.no_alloc);
             const size_t max_size = ggml_get_max_tensor_size(ctx);
 
