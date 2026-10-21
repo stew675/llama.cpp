@@ -656,8 +656,12 @@ struct llama_device {
 };
 
 struct llama_meta_device_get_split_state_userdata {
-    size_t                     n_devices;
-    const struct llama_model * model;
+    // Zero-initialized on purpose: the meta wrapper (and so this assignment) exists only for a >= 2-device
+    // tensor split, and a consumer that reads it on a non-meta model (single device, `-sm layer`) must see
+    // 0/nullptr rather than indeterminate bytes -- issue #164: `llama_model::max_host_expert_slice_bytes`
+    // dereferences `model` through this struct.
+    size_t                     n_devices = 0;
+    const struct llama_model * model     = nullptr;
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
@@ -897,6 +901,11 @@ struct llama_model {
     // (issue #33 class): the H2D staging ring holds one table per slot, so its worst case is
     // `slots x this`.
     size_t max_host_weight_tensor_bytes() const;
+
+    // issue #164: the largest per-device slice of a host-resident expert table (see
+    // `ggml_backend_meta_split_dev_bytes`).  It is the *slice* -- not the whole table -- that one H2D ring
+    // slot has to hold, and the split is not necessarily even (it is granularity-rounded).
+    size_t max_host_expert_slice_bytes() const;
 
     // total number of parameters in the model
     uint64_t n_elements() const;

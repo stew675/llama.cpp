@@ -3483,6 +3483,77 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     return ggml_backend_cuda_host_buffer_type_dev(0);
 }
 
+// wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
+//
+// It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
+// is still scheduled on the owning GPU -- exactly like `ROCm_Host`.  The difference is what backs the
+// bytes: with `--host-experts pool` the loader does NOT allocate (or fill) a pinned master; it places the
+// tensors directly in the read-only model mapping (`ggml_backend_host_buffer_from_ptr`), so the source of
+// truth is the page cache / the GGUF on disk, and every GPU read of it is served through the bounded
+// pinned host pool (moe-expert-cache.cu).  This is what makes a model whose host-expert set does not fit
+// in RAM runnable: the page cache is reclaimable, the pinned pool is the only non-swappable part.
+//
+// It must NOT report `ROCm_Host`'s name: the pinned buft's allocation path (cudaMallocHost) is precisely
+// what this mode removes, and `ggml_backend_cuda_host_buffer_type_alloc_buffer` would be used for a
+// non-mmap load.  The generic alloc below is a pageable aligned allocation, which is only reached when
+// the loader cannot map the file (`--load-mode none`); the usual mapping path bypasses it entirely.
+static const char * ggml_backend_cuda_host_map_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_HostMap";
+
+    GGML_UNUSED(buft);
+}
+
+static void ggml_backend_cuda_host_map_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_aligned_free(buffer->context, buffer->size);
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_host_map_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    // Only a `--load-mode none` load gets here (no file mapping to place the tensors in).  The bytes are
+    // then a pageable full copy of the host expert set: swappable and reclaimable (so still not the
+    // non-swappable pinned master), but not a memory win either.  Warn once so the state is visible.
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        GGML_LOG_WARN("%s: host expert master is not file-mapped (load mode without mmap); the set is "
+                      "held as a pageable copy instead of being read from disk on demand\n", __func__);
+    }
+    void * ptr = ggml_aligned_malloc(size);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_map_buffer_free_buffer;
+    return buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_host_map_buffer_type_dev(int device) {
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+
+    static struct ggml_backend_buffer_type bufts[GGML_CUDA_MAX_DEVICES];
+    static bool init[GGML_CUDA_MAX_DEVICES] = {};
+
+    if (!init[device]) {
+        bufts[device] = {
+            /* .iface    = */ {
+                /* .get_name            = */ ggml_backend_cuda_host_map_buffer_type_name,
+                /* .alloc_buffer        = */ ggml_backend_cuda_host_map_buffer_type_alloc_buffer,
+                /* .alloc_buffer_n      = */ NULL,
+                /* .get_alignment       = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+                /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                /* .get_alloc_size_n    = */ NULL,
+                /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            },
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+            /* .context  = */ nullptr,
+        };
+        init[device] = true;
+    }
+
+    return &bufts[device];
+}
+
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
@@ -4560,6 +4631,10 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
         case GGML_OP_DUP:
             ggml_cuda_dup(ctx, dst);
             break;
+        case GGML_OP_ALL_GATHER:
+            // single backend: the collective degenerates to a copy of the input
+            ggml_cuda_dup(ctx, dst);
+            break;
         case GGML_OP_CPY:
             ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
             break;
@@ -4958,6 +5033,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         }
     }
     ggml_cuda_async_input_drain(cuda_ctx->device);
+
+    // wip/host-expert-master-drop (TODO #55): a host expert master may be backed by the read-only model
+    // mapping (`--host-experts pool`), which is PAGEABLE.  A pageable `cudaMemcpyAsync` is staged through
+    // a shared internal bounce and tears under back-to-back use (measured: nondeterministic greedy text),
+    // so the bytes are staged through the expert pool / the per-table pinned bounce instead.  The helper
+    // is a no-op for any other source (a pooled table is the only thing it matches).
+    if (data != nullptr && size > 0 &&
+        moe_cache_upload_pageable((char *) tensor->data + offset, data, size, cuda_ctx->stream(), cuda_ctx->device)) {
+        return;
+    }
+    if (moe_cache_source_pageable(data)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: a pool-backed host expert master is being uploaded with a PAGEABLE copy "
+                          "(%zu bytes); this is slow and may tear -- please report\n", __func__, size);
+        }
+    }
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -7636,6 +7729,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_DUP:
                 return true;
+        case GGML_OP_ALL_GATHER:
+                return ggml_is_contiguous(op->src[0]);
         case GGML_OP_ARGMAX:
         case GGML_OP_COUNT_EQUAL:
             return true;
@@ -8022,6 +8117,16 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
     return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
 }
 
+static void ggml_backend_cuda_device_moe_cache_forget(ggml_backend_dev_t dev) {
+    // r143: the model that registered this device's host-expert tables is being freed (`llama_model_free`).
+    // Drop them before its host masters go: the deferred arena sizing fills EVERY registered table, so a
+    // surviving table would read freed memory (a host memcpy SIGSEGV in `fill_slot_from_host`).
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (moe_cache_enabled() || moe_cache_has_tables()) {
+        moe_cache_forget_all(ctx->device);
+    }
+}
+
 static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
     // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
     (void) dev;
@@ -8044,6 +8149,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
         int n_experts, size_t host_bytes, size_t total_bytes) {
     (void) dev;
     moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
+}
+
+// wip/host-expert-master-drop (TODO #55): the pool-backed host expert master buffer type, or NULL when
+// this device must keep the pinned master.  A discrete GPU reads a pageable mapping only through the
+// pinned pool, so the mode is offered there.  An INTEGRATED (APU) device shares host memory with the
+// GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
+// keeps the historical pinned master.
+static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
+    const ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (dev_ctx == nullptr || ggml_cuda_info().devices[dev_ctx->device].integrated) {
+        return nullptr;
+    }
+    return ggml_backend_cuda_host_map_buffer_type_dev(dev_ctx->device);
 }
 
 static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
@@ -8180,7 +8298,9 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
     /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
     /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
+    /* .moe_host_master_buft      = */ ggml_backend_cuda_device_moe_host_master_buft,
     /* .moe_cache_band            = */ ggml_backend_cuda_device_moe_cache_band,
+    /* .moe_cache_forget          = */ ggml_backend_cuda_device_moe_cache_forget,
 };
 
 // backend reg

@@ -290,6 +290,14 @@ void ggml_backend_dev_moe_cache_set_reserve(ggml_backend_dev_t dev, size_t bytes
     dev->iface.moe_cache_set_reserve(dev, bytes);
 }
 
+void ggml_backend_dev_moe_cache_forget(ggml_backend_dev_t dev) {
+    // r143: see `ggml_backend_dev_moe_cache_preflight` -- a backend without the cache ignores it.
+    if (dev == nullptr || dev->iface.moe_cache_forget == nullptr) {
+        return;
+    }
+    dev->iface.moe_cache_forget(dev);
+}
+
 bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
     if (dev == nullptr || dev->iface.moe_cache_stats == nullptr) {
         return false;
@@ -325,6 +333,40 @@ void ggml_backend_dev_moe_cache_set_host_source(ggml_backend_dev_t dev, const vo
         return;
     }
     dev->iface.moe_cache_set_host_source(dev, tensor_data, path, offs, n_experts, host_bytes, total_bytes);
+}
+
+// wip/host-expert-master-drop (TODO #55): the buffer type a pool-backed (mapping-backed, NOT pinned) host
+// expert master should use.  NULL when the backend keeps its pinned master (the default), so no caller
+// changes behaviour unless the backend opts in.
+ggml_backend_buffer_type_t ggml_backend_dev_moe_host_master_buft(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.moe_host_master_buft == nullptr) {
+        return nullptr;
+    }
+    return dev->iface.moe_host_master_buft(dev);
+}
+
+// Wrap an existing host pointer in a buffer of `buft` without owning it.  The buffer is built over the
+// public CPU_Mapped machinery (whose free is a no-op and whose set/get operate on `tensor->data`, which is
+// in host memory) and then re-typed, so the tensors placed in it look like any other buffer of `buft` to
+// the scheduler while the bytes stay where the caller put them.  Requires a device-carrying host buft: a
+// CPU buffer type has no device, and an op whose weight sits in it would be scheduled on the CPU backend
+// instead of the GPU that owns the expert table.
+ggml_backend_buffer_t ggml_backend_host_buffer_from_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size, size_t max_tensor_size) {
+    if (buft == nullptr || ptr == nullptr || size == 0) {
+        return nullptr;
+    }
+    if (!ggml_backend_buft_is_host(buft) || ggml_backend_buft_get_device(buft) == nullptr) {
+        return nullptr;
+    }
+    if (ggml_backend_buft_get_max_size(buft) < max_tensor_size) {
+        return nullptr;
+    }
+    if ((uintptr_t) ptr % ggml_backend_buft_get_alignment(buft) != 0) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    return buffer;
 }
 
 void ggml_backend_dev_slab_ring_set(ggml_backend_dev_t dev, bool arm) {

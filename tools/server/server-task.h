@@ -708,11 +708,22 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // buffers of states that were restored or evicted, kept for the next save: a large state buffer costs about as much to
+    // zero-fill and fault in as to copy from the device, and as much again to free (LLAMA_SERVER_CACHE_REUSE=0: off)
+    std::vector<std::vector<uint8_t>> spare;
+
     size_t size() const;
 
     size_t n_tokens() const;
 
+    // a buffer of n bytes (a spare one if one is large enough), and the way back for a buffer that is no longer needed
+    std::vector<uint8_t> take(size_t n);
+    void recycle(std::vector<uint8_t> && buf);
+
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+
+    // the cached prompt that load() would restore for tokens_new into a slot holding prompt (states.end(): none)
+    std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

@@ -190,8 +190,10 @@ public:
     llama_ubatch split_seq(uint32_t n_ubatch);
 
     // a helper method for creating a well-defined ubatch of tokens
-    // TODO: support embeddings if needed in the future
-    llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
+    // with_embd: mark the ubatch as an embedding batch (a non-null embd pointer), so a model whose graph
+    //   branches on the batch kind can measure its embedding branch with a reserve graph (DFlash, issue #239).
+    //   The contents are never read: only the graph layout is measured.
+    llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs, bool with_embd = false);
 
 private:
     void clear();

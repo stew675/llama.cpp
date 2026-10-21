@@ -67,6 +67,12 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
 // meta backend device
 //
 
+// Upper bound on the "rows" (elements of every dim above the split axis) an ALL_GATHER collective copies
+// per (source, destination) pair.  The only producer is the DFlash2 selector's draft batch, whose row count
+// is the draft block size times the number of sequences: 16 sequences of an 8-token block is far above any
+// supported --parallel.  A larger batch trips the bound assert instead of overrunning the view pool.
+#define GGML_META_GATHER_MAX_ROWS 128
+
 struct ggml_backend_meta_device_context {
     std::vector<ggml_backend_dev_t>     simple_devs;
     ggml_backend_meta_get_split_state_t get_split_state;
@@ -212,6 +218,11 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    // ALL_GATHER is the meta backend's own collective (cross-device copies between the simple backends);
+    // no simple backend has to implement it for the meta device to run it.
+    if (op->op == GGML_OP_ALL_GATHER) {
+        return true;
+    }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
@@ -1189,6 +1200,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
+    // ALL_GATHER: the result is the whole tensor on every backend, so it is MIRRORED whatever the source
+    // split is.  The collective itself runs between the subgraphs (see `graph_compute`): each device's
+    // slice is written into every device's copy at that slice's own offset, which keeps the element
+    // positions of a split axis-0 input (the Draft/DFlash2 selector's global vocabulary indices).
+    auto handle_all_gather = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_0 && src_ss[0].axis < GGML_MAX_DIMS));
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    };
+
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1510,6 +1531,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_ARGSORT:
             case GGML_OP_TOP_K: {
                 split_state = handle_per_row(src_ss);
+            } break;
+            case GGML_OP_ALL_GATHER: {
+                split_state = handle_all_gather(src_ss);
             } break;
             case GGML_OP_LEAKY_RELU: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -2629,6 +2653,10 @@ struct ggml_backend_meta_context {
     ggml_context_ptr            ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
+    // ALL_GATHER collectives: the node to run after each subgraph (or -1) and the scratch destination
+    // views the copies write through, one per (source device, destination device) pair
+    std::vector<int>            gather_nodes;
+    std::vector<ggml_tensor *>  gather_views;
     size_t                      n_reduce_steps;
     int                         max_nnodes    = 0;
     size_t                      max_tmp_size  = 0;
@@ -3493,6 +3521,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             };
 
             int i_start = 0;
+            std::vector<int> gather_nodes_new;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
@@ -3502,12 +3531,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                // ALL_GATHER is a collective that replaces the node's own computation, so it is a boundary
+                // of its own: the subgraph ends just before it, the gather runs, and the following subgraph
+                // starts after it.  Without the cut the per-device kernels would each write their own slice
+                // into the front of their copy.
+                const bool is_gather = i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_ALL_GATHER;
+                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || is_gather;
                 if (!new_subgraph) {
                     continue;
                 }
 
-                const int i_delayed = get_i_delayed(i);
+                // the delayed-reduce search walks forward looking for a better reduce point and must not
+                // step over the gather node
+                const int i_delayed = is_gather ? i : get_i_delayed(i);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -3530,10 +3566,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     auto & bcj = backend_ctx->backend_configs[j];
                     bcj.cgraphs[n_subgraphs].offset = i_start;
                 }
+                gather_nodes_new.push_back(is_gather ? i + 1 : -1);
                 n_subgraphs++;
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+            backend_ctx->gather_nodes = std::move(gather_nodes_new);
         }
 
         backend_ctx->uid         = cgraph->uid;
@@ -3555,7 +3593,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
-            const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
+            const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead()
+                                                  + 2*n_backends*GGML_META_GATHER_MAX_ROWS*ggml_tensor_overhead(); // ALL_GATHER views
             const ggml_init_params params = {
                 /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
                 /*.mem_buffer =*/ nullptr,
@@ -3576,6 +3615,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (size_t k = 0; k < backend_ctx->nodes_aux.size(); k++) {
                 backend_ctx->nodes_aux[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
             }
+            // scratch views for the ALL_GATHER collectives: one (source, destination, row) triple takes
+            // two 1-D view tensors.  The row count is a runtime property of the gathered tensor, so the
+            // pool is sized for the largest token batch a split can carry plus slack, and `all_gather`
+            // asserts rather than overrunning it.
+            backend_ctx->gather_views.resize(2*n_backends*n_backends*GGML_META_GATHER_MAX_ROWS);
+            for (size_t k = 0; k < backend_ctx->gather_views.size(); k++) {
+                backend_ctx->gather_views[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
+            }
         }
 
         for (size_t j = 0; j < n_backends; j++) {
@@ -3584,11 +3631,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
-                cgraph_ij->n_nodes = i_node_stop - i_node_start;
+                cgraph_ij->n_nodes = 0;
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
+                    if (cgraph->nodes[i_node]->op == GGML_OP_ALL_GATHER) {
+                        // the meta collective fills this tensor (each device's slice written into every
+                        // device's copy); a device-local execution would copy its own slice only
+                        continue;
+                    }
                     ggml_tensor * node_ij = bcj.nodes[i_node];
-                    cgraph_ij->nodes[i_node - i_node_start] = node_ij;
+                    cgraph_ij->nodes[cgraph_ij->n_nodes++] = node_ij;
                     const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_node]);
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
@@ -3777,6 +3829,102 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // The ALL_GATHER collective: every device ends up holding the WHOLE input tensor.
+    //
+    // On a Meta device an op that reduces along an axis-0 split (the DFlash2 selector's `ggml_top_k`
+    // over vocab-split draft logits, and the `ggml_get_rows` that reads the candidate values back)
+    // cannot be computed per device: no device holds the whole row.  This op is the split state's way
+    // of saying "I need all of it": each device's slice is copied into every device's full copy at
+    // that slice's own offset.  The slices are disjoint (they tile the tensor) and nothing is summed,
+    // so the element positions of the split axis are preserved across devices -- which is what makes a
+    // vocabulary index produced by one device meaningful on the others.
+    //
+    // Only a plain axis-0 split (one segment, no repeats: each device holds a contiguous run of rows) is
+    // implemented; anything else is a deliberate abort rather than a silently wrong gather.
+    auto all_gather = [&](const int i_node) -> ggml_status {
+        ggml_tensor * node = cgraph->nodes[i_node];
+        ggml_tensor * src  = node->src[0];
+        GGML_ASSERT(node->op == GGML_OP_ALL_GATHER && src != nullptr);
+
+        int i_src = -1;
+        for (int k = 0; k < i_node; k++) {
+            if (cgraph->nodes[k] == src) {
+                i_src = k;
+                break;
+            }
+        }
+        GGML_ASSERT(i_src >= 0);
+
+        const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ false);
+        const bool split = ss.axis >= 0 && ss.axis < GGML_MAX_DIMS;
+        if (split) {
+            GGML_ASSERT(ss.axis == GGML_BACKEND_SPLIT_AXIS_0);
+            GGML_ASSERT(ss.n_segments == 1 && ss.nr[0] == 1);
+            GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(node));
+        } else {
+            GGML_ASSERT(ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
+        // Each device's slice is contiguous in its OWN copy, but the destination is the full tensor, where
+        // the split axis (0) is the slowest: the copies have to go one "row" (one element of every dim > 0)
+        // at a time, exactly like the canonical host assembly in `ggml_backend_meta_get_tensor_impl`.
+        const int64_t ne0     = src->ne[0];
+        const int64_t n_rows  = src->ne[1] * src->ne[2] * src->ne[3];
+        const size_t  elem    = ggml_element_size(src);
+
+        const size_t n_src = split ? n_backends : 1;
+        GGML_ASSERT(n_rows <= GGML_META_GATHER_MAX_ROWS && "ALL_GATHER row batch exceeds GGML_META_GATHER_MAX_ROWS");
+        GGML_ASSERT(2*n_src*n_backends*n_rows <= backend_ctx->gather_views.size());
+
+        size_t   i_view    = 0;
+        int64_t  elems     = 0; // elements that precede this source's slice in the full tensor
+        for (size_t s = 0; s < n_src; s++) {
+            ggml_tensor * src_s = backend_ctx->backend_configs[s].nodes[i_src];
+            GGML_ASSERT(src_s != nullptr);
+            const int64_t ne_j  = split ? ss.ne[s] * ss.nr[0] : ne0;
+            const size_t  nbytes_row = size_t(ne_j) * elem;
+            GGML_ASSERT(elems + ne_j * n_rows <= ggml_nelements(node));
+            for (size_t d = 0; d < n_backends; d++) {
+                ggml_tensor * dst_d = backend_ctx->backend_configs[d].nodes[i_node];
+                GGML_ASSERT(dst_d != nullptr);
+                for (int64_t r = 0; r < n_rows; r++) {
+                    ggml_tensor * row_src = backend_ctx->gather_views[i_view++];
+                    ggml_tensor * row_dst = backend_ctx->gather_views[i_view++];
+                    memset(row_src, 0, sizeof(ggml_tensor));
+                    memset(row_dst, 0, sizeof(ggml_tensor));
+                    for (ggml_tensor * t : { row_src, row_dst }) {
+                        t->type    = src_s->type;
+                        t->ne[0]   = ne_j;
+                        t->nb[0]   = elem;
+                        // ne/nb of the trailing dims must be a valid 1-element row: the copy sizes the
+                        // transfer with `ggml_nbytes`, which returns 0 for a zero extent
+                        for (int k = 1; k < GGML_MAX_DIMS; k++) {
+                            t->ne[k] = 1;
+                            t->nb[k] = nbytes_row;
+                        }
+                    }
+                    // 1-D views: the source row of this device's slice, the destination row of the full tensor
+                    row_src->view_src  = src_s;
+                    row_src->view_offs = r * src_s->nb[1];
+                    row_dst->view_src  = dst_d;
+                    row_dst->view_offs = (r * ne0 + elems) * elem;
+                    GGML_ASSERT(row_src->view_offs + nbytes_row <= ggml_nbytes(src_s));
+                    GGML_ASSERT(row_dst->view_offs + nbytes_row <= ggml_nbytes(dst_d));
+                    if (ggml_backend_view_init(row_src) != GGML_STATUS_SUCCESS ||
+                        ggml_backend_view_init(row_dst) != GGML_STATUS_SUCCESS) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    ggml_backend_tensor_copy_async(backend_ctx->backend_configs[s].backend,
+                            backend_ctx->backend_configs[d].backend, row_src, row_dst);
+                }
+            }
+            elems += ne_j;
+        }
+        GGML_ASSERT(elems == ne0);
+
+        return GGML_STATUS_SUCCESS;
+    };
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -3784,6 +3932,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+        }
+
+        if (i < backend_ctx->n_subgraphs - 1 && i < backend_ctx->gather_nodes.size() && backend_ctx->gather_nodes[i] >= 0) {
+            const ggml_status status = all_gather(backend_ctx->gather_nodes[i]);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            continue;
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
