@@ -41,6 +41,12 @@ int llama_cli(int argc, char ** argv) {
         return 1;
     }
 
+    // Releasing the wide-prefill compute layout at the prefill->decode transition is what lets the MoE
+    // expert-cache arena size itself large; it is ON by default in `common.h` for every tool now that the
+    // movable-boundary slab can reclaim a wide layout later.  Set explicitly so the intent is visible here
+    // and so `LLAMA_DROP_COMPUTE_BUFFERS=0` remains the single kill switch.
+    params.drop_compute_buffers = true;
+
     llama_backend_init();
     llama_numa_init(params.numa);
 

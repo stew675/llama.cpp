@@ -2676,6 +2676,74 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
     add_opt(common_arg(
+        {"--host-experts"}, "MODE",
+        "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
+        "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
+        "- pool: the pinned master plus a bounded pinned host pool (MOE_HOST_POOL_MIB, default 25% of the MoE host expert bytes)\n"
+        "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
+        [](common_params & params, const std::string & value) {
+            fprintf(stderr, "warning: --host-experts is deprecated; use --limit-host-experts [auto|N] "
+                            "(-lme) instead\n");
+            // The mechanism is uniform (every host-expert tier is hipHostMalloc'd) and the budget is the only
+            // thing that varies, so the old spelling has one meaning each: 'pinned' = pin the whole set,
+            // 'pool' = 'auto' (which picks the pool when the set does not fit).
+            /**/ if (value == "auto")                            { params.host_experts_limit_gib = 0; params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
+            else if (value == "pinned" || value == "pin" || value == "1") { params.host_experts_limit_gib = -1; params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED; }
+            else if (value == "pool")                            { params.host_experts_limit_gib = 0; params.host_experts_mode = LLAMA_HOST_EXPERTS_MODE_AUTO;   }
+            else if (value == "mmap"   || value == "0")          { throw std::invalid_argument("--host-experts mmap is not supported (a pageable host master cannot be read by a no-XNACK GPU, issue #116); use 'pinned'"); }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ));
+    add_opt(common_arg(
+        {"-lme", "--limit-host-experts"}, "auto|N",
+        "cap the NON-SWAPPABLE memory used by host-resident MoE experts (--n-cpu-moe/-ncmoe) (default: auto)\n"
+        "- auto: pin the whole host expert set when it fits MOE_HOST_LIMIT_FRAC (default 80%) of the available\n"
+        "        memory; otherwise no pinned master -- the experts stay in the read-only model mapping and the\n"
+        "        bounded pinned pool (MOE_HOST_POOL_MIB/MOE_HOST_POOL_FRAC) serves the reads.  It is decided at\n"
+        "        load, before any tensor is placed, and logged once.\n"
+        "- N:    pin N GiB of host experts, spent on WHOLE tensors in descending hotness order (the persisted\n"
+        "        expert heat map ranks them, so the bytes that are actually read are the ones that are pinned).\n"
+        "        The rest stays in the model mapping.  N above 90% of the available memory is refused, because\n"
+        "        that memory cannot be swapped out.\n"
+        "A pinned master is the fastest host-expert transport (no per-call staging, and the in-place cold read\n"
+        "is available), but it is a second copy of the bytes, which is why a set that does not fit is not\n"
+        "pinned wholesale.  (--host-experts pinned|pool are deprecated shorthands for the same budget.)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.host_experts_limit_gib = 0;
+                params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
+                return;
+            }
+            char * end = nullptr;
+            const long long n = strtoll(value.c_str(), &end, 10);
+            if (end == value.c_str() || *end != '\0' || n < 0) {
+                throw std::invalid_argument("expected 'auto' or a number of GiB");
+            }
+            params.host_experts_limit_gib = (int64_t) n;
+            params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
+            if (n > 0) {
+                // Refuse a budget that would make most of RAM non-swappable.  Checked here, where the user
+                // gets the error before a 20-70 GiB model load; the exact figure is re-checked when the pool
+                // is sized (the loader knows the host expert bytes then).
+                FILE * mi = fopen("/proc/meminfo", "r");
+                long long avail_mib = -1;
+                if (mi != nullptr) {
+                    char line[256];
+                    while (fgets(line, sizeof(line), mi) != nullptr) {
+                        if (strncmp(line, "MemAvailable:", 13) == 0) { avail_mib = atoll(line + 13) / 1024; break; }
+                    }
+                    fclose(mi);
+                }
+                if (avail_mib > 0 && (long long) n * 1024 > avail_mib * 90 / 100) {
+                    throw std::invalid_argument(
+                        "--limit-host-experts " + value + " (GiB) is more than 90% of the available memory (" +
+                        std::to_string(avail_mib / 1024) + " GiB): that memory is non-swappable, so it is refused. "
+                        "Use 'auto', a smaller N, or free memory first.");
+                }
+            }
+        }
+    ));
+    add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
@@ -2747,11 +2815,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
+        "keep the Mixture of Experts (MoE) weights of the LAST N trunk layers in the CPU (set\n"
+        "LLAMA_HOST_EXPERTS_FROM_END=0 to restore the historical first-N placement)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.n_cpu_moe = value;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
@@ -4166,11 +4236,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
     add_opt(common_arg(
         {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model",
+        "keep the Mixture of Experts (MoE) weights of the LAST N trunk layers in the CPU for the draft model",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.speculative.draft.n_cpu_moe = value;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
