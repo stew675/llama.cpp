@@ -2943,6 +2943,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 
+    // issue #238: the draft context only ever sees the target's text positions, never an image/audio chunk,
+    // so it must not inherit --mmproj and reserve the packed KQ mask for 2-D positions it cannot receive
+    result.mmproj.path.clear();
+
     if (has_draft) {
         // default to global devices value
         if (!params_spec.devices.empty()) {
