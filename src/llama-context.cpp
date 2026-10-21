@@ -557,9 +557,10 @@ llama_context::llama_context(
         }
     }
 
-    cparams.op_offload     = params.op_offload;
-    cparams.kv_unified     = params.kv_unified;
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.op_offload           = params.op_offload;
+    cparams.kv_unified           = params.kv_unified;
+    cparams.moe_cache_size       = params.moe_cache_size; // upstream MoE cache (dormant unless --moe-cache-mib)
+    cparams.drop_compute_buffers = params.drop_compute_buffers;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -982,6 +983,51 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+void llama_context::sched_alt_select(bool alt) {
+    if (alt == sched_alt_in_use) {
+        return;
+    }
+    if (alt && !sched_alt) {
+        ggml_backend_sched_ptr sched_main = std::move(sched);
+        sched_new(gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel);
+        sched_alt = std::move(sched);
+        sched     = std::move(sched_main);
+    }
+    std::swap(sched, sched_alt);
+    std::swap(gf_res_prev_active, gf_res_prev_active_alt);
+    sched_alt_in_use = alt;
+    ggml_backend_meta_set_view_slot(alt ? 1 : 0);
+}
+
+bool llama_context::sched_alt_for(const llama_ubatch & ubatch) const {
+    if (cparams.ctx_other == nullptr) {
+        return false;
+    }
+
+    // read once: this runs for every ubatch; getenv() is expensive on Windows
+    static const bool draft_sched2 = [] {
+        const char * e = getenv("LLAMA_DRAFT_SCHED2");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!draft_sched2) {
+        return false;
+    }
+
+    if (model.arch == LLM_ARCH_DFLASH) {
+        // A DFlash/DFlash2 draft context alternates two graphs and NEITHER marks outputs: the KV injection
+        // (host feature rows, or the F1 device injection whose token ids are target rows), and the noise-block
+        // draft step, whose result is read from h_nextn (the selector lattice) instead of the logits.  So
+        // `n_outputs` cannot tell them apart -- the batch kind can: the injection is the one that carries the
+        // target features.  Without this split both graphs share one scheduler and one `gf_res_prev` slot, the
+        // draft context rebuilds and re-allocates both of them on every verify step and never reuses a graph
+        // (issue #208).  MTP keeps `n_outputs`: its ingest is a token batch without outputs and its step graph
+        // is the one with outputs, so the batch kind would merge the two graphs instead of separating them.
+        return ubatch.embd == nullptr && !cparams.lf_dev_inject;
+    }
+
+    return n_outputs > 0;
+}
+
 // the attention KV caches that decide the derived kq mask: the cache itself, the attention part of a hybrid memory,
 // or both caches of an iSWA memory; empty for any other memory (which then keeps the packed reserve).  Resolved once:
 // `memory` is immutable for the lifetime of the context, and decode() asks this on every batch until a latch fires.
@@ -1066,6 +1112,10 @@ void llama_context::sched_reserve() {
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
+
+    GGML_ASSERT(!sched_alt_in_use);
+    sched_alt.reset();
+    gf_res_prev_active_alt = nullptr;
 
     sched_new(max_nodes, cparams.pipeline_parallel);
 
@@ -1198,6 +1248,22 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us_l)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+void llama_context::drop_compute_buffers() {
+    // WIP r42 (TODO #42): release the grow-only compute buffers so the next alloc_graph re-reserves them
+    // from the graph at hand.  See ggml_backend_sched_drop_buffers().
+    if (!sched) {
+        return;
+    }
+    ggml_backend_sched_drop_buffers(sched.get());
+}
+
+void llama_context_drop_compute_buffers(struct llama_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->drop_compute_buffers();
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
@@ -1309,6 +1375,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        gf_res_prev_active_alt = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1841,6 +1908,13 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// OPEN 2: how much wider than the last settled narrow layout the live work region must be before the
+// compute reserve is dropped and re-reserved.  A material difference only -- the narrow layout varies a
+// little between a 1-token decode and an `n_rs_batch`-token verify pass, and dropping for that would
+// thrash the layout every token.  The real cases are GiBs (a 6.75 GiB wide reserve vs a ~1 GiB narrow
+// one), so 512 MiB is comfortably below anything worth reclaiming.
+static const size_t GGML_DROP_RESERVE_SLACK_BYTES = (size_t) 512 << 20;
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1848,7 +1922,193 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    // TODO #42 (OPEN 1): release the wide-prefill compute layout at the prefill -> decode transition so
+    // the MoE expert-cache arena can be sized large.  ON by default for every tool now that the
+    // movable-boundary slab can reclaim a wide layout later (the boundary move evicts only the arena
+    // tables in the chunks the work pool takes), so a server with `-np 4` still benefits whenever fewer
+    // streams are active.  `LLAMA_DROP_COMPUTE_BUFFERS=0` is the kill switch.
+    // read once: this runs for every ubatch; getenv() is expensive on Windows
+    static const int drop_env = [] {
+        const char * e = getenv("LLAMA_DROP_COMPUTE_BUFFERS");
+        return e != nullptr ? atoi(e) : -1;
+    }();
+    const bool drop_enabled = drop_env >= 0 ? drop_env != 0 : cparams.drop_compute_buffers;
+    // OPEN 2: WHEN to drop.  The compute reserve is created for the WIDEST graph the parameters allow, and
+    // the work region holds it until a drop releases it.  The classic condition below only drops after a
+    // WIDE pass (`n_tokens_prev > 8`), so a workload that never prefills -- a chat of short prompts -- keeps
+    // the full reserve forever, and the MoE arena (sized against that boundary) stays small: measured on
+    // `-ub 4096 -c 163860`, arena 32263 MiB with the wide reserve held vs 34645 MiB once it was released.
+    //
+    // Under the movable-boundary slab a drop is cheap and safe (the layout comes back via a boundary move),
+    // so the condition becomes "the live work region is materially wider than the narrow layout we last
+    // settled on" -- self-calibrating, no history guess, and it fires on the FIRST narrow pass of a
+    // short-prompt workload.  Without a slab the classic wide-pass condition is kept, because there
+    // reclaiming the wide layout is exactly what used to abort.
+    bool drop_now = false;
+    // The work region actually observed before the drop.  The reference must be at least this: the narrow
+    // layout varies with the graph (the MTP decode/verify graph is wider than the `n_rs_batch` reserve the
+    // drop re-creates), and recording only the post-reserve size made every following pass look
+    // "materially wider" -- one drop per decode step, each evicting the band from the arena.
+    size_t drop_observed = 0;
+    if (drop_enabled && sched && ubatch.n_tokens <= 8 && n_tokens_prev > 0 &&
+            !model.moe_host_expert_bytes.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        bool any_slab = false;
+        for (const auto & kv : model.moe_host_expert_bytes) {
+            const size_t cur = ggml_backend_dev_slab_work_size(kv.first);
+            if (cur == 0) {
+                continue;   // this device has no slab to reclaim the wide layout with
+            }
+            any_slab = true;
+            drop_observed = std::max(drop_observed, cur);
+            const auto it = slab_narrow_boundary.find(kv.first);
+            const size_t was = it == slab_narrow_boundary.end() ? 0 : it->second;
+            // A material difference only: the narrow layout varies a little between a 1-token and a
+            // `n_rs_batch`-token verify pass, and dropping for that would thrash the layout every token.
+            // A wide -> narrow transition ALWAYS drops.  `slab_narrow_boundary` is recorded as
+            // `max(re-reserved narrow, drop_observed)`, and at a prefill -> decode transition
+            // `drop_observed` is the WIDE prefill region, so an equally-wide SECOND prefill would compare
+            // equal and never release the wide layout or re-arm the arena (r85 regression: the second
+            // request keeps the wide work buffer and a small arena, decode ~half speed).
+            if (n_tokens_prev > 8 || cur >= was + (size_t) GGML_DROP_RESERVE_SLACK_BYTES) {
+                drop_now = true;
+                break;
+            }
+        }
+        if (!any_slab) {
+            drop_now = n_tokens_prev > 8;
+        }
+    }
+
+    // wip/slab-ring-region: the H2D staging ring is one meta-unit with the WIDE (prefill) compute layout.
+    // It is armed for a wide pass (>= the staging gate floor, 64 tokens) and disarmed for a narrow one, so
+    // a decode-only stretch returns its hole to the arena.  This runs BEFORE the drop's cache re-arm, so a
+    // post-prefill re-arm sizes against the FULL (disarmed) arena instead of the ring-reduced one.  It does
+    // NOT piggyback on the compute-buffer drop: the drop only fires when the work boundary actually grew,
+    // while the ring is used on every wide pass.  `ring_set` is a no-op when the state already matches.
+    if (!model.moe_host_expert_bytes.empty() && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+        const bool ring_arm = ubatch.n_tokens >= 64;
+        for (const auto & kv : model.moe_host_expert_bytes) {
+            ggml_backend_dev_slab_ring_set(kv.first, ring_arm);
+        }
+        for (size_t d = 0; d < model.devices.size(); ++d) {
+            if (!model.devices[d].is_meta) {
+                ggml_backend_dev_slab_ring_set(model.devices[d].dev, ring_arm);
+            }
+        }
+    }
+    if (drop_now) {
+        ggml_backend_sched_drop_buffers(sched.get());
+        // re-reserve the widest post-prefill (verify) layout so the first decode graphs fit.
+        // The reserve must use the CURRENT ubatch's sequence count, not a fixed 1: the memory context
+        // (`mctx`) spans this ubatch's streams, and `build_attn_mha`/`ggml_flash_attn_ext` require the
+        // query and the cache to agree on the stream dim (`q->ne[3] == k->ne[3]`).  A hard-coded 1
+        // against a multi-sequence batch took `q->ne[2]/n_stream` to zero and aborted (issue #48).
+        const uint32_t n_rs_seqs = std::max<uint32_t>(1, ubatch.n_seqs);
+        // wip/slab-ring-region: measure the narrow (decode/verify) layout BEFORE allocating it, so the slab
+        // can pin its narrow floor AHEAD of the cache's deferred sizing (which runs later in this same pass).
+        // `split_only` + a `sizes` array is a size-only reserve (no allocation); the real reserve follows.
+        {
+            size_t narrow_sizes[16] = {0};
+            if (graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, /*split_only=*/true,
+                              narrow_sizes, kq_mask_packed_reachable()) != nullptr) {
+                size_t narrow_bytes = 0;
+                for (int i = 0; i < 16; i++) {
+                    if (narrow_sizes[i] > narrow_bytes) {
+                        narrow_bytes = narrow_sizes[i];
+                    }
+                }
+                if (narrow_bytes > 0) {
+                    for (const auto & kv : model.moe_host_expert_bytes) {
+                        ggml_backend_dev_slab_narrow_floor(kv.first, narrow_bytes);
+                    }
+                    for (size_t d = 0; d < model.devices.size(); ++d) {
+                        if (!model.devices[d].is_meta) {
+                            ggml_backend_dev_slab_narrow_floor(model.devices[d].dev, narrow_bytes);
+                        }
+                    }
+                }
+            }
+        }
+        const bool narrow_ok = graph_reserve(cparams.n_rs_batch, n_rs_seqs, cparams.n_rs_batch, mctx, false) != nullptr;
+        if (!narrow_ok) {
+            LLAMA_LOG_WARN("%s: failed to re-reserve the post-prefill compute layout; a later"
+                    " growth may not fit next to the MoE expert cache arena\n", __func__);
+        } else if (!model.hparams.no_alloc) {
+            // `~llama_context` compares the CURRENT sched buffer sizes against `backend_buf_exp_size`,
+            // which `sched_reserve()` captured for the WIDEST layout.  The drop legitimately narrows the
+            // buffers, so refresh the expectation to the layout this workload settled on -- otherwise
+            // every dropped run reports a healthy buffer as a mismatch.  (The field's only other reader is
+            // the no-alloc memory accounting, which this branch skips.)
+            size_t narrow_bytes = 0;
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+                if (backend_buf_exp_size[i] > narrow_bytes) {
+                    narrow_bytes = backend_buf_exp_size[i];
+                }
+            }
+            // wip/slab-ring-region: pin the narrow (decode/verify) work floor so the slab places the H2D
+            // staging ring just above it (and reclaims it with the wide view on a decode stretch).
+            if (narrow_bytes > 0) {
+                for (const auto & kv : model.moe_host_expert_bytes) {
+                    ggml_backend_dev_slab_narrow_floor(kv.first, narrow_bytes);
+                }
+                for (size_t d = 0; d < model.devices.size(); ++d) {
+                    if (!model.devices[d].is_meta) {
+                        ggml_backend_dev_slab_narrow_floor(model.devices[d].dev, narrow_bytes);
+                    }
+                }
+            }
+        }
+        // Record the work region's size AFTER the narrow re-reserve: that is the steady state this workload
+        // settled on, and the value the next pass is compared against.  Take the MAX with the region
+        // actually observed before the drop, because the re-reserve here is not the widest narrow graph
+        // (`n_rs_batch` vs the MTP decode/verify layout).
+        for (const auto & kv : model.moe_host_expert_bytes) {
+            const size_t cur = ggml_backend_dev_slab_work_size(kv.first);
+            const size_t settled = std::max(cur, drop_observed);
+            if (settled > 0) {
+                slab_narrow_boundary[kv.first] = settled;
+            }
+        }
+        // OPEN 2 (TODO #42): re-arm the MoE expert-cache arena with the VRAM the wide layout just
+        // released.  The arena was culled to make room for the wide compute buffer; the surviving tables
+        // were never freed and the cache is merely bypassed while any table is down (the
+        // wholesale-fallback invariant), so re-allocating the stood-down tables restores the cache WITH
+        // its residents -- not cold -- for the decode that follows.  Idempotent: the first call does the
+        // work, the rest are no-ops.  The narrow layout is reserved first, so the arena takes only what is
+        // left free.
+        for (const auto & kv : model.moe_host_expert_bytes) {
+            (void) ggml_backend_dev_moe_cache_rearm(kv.first);
+        }
+        for (size_t d = 0; d < model.devices.size(); ++d) {
+            if (!model.devices[d].is_meta) {
+                (void) ggml_backend_dev_moe_cache_rearm(model.devices[d].dev);
+            }
+        }
+        // Extra arena reserve.  DEFAULT 0: the compute-buffer margin covers the small post-drop growth
+        // and the layer-uniform re-size absorbs arena fragmentation, so holding VRAM out only costs
+        // arena.  `LLAMA_DROP_EXTRA_RESERVE_MIB=N` raises it (per device) for A/B.
+        const char * extra_mib_env = getenv("LLAMA_DROP_EXTRA_RESERVE_MIB");
+        const int64_t extra_mib = extra_mib_env != nullptr ? atoll(extra_mib_env) : 0;
+        if (extra_mib > 0) {
+            // Under -sm tensor the scheduler's backends are Meta wrappers, so set the reserve on the
+            // model's real (host-expert-owning) devices, which own the MoE expert cache.
+            const size_t extra_bytes = (size_t) extra_mib * 1024 * 1024;
+            for (const auto & kv : model.moe_host_expert_bytes) {
+                ggml_backend_dev_moe_cache_set_reserve(kv.first, extra_bytes);
+            }
+            for (size_t d = 0; d < model.devices.size(); ++d) {
+                if (!model.devices[d].is_meta) {
+                    ggml_backend_dev_moe_cache_set_reserve(model.devices[d].dev, extra_bytes);
+                }
+            }
+        }
+    }
+
+    const bool alt = sched_alt_for(ubatch);
+    sched_alt_select(alt);
+
+    auto * res = get_gf_res_prev(alt);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -1917,6 +2177,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    // the draft context's second scheduler is swapped into `sched` only while this call runs
+    struct sched_alt_restore {
+        llama_context * ctx;
+        ~sched_alt_restore() { ctx->sched_alt_select(false); }
+    } sched_alt_restore_ { this };
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -2156,6 +2422,12 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // the draft context's second scheduler is swapped into `sched` only while this call runs
+    struct sched_alt_restore {
+        llama_context * ctx;
+        ~sched_alt_restore() { ctx->sched_alt_select(false); }
+    } sched_alt_restore_ { this };
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2746,6 +3018,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
         // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
         auto * output_dev = model.dev_output();
         auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+        // A meta (tensor-split) device has no single host buffer type when its devices each have their own (the CUDA
+        // per-device pinned types differ only in `device`).  The output buffer is never scheduled on, so the first
+        // simple device's pinned type serves it: without it the per-step D2H reads of the outputs land in pageable
+        // memory and each one blocks the host until the GPU is done.
+        static const bool output_pinned = [] { const char * e = getenv("LLAMA_OUTPUT_PINNED"); return e == nullptr || atoi(e) != 0; }();
+        if (output_pinned && output_dev_host_buft == nullptr && output_dev != nullptr && ggml_backend_dev_is_meta(output_dev) &&
+                ggml_backend_meta_dev_n_devs(output_dev) > 0) {
+            output_dev_host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_meta_dev_simple_dev(output_dev, 0));
+        }
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
@@ -2994,8 +3275,8 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+llm_graph_result * llama_context::get_gf_res_prev(bool alt) {
+    auto & res = gf_res_prev[alt];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }
@@ -3079,6 +3360,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    gf_res_prev_active_alt = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3204,8 +3486,6 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
-    copy_experts.reset();
-
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -3219,85 +3499,13 @@ ggml_status llama_context::graph_compute(
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
-    // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
-        return true;
-    }
-
-    auto & st = lctx->copy_experts;
-
-    // the ids must be computed before the split starts, so only the first node of the split is considered
-    if (ggml_graph_n_nodes(graph) == 0) {
-        return false;
-    }
-    const ggml_tensor * node = ggml_graph_node(graph, 0);
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
-        return false;
-    }
-
-    const ggml_tensor * ids = node->src[2];
-    if (ggml_nelements(ids) == 0) {
-        return true;
-    }
-
-    const int64_t n_expert    = src->ne[2];
-    const size_t  expert_size = src->nb[2];
-
-    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
-        st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
-        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
-        ggml_backend_synchronize(backend);
-
-        st.used.assign(n_expert, false);
-        for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
-            for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
-                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
-                GGML_ASSERT(id >= 0 && id < n_expert);
-                st.used[id] = true;
-            }
-        }
-
-        st.ids = ids;
-    }
-
-    // group consecutive experts and copy them together
-    for (int64_t first = 0; first < n_expert; ) {
-        if (!st.used[first]) {
-            first++;
-            continue;
-        }
-        int64_t last = first;
-        while (last + 1 < n_expert && st.used[last + 1]) {
-            last++;
-        }
-
-        // the experts in the MoE cache are copied from device memory, the others are uploaded
-        int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
-            if (n == 0) {
-                e++;
-                continue;
-            }
-            if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
-            }
-            e   += n;
-            next = e;
-        }
-
-        // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
-        const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
-        }
-
-        first = last + 1;
-    }
-
-    return true;
+    // The slot maps of the upstream `llama_moe_cache` (`--moe-cache-mib`): plan the slots, upload
+    // the missing experts and fill the slot map, so the GET_ROWS that follows reads fresh slot ids.
+    // This is the ONLY thing this callback answers for.  The used-expert staging and pruning of
+    // the delivery's own host-expert paths (op-offload / expert cache / slab) lives in the
+    // scheduler (`ggml_backend_sched_copy_input`), which is the sole owner of that machinery --
+    // keeping a second copy of it here would double-stage every host expert table.
+    return lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph);
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
@@ -4154,6 +4362,52 @@ void llama_context::perf_reset() {
     // note: the reallocation counters are not reset - they track the lifetime totals for this context
 }
 
+// The FA prefill staging arena (block 15) is a raw device allocation outside the compute-graph
+// reserve, so llama_get_memory_breakdown (and therefore --fit) does not include it.  A live context
+// reports what the arenas have actually grown to; the no_alloc (--fit) path reserves the bounded
+// worst case the runtime can request for this context, so the fit cannot under-provision a deep
+// prefill.  The provider is the CUDA backend (the only backend with this arena); every other
+// backend returns 0.  `f16_kv_bytes` is the F16 attention-KV size the context could stage.
+static size_t llama_fattn_stage_accounting(ggml_backend_t backend, bool reserve, size_t f16_kv_bytes) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (reg == nullptr) {
+        return 0;
+    }
+    if (!reserve) {
+        auto used_fn = (size_t (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fattn_stage_used");
+        return used_fn != nullptr ? used_fn(backend) : 0;
+    }
+    auto bound_fn = (size_t (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_fattn_stage_bound");
+    if (bound_fn == nullptr) {
+        return 0;
+    }
+    const size_t bound = bound_fn(backend);
+    if (bound == 0) {
+        return 0;                   // this device never prefill-stages
+    }
+    if (bound == std::numeric_limits<size_t>::max()) {
+        return f16_kv_bytes;        // unbounded cap: reserve the realistic high-water mark
+    }
+    return std::min(bound, f16_kv_bytes);
+}
+
+// The op-offload H2D staging ring (block 06) is also a raw device allocation outside the compute
+// reserve.  `reserve` (the --fit / no_alloc path) uses the worst-case bound for a model whose largest
+// host-resident weight tensor is `max_table` bytes (the ring holds one table per slot); the live path
+// reports what the ring has actually grown to.  Every non-CUDA backend returns 0.
+static size_t llama_h2d_stage_accounting(ggml_backend_t backend, bool reserve, size_t max_table) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (reg == nullptr) {
+        return 0;
+    }
+    if (!reserve) {
+        auto used_fn = (size_t (*)(ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_stage_used");
+        return used_fn != nullptr ? used_fn(backend) : 0;
+    }
+    auto bound_fn = (size_t (*)(ggml_backend_t, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_h2d_stage_bound");
+    return bound_fn != nullptr ? bound_fn(backend, max_table) : 0;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -4164,22 +4418,38 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
+    // F16 attention-KV size the FA prefill staging could copy for this context (used only to bound
+    // the fit's arena reserve; the cap is the hard bound).  Only the types the launcher stages
+    // (anything a native-capable arm can read) are counted.
+    const bool fa_stages =
+            cparams.flash_attn && cparams.type_k != GGML_TYPE_F16 && cparams.type_k != GGML_TYPE_F32;
+    size_t f16_kv_bytes = 0;
+    if (model.hparams.no_alloc && fa_stages) {
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            f16_kv_bytes += (size_t) cparams.n_ctx * model.hparams.n_embd_k_gqa(il) * sizeof(ggml_fp16_t);
+            f16_kv_bytes += (size_t) cparams.n_ctx * model.hparams.n_embd_v_gqa(il) * sizeof(ggml_fp16_t);
+        }
+    }
+
     if (moe_cache) {
         for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
             ret[buft].context += size;
         }
     }
     if (model.hparams.no_alloc) {
+        const size_t max_host_table = model.max_host_weight_tensor_bytes();
         for (size_t i = 0; i < backends.size(); ++i) {
             ggml_backend_t             backend = backends[i].get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += backend_buf_exp_size[i];
+            ret[buft].compute += backend_buf_exp_size[i] + llama_fattn_stage_accounting(backend, true, f16_kv_bytes)
+                               + llama_h2d_stage_accounting(backend, true, max_host_table);
         }
     } else {
         for (const auto & backend_ptr : backends) {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
-            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend) + llama_fattn_stage_accounting(backend, false, 0)
+                               + llama_h2d_stage_accounting(backend, false, 0);
         }
     }
     return ret;
@@ -4330,12 +4600,15 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = get_gf_res_prev();
+            // the trainer has no draft context and therefore no second scheduler: keep the slot the
+            // output count selects, as before
+            auto * res = get_gf_res_prev(n_outputs > 0);
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
+            gf_res_prev_active_alt = nullptr;
             res->reset();
 
             auto * gf = model.build_graph(gparams);
@@ -4366,7 +4639,6 @@ void llama_context::opt_epoch_iter(
                     ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
             }
-            copy_experts.reset();
             ggml_opt_eval(opt_ctx, result);
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
@@ -4468,6 +4740,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.drop_compute_buffers        =*/ false,
         /*.pos_2d                      =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,

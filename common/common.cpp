@@ -7,6 +7,7 @@
 
 #include "../src/llama-ext.h"
 
+#include "draft-reserve.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1159,6 +1160,7 @@ struct common_init_result::impl {
     common_threadpools threadpools;
 
     llama_model_ptr   model;
+    llama_model_ptr   model_dft;   // wip/slab-transient-absorption (step 4): loaded before the target context
     llama_context_ptr context;
 
     std::vector<llama_adapter_lora_ptr> lora;
@@ -1246,17 +1248,41 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     return info;
 }
 
-common_init_result::common_init_result(common_params & params, bool model_only) :
+common_init_result::common_init_result(common_params & params, bool model_only, bool preload_draft) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    // wip/slab-transient-absorption (step 2): derive the draft's post-slab footprint ONCE, before `--fit` and
+    // the MoE preflight, so both use the same number.  `--fit` normally MEASURES the draft per device, but
+    // that measurement cannot work for an MTP draft (its context requires `ctx_other`, which does not exist
+    // while fitting) and silently fell back to zero -- i.e. fit sized the target as if the draft were free.
+    common_draft_reserve draft_reserve;
+    {
+        const bool has_aux = params.speculative.has_aux();
+        const char * e = getenv("MOE_EXPERT_CACHE_AUX_RESERVE_MIB");
+        if (has_aux) {
+            if (e != nullptr) {
+                draft_reserve.total = (size_t) atoll(e) * 1024 * 1024;
+                draft_reserve.ok    = true;
+            } else {
+                // `n_ctx == 0` ("from the model") is resolved inside the estimator from the draft GGUF's own
+                // `context_length`: estimating with 0 would UNDER-estimate the reserve, the dangerous direction.
+                draft_reserve = common_draft_reserve_estimate(
+                        params.speculative.draft.mparams.path,
+                        params.n_ctx,
+                        params.n_ubatch,
+                        params.cache_type_k, params.cache_type_v);
+            }
+        }
+    }
 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
         // the draft context is created from the same base params and follows the main context, fit both together
-        const bool has_draft = params.speculative.has_dft();
+        const bool has_draft = params.speculative.has_aux() && params.speculative.has_dft();
         const bool spec_mtp  = params.speculative.has_mtp();
 
         common_params params_dft = common_base_params_to_speculative(params);
@@ -1273,6 +1299,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.mparams      =*/ &mparams_dft,
             /*.cparams      =*/ &cparams_dft,
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+            /*.reserve_bytes =*/ draft_reserve.ok ? draft_reserve.total : 0,   // used when measuring fails
         };
 
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
@@ -1290,7 +1317,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->model.reset(model);
-
     if (model_only) {
         return;
     }
@@ -1377,10 +1403,81 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    // MoE expert cache early auto-sizing (wip/moe-cache-autosize): decide BEFORE the context exists, so
+    // that (a) the decision precedes every graph -- flipping `g_enabled` after graphs have been planned
+    // makes the MTP draft and the target plan different kernels -- and (b) the projected arena reflects
+    // the VRAM the WEIGHTS left free.  Called after the context instead, it would see only the headroom
+    // left after the KV cache, the compute buffers and the slab, and would decline the cache on every
+    // default run.  Subtract an estimate of the auxiliary (MTP draft) context's own memory so the
+    // projection is realistic; MOE_EXPERT_CACHE_AUX_RESERVE_MIB overrides it.
+    //
+    // wip/slab-transient-absorption (step 1): that estimate is now DERIVED from the draft's own GGUF
+    // (weights + KV(n_ctx) + a measured compute tier + slack; see `draft-reserve.h`) instead of being the
+    // flat `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT`.  The constant is exactly the FIELD draft's footprint
+    // (2 647 weights + ~430 KV + 512 compute), so it was ~400 MiB short for the same draft at a longer
+    // context, which is the config that then ran with a thinner outside cushion than the headroom says.
+    // A draft we cannot estimate from its metadata (or a shared/embedded MTP head, whose weights are the
+    // target's) keeps the constant.
+    {
+        // r125 (issue #216): the draft reserve is the input to the MoE expert-cache / movable-boundary
+        // slab preflight, and `llama_model_moe_cache_preflight()` is a no-op for a model with no
+        // host-resident experts (a dense model, i.e. no `-ncmoe` / `-cmoe`).  Computing and PRINTING it
+        // anyway made a dense model's VRAM failure read as a slab/arena problem in issue #216, where the
+        // "keeping the flat 3584 MiB draft reserve" line was the first thing the report pointed at.  Gate
+        // the whole block on the host-expert map: with no arena to sit beside, there is no reserve.
+        const bool has_host_experts = llama_model_moe_host_expert_dev_count(model) > 0;
+        const bool has_aux = has_host_experts &&
+                (params.speculative.has_dft() || params.speculative.has_mtp());
+        size_t aux_bytes = 0;
+        if (has_aux) {
+            // wip/slab-transient-absorption (step 1/2): the reserve derived above (the same value `--fit`
+            // uses as its fallback), or the flat default when it could not be derived.
+            const char * e = getenv("MOE_EXPERT_CACHE_AUX_RESERVE_MIB");
+            if (draft_reserve.ok) {
+                // wip/slab-transient-absorption (step 4): the draft MODEL is now loaded BEFORE the target
+                // context (below), so its weights are already resident when the slab is created and are
+                // measured there from the free VRAM.  They must NOT be charged to the slab's reserve a
+                // second time.  What still arrives AFTER the slab is the draft CONTEXT: its KV cache
+                // (which follows the layer placement, so it can sit entirely on one device), the 512 MiB
+                // narrow-2 compute region (mapped from the slab's VA spare) and the load/steady slack.
+                // Charging the whole KV to each device is the safe, bounded direction: the field draft's
+                // KV is 431 MiB total, so at most (n-1)/n of it is unused on a device.  (The old equal
+                // `1/n` split assumed the weights and KV were shared evenly; a 1-layer draft is placed as
+                // a whole layer on ONE device, which is what left device 1 ~510 MiB short.)
+                const size_t context_bytes = draft_reserve.total > draft_reserve.weights
+                                           ? draft_reserve.total - draft_reserve.weights
+                                           : draft_reserve.total;
+                if (e != nullptr) {
+                    aux_bytes = (size_t) atoll(e) * 1024 * 1024;
+                    LOG_INF("%s: MOE_EXPERT_CACHE_AUX_RESERVE_MIB=%.0f MiB overrides the derived draft "
+                            "context reserve (it is the reserve the slab holds back, i.e. WITHOUT the draft "
+                            "weights, which are loaded before the slab)\n",
+                            __func__, (double) aux_bytes / 1048576.0);
+                } else {
+                    aux_bytes = context_bytes;
+                    LOG_WRN("%s: slab draft reserve derived from '%s': draft CONTEXT %.0f MiB (kv %.0f + "
+                            "compute %.0f + slack %.0f); the draft's %.0f MiB of weights are loaded BEFORE "
+                            "this slab and are measured from the free VRAM instead of reserved.  The "
+                            "reserve is headroom + this.\n",
+                            __func__, params.speculative.draft.mparams.path.c_str(),
+                            (double) aux_bytes / 1048576.0, (double) draft_reserve.kv / 1048576.0,
+                            (double) draft_reserve.compute / 1048576.0, (double) draft_reserve.slack / 1048576.0,
+                            (double) draft_reserve.weights / 1048576.0);
+                }
+            } else {
+                aux_bytes = (size_t) LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT * 1024 * 1024;
+                LOG_INF("%s: keeping the flat %d MiB draft reserve (%s)\n", __func__,
+                        LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT,
+                        draft_reserve.note.empty() ? "not derivable" : draft_reserve.note.c_str());
+            }
+        }
+        llama_model_moe_cache_preflight(model, aux_bytes);
+    }
+
     // a DFlash draft turns on the extraction of some target layers' inputs when it attaches, after this context and its
     // warm-up: take those layers from the draft's GGUF now, so the first graph reserve already sizes the compute
     // buffers for them (otherwise they are freed and allocated again, larger, at the first request)
-    if (params.speculative.has_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto t) {
+    if (preload_draft && params.speculative.has_dft() && params.speculative.uses_dft() && std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; })) {
         gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
         if (gguf_context * g = gguf_init_from_file(params.speculative.draft.mparams.path.c_str(), gp)) {
@@ -1399,6 +1496,55 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
+    // wip/slab-transient-absorption (step 4): load the draft MODEL now, BEFORE the target context.  The
+    // slab is created inside `llama_init_from_model` and sizes itself from the free VRAM it measures, so
+    // with the draft's weights already resident their per-device (asymmetric) footprint is MEASURED rather
+    // than predicted -- the term the equal-split reserve got wrong (a 1-layer draft lands as a whole layer
+    // on one device: measured 1601.8 MiB vs 1091.8 MiB across two R9700s).  The draft CONTEXT still comes
+    // after the target context, because it needs `ctx_other`.
+    if (preload_draft && params.speculative.has_dft() && params.speculative.uses_dft()) {
+        common_params params_dft = common_base_params_to_speculative(params);
+        params_dft.load_progress_callback           = params.load_progress_callback;
+        params_dft.load_progress_callback_user_data = params.load_progress_callback_user_data;
+        pimpl->model_dft = common_speculative_load_model(params_dft);
+        if (!pimpl->model_dft) {
+            COM_ERR("failed to load draft model, '%s'\n", params.speculative.draft.mparams.path.c_str());
+            return;
+        }
+    }
+
+
+    // TODO #59/#96: bound the DRAFTLESS (n-gram) draft length by the MoE expert cache's verify band.
+    //
+    // `ngram-mod` (and the ngram-map family) draft as far as their n-gram match reaches -- 48..64 tokens by
+    // default, `--spec-ngram-mod-n-max` verbatim -- and every one of those tokens is a row of the verify
+    // batch.  The expert cache serves a routed `MUL_MAT_ID` from its arena only up to its decode/verify band
+    // (`MOE_EXPERT_CACHE_MAX_TOK`: 16 tokens on RDNA4, 8 on RDNA3/NVIDIA); above it the op leaves the arena
+    // and the routed experts are streamed from the pinned host master on EVERY verify step.  Measured on
+    // 2x R9700 `-ncmoe 36` (Flash-Next IQ4_NL, `prompts/recall.txt`, `-n 2000`): 159.2 t/s with a 16-row
+    // verify vs 55.0 t/s at 17 rows, and the README's `draft-mtp-adaptive,ngram-mod` recommendation
+    // 73.9 -> 168.3 t/s with the clamp.  The MTP/draft family is already bounded to 15 (i.e. a 16-row
+    // verify) by `LLAMA_SPEC_DRAFT_N_MAX_CLAMP` above.
+    //
+    // **The clamp is applied AFTER the context, on the arena's real state (TODO #96).**
+    // `llama_model_moe_cache_band()` answers from `moe_cache_enabled()`, and the arena is only ARMED at
+    // model load: the movable-boundary slab is created (or it declines) at the first compute-buffer
+    // allocation, which is inside `llama_init_from_model` (its widest reserve), and a decline there calls
+    // `moe_cache_disable_streaming()`.  Clamping on the model-load answer therefore clamped configs that
+    // run the stock streaming path with NO arena -- exactly the class in the issue #214 report
+    // (`the movable-boundary slab does NOT fit` + `moe_cache_disable_streaming`) -- and that cost the
+    // copy-heavy win the wide draft gives off the arena (2x R9700 control: 67.6 wide vs 52.2 capped t/s).
+    // A device-resident model, or one whose host experts are computed on the CPU, reports no band and is
+    // never clamped either: there the wide draft is the win (144.7 -> 378.7 t/s measured on the same model
+    // fully resident).  `LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0` keeps the uncapped draft (A/B and bisect only).
+    //
+    // The deferral is free: nothing between here and the speculator's construction reads the draft length.
+    // What must NOT be deferred is `cparams.n_rs_batch`, which stays the UNCLAMPED safety bound from
+    // `common_context_params_to_llama` -- it is the correctness bound (the widest per-seq batch a partial
+    // rollback can land in) and it floors the chunked-GDN threshold.  The slab's narrow (decode/verify)
+    // reserve takes the band-limited width instead (`llama_context::verify_batch_width()`), so a live arena
+    // still reserves for the clamped draft rather than for the wide one.
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     llama_model_set_embeddings_layer_inp_preset(model, nullptr, 0); // only this context: not an MTP draft context made later
     if (lctx == NULL) {
@@ -1408,6 +1554,28 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
+    // TODO #59/#96: the band the CONTEXT reports is the one this run will have -- 0 when the slab declined
+    // or the arena was released to satisfy an allocation, so a no-arena config keeps its wide draft.
+    if (const int moe_band = llama_model_moe_cache_band(model); moe_band > 1) {
+        static const bool band_clamp_enabled = []() {
+            const char * env = getenv("LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP");
+            return env == nullptr || atoi(env) != 0;
+        }();
+        if (band_clamp_enabled) {
+            common_speculative_clamp_ngram_n_max(&params.speculative, moe_band - 1);
+        }
+        // The draft-based speculators (MTP / MTP-adaptive / draft-simple / eagle3) are bounded to 15 rather
+        // than to the band: that bound is a correctness one (the recurrent rollback snapshot set), and on
+        // RDNA4 the band happens to be 16.  On a part whose band is narrower (8 on RDNA3) a deep draft is
+        // the same performance trap, so say so once and leave the choice to the user.
+        if (params.speculative.has_aux() && params.speculative.draft.n_max > moe_band - 1) {
+            LOG_WRN("--spec-draft-n-max %d is wider than this device's MoE expert-cache verify band "
+                    "(%d tokens, i.e. n_max <= %d): with host-resident experts served through the arena, a "
+                    "deeper verify batch streams the routed experts from host memory on every step.\n",
+                    params.speculative.draft.n_max, moe_band, moe_band - 1);
+        }
+    }
+
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
@@ -1415,6 +1583,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
 llama_model * common_init_result::model() {
     return pimpl->model.get();
+}
+
+llama_model * common_init_result::draft_model() {
+    return pimpl->model_dft.get();
+}
+
+llama_model * common_init_result::take_draft_model() {
+    return pimpl->model_dft.release();
 }
 
 llama_context * common_init_result::context() {
@@ -1446,7 +1622,7 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
     }
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only, bool preload_draft) {
     // --spec-draft-n-max is capped at 15 (a clamp, not an error).  There are two independent
     // bounds, and they have different severities:
     //
@@ -1517,7 +1693,38 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
     }
 
-    common_init_result_ptr res(new common_init_result(params, model_only));
+    // A speculative verify batch carries `n_max` drafts plus the sampled token, and the tools hand that
+    // batch to the target context as one `common_batch::get()` (-> `get_sub_batch()`), which is capped by
+    // the context's logical batch size (`llama_n_batch`).  A smaller `-b` therefore aborted in the batch
+    // add (`get_sub_batch: failed to add token ... at index N`) instead of decoding, and the abort came
+    // from a server worker after the model had loaded -- a crash with no usable diagnostic.  Raise
+    // `n_batch` to the smallest value that can carry one verify batch; the user's `-ub` is what bounds the
+    // per-launch memory, so this is a logical-batch hint only and changes no allocation.  Same shape as the
+    // n_max clamp above: a WRN and continue, never a failure.
+    {
+        const int32_t n_max_eff = common_speculative_n_max(&params.speculative);
+        const int32_t n_verify  = n_max_eff > 0 ? n_max_eff + 1 : 0;
+        if (n_verify > 1 && params.n_batch > 0 && params.n_batch < n_verify) {
+            LOG_WRN("speculative decoding with --spec-draft-n-max %d needs a verify batch of %d tokens, "
+                    "but -b/--batch-size is %d; raising n_batch to %d.  Set -b >= %d to silence this.\n",
+                    n_max_eff, n_verify, params.n_batch, n_verify, n_verify);
+            params.n_batch = n_verify;
+        }
+    }
+
+    // A draft model (`-md`) is only useful to a speculative type that drafts with it.  With `--spec-type none`
+    // -- or only model-free n-gram types -- the extra model used to be loaded, its context created and warmed
+    // up regardless: wasted VRAM, and for an arch whose graph always needs the target's hidden state
+    // (gemma4-assistant) that warm-up aborted the process on `ubatch->embd_state`, so a "plain baseline with
+    // the drafter loaded" run was impossible.  The creation sites are gated on `has_aux()` / `uses_dft()`;
+    // say so once, here.
+    if (params.speculative.has_dft() && !params.speculative.uses_dft()) {
+        LOG_WRN("%s: -md '%s' is set but no enabled speculative type drafts with a model; ignoring the draft "
+                "model (enable one with --spec-type, e.g. --spec-type draft-mtp)\n", __func__,
+                params.speculative.draft.mparams.path.c_str());
+    }
+
+    common_init_result_ptr res(new common_init_result(params, model_only, preload_draft));
 
     llama_model * model = res->model();
     if (model == NULL) {
@@ -1782,6 +1989,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.lazy_mode = params.lazy_mode;
+    mparams.host_experts_mode = params.host_experts_mode;
+    // `-ncmoe N` hosts the LAST N trunk layers (the tail placement, the default).
+    // `LLAMA_HOST_EXPERTS_FROM_END=0` is the kill switch that restores the historical first-N placement.
+    {
+        const char * env = getenv("LLAMA_HOST_EXPERTS_FROM_END");
+        const bool from_end = env == nullptr || atoi(env) != 0;
+        mparams.n_cpu_moe_from_end = from_end ? params.n_cpu_moe : 0;
+    }
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
@@ -1845,6 +2060,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.drop_compute_buffers = params.drop_compute_buffers;
 
     // issue #238: a multimodal projector feeds 2-D (M-RoPE) positions into this context, and the packed KQ
     // mask must be part of the compute reserve for those.  Without a projector the context only ever sees

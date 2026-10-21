@@ -1599,9 +1599,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_hard.assign(n_seq, 0);
         n_last.assign(n_seq, 0);
 
-        // issue #234: the verify-band bound of the aligned depth is read once by the MoE expert-cache
-        // integration, which is where `llama_model_moe_cache_band()` lives (0 = no arena = no bound)
+        // issue #234: the verify-band bound of the aligned depth is read once here, after the target context
+        // exists, because `llama_model_moe_cache_band()` answers from the arena's real state (0 = the slab
+        // declined or there is no host-expert cache, in which case the aligned depth is unbounded)
         this->align = align;
+        this->band  = llama_model_moe_cache_band(llama_get_model(ctx_tgt));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
@@ -3019,15 +3021,32 @@ struct common_speculative_init_result::impl {
     llama_context_ptr context;
 };
 
+llama_model_ptr common_speculative_load_model(common_params & params) {
+    if (!params.speculative.has_dft()) {
+        return nullptr;   // MTP runs on the target model's weights
+    }
+    auto mparams = common_model_params_to_llama(params);
+    // The draft model's own host-expert placement (`--spec-draft-n-cpu-moe`), not the target's `-ncmoe`.
+    mparams.n_cpu_moe_from_end = params.speculative.draft.n_cpu_moe;
+    mparams.allow_nextn_cpu_offload = true;
+
+    const std::string model_path = params.speculative.draft.mparams.path;
+    LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+    return llama_model_ptr(llama_model_load_from_file(model_path.c_str(), mparams));
+}
+
 common_speculative_init_result::common_speculative_init_result(
     common_params & params,
       llama_model * model_tgt,
-    llama_context * ctx_tgt) :
+    llama_context * ctx_tgt,
+    llama_model * model_dft_pre) :
     pimpl(new impl{}) {
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp = params.speculative.has_mtp();
 
     auto mparams = common_model_params_to_llama(params);
+    // The draft model's own host-expert placement (`--spec-draft-n-cpu-moe`), not the target's `-ncmoe`.
+    mparams.n_cpu_moe_from_end = params.speculative.draft.n_cpu_moe;
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
@@ -3057,9 +3076,22 @@ common_speculative_init_result::common_speculative_init_result(
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
-        LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        // wip/slab-transient-absorption (step 4): `common_init_result` normally loads the draft model
+        // before the target context, so the slab is sized from the free VRAM measured with it resident.
+        // The fallback load below keeps other callers working unchanged.
+        llama_model * model_dft = model_dft_pre;
+        if (model_dft == nullptr) {
+            LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+            // The separate draft model's own `--spec-draft-n-cpu-moe` / `--spec-draft-cpu-moe` must be
+            // honoured: allow its CPU overrides to match its nextn/MTP head layer.  (The main model's
+            // `-ncmoe` never lands here -- `common_base_params_to_speculative` replaced the overrides with
+            // the draft's -- but this makes the intent explicit.)
+            mparams.allow_nextn_cpu_offload = true;
+
+            model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        }
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
@@ -3087,6 +3119,15 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->context.reset(ctx_dft);
     }
+
+    // WIP r42 / stage 2 (TODO #42): the MTP draft context reserves its compute buffers at construction,
+    // sized for the target's full -ub (~1.7 GiB per device).  That resident dead weight is what makes
+    // the target's first-prefill compute growth (a contiguous ~11.8 GiB allocation) run out of VRAM on
+    // 2 GPUs.  Release the draft buffers here (before the target's first prefill); the draft is not used
+    // during the target's prefill and re-reserves lazily on its first real (n_max+1-token) graph.
+    if (spec_mtp && pimpl->context) {
+        llama_context_drop_compute_buffers(pimpl->context.get());
+    }
 }
 
 common_speculative_init_result::~common_speculative_init_result() = default;
@@ -3099,8 +3140,9 @@ llama_context * common_speculative_init_result::context() {
     return pimpl->context.get();
 }
 
-common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
-    return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                                                       llama_model * model_dft) {
+    return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt, model_dft);
 }
 
 common_speculative_output_limits common_speculative_get_output_limits(
@@ -3530,4 +3572,50 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 str_stats.c_str(),
                 str_perf.c_str());
     }
+}
+
+bool common_speculative_clamp_ngram_n_max(common_params_speculative * spec, int32_t cap) {
+    if (spec == nullptr || cap <= 0) {
+        return false;
+    }
+
+    // Only touch a speculator that is actually enabled: an unused type's draft length is inert, and
+    // clamping it would emit a notice for a config that never drafts with it.
+    const auto enabled = [spec](common_speculative_type type) {
+        return std::find(spec->types.begin(), spec->types.end(), type) != spec->types.end();
+    };
+
+    bool clamped = false;
+
+    // ngram-mod: `n_max` is the draft length; `n_min` is the floor below which a draft is discarded
+    // (see `common_speculative_impl_ngram_mod::draft_one`), so clamping only `n_max` would leave the
+    // default `n_min 48` and silently turn the speculator off.
+    if (enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MOD) && spec->ngram_mod.n_max > cap) {
+        SPC_WRN("ngram-mod: draft length %d -> %d (the MoE expert cache serves a verify batch of at most %d "
+                "tokens from its arena; a wider one streams the routed experts from host memory every step). "
+                "Set LLAMA_SPEC_NGRAM_MOD_BAND_CLAMP=0 to keep %d, or raise the band with "
+                "GGML_MOE_CACHE_MAX_TOK if the device supports it.\n",
+                spec->ngram_mod.n_max, cap, cap + 1, spec->ngram_mod.n_max);
+        spec->ngram_mod.n_max = cap;
+        if (spec->ngram_mod.n_min > spec->ngram_mod.n_max) {
+            spec->ngram_mod.n_min = spec->ngram_mod.n_max;
+        }
+        clamped = true;
+    }
+
+    // The ngram-map family's draft length is `size_m` (uint16_t, 48 by default).
+    const auto clamp_map = [cap, &clamped, &enabled](common_speculative_type type, const char * name,
+                                                     common_params_speculative_ngram_map & m) {
+        if (enabled(type) && (int32_t) m.size_m > cap) {
+            SPC_WRN("%s: draft length %u -> %d (MoE expert-cache verify band, see the ngram-mod note).\n",
+                    name, (unsigned) m.size_m, cap);
+            m.size_m = (uint16_t) cap;
+            clamped = true;
+        }
+    };
+    clamp_map(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  "ngram-simple",  spec->ngram_simple);
+    clamp_map(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   "ngram-map-k",   spec->ngram_map_k);
+    clamp_map(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, "ngram-map-k4v", spec->ngram_map_k4v);
+
+    return clamped;
 }
