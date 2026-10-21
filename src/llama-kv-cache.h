@@ -236,6 +236,23 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // V3 derived kq mask: true when the packed mask for this batch can be replaced by the compact
+    // per-cell state (see set_input_kq_derived).  The predicate is exactly the shape the phase-1
+    // host oracle proved bit-exact against the packed fill - extend it only with new coverage.
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+
+    // the derived kq mask over several sequences (LLAMA_KQ_MASK_DERIVED_MULTISEQ, on unless 0): each sequence of the
+    // batch gets its own position range, so it needs every cell to carry at most one of `seqs` and every position below
+    // the range stride (see kq_mask_derivable_seqs in the .cpp)
+    static bool kq_mask_derived_multiseq_enabled();
+    // a batch of several sequences takes the derived form only above this many tokens: the multi-slot verify batches below
+    // it (2 x 6, 4 x 6, 2 x 16 rows) keep the packed mask, whose few MiB the reserve covers, and the per-ubatch checks
+    static constexpr uint32_t KQ_DERIVED_MULTISEQ_MIN_TOKENS = 32;
+    bool kq_mask_derivable_seqs(const llama_seq_id * seqs, uint32_t n_seqs, llama_pos pos_max) const;
+    void set_input_kq_derived(
+            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+            const llama_ubatch * ubatch, bool causal_attn) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -431,6 +448,12 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // V3 derived kq mask - see llama_kv_cache::kq_mask_derivable
+    bool kq_mask_derivable(const llama_ubatch & ubatch) const;
+    void set_input_kq_derived(
+            ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+            const llama_ubatch * ubatch, bool causal_attn) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
