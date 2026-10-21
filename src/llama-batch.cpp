@@ -499,7 +499,7 @@ bool llama_batch_allocr::init(
     return true;
 }
 
-llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs) {
+llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs, bool with_embd) {
     const uint32_t n_tokens = n_seq_tokens*n_seqs;
 
     clear();
@@ -510,7 +510,12 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
     udata->token     .resize(n_tokens);
-    udata->embd      .clear();
+    if (with_embd) {
+        // only a non-null marker for the measure graph: nothing reads the rows during a reserve
+        udata->embd.resize(n_tokens, 0.0f);
+    } else {
+        udata->embd.clear();
+    }
     udata->embd_state.clear();
     udata->pos       .resize(n_pos_all);
     udata->n_seq_id  .resize(n_tokens);
@@ -533,7 +538,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.n_pos        =*/ n_pos_per_embd,
 
         /*.token        =*/ udata->token.data(),
-        /*.embd         =*/ nullptr,
+        /*.embd         =*/ with_embd ? udata->embd.data() : nullptr,
         /*.embd_state   =*/ nullptr,
         /*.pos          =*/ udata->pos.data(),
         /*.n_seq_id     =*/ udata->n_seq_id.data(),

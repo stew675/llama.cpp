@@ -1510,6 +1510,10 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_lf_rows      = nullptr;
+    lf_pending_il  = -1;
+    lf_store_armed = false;
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1540,6 +1544,57 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_result::set_layer_inp(int il, ggml_tensor * t) {
+    t_layer_inp[il] = t;
+
+    if (!lf_store_armed) {
+        lf_pending_il = -1;
+        return;
+    }
+
+    const auto & enabled = params.cparams.embeddings_layer_inp;
+    const auto is_stored = [&enabled](int l) {
+        return l >= 0 && (size_t) l < enabled.size() && enabled[l];
+    };
+
+    if (is_stored(lf_pending_il)) {
+        // The previous recorded layer is complete: this tensor is its output, so expanding it now puts every
+        // node that reads that layer's input into the graph.  The copy below then lands right after them, which
+        // is the earliest point the layer input may be reused.  When the arch already expanded these nodes
+        // (several do, per layer) this is a no-op walk over its visited set.
+        ggml_build_forward_expand(gf, t);
+        lf_emit_layer_inp_store(lf_pending_il);
+    }
+
+    lf_pending_il = il;
+}
+
+void llm_graph_result::lf_emit_layer_inp_store(int il) {
+    const auto & stores = params.cparams.lf_layer_inp_dev_store;
+    if (il < 0 || (size_t) il >= stores.size() || stores[il] == nullptr) {
+        return;
+    }
+
+    ggml_tensor * store = stores[il];
+    ggml_tensor * src   = t_layer_inp[il];
+    GGML_ASSERT(src != nullptr && "layer input tensor is null");
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(src));
+    GGML_ASSERT(src->ne[0] == store->ne[0] &&
+            "F1: the extracted layer input is not n_embd wide (see llama_context::extract_layer_inputs)");
+
+    if (t_lf_rows == nullptr) {
+        // one row index per token of this graph's batch, shared by every store
+        t_lf_rows = ggml_new_tensor_1d(ctx_compute.get(), GGML_TYPE_I32, src->ne[1]);
+        ggml_set_input(t_lf_rows);
+        ggml_format_name(t_lf_rows, "lf_layer_inp_rows");
+    }
+    GGML_ASSERT(t_lf_rows->ne[0] == src->ne[1]);
+
+    ggml_tensor * node = ggml_set_rows(ctx_compute.get(), store, src, t_lf_rows);
+    ggml_format_name(node, "lf_layer_inp_store-%d", il);
+    ggml_build_forward_expand(gf, node);
+}
+
 void llm_graph_result::set_outputs(const llm_graph_params & params_l) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
@@ -1558,8 +1613,22 @@ void llm_graph_result::set_outputs(const llm_graph_params & params_l) {
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
-                ggml_set_output(t_layer_inp[il]);
+                // F1 (issue #240): a layer input with a persistent device store is written from inside the
+                // graph instead of being an output, so the allocator can reuse it after the layer instead of
+                // keeping every extracted input live to the end of the graph (5 x n_embd x n_ubatch f32, about
+                // 189 MiB of compute buffer at -ub 2048 on a 27B).
+                if (!lf_store_armed) {
+                    ggml_set_output(t_layer_inp[il]);
+                }
             }
+        }
+        if (lf_store_armed) {
+            // the last recorded layer's copy (the earlier ones closed at the next layer's set_layer_inp)
+            if (lf_pending_il >= 0 && (size_t) lf_pending_il < embeddings_layer_inp.size() &&
+                    embeddings_layer_inp[lf_pending_il]) {
+                lf_emit_layer_inp_store(lf_pending_il);
+            }
+            lf_pending_il = -1;
         }
     }
     for (auto * tensor : t_sampled) {
@@ -1636,6 +1705,12 @@ void llm_graph_result::set_hdmd_input(const ggml_tensor * cur, const ggml_tensor
 
 void llm_graph_result::set_params(const llm_graph_params & params_l) {
     this->params = params_l;
+    // F1 (issue #240): the arch graphs record their layer inputs through set_layer_inp (which needs to know,
+    // while it builds, whether the in-graph stores are armed), and this runs before the arch body.  An encoder
+    // graph never extracts layer inputs (llama_context::encode does not call extract_layer_inputs), and
+    // `cparams.lf_row_offset` describes a decode batch, so it keeps the output shape.
+    lf_store_armed = !params_l.cparams.lf_layer_inp_dev_store.empty() &&
+            params_l.gtype != LLM_GRAPH_TYPE_ENCODER;
 }
 
 //

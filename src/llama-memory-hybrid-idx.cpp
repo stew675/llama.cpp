@@ -538,6 +538,77 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
 
+bool llama_memory_hybrid_idx::can_park() const {
+    if (!get_mem_attn()->can_park()) {
+        return false;
+    }
+
+    // the indexer mirrors the attention cells, so it has to be parkable too (nullptr when the model has no indexer)
+    return mem_idx == nullptr || mem_idx->can_park();
+}
+
+// Whether the two caches still hold the same cells: same (position, cell) pair for every sequence of the stream.
+// Parking moves whole runs, and park_compact() also moves the sequences parked beside this one, so the whole stream
+// is compared rather than the one sequence being parked.
+bool llama_memory_hybrid_idx::attn_idx_in_step(llama_seq_id seq_id) const {
+    const auto & cells_attn = get_mem_attn()->get_cells(seq_id);
+    const auto & cells_idx  = mem_idx->get_cells(seq_id);
+
+    if (cells_attn.size() != cells_idx.size()) {
+        return false;
+    }
+
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        if (cells_attn.seq_pos_get(s) != cells_idx.seq_pos_get(s)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool llama_memory_hybrid_idx::seq_park(llama_seq_id seq_id, bool park) {
+    if (!can_park()) {
+        return false;
+    }
+
+    // no indexer: the attention cache is all there is (the same move llama_memory_seq_park() makes for a hybrid)
+    if (mem_idx == nullptr) {
+        return park ? get_mem_attn()->seq_park(seq_id) : get_mem_attn()->seq_unpark(seq_id);
+    }
+
+    // a cache that is already out of step cannot be moved coherently (the attention cache would keep other cells than
+    // the indexer reads): refuse before anything moves, which leaves the caller its save-and-clear fallback
+    if (seq_id >= 0 && seq_id < LLAMA_MAX_SEQ && !attn_idx_in_step(seq_id)) {
+        LLAMA_LOG_WARN("%s: seq %d: the indexer cache does not mirror the attention cache, not parking\n", __func__, seq_id);
+        return false;
+    }
+
+    if (!(park ? get_mem_attn()->seq_park(seq_id) : get_mem_attn()->seq_unpark(seq_id))) {
+        return false;
+    }
+
+    if (!(park ? mem_idx->seq_park(seq_id) : mem_idx->seq_unpark(seq_id))) {
+        // all or nothing: a misaligned pair is worse than a slot that stays where it is
+        if (park) {
+            get_mem_attn()->seq_unpark(seq_id);
+        } else {
+            get_mem_attn()->seq_park(seq_id);
+        }
+
+        return false;
+    }
+
+    // The cells moved under the feet of the state that is derived from them: the pool layout caches each sequence's
+    // (position, cell) pairs, and the derived pool rows are indexed by the block ordinal of the cells in the decode
+    // window, which changes when cells leave or re-enter that window.  Dropping both recomputes them from the moved
+    // cells on the next ubatch (the raw key rows moved with their cells, so nothing else is stale).
+    mem_idx_stale_set(-1, 0);
+    pool_invalidate_all();
+
+    return true;
+}
+
 void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
