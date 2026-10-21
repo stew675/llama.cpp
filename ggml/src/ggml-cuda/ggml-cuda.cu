@@ -590,7 +590,6 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     CUdeviceptr pool_addr = 0;
     size_t pool_used = 0;
     size_t pool_size = 0;
-    size_t max_size = CUDA_POOL_VMM_MAX_SIZE;
     size_t granularity;
 #if defined(GGML_USE_HIP)
     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
@@ -612,7 +611,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #else
             CU_CHECK(cuMemUnmap(pool_addr, pool_size));
 #endif
-            CU_CHECK(cuMemAddressFree(pool_addr, max_size));
+            CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
     }
 
@@ -628,21 +627,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             size_t reserve_size = size - avail;
             reserve_size = granularity * ((reserve_size + granularity - 1) / granularity);
 
-            // reserve virtual address space (if not already reserved)
-            if (pool_addr == 0) {
-                CUresult err = cuMemAddressReserve(&pool_addr, max_size, 0, 0, 0);
-                while (err == CUDA_ERROR_OUT_OF_MEMORY && (max_size >> 1) >= reserve_size && (max_size >> 1) >= granularity) {
-                    max_size >>= 1;
-                    err = cuMemAddressReserve(&pool_addr, max_size, 0, 0, 0);
-                }
-                CU_CHECK(err);
-                if (max_size < CUDA_POOL_VMM_MAX_SIZE) {
-                    GGML_LOG_WARN(GGML_CUDA_NAME " pool[%d]: reserved %.2f GiB of virtual memory instead of %.2f GiB\n",
-                                  device, max_size / (1024.0 * 1024.0 * 1024.0), CUDA_POOL_VMM_MAX_SIZE / (1024.0 * 1024.0 * 1024.0));
-                }
-            }
-
-            GGML_ASSERT(pool_size + reserve_size <= max_size);
+            GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
 
             // allocate more physical memory
             CUmemAllocationProp prop = {};
@@ -651,6 +636,11 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+
+            // reserve virtual address space (if not already reserved)
+            if (pool_addr == 0) {
+                CU_CHECK(cuMemAddressReserve(&pool_addr, CUDA_POOL_VMM_MAX_SIZE, 0, 0, 0));
+            }
 
             // map at the end of the pool
             CUdeviceptr start_ptr = (CUdeviceptr)((char *)(pool_addr) + pool_size);
@@ -2064,21 +2054,30 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = GGML_TYPE_F32;
     }
 
-    const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
-    if (env_c != nullptr) {
+    // Parse GGML_CUDA_CUBLAS_COMPUTE_TYPE once: this runs for every cuBLAS matmul, and getenv() is
+    // expensive on Windows (whose getenv returns a pointer that must not be retained across calls).
+    static const ggml_type cublas_compute_type_env = []() -> ggml_type {
+        const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+        if (env_c == nullptr) {
+            return GGML_TYPE_COUNT;
+        }
         std::string env_cpp = env_c;
         for (char & c : env_cpp) {
             c = std::tolower(c);
         }
         if (env_cpp == "f32" || env_cpp == "fp32") {
-            compute_type = GGML_TYPE_F32;
+            return GGML_TYPE_F32;
         } else if (env_cpp == "f16" || env_cpp == "fp16") {
-            compute_type = GGML_TYPE_F16;
+            return GGML_TYPE_F16;
         } else if (env_cpp == "bf16") {
-            compute_type = GGML_TYPE_BF16;
+            return GGML_TYPE_BF16;
         } else if (env_cpp != "auto") {
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
+        return GGML_TYPE_COUNT;
+    }();
+    if (cublas_compute_type_env != GGML_TYPE_COUNT) {
+        compute_type = cublas_compute_type_env;
     }
 
     constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
@@ -2624,11 +2623,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                 assert(expert_to_use >= 0 && expert_to_use < ne02);
+                // an id may repeat within a row: each occurrence is a separate dst column with its own src1 column
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
                 }
             }
         }

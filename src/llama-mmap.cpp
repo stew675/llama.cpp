@@ -929,8 +929,8 @@ struct llama_mlock::impl {
         return (size_t) sysconf(_SC_PAGESIZE);
     }
 
-    bool raw_lock(const void * addr, size_t size) const {
-        if (!mlock(addr, size)) {
+    bool raw_lock(const void * addr_l, size_t size_l) const {
+        if (!mlock(addr_l, size_l)) {
             return true;
         }
 
@@ -954,13 +954,13 @@ struct llama_mlock::impl {
         if (suggest && getrlimit(RLIMIT_MEMLOCK, &lock_limit)) {
             suggest = false;
         }
-        if (suggest && ((uint64_t)lock_limit.rlim_max > (uint64_t)lock_limit.rlim_cur + size)) {
+        if (suggest && ((uint64_t)lock_limit.rlim_max > (uint64_t)lock_limit.rlim_cur + size_l)) {
             suggest = false;
         }
 #endif
 
         LLAMA_LOG_WARN("warning: failed to mlock %zu-byte buffer (after previously locking %zu bytes): %s\n%s",
-                size, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
+                size_l, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
         return false;
     }
 
@@ -1057,6 +1057,18 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+size_t llama_mlock::size() const { return pimpl->size; }
+
+// Release the pin without dropping the pages: `munlock` only clears the VM_LOCKED flag, so everything the
+// mlock pulled in stays in the page cache and stays hot -- it just becomes reclaimable again, which is what a
+// box that is over-committed (a full expert arena + the model mapping beside a multi-GiB lazy table) needs.
+void llama_mlock::release() {
+    if (pimpl->size > 0) {
+        impl::raw_unlock((uint8_t *) pimpl->addr, pimpl->size);
+        pimpl->size = 0;
+    }
+}
+size_t llama_mlock::granularity() { return impl::lock_granularity(); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;

@@ -2674,11 +2674,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
         "- auto: on, but only for tensors larger than 4 GiB\n"
-        "- off: always keep them resident",
+        "- off: always keep them resident, even with a mapped load (--load-mode mmap):\n"
+        "       the tensors are read into host RAM instead of being served from the mapping\n"
+        "- mlock: on, and every row of such a tensor is also pulled into the page cache and\n"
+        "         pinned there (mlock) at load, so it can never be reclaimed; the pages are read\n"
+        "         from the mapping on demand exactly as in on, and the pin is released when the\n"
+        "         process exits (the pages then go back to being ordinary reclaimable cache)\n"
+        "- mlockr: mlock, but the pin is released as soon as loading is done (munlock, nothing is\n"
+        "          dropped): the tables are populated and stay hot in the page cache, and are\n"
+        "          reclaimable again.  Prefer this over mlock when something else also wants the\n"
+        "          RAM during the run -- an auto-sized expert arena, for one, where an unevictable\n"
+        "          multi-GiB table leaves the model mapping as the only memory the kernel can take\n"
+        "          back, so host-expert misses intermittently come from disk",
         [](common_params & params, const std::string & value) {
-            /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
-            else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
-            else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
+            /**/ if (value == "on")    { params.lazy_mode = LLAMA_LAZY_MODE_ON;    }
+            else if (value == "auto")  { params.lazy_mode = LLAMA_LAZY_MODE_AUTO;  }
+            else if (value == "off")   { params.lazy_mode = LLAMA_LAZY_MODE_OFF;   }
+            else if (value == "mlock") { params.lazy_mode = LLAMA_LAZY_MODE_MLOCK; }
+            else if (value == "mlockr") { params.lazy_mode = LLAMA_LAZY_MODE_MLOCKR; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
