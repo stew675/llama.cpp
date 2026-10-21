@@ -491,6 +491,10 @@ struct ggml_gallocr {
     struct node_alloc * node_allocs; // [n_nodes]
     int n_nodes;
 
+    // fingerprint of the graph the recorded layout (node_allocs/leaf_allocs) was computed for; see
+    // ggml_gallocr_graph_fp
+    uint64_t layout_fp;
+
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
 };
@@ -594,6 +598,42 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor 
     return t->data != NULL // tensor data already set externally
         || t->buffer // tensor on external buffer (but not yet allocated)
         || ggml_gallocr_is_own(galloc, t); // tensor will be allocated by galloc
+}
+
+// FNV-1a over a per-tensor descriptor: a fingerprint of everything the linear-scan layout depends
+// on -- the node/leaf order, the op (which decides in-place eligibility), the element type and shape
+// (which decide the sizes) and the input/output/compute flags (outputs are never freed, and inputs
+// are allocated up front, so both change the plan).  Two graphs with the same fingerprint get the
+// same layout; a different one must not reuse node_allocs positionally -- that would hand a tensor
+// the address the plan gave to some unrelated tensor, which may be a block the plan recycles.
+//
+// This is not hypothetical: a graph built by ggml_build_forward_select (in-graph sampling, one chain
+// per sequence x output row) keeps its node count but changes both its node order and which tensors
+// are outputs when a different chain is selected, e.g. when another sequence starts drafting.
+static uint64_t ggml_gallocr_graph_fp(const struct ggml_cgraph * graph) {
+    uint64_t h = 1469598103934665603ull;
+
+    const uint32_t flags_mask = GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_COMPUTE;
+
+    const int n_tensors = graph->n_nodes + graph->n_leafs;
+    for (int i = 0; i < n_tensors; ++i) {
+        const struct ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+
+        uint64_t v = (uint64_t) t->op;
+        v = v*0x100000001b3ull ^ (uint64_t) t->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            v = v*0x100000001b3ull ^ (uint64_t) t->ne[d];
+        }
+        v = v*0x100000001b3ull ^ (uint64_t) (t->view_src != NULL);
+        v = v*0x100000001b3ull ^ (uint64_t) (t->flags & flags_mask);
+
+        h = (h ^ v) * 1099511628211ull;
+    }
+
+    // the node/leaf split itself is part of the plan
+    h = (h ^ ((uint64_t) graph->n_nodes << 32 | (uint32_t) graph->n_leafs)) * 1099511628211ull;
+
+    return h;
 }
 
 // free the extra space at the end if the new tensor is smaller
@@ -760,6 +800,41 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         }
     }
 
+    // a view node that is never used as a source keeps its view source's n_views count elevated
+    // forever: the free pass below only decrements that count when the view itself is released, which
+    // never happens for a node with no consumers (e.g. a ggml_cpy expanded into the graph purely for
+    // its side effect - the "copy into a view of preallocated memory" idiom). The inflated count
+    // blocks both the view source's release and its in-place reuse, so the buffer grows by the size of
+    // every such view source. Fold those contributions in here, while the child counts are final.
+    // Graph outputs are exempt: they are never freed and may alias the view source, which must stay
+    // allocated for the application to read it.
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+
+        if (!ggml_impl_is_view(node) || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            continue;
+        }
+
+        struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+        if (hn->n_children != 0) {
+            continue;
+        }
+
+        struct ggml_tensor * view_src = node->view_src;
+        struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
+        view_src_hn->n_views -= 1;
+
+        AT_PRINTF("unused view %s: view_src %s: %d children, %d views\n",
+            node->name, view_src->name, view_src_hn->n_children, view_src_hn->n_views);
+
+        if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
+            ggml_gallocr_free_node(galloc, view_src);
+        }
+    }
+
     // allocate tensors
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
@@ -846,6 +921,10 @@ static bool ggml_gallocr_reserve_n_impl(
 
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+
+    // the layout now describes this graph; note the failure case leaves it recorded too, which the
+    // caller must handle (a failed buffer allocation is reported through the return value)
+    galloc->layout_fp = ggml_gallocr_graph_fp(graph);
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
@@ -1017,6 +1096,15 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     if (galloc->n_leafs != graph->n_leafs) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
+#endif
+        return true;
+    }
+
+    // node_allocs/leaf_allocs are applied positionally, so the layout only holds for a graph with the
+    // same node order, ops, shapes and output/input markings (see ggml_gallocr_graph_fp)
+    if (galloc->layout_fp != ggml_gallocr_graph_fp(graph)) {
+#ifndef NDEBUG
+        GGML_LOG_DEBUG("%s: graph topology changed (fingerprint mismatch)\n", __func__);
 #endif
         return true;
     }

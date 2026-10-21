@@ -72,6 +72,13 @@ struct llama_mlock {
     void init(void * ptr);
     void grow_to(size_t target_size);
 
+    // bytes actually locked (0 if the last grow_to failed); a short value means the range is not
+    // held resident and the pages are ordinary reclaimable page cache
+    size_t size() const;
+
+    // the granularity mlock()/VirtualLock() works at: the address must be a multiple of it
+    static size_t granularity();
+
     static const bool SUPPORTED;
 
 private:

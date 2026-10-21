@@ -120,21 +120,21 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
         } else {
             const int64_t q_lora_rank      = hparams.n_lora_q;
             const int64_t kv_lora_rank     = hparams.n_lora_kv;
-            const int64_t n_embd_head_k    = hparams.n_embd_head_k_mla();
-            const int64_t n_embd_head_v    = hparams.n_embd_head_v_mla();
+            const int64_t n_embd_head_k_l    = hparams.n_embd_head_k_mla();
+            const int64_t n_embd_head_v_l    = hparams.n_embd_head_v_mla();
             const int64_t qk_rope_head_dim = hparams.n_rot();
-            const int64_t qk_nope_head_dim = n_embd_head_k - qk_rope_head_dim;
+            const int64_t qk_nope_head_dim = n_embd_head_k_l - qk_rope_head_dim;
 
             layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, flags);
             layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, flags);
 
             layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), {n_embd, q_lora_rank}, flags);
-            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), {q_lora_rank, n_head * n_embd_head_k}, flags);
+            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), {q_lora_rank, n_head * n_embd_head_k_l}, flags);
 
             layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + qk_rope_head_dim}, flags);
             layer.wk_b      = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), {qk_nope_head_dim, kv_lora_rank, n_head}, flags);
-            layer.wv_b      = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v, n_head}, flags);
-            layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v, n_embd}, flags);
+            layer.wv_b      = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v_l, n_head}, flags);
+            layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v_l, n_embd}, flags);
 
             const int64_t n_indexer_head = hparams.indexer_n_head;
             const int64_t n_embd_indexer = hparams.indexer_head_size;

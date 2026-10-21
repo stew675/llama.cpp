@@ -23,9 +23,9 @@ void llama_model_openelm::load_arch_tensors(llama_model_loader &) {
     output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
 
     for (int i = 0; i < n_layer; ++i) {
-        const int64_t n_head      =   hparams.n_head(i);
-        const int64_t n_head_qkv  = 2*hparams.n_head_kv(i) + n_head;
-        const int64_t n_ff        =   hparams.n_ff(i);
+        const int64_t n_head_l      =   hparams.n_head(i);
+        const int64_t n_head_qkv  = 2*hparams.n_head_kv(i) + n_head_l;
+        const int64_t n_ff_l        =   hparams.n_ff(i);
 
         auto & layer = layers[i];
 
@@ -34,12 +34,12 @@ void llama_model_openelm::load_arch_tensors(llama_model_loader &) {
         layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", i), {n_embd, n_head_qkv*n_embd_head_k}, 0);
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head*n_embd_head_k, n_embd}, 0);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head_l*n_embd_head_k, n_embd}, 0);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff_l}, 0);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_l, n_embd}, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff_l}, 0);
     }
 }
 

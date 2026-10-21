@@ -85,7 +85,7 @@ llama_model_nanbeige::graph::graph(const llama_model & model, const llm_graph_pa
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     const int n_phys  = nb.n_layer_phys > 0 ? nb.n_layer_phys : (int) n_layer;
-    const int n_loops = nb.n_loops > 0 ? nb.n_loops : 1;
+    const int n_loops_l = nb.n_loops > 0 ? nb.n_loops : 1;
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -161,7 +161,7 @@ llama_model_nanbeige::graph::graph(const llama_model & model, const llm_graph_pa
 
         inpL = cur;
 
-        if (n_loops > 1 &&
+        if (n_loops_l > 1 &&
             ((il + 1) % n_phys) == 0 &&
             (il + 1) < n_layer &&
             !nb.skip_loop_final_norm) {

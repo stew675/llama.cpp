@@ -131,24 +131,24 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
         const float freq_base_l  = model.get_rope_freq_base(cparams, il);
         const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
 
-        ggml_tensor * cur         = inpL;                    // [n_embd, n_tokens, n_altup]
-        ggml_tensor * predictions = altup_predict(cur, il);  // [n_embd, n_tokens, n_altup]
+        ggml_tensor * cur_l         = inpL;                    // [n_embd, n_tokens, n_altup]
+        ggml_tensor * predictions = altup_predict(cur_l, il);  // [n_embd, n_tokens, n_altup]
 
         // predicted value will go through self-attention and laurel
         ggml_tensor * active_prediction = gemma3n_view_2d_slice(ctx0, predictions, i_altup_act);  // [n_embd, n_tokens]
-        cur = active_prediction;
-        cb(cur, "active_prediction", il);
+        cur_l = active_prediction;
+        cb(cur_l, "active_prediction", il);
 
         // norm
-        cur = build_norm(cur, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "attn_norm", il);
+        cur_l = build_norm(cur_l, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
+        cb(cur_l, "attn_norm", il);
 
         // laurel
-        ggml_tensor * laurel_out = laurel(cur, il);  // [n_embd, n_tokens]
+        ggml_tensor * laurel_out = laurel(cur_l, il);  // [n_embd, n_tokens]
 
         // self-attention
         if (hparams.has_kv(il)) {
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur, n_embd_head, n_head, n_head_kv, il);
+            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur_l, n_embd_head, n_head, n_head_kv, il);
 
             Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
             Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
@@ -167,18 +167,18 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
             cb(Qcur, "Qcur_pos", il);
             cb(Kcur, "Kcur_pos", il);
 
-            cur = build_attn(inp_attn, model.layers[il].wo,
+            cur_l = build_attn(inp_attn, model.layers[il].wo,
                     NULL, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     hparams.f_attention_scale, il);
         } else {
             // reuse KV cache of earlier layers
             ggml_tensor * Qcur;
             if (model.layers[il].wqkv) {
-                ggml_tensor * qkv = build_lora_mm(model.layers[il].wqkv, cur);
+                ggml_tensor * qkv = build_lora_mm(model.layers[il].wqkv, cur_l);
                 const int64_t q_dim = n_embd_head * n_head;
                 Qcur = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, q_dim, n_tokens, qkv->nb[1], 0));
             } else {
-                Qcur = build_lora_mm(model.layers[il].wq, cur);
+                Qcur = build_lora_mm(model.layers[il].wq, cur_l);
             }
             cb(Qcur, "Qcur", il);
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
@@ -190,27 +190,27 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
                                  ext_factor, attn_factor, beta_fast, beta_slow);
             cb(Qcur, "Qcur_pos", il);
 
-            cur = build_attn(inp_attn,
+            cur_l = build_attn(inp_attn,
                     model.layers[il].wo, NULL, model.layers[il].wo_s,
                     Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
         }
-        cur = build_norm(cur, model.layers[il].attn_post_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "attn_post_norm", il);
+        cur_l = build_norm(cur_l, model.layers[il].attn_post_norm, NULL, LLM_NORM_RMS, il);
+        cb(cur_l, "attn_post_norm", il);
 
-        cur = ggml_add(ctx0, cur, active_prediction);  // [n_embd, n_tokens]
-        cb(cur, "attn_gated", il);
+        cur_l = ggml_add(ctx0, cur_l, active_prediction);  // [n_embd, n_tokens]
+        cb(cur_l, "attn_gated", il);
 
-        ggml_tensor * attn_laurel = ggml_scale(ctx0, ggml_add(ctx0, cur, laurel_out),
+        ggml_tensor * attn_laurel = ggml_scale(ctx0, ggml_add(ctx0, cur_l, laurel_out),
                                                1.0f / sqrtf(2.0f));  // [n_embd, n_tokens]
         cb(attn_laurel, "attn_laurel", il);
 
-        cur = build_norm(attn_laurel, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
+        cur_l = build_norm(attn_laurel, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
+        cb(cur_l, "ffn_norm", il);
 
         // feed-forward network
         {
-            ggml_tensor * up_proj   = build_lora_mm(model.layers[il].ffn_up, cur);
-            ggml_tensor * gate_proj = build_lora_mm(model.layers[il].ffn_gate, cur);
+            ggml_tensor * up_proj   = build_lora_mm(model.layers[il].ffn_up, cur_l);
+            ggml_tensor * gate_proj = build_lora_mm(model.layers[il].ffn_gate, cur_l);
 
             if (il < n_layer_sparsity) {
                 // apply activation sparsity
@@ -218,14 +218,14 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
             }
             gate_proj = ggml_gelu(ctx0, gate_proj);
 
-            cur = ggml_mul(ctx0, up_proj, gate_proj);
-            cur = build_lora_mm(model.layers[il].ffn_down, cur);
-            cb(cur, "ffn_out", il);
+            cur_l = ggml_mul(ctx0, up_proj, gate_proj);
+            cur_l = build_lora_mm(model.layers[il].ffn_down, cur_l);
+            cb(cur_l, "ffn_out", il);
         }
-        cur = build_norm(cur, model.layers[il].ffn_post_norm, NULL, LLM_NORM_RMS, -1);
-        cb(cur, "ffn_post_norm", il);
+        cur_l = build_norm(cur_l, model.layers[il].ffn_post_norm, NULL, LLM_NORM_RMS, -1);
+        cb(cur_l, "ffn_post_norm", il);
 
-        ggml_tensor * attn_ffw_laurel_gated = ggml_add(ctx0, cur, attn_laurel);  // [n_embd, n_tokens]
+        ggml_tensor * attn_ffw_laurel_gated = ggml_add(ctx0, cur_l, attn_laurel);  // [n_embd, n_tokens]
         cb(attn_ffw_laurel_gated, "attn_ffw_laurel_gated", il);
 
         ggml_tensor * corrected = altup_correct(predictions, attn_ffw_laurel_gated, il);  // [n_embd, n_tokens, n_altup]
@@ -256,12 +256,12 @@ llama_model_gemma3n::graph::graph(const llama_model & model, const llm_graph_par
             ggml_tensor * tmp = ggml_add(ctx0, slice_rest, first_prediction);  // [n_embd, n_tokens, n_altup - 1]
             corrected         = ggml_concat(ctx0, slice_first, tmp, 2);        // [n_embd, n_tokens, n_altup]
         }
-        cur = corrected;                                                       // [n_embd, n_tokens, n_altup]
-        cur = build_cvec(cur, il);
-        cb(cur, "l_out", il);
+        cur_l = corrected;                                                       // [n_embd, n_tokens, n_altup]
+        cur_l = build_cvec(cur_l, il);
+        cb(cur_l, "l_out", il);
 
         // input for next layer
-        inpL = cur;
+        inpL = cur_l;
     }
     cur = inpL;  // [n_embd, n_tokens, n_altup]
 

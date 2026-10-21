@@ -13,8 +13,12 @@
 #include <sstream>
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed) : n_pos_per_embd(n_pos_per_embd), allow_mixed(allow_mixed) {
-    const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
-    debug = LLAMA_BATCH_DEBUG ? atoi(LLAMA_BATCH_DEBUG) : 0;
+    // read once: an allocr is constructed per batch, and getenv() is expensive on Windows
+    static const int batch_debug = [] {
+        const char * env = getenv("LLAMA_BATCH_DEBUG");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    debug = batch_debug;
 
     seq_pos.resize(LLAMA_MAX_SEQ);
     seq_cpl.resize(LLAMA_MAX_SEQ);
@@ -27,11 +31,11 @@ llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd, bool allow_mixed
 
 bool llama_batch_allocr::init(
         const llama_batch_ext & batch_inp,
-        const llama_vocab & vocab,
+        const llama_vocab & vocab_l,
         bool output_all) {
     clear();
 
-    this->vocab        = &vocab;
+    this->vocab        = &vocab_l;
     this->n_embd       = batch_inp.n_embd > 0 ? batch_inp.n_embd : batch_inp.n_embd_inp;
     this->n_embd_state = batch_inp.n_embd_state;
     this->n_seq_max    = batch_inp.n_seq_max;
@@ -275,10 +279,10 @@ bool llama_batch_allocr::init(
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
             seq_set_t cur;
             for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
-                const llama_seq_id seq_id = batch.seq_id[i][s];
+                const llama_seq_id seq_id_l = batch.seq_id[i][s];
 
-                cur        .set(seq_id);
-                seq_set_unq.set(seq_id);
+                cur        .set(seq_id_l);
+                seq_set_unq.set(seq_id_l);
             }
 
             seq_set.push_back(cur);
@@ -468,24 +472,24 @@ bool llama_batch_allocr::init(
         }
 
         for (int32_t i = 0; i < batch.n_tokens; ++i) {
-            const llama_pos pos = batch.pos[i];
+            const llama_pos pos_l = batch.pos[i];
 
             for (int32_t s = 0; s < batch.n_seq_id[i]; ++s) {
-                const llama_seq_id seq_id = batch.seq_id[i][s];
+                const llama_seq_id seq_id_l = batch.seq_id[i][s];
 
-                cur_seq_set[seq_id] &= seq_set[i];
+                cur_seq_set[seq_id_l] &= seq_set[i];
 
-                if (cur_seq_set[seq_id].none()) {
-                    LLAMA_LOG_ERROR("%s: sequence %d belongs to incompatible sequence sets (not allowed)\n", __func__, seq_id);
+                if (cur_seq_set[seq_id_l].none()) {
+                    LLAMA_LOG_ERROR("%s: sequence %d belongs to incompatible sequence sets (not allowed)\n", __func__, seq_id_l);
                     return false;
                 }
 
-                if (pos < cur_seq_pos[seq_id]) {
-                    LLAMA_LOG_ERROR("%s: sequence %d positions are decreasing (not allowed)\n", __func__, seq_id);
+                if (pos_l < cur_seq_pos[seq_id_l]) {
+                    LLAMA_LOG_ERROR("%s: sequence %d positions are decreasing (not allowed)\n", __func__, seq_id_l);
                     return false;
                 }
 
-                cur_seq_pos[seq_id] = pos;
+                cur_seq_pos[seq_id_l] = pos_l;
             }
         }
     }
@@ -565,12 +569,12 @@ std::vector<int32_t> & llama_batch_allocr::get_out_ids() {
     return out_ids;
 }
 
-llama_pos llama_batch_allocr::seq_pos_min(llama_seq_id seq_id) const {
-    return seq_pos[seq_id].empty() ? -1 : *seq_pos[seq_id].begin();
+llama_pos llama_batch_allocr::seq_pos_min(llama_seq_id seq_id_l) const {
+    return seq_pos[seq_id_l].empty() ? -1 : *seq_pos[seq_id_l].begin();
 }
 
-llama_pos llama_batch_allocr::seq_pos_max(llama_seq_id seq_id) const {
-    return seq_pos[seq_id].empty() ? -1 : *seq_pos[seq_id].rbegin();
+llama_pos llama_batch_allocr::seq_pos_max(llama_seq_id seq_id_l) const {
+    return seq_pos[seq_id_l].empty() ? -1 : *seq_pos[seq_id_l].rbegin();
 }
 
 void llama_batch_allocr::split_reset() {
@@ -932,10 +936,10 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
 
         for (int s = 0; s < udata->n_seq_id[i]; ++s) {
-            const llama_seq_id seq_id = batch.seq_id[idxs[i]][s];
+            const llama_seq_id seq_id_l = batch.seq_id[idxs[i]][s];
 
-            udata->seq_id_data.push_back(seq_id);
-            seq_set_unq.set(seq_id);
+            udata->seq_id_data.push_back(seq_id_l);
+            seq_set_unq.set(seq_id_l);
         }
 
         if (udata->output[i]) {
@@ -987,8 +991,8 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     return res;
 }
 
-void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
-    if (debug > 0) {
+void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug_l) {
+    if (debug_l > 0) {
         LLAMA_LOG_DEBUG("%s:   equal_seqs   = %d\n", __func__, ubatch.equal_seqs());
         LLAMA_LOG_DEBUG("%s:   n_tokens     = %d\n", __func__, ubatch.n_tokens);
         LLAMA_LOG_DEBUG("%s:   n_seq_tokens = %d\n", __func__, ubatch.n_seq_tokens);
@@ -1028,28 +1032,26 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
         LLAMA_LOG_DEBUG("%s:   type       = %p\n", __func__, (void *) ubatch.type);
         LLAMA_LOG_DEBUG("%s:   n_outputs  = %d\n", __func__, n_outputs);
 
-        if (debug > 0) {
+        if (debug_l > 0) {
             int seq_id_max = 0;
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 for (int s = 0; s < ubatch.n_seq_id[i]; ++s) {
-                    for (int s = 0; s < ubatch.n_seq_id[i]; ++s) {
-                        seq_id_max = std::max(seq_id_max, ubatch.seq_id[i][s]);
-                    }
+                    seq_id_max = std::max(seq_id_max, ubatch.seq_id[i][s]);
                 }
             }
             ++seq_id_max;
 
             LLAMA_LOG_DEBUG("%s:   token     = [\n", __func__);
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                std::vector<int8_t> seq_id(seq_id_max);
+                std::vector<int8_t> seq_id_l(seq_id_max);
 
                 for (int s = 0; s < ubatch.n_seq_id[i]; ++s) {
-                    seq_id[ubatch.seq_id[i][s]] = 1;
+                    seq_id_l[ubatch.seq_id[i][s]] = 1;
                 }
 
                 std::stringstream ss;
                 for (int s = 0; s < seq_id_max; ++s) {
-                    if (seq_id[s]) {
+                    if (seq_id_l[s]) {
                         ss << s%10;
                     } else {
                         ss << ".";

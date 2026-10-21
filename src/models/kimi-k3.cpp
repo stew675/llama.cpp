@@ -106,34 +106,34 @@ void llama_model_kimi_k3::load_arch_tensors(llama_model_loader &) {
         } else {
             const int64_t q_lora_rank      = hparams.n_lora_q;
             const int64_t kv_lora_rank     = hparams.n_lora_kv;
-            const int64_t n_embd_head_k    = hparams.n_embd_head_k_mla();
-            const int64_t n_embd_head_v    = hparams.n_embd_head_v_mla();
+            const int64_t n_embd_head_k_l    = hparams.n_embd_head_k_mla();
+            const int64_t n_embd_head_v_l    = hparams.n_embd_head_v_mla();
             const int64_t qk_rope_head_dim = hparams.n_rot();
-            const int64_t qk_nope_head_dim = n_embd_head_k - qk_rope_head_dim;
+            const int64_t qk_nope_head_dim = n_embd_head_k_l - qk_rope_head_dim;
 
             layer.attn_q_a_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, TENSOR_NOT_REQUIRED);
             layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {kv_lora_rank}, 0);
 
             if (layer.attn_q_a_norm) {
                 layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), {n_embd, q_lora_rank}, 0);
-                layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), {q_lora_rank, n_head * n_embd_head_k}, 0);
+                layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), {q_lora_rank, n_head * n_embd_head_k_l}, 0);
             } else {
-                layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_head * n_embd_head_k}, 0);
+                layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, n_head * n_embd_head_k_l}, 0);
             }
 
             layer.wkv_a_mqa = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i), {n_embd, kv_lora_rank + qk_rope_head_dim}, 0);
             layer.wkv_b     = create_tensor(tn(LLM_TENSOR_ATTN_KV_B, "weight", i),
-                                            {kv_lora_rank, n_head * (qk_nope_head_dim + n_embd_head_v)},
+                                            {kv_lora_rank, n_head * (qk_nope_head_dim + n_embd_head_v_l)},
                                             TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
             if (!layer.wkv_b) {
                 layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), {qk_nope_head_dim, kv_lora_rank, n_head}, 0);
-                layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v, n_head}, 0);
+                layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v_l, n_head}, 0);
             }
 
             // K3: sigmoid output gate applied to the attention output before o_proj
-            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head * n_embd_head_v}, TENSOR_NOT_REQUIRED);
+            layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_head * n_embd_head_v_l}, TENSOR_NOT_REQUIRED);
 
-            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v, n_embd}, 0);
+            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v_l, n_embd}, 0);
         }
 
         if (i < (int) hparams.n_layer_dense_lead) {
