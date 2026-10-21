@@ -1793,9 +1793,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
+    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
+    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
+    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
+    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
+    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
+    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
+    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
+    // stays host-resident either way (see create_tensor).
+    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
+    if (dev_input_on) {
+        pimpl->dev_input = get_layer_buft_list(n_layer_all);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
@@ -1820,6 +1832,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
 
         layers.resize(n_layer_all);
+
+        // wip/host-expert-tier: decide the `-lme` budget and WHICH host-expert tensors get a pinned master
+        // BEFORE any of them is placed.  Every input it needs (the tensor index, the `-ncmoe` selection, the
+        // heat prior, MemAvailable) is known here, and a per-tensor decision cannot be revisited once the
+        // buffers are allocated.
+        // NB: the `-ncmoe` tail bound is `hparams.n_layer()` (the TRUNK layers), not `n_layer_all` (which
+        // also counts the appended nextn/MTP head): `create_tensor` uses the trunk count, so using the other
+        // here would shift the tail by one layer and plan a pinned MTP head that is never hosted.
+        ml.plan_host_expert_placement((int) hparams.n_layer());
 
         // call the per-model loading function
         load_arch_tensors(ml);
@@ -2010,6 +2031,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // wip/moe-cache-autosize: host-resident MoE expert bytes for the --fit arena floor reservation
+    moe_host_expert_bytes = ml.moe_host_expert_bytes;
+
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
@@ -2083,6 +2107,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                     }
                     bufs.emplace_back(buf);
+                }
+            }
+
+            // record the exact mmap-backed ranges before any data is loaded, so the loader's
+            // per-tensor release never unmaps pages that a host-pointer tensor points into
+            // (a tied embedding is loaded once mmap-backed and once copied to a device)
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                const auto * w = ml.get_weight(ggml_get_name(t));
+                if (w != nullptr) {
+                    ml.mark_mmap_used((uint32_t) w->idx, w->offs, ggml_nbytes(t));
                 }
             }
         } else {
@@ -2182,6 +2216,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    // wip/host-expert-tier: the tier census, once, after the placement is final.
+    ml.report_host_expert_placement();
+
+    // TODO #135: refuse a degenerate `-sm tensor` spread of the host-resident expert tables (a silent ~5x
+    // decode cliff).  It goes here, not earlier: a host-expert tensor does not have its host buffer until
+    // the loader places the tier DURING the data load (measured: 0 of 733 tensors has a host buffer before
+    // `load_all_data`), so the placement is only readable afterwards -- the same point the tier census uses.
+    check_host_expert_split_shares();
 
     return true;
 }
@@ -3578,7 +3621,10 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.host_experts_mode           =*/ LLAMA_HOST_EXPERTS_MODE_PINNED,
+        /*.host_experts_limit_gib      =*/ -1,
         /*.main_gpu                    =*/ 0,
+        /*.n_cpu_moe_from_end          =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -3589,6 +3635,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.allow_nextn_cpu_offload     =*/ false,
     };
 
     return result;
@@ -4011,6 +4058,102 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
     return model->tensors_by_name;
 }
 
+void llama_model_moe_cache_preflight(const llama_model * model, size_t aux_reserve_bytes) {
+    if (model == nullptr) {
+        return;
+    }
+    // wip/slab-ring-region: the largest single host weight tensor sizes the slab's H2D-ring hole.  It is
+    // model-global (the same bound for every device), and it is known here (the model is fully loaded).
+    const size_t max_host_table = model->max_host_weight_tensor_bytes();
+    // Walk the HOST-EXPERT map, not `model->devices`.  The map is keyed by the real device that owns the
+    // host-expert buffer, while `model->devices` holds the scheduler's META device under `-sm tensor`;
+    // looking a meta device up in the map returns 0 for every device, which silently skipped the whole
+    // preflight -- and with it BOTH auto floors (`MOE_EXPERT_CACHE_MIN_MIB` and `_MIN_RES_PCT`) -- in the
+    // `-sm tensor` + host-expert configuration.  That left `alloc_all_locked`'s floor as the only one,
+    // and that one runs AFTER the tables are registered and graphs are planned against them: a late
+    // `g_enabled = false` there plans the MTP draft and the target with different kernels (measured MTP
+    // acceptance 0.00874 instead of the streaming path's 0.89506).  The map's keys are real devices -- the
+    // post-prefill drop already relies on that (`ggml_backend_dev_slab_work_size(kv.first)`).
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (kv.second > 0) {
+            ggml_backend_dev_moe_cache_preflight(kv.first, kv.second, aux_reserve_bytes, max_host_table);
+        }
+    }
+}
+
+bool llama_moe_cache_stats(const llama_model * model, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
+    if (model == nullptr) {
+        return false;
+    }
+    // The arena is one process-global cache, so any MoE-capable device returns the same aggregate.
+    // Under -sm tensor the model's device list is a Meta wrapper, so try the host-expert devices first.
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        if (ggml_backend_dev_moe_cache_stats(kv.first, hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < model->devices.size(); i++) {
+        if (ggml_backend_dev_moe_cache_stats(llama_model_get_device(model, (uint32_t) i), hits, misses, arena_bytes)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int llama_model_moe_cache_band(const llama_model * model) {
+    if (model == nullptr) {
+        return 0;
+    }
+    // TODO #59: the band is a per-device kernel property, so answer with the SMALLEST band across the
+    // model's host-expert devices: a verify batch is replicated over every device of a tensor split, so
+    // the narrowest band is the one that decides whether the batch is served from the arena.
+    //
+    // TODO #117: ONLY a device that actually carries host-resident experts has a band.  This used to fall
+    // back to `model->devices`, and with `moe_cache_enabled()` true by default (AUTO) that answered 16 for
+    // a DENSE model on every non-Meta device list -- a single GPU, or any `-sm layer` run -- where no
+    // routed expert exists anywhere and there is nothing to respect: `common`'s n-gram clamp then cut a
+    // 64-token draft to 15, and the MTP/DFlash2 multi-slot alignment bounded every slot to
+    // `band / n_drafting - 1` rows (measured -7.5 % wall on a dense 3-slot DFlash2 arm).  The fallback also
+    // contradicted this function's documented contract.  `moe_host_expert_bytes` is the host-resident
+    // expert account the loader fills (r97: a pageable CPU-only placement is deliberately not accounted),
+    // so it is empty exactly when no routed expert is streamed from a host master.  Keep the
+    // `moe_cache_enabled()` gate the device hook applies -- a slab-declined or arena-released host-expert
+    // config reports 0 (TODO #96) -- and do NOT test `moe_cache_has_tables()` here: tables register during
+    // the first compute, after `llama_init_from_model`, which is exactly the r129 bug.
+    int band = 0;
+    for (const auto & kv : model->moe_host_expert_bytes) {
+        const int b = ggml_backend_dev_moe_cache_band(kv.first);
+        if (b > 0 && (band == 0 || b < band)) {
+            band = b;
+        }
+    }
+    return band;
+}
+
+size_t llama_model_moe_host_expert_bytes(const llama_model * model, uint32_t dev_index) {
+    if (model == nullptr || dev_index >= model->devices.size()) {
+        return 0;
+    }
+    const auto it = model->moe_host_expert_bytes.find(llama_model_get_device(model, dev_index));
+    return it != model->moe_host_expert_bytes.end() ? it->second : 0;
+}
+
+int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model) {
+    return model == nullptr ? 0 : (int32_t) model->moe_host_expert_bytes.size();
+}
+
+bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
+                                     ggml_backend_dev_t * dev, size_t * bytes) {
+    if (model == nullptr || i < 0 || i >= (int32_t) model->moe_host_expert_bytes.size()) {
+        return false;
+    }
+    auto it = model->moe_host_expert_bytes.begin();
+    std::advance(it, i);
+    if (dev   != nullptr) { *dev   = it->first;  }
+    if (bytes != nullptr) { *bytes = it->second; }
+    return true;
+}
+
 int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
@@ -4215,4 +4358,121 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
     }
 
     return n_tokens * (uint32_t) tensor->ne[0];
+}
+
+// TODO #135 (r250): refuse a `-sm tensor` split whose granularity-rounded share of a HOST-RESIDENT expert
+// table leaves a device with ZERO of that table's split-axis columns.
+//
+// WHY: measured on gfx1201 with 35B-A3B (`n_embd` 2048, expert FF 512), `-ncmoe 40`, decode 109.7 t/s at 2
+// devices against 20.5 at 3 -- Q3_K_M 105.0/23.0, and Q8_0 95.7/90.2.  The share is the LOADER's own rule
+// (FFN granularity `lcm(blck_size,128)`, get_split_granularity + the `ne_s*(j+1)/n` flooring in the
+// split-state callback): Q4_K/Q3_K blocks are 256 elements, so `ffn_down_exps` (axis0 512) splits
+// 0/256/256 at three devices, while Q8_0's 32-element blocks split 128/128/256.  So this decides from the
+// model's own geometry AND the quant's block size -- never a model list -- and the predicate is
+// deliberately narrow:
+//   * host-resident experts only.  The SAME zero share exists in the all-VRAM 3-device arm (130.9 t/s) and
+//     in every 3-device `-sm tensor` arm the delivery validates (all Q8_0), so a placement-blind rule would
+//     refuse a configuration that measures healthy;
+//   * an explicit `--tensor-split` zero share is a placement choice, not a defect -- skip it;
+//   * `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` is the escape hatch (an explicit "I know what this shape is"
+//     for a measurement, not a default).
+// The failure mode it prevents is a silent 5x decode cliff (the moe cache prints one `DEGENERATE TENSOR
+// SPLIT` line to stderr when a table is created, but only when the cache is on), so a WARN would not be
+// enough (TODO #135 asks for vLLM-style TP validation).
+void llama_model::check_host_expert_split_shares() const {
+    static const bool allow_degenerate = [] {
+        const char * e = getenv("GGML_TENSOR_SPLIT_ALLOW_DEGENERATE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (allow_degenerate) {
+        return;
+    }
+    const size_t n_devs = get_split_state_ud.n_devices;
+    if (n_devs < 2 || n_devs > GGML_BACKEND_META_MAX_DEVICES || get_split_state_ud.model == nullptr) {
+        return;
+    }
+    // An explicit 0 share means the user chose that placement (e.g. `--tensor-split 1,0,1`); do not refuse it.
+    // An all-zero vector is "no explicit split" (the proportional default), not an explicit choice.
+    const float * ts = tensor_split();
+    if (ts != nullptr) {
+        float ts_sum = 0.0f;
+        for (size_t d = 0; d < n_devs; d++) {
+            ts_sum += ts[d];
+        }
+        if (ts_sum > 0.0f) {
+            for (size_t d = 0; d < n_devs; d++) {
+                if (ts[d] == 0.0f) {
+                    return;
+                }
+            }
+        }
+    }
+    std::string worst;
+    size_t n_bad = 0;
+    size_t n_seen = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            if (std::string(t->name).find("exps") == std::string::npos) {
+                continue;
+            }
+            const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(t, const_cast<void *>(static_cast<const void *>(&get_split_state_ud)));
+            if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS || ss.n_segments == 0) {
+                continue; // mirrored (or partial) -- not a split-axis table
+            }
+            n_seen++;
+            std::string zero_at;
+            for (size_t d = 0; d < n_devs; d++) {
+                int64_t extent = 0;
+                for (uint32_t s = 0; s < ss.n_segments; s++) {
+                    extent += ss.ne[s*n_devs + d] * ss.nr[s];
+                }
+                if (extent == 0) {
+                    zero_at += zero_at.empty() ? std::to_string(d) : ("," + std::to_string(d));
+                }
+            }
+            if (!zero_at.empty()) {
+                n_bad++;
+                if (worst.empty()) {
+                    worst = format("%s (axis %d: %lld columns over %zu devices, granularity %lld) -> device %s holds 0",
+                            t->name, (int) ss.axis, (long long) t->ne[ss.axis], n_devs,
+                            (long long) std::lcm((int64_t) ggml_blck_size(t->type), (int64_t) 128), zero_at.c_str());
+                }
+            }
+        }
+    }
+    if (n_bad > 0) {
+        throw std::runtime_error(format(
+                "-sm tensor: %zu of %zu host-resident expert tables get a ZERO per-device share of their split "
+                "axis (first: %s).  This split cannot work: the host-expert path degenerates (measured 20.5 t/s "
+                "decode against 109.7 at two devices on such a shape).  Use -sm layer, fewer devices, or a quant "
+                "whose block size leaves every device a share; GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1 overrides.",
+                n_bad, n_seen, worst.c_str()));
+    }
+}
+
+size_t llama_model::max_host_weight_tensor_bytes() const {
+    size_t max_bytes = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(t);
+            if (bytes > max_bytes) {
+                max_bytes = bytes;
+            }
+        }
+    }
+    return max_bytes;
 }

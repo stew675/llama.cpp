@@ -946,6 +946,9 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // wip/moe-cache-autosize: host-resident MoE expert bytes per device (from the loader)
+    std::map<ggml_backend_dev_t, size_t> moe_host_expert_bytes;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -981,6 +984,14 @@ struct llama_model {
 
     // total number of parameters in the model
     uint64_t n_elements() const;
+    size_t max_host_weight_tensor_bytes() const;
+
+    // TODO #135: a load-time guard against a degenerate `-sm tensor` device count.  It refuses (throws) a
+    // split whose granularity-rounded per-device share of a HOST-RESIDENT expert table leaves a device with
+    // zero columns of that table, which measures a silent ~5x decode cliff.  Geometry-derived (the loader's
+    // own share rule + the quant's block size), so it carries no model list.  Called once at the end of
+    // `load_tensors`; `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` overrides.
+    void check_host_expert_split_shares() const;
 
     void print_info() const;
 

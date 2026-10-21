@@ -653,6 +653,8 @@ llama_file::~llama_file() = default;
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
 
+const std::string & llama_file::path() const { return pimpl->fname; }
+
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 
@@ -708,10 +710,12 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+    int fd = -1;   // r273: kept so a released range's page-cache copy can be dropped (see `unmap_fragment`)
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
         int fd = file->file_id();
+        this->fd = fd;   // r273: retained for the post-unmap DONTNEED
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
@@ -783,22 +787,38 @@ struct llama_mmap::impl {
         GGML_ASSERT(last % page_size == 0);
         GGML_ASSERT(last > first);
 
-        void * next_page_start = (uint8_t *) addr + first;
-
-        if (munmap(next_page_start, len)) {
-            LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-        }
-
+        // Only munmap the parts that are still mapped: a tensor whose data has been uploaded to a
+        // device is unmapped as soon as it is loaded, so the final offload cleanup must not munmap
+        // the same range twice (munmap of an unmapped range fails) and must keep the fragments
+        // pointing into the mapping intact.
         std::vector<std::pair<size_t, size_t>> new_mapped_fragments;
         for (const auto & frag : mapped_fragments) {
-            if (frag.first < first && frag.second > last) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first < first && frag.second > first) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-            } else if (frag.first < last && frag.second > last) {
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first >= first && frag.second <= last) {
+            const size_t lo = std::max(frag.first, first);
+            const size_t hi = std::min(frag.second, last);
+            if (lo < hi) {
+                if (munmap((char *) addr + lo, hi - lo)) {
+                    LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+                }
+#ifdef __linux__
+                // r273: drop the page-cache copy of a tensor that has just been uploaded to a device and
+                // UNMAPPED.  It is read exactly once and never again, so those pages are pure overhead next
+                // to the device copy -- and while the range was MAPPED, `posix_fadvise` could not drop them at
+                // all (it skips mapped pages, which is why the delivered path left them to reclaim).  This is
+                // the cheap half of "do not flush the system page cache for weights that are already placed":
+                // the release is per tensor and already exists, the drop just was not asked for.  It does not
+                // change the read transport (a mapped upload stays mapped and fast); it removes what is left
+                // behind afterwards.  `MOE_LAZY`/host-expert tensors never reach here (they are not released).
+                if (fd >= 0 && posix_fadvise(fd, (off_t) lo, (off_t) (hi - lo), POSIX_FADV_DONTNEED)) {
+                    LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n",
+                            strerror(errno));
+                }
+#endif
+                if (frag.first < first) {
+                    new_mapped_fragments.emplace_back(frag.first, first);
+                }
+                if (frag.second > last) {
+                    new_mapped_fragments.emplace_back(last, frag.second);
+                }
             } else {
                 new_mapped_fragments.push_back(frag);
             }
@@ -866,8 +886,24 @@ struct llama_mmap::impl {
     }
 
     void unmap_fragment(size_t first, size_t last) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
+        // A view cannot be unmapped in part, so drop the range's pages from the working set
+        // instead: the range has been copied to a device (or a non-mapping host buffer), and
+        // its clean file pages otherwise stay resident next to that copy for as long as the
+        // process lives.  VirtualUnlock on pages that are not locked does exactly that (and
+        // reports ERROR_NOT_LOCKED); the pages move to the standby list.
+        static const size_t page_size = [] {
+            SYSTEM_INFO info;
+            GetSystemInfo(&info);
+            return (size_t) info.dwPageSize;
+        }();
+        first = (first + page_size - 1) / page_size * page_size;
+        last  = std::min(last, size) / page_size * page_size;
+        if (last <= first) {
+            return;
+        }
+        if (!VirtualUnlock((char *) addr + first, last - first) && GetLastError() != ERROR_NOT_LOCKED) {
+            LLAMA_LOG_WARN("warning: VirtualUnlock failed: %s\n", llama_format_win_err(GetLastError()).c_str());
+        }
     }
 
     ~impl() {
