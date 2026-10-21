@@ -313,6 +313,13 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // rollback snapshots: the rows of planes 1..n_rs_seq of the source cells of the extra states, plane-major, so
+    // a moved extra state keeps its snapshots (nullptr without snapshots or extra states)
+    ggml_tensor * s_copy_extra = nullptr; // I32 [n_rs_seq * (n_rs - n_seqs)]
+
+    // fill s_copy_extra
+    void set_extra_input(const llama_memory_recurrent_context * mctx_r);
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -1075,6 +1082,15 @@ struct llm_graph_context {
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+
+    // build_conv_state_store: the rollback slot order is a graph constant, so it is built once per
+    // (graph, device) instead of once per conv layer.  `share_slot_rev` is the kill switch
+    // (LLAMA_SHARE_SLOT_REV=0 restores the per-layer chain, for an A/B or a bisect).
+    const bool share_slot_rev = [] {
+        const char * e = getenv("LLAMA_SHARE_SLOT_REV");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    mutable std::map<ggml_backend_buffer_type_t, ggml_tensor *> s_slot_rev_cache;
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;

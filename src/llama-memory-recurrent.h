@@ -25,6 +25,7 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                     uint32_t   n_rs_batch,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -73,6 +74,10 @@ public:
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
+
+    // largest per-seq batch that can be rolled back into; batches above this bound cannot be
+    // speculative verify batches, so their rollback snapshots are never read
+    uint32_t n_rs_batch = 0;
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
@@ -186,6 +191,10 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // rollback snapshots per cell, and the source cell of cell head + i without its rollback (plane 0)
+    uint32_t get_n_rs_seq() const;
+    int32_t  s_src(int i) const;
 
 private:
     const llama_memory_status status;

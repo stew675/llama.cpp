@@ -33,7 +33,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    // n_rs_batch=1: a single-token batch is always a rollback target, so keep its snapshot
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1, /*n_rs_batch=*/1);
     ggml_tensor * output = ggml_view_4d(ctx0, result,
             S_v, H_v, n_tokens, n_seqs,
             ggml_row_size(result->type, S_v),
@@ -115,8 +116,20 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    // the GDN op only snapshots the per-token states (slots 0..n_seq_tokens-1), so a rollback that
+    // removes the whole batch needs the pre-batch state: keep it in slot n_seq_tokens when it fits
+    if (0 < n_seq_tokens && n_seq_tokens < K) {
+        const size_t pre_row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        ggml_tensor * pre_src = ggml_reshape_2d(ctx0, s, D, n_seqs);
+        ggml_tensor * pre_dst = ggml_view_2d(ctx0, ssm_states_all, D, n_seqs,
+                ssm_states_all->nb[1], ((size_t) n_seq_tokens * mem_size + kv_head) * pre_row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, pre_src, pre_dst));
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    // a batch above n_rs_batch cannot be a speculative verify batch and is never rolled back
+    // into, so a chunked GDN kernel may skip the rollback snapshots for it
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K, cparams.n_rs_batch);
     const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
 

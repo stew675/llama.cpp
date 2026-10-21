@@ -14,6 +14,7 @@
 #include "ggml-backend.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -75,7 +76,7 @@ static double run_case(
         const common_params & params, llama_model * model, llama_context * ctx_tok,
         const llama_vocab * vocab,
         uint32_t n_rs_seq, uint32_t n_rs_batch, uint32_t n_ubatch,
-        uint32_t n_tokens, uint32_t n_rollback, bool verbose) {
+        uint32_t n_tokens, uint32_t n_rollback, bool verbose, bool * refused_out = nullptr) {
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
     std::vector<llama_token> toks = make_tokens(ctx_tok, vocab, n_tokens, (uint32_t) n_vocab);
@@ -102,7 +103,11 @@ static double run_case(
 
     const bool rm = llama_memory_seq_rm(llama_get_memory(ctx_roll), 0, (llama_pos) p0, -1);
     if (!rm) {
-        fprintf(stderr, "  [rollback] seq_rm refused (n_tokens=%u rollback=%u)\n", n_tokens, n_rollback);
+        if (refused_out) {
+            *refused_out = true;
+        } else {
+            fprintf(stderr, "  [rollback] seq_rm refused (n_tokens=%u rollback=%u)\n", n_tokens, n_rollback);
+        }
         llama_free(ctx_roll); llama_free(ctx_ref);
         return -1;
     }
@@ -136,6 +141,124 @@ static double run_case(
     llama_free(ctx_roll);
     llama_free(ctx_ref);
     return diff_max;
+}
+
+
+// ---------------------------------------------------------------------------
+// Phase C: a cell that find_slot MOVES between a verify batch and that
+// sequence's rollback must keep its snapshot planes.  build_rs relocates the
+// extra states (the cells inside [head, head+n_rs) that no sequence of this
+// ubatch uses) by copying plane 0 only, so a moved cell's planes 1..n_rs_seq
+// stay at the old index and are overwritten by the cells that take their
+// place.  With n_seq_max = 3 and 3 resident sequences, a batch of
+// [seq 0, seq 2] spans cells 0..2, and find_slot swaps seq 1 (cell 1) with
+// seq 2 (cell 2): seq 1 becomes the extra state, its snapshots are read from
+// its OLD cell, and its new cell keeps whatever the old cell 2 held.
+//
+//   moved = false : the two tokens are decoded one at a time, so no cell moves
+//   moved = true  : the two tokens are decoded in ONE batch of [seq 0, seq 2]
+//
+// Both arms must produce identical logits for the rolled-back sequence.
+static llama_context * make_ctx_seq( const common_params & params, llama_model * model,
+        uint32_t n_rs_seq, uint32_t n_rs_batch, uint32_t n_ubatch) {
+    auto cparams = common_context_params_to_llama(params);
+    cparams.n_seq_max  = 3;
+    cparams.n_rs_seq   = n_rs_seq;
+    cparams.n_rs_batch = n_rs_batch;
+    cparams.n_ctx      = 512;
+    cparams.n_batch    = 512;
+    cparams.n_ubatch   = n_ubatch;
+    cparams.kv_unified = true; // a non-sequential split is what puts two seqs in one ubatch
+    return llama_init_from_model(model, cparams);
+}
+
+static bool decode_pair(llama_context * ctx, llama_token t0, llama_token t1,
+                        llama_pos pos, llama_seq_id s0, llama_seq_id s1, bool separate,
+                        bool last_logits) {
+    if (separate) {
+        common_batch b0(ctx);
+        b0.add(t0, pos, s0, last_logits);
+        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b0.get()) != 0) {
+            return false;
+        }
+        common_batch b1(ctx);
+        b1.add(t1, pos, s1, last_logits);
+        return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b1.get()) == 0;
+    }
+    common_batch b(ctx);
+    b.add(t0, pos, s0, last_logits);
+    b.add(t1, pos, s1, last_logits);
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0;
+}
+
+static std::vector<float> run_moved_cell(
+        const common_params & params, llama_model * model, llama_context * ctx_tok,
+        const llama_vocab * vocab, uint32_t n_rs_seq, uint32_t n_rollback,
+        bool moved, bool verbose, bool * ok_out) {
+    const int      n_vocab = llama_vocab_n_tokens(vocab);
+    const uint32_t n_pre   = 6;
+    const uint32_t K       = n_rs_seq + 1;
+
+    *ok_out = false;
+    std::vector<float> none;
+
+    // distinct token streams per sequence, drawn from the shared pool
+    std::vector<llama_token> pool = make_tokens(ctx_tok, vocab, 64, (uint32_t) n_vocab);
+    auto tok = [&](uint32_t i, uint32_t s) { return pool[(i + 7u*s) % pool.size()]; };
+
+    llama_context * ctx = make_ctx_seq(params, model, n_rs_seq, n_rs_seq + 1, 32);
+    if (ctx == nullptr) {
+        return none;
+    }
+
+    bool ok = true;
+    // 3 prefills -> cells 0, 1, 2 in sequence-id order
+    for (llama_seq_id s = 0; s < 3; ++s) {
+        common_batch b(ctx);
+        for (uint32_t i = 0; i < n_pre; ++i) {
+            b.add(tok(i, (uint32_t) s), (llama_pos) i, s, i + 1 == n_pre);
+        }
+        ok = ok && llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0;
+    }
+    // verify batch for seq 1: K tokens, so K-1 = n_rs_seq snapshot planes
+    {
+        common_batch b(ctx);
+        for (uint32_t i = 0; i < K; ++i) {
+            b.add(tok(n_pre + i, 1), (llama_pos) (n_pre + i), 1, i + 1 == K);
+        }
+        ok = ok && llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0;
+    }
+    // the move: seq 0 and seq 2 decode one token each
+    ok = ok && decode_pair(ctx, tok(n_pre, 0), tok(n_pre, 2), (llama_pos) n_pre, 0, 2, !moved, false);
+    if (!ok) {
+        llama_free(ctx);
+        return none;
+    }
+    // partial rollback of seq 1 into its verify batch, then replay
+    const uint32_t p0 = n_pre + K - n_rollback;
+    if (!llama_memory_seq_rm(llama_get_memory(ctx), 1, (llama_pos) p0, -1)) {
+        if (verbose) {
+            fprintf(stderr, "  [moved-cell] seq_rm refused (n_rs_seq=%u rollback=%u)\n", n_rs_seq, n_rollback);
+        }
+        llama_free(ctx);
+        return none;
+    }
+    std::vector<float> last;
+    for (uint32_t i = p0; i < n_pre + K; ++i) {
+        if (!decode_one(ctx, tok(i, 1), (llama_pos) i, 1)) {
+            llama_free(ctx);
+            return none;
+        }
+        const float * l = llama_get_logits_ith(ctx, 0);
+        if (l == nullptr) {
+            llama_free(ctx);
+            return none;
+        }
+        last.assign(l, l + n_vocab);
+    }
+    llama_free(ctx);
+    *ok_out = true;
+    return last;
 }
 
 int main(int argc, char ** argv) {
@@ -186,10 +309,13 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "  n_rs_seq=%2u verify shape: %s\n", n_rs_seq, fail_a ? "FAIL" : "PASS");
     }
 
-    // Phase B: deeper-than-K batch still at/below the draft bound.  A batch with
-    // n_tokens > K can be rolled back into when the speculator drafts deeply
-    // (n_rs_batch > K).  n_tokens = n_rs_batch, rollback the full draft range.
-    fprintf(stderr, "=== Phase B: deep draft (n_tokens = n_rs_batch > K) ===\n");
+    // Phase B: a batch deeper than K = n_rs_seq + 1.  The rollback bound is upstream's
+    // (#31368): rs_max = min(n_seq_tokens, n_rs_seq) for a ubatch of n_seq_tokens tokens, and
+    // 0 when the ubatch is longer than n_rs_seq + 1 -- a batch that long only guarantees its final
+    // state, so every rollback into it must be REFUSED.  (The delivery's own ubatch tracker used to
+    // allow a rollback up to n_rs_batch tokens, which is where the deep-draft verify batch lived;
+    // that relaxation went with the tracker -- see wip/upstream-rebase-261108, rung R04, D4.)
+    fprintf(stderr, "=== Phase B: deeper than K (n_tokens > n_rs_seq+1) refuses every rollback ===\n");
     for (uint32_t n_rs_seq = 7; n_rs_seq <= 15; n_rs_seq += 4) {
         const uint32_t K = n_rs_seq + 1;
         for (uint32_t extra = 1; extra <= 16; extra += 5) {
@@ -197,9 +323,11 @@ int main(int argc, char ** argv) {
             const uint32_t n_tokens   = n_rs_batch;
             int fail_b = 0;
             for (uint32_t r = 1; r <= n_rs_seq; ++r) {
-                const double d = run_case(params, model, llama_init->context(), vocab, n_rs_seq, n_rs_batch, 32, n_tokens, r, false);
-                if (d < 0 || d > eps) {
-                    fprintf(stderr, "FAIL B: n_rs_seq=%u n_rs_batch=%u n_tokens=%u rollback=%u max diff=%g\n",
+                bool refused = false;
+                const double d = run_case(params, model, llama_init->context(), vocab, n_rs_seq, n_rs_batch, 32,
+                                          n_tokens, r, false, &refused);
+                if (d >= 0 || !refused) {
+                    fprintf(stderr, "FAIL B: n_rs_seq=%u n_rs_batch=%u n_tokens=%u rollback=%u was NOT refused (d=%g)\n",
                             n_rs_seq, n_rs_batch, n_tokens, r, d);
                     ++fail_b;
                 }
@@ -207,6 +335,38 @@ int main(int argc, char ** argv) {
             n_fail += fail_b;
             fprintf(stderr, "  n_rs_seq=%2u n_rs_batch=%2u n_tokens=%2u: %s\n",
                     n_rs_seq, n_rs_batch, n_tokens, fail_b ? "FAIL" : "PASS");
+        }
+    }
+
+    // Phase C: a find_slot-moved cell keeps its rollback snapshots.  The two arms
+    // differ only in whether seq 1's cell is relocated between its verify batch and
+    // the rollback (one batch of [seq 0, seq 2] vs the same two tokens decoded one
+    // at a time), so their logits must match.
+    {
+        fprintf(stderr, "=== Phase C: snapshots of a moved cell (3 sequences) ===\n");
+        for (uint32_t n_rs_seq = 1; n_rs_seq <= 8; n_rs_seq *= 2) {
+            int fail_c = 0;
+            for (uint32_t r = 1; r <= n_rs_seq; ++r) {
+                bool ok_a = false, ok_b = false;
+                std::vector<float> a = run_moved_cell(params, model, llama_init->context(), vocab, n_rs_seq, r, false, false, &ok_a);
+                std::vector<float> b = run_moved_cell(params, model, llama_init->context(), vocab, n_rs_seq, r, true,  false, &ok_b);
+                if (!ok_a || !ok_b || a.empty() || a.size() != b.size()) {
+                    fprintf(stderr, "FAIL C: n_rs_seq=%u rollback=%u: arm did not run (ok_plain=%d ok_moved=%d)\n",
+                            n_rs_seq, r, (int) ok_a, (int) ok_b);
+                    ++fail_c;
+                    continue;
+                }
+                double d = 0.0;
+                for (size_t t = 0; t < a.size(); ++t) {
+                    d = std::max(d, std::fabs((double) a[t] - (double) b[t]));
+                }
+                if (d > eps) {
+                    fprintf(stderr, "FAIL C: n_rs_seq=%u rollback=%u max diff=%g\n", n_rs_seq, r, d);
+                    ++fail_c;
+                }
+            }
+            n_fail += fail_c;
+            fprintf(stderr, "  n_rs_seq=%2u moved cell: %s\n", n_rs_seq, fail_c ? "FAIL" : "PASS");
         }
     }
 
