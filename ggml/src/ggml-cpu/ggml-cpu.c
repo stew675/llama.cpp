@@ -2066,6 +2066,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_unary(params, tensor);
             } break;
+        case GGML_OP_ALL_GATHER:
+            {
+                // single backend: the result is a plain copy of the input
+                ggml_compute_forward_dup(params, tensor);
+            } break;
         case GGML_OP_GLU:
             {
                 ggml_compute_forward_glu(params, tensor);
@@ -2292,6 +2297,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
+        case GGML_OP_ALL_GATHER:
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
         case GGML_OP_ADD1:

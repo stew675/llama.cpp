@@ -83,7 +83,7 @@ ggml_tensor * llama_model_qwen3::graph::build_backbone(const llama_model & model
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = inpL;
+        res->set_layer_inp(il, inpL);
 
         ggml_tensor * inpSA = inpL;
 
