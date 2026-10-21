@@ -79,8 +79,16 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
-    // Host-resident expert weights (`-ncmoe`/`-cmoe`) are always pinned (`ROCm_Host`).  The pageable
-    // `--host-experts mmap` mode was removed (issue #116).
+    // Host-resident expert weights (`-ncmoe`/`-cmoe`) are always pinned (`ROCm_Host`) unless the caller
+    // selected `--host-experts pool`: in that mode the backend may offer a pageable, file-mapping-backed
+    // master buffer type and every GPU read is served through the bounded pinned host pool (TODO #55).
+    // The pageable `--host-experts mmap` mode was removed (issue #116).
+    llama_host_experts_mode host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
+
+    // The buffer type a host-resident expert weight (`-ncmoe`/`-cmoe`, a `MUL_MAT_ID` table) should use on
+    // `dev`: the pinned host buffer by default, or the backend's pool-backed master buffer in POOL mode
+    // when the load is file-mapped (a non-mmap load has no mapping to place the tensors in).
+    ggml_backend_buffer_type_t host_expert_buft(ggml_backend_dev_t dev) const;
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;

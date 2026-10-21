@@ -83,7 +83,7 @@ llama_model_maion_coder::graph::graph(const llama_model & model, const llm_graph
 
     for (int il = 0; il < n_layer; ++il) {
         // export per-layer input hidden state so speculative drafts (e.g. dflash/eagle3) can read it
-        res->t_layer_inp[il] = inpL;
+        res->set_layer_inp(il, inpL);
 
         ggml_tensor * inpSA = inpL;
         ggml_tensor * cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);

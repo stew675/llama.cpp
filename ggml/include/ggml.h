@@ -608,6 +608,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_ALL_GATHER,
+
         GGML_OP_COUNT,
     };
 
@@ -912,6 +914,17 @@ extern "C" {
 
     // in-place, returns view(a)
     GGML_API struct ggml_tensor * ggml_dup_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // The result holds the WHOLE input on every backend.
+    //
+    // On a single backend this is a plain copy (GGML_OP_DUP).  On a Meta (tensor-parallel) device it is
+    // the collective the split state cannot otherwise express: the input may be split along its axis 0
+    // (each backend holds a slice) and the output is MIRRORED, so every backend holds all of it and ops
+    // that need the whole tensor -- a reduction along the split axis such as TOP_K over a vocab-split
+    // logits row -- can run locally without a cross-device reduction.
+    GGML_API struct ggml_tensor * ggml_all_gather(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
