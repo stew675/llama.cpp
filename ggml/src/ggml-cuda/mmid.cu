@@ -41,7 +41,8 @@ __device__ static void mm_ids_write_tile_spec(
 __launch_bounds__(1024, 1)
 static __global__ void mm_ids_helper_512_10(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
-        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int n_tokens, const int nchannels_y,
+        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, int32_t * __restrict__ expert_bounds,
+        const int n_tokens, const int nchannels_y,
         const uint3 tile_width, const int si1, const int sis1, const bool write_inverse) {
     __shared__ int counts[512];
     __shared__ int cursors[512];
@@ -88,6 +89,12 @@ static __global__ void mm_ids_helper_512_10(
 
     if (tid < 512) {
         mm_ids_write_tile_spec(tile_spec, tid, counts[tid], cursors[tid], tile_width, n_tokens, 10);
+        if (expert_bounds) {
+            expert_bounds[tid] = counts[tid];
+            if (tid == 511) {
+                expert_bounds[512] = counts[511] + cursors[511];
+            }
+        }
     }
 }
 
@@ -117,7 +124,7 @@ template <int n_expert_used_template>
 __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
-        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
+        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, int32_t * __restrict__ expert_bounds,
         const int n_tokens, const int n_expert_used_var, const int nchannels_y, const uint3 tile_width,
         const int si1, const int sis1, const bool write_inverse) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -167,6 +174,12 @@ static __global__ void mm_ids_helper(
 
         if (lane == 0) {
             mm_ids_write_tile_spec(tile_spec, expert, nex_prev, it_compact, tile_width, n_tokens, n_expert_used);
+            if (expert_bounds) {
+                expert_bounds[expert] = nex_prev;
+                if (expert == static_cast<int>(gridDim.x) - 1) {
+                    expert_bounds[gridDim.x] = nex_prev + it_compact;
+                }
+            }
         }
         return;
     }
@@ -228,6 +241,12 @@ static __global__ void mm_ids_helper(
 
     if (threadIdx.x == 0) {
         mm_ids_write_tile_spec(tile_spec, expert, nex_prev, it_compact, tile_width, n_tokens, n_expert_used);
+        if (expert_bounds) {
+            expert_bounds[expert] = nex_prev;
+            if (expert == static_cast<int>(gridDim.x) - 1) {
+                expert_bounds[gridDim.x] = nex_prev + it_compact;
+            }
+        }
     }
 }
 
@@ -235,6 +254,7 @@ template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids,
         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
+        int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int tile_width,
         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
     GGML_ASSERT((int64_t) n_tokens * n_expert_used_var < (int64_t) 1 << 31);
@@ -247,11 +267,12 @@ static void launch_mm_ids_helper(
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, 0, stream>>>
-        (ids, ids_src1, ids_dst, tile_spec, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
+        (ids, ids_src1, ids_dst, tile_spec, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
 }
 
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
+        int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -263,7 +284,7 @@ void ggml_cuda_launch_mm_ids_helper(
     if ((GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) && n_experts == 512 && n_expert_used == 10 && !mmid_512_disabled) {
         const uint3 tile_width_fd = init_fastdiv_values(tile_width);
         mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
-            ids, ids_src1, ids_dst, tile_spec, n_tokens, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
+            ids, ids_src1, ids_dst, tile_spec, expert_bounds, n_tokens, nchannels_y, tile_width_fd, si1, sis1, write_inverse);
         return;
     }
 
@@ -271,35 +292,35 @@ void ggml_cuda_launch_mm_ids_helper(
 
     switch (n_expert_used) {
         case  2:
-            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, tile_spec,
+            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, tile_spec, expert_bounds,
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
         case  4:
-            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, tile_spec,
+            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, tile_spec, expert_bounds,
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
         case  6:
-            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, tile_spec,
+            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, tile_spec, expert_bounds,
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
         case  8:
-            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, tile_spec,
+            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, tile_spec, expert_bounds,
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
         case 10:
-            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, tile_spec,
+            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, tile_spec, expert_bounds,
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
         case 16:
-            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, tile_spec,
+            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, tile_spec, expert_bounds,
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
         case 32:
-            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, tile_spec,
+            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, tile_spec, expert_bounds,
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
         default:
-            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, tile_spec,
+            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, tile_spec, expert_bounds,
                 n_experts, n_tokens, n_expert_used, nchannels_y, tile_width, si1, sis1, write_inverse, stream);
             break;
     }
