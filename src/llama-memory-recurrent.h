@@ -24,6 +24,7 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                     uint32_t   n_rs_batch,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -73,8 +74,26 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // largest per-seq batch that can be rolled back into; batches above this bound cannot be
+    // speculative verify batches, so their rollback snapshots are never read
+    uint32_t n_rs_batch = 0;
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+
+    // Shape of the most recently prepared ubatch, used by the rollback guard in seq_rm():
+    // a rollback may only remove tokens the last batch decoded, and a batch that can be
+    // rolled back into never decodes more than n_rs_batch tokens.  See the guard there.
+    uint32_t  last_ubatch_nseq_tokens = 0;
+    llama_pos last_ubatch_pos_last    = -1;
+    // Per-sequence shape of the last batch each sequence ran in (issue #131): a rollback may only
+    // read the snapshot planes its own sequence's last batch wrote, so the guard below must use the
+    // sequence's own value, not the last batch of whichever sequence was prepared last.  Only the
+    // sequences present in the last ubatch are updated; the others keep the count from the last
+    // batch they ran in.
+    std::vector<uint32_t>  last_ubatch_nseq_tokens_by_seq;
+    std::vector<llama_pos> last_ubatch_pos_last_by_seq;
+    bool      warned_rollback_boundary = false;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
@@ -181,6 +200,10 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // rollback snapshots per cell, and the source cell of cell head + i without its rollback (plane 0)
+    uint32_t get_n_rs_seq() const;
+    int32_t  s_src(int i) const;
 
 private:
     const llama_memory_status status;
