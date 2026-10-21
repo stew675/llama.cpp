@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -26,6 +28,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_batch,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max), ctxs_bufs(no_alloc) {
     const int32_t n_layer = hparams.n_layer();
 
@@ -33,7 +36,8 @@ llama_memory_recurrent::llama_memory_recurrent(
     size = mem_size;
     used = 0;
 
-    this->n_rs_seq = n_rs_seq;
+    this->n_rs_seq   = n_rs_seq;
+    this->n_rs_batch = n_rs_batch > 0 ? n_rs_batch : n_rs_seq + 1;
     rs_idx.assign(n_seq_max, 0);
 
     cells.clear();
@@ -509,6 +513,30 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     used = org_used;
     head = org_head;
 
+    // `LLAMA_RS_ROLLBACK_DEBUG=1`: one line per prepared ubatch, so a log shows the prepare order that
+    // leads into a rollback.  The rollback bound itself is upstream's (see seq_rm(), rs_max); this is the
+    // instrument that showed a large batch can precede a small sequence's rollback in one prepare list.
+    if (!ubatches.empty()) {
+        const bool rs_debug = getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr;
+        if (rs_debug) {
+            for (size_t u = 0; u < ubatches.size(); ++u) {
+                const llama_ubatch & ub = ubatches[u];
+                char ids[128] = {0};
+                size_t o = 0;
+                for (uint32_t s = 0; s < ub.n_seqs_unq && o + 12 < sizeof(ids); ++s) {
+                    o += (size_t) snprintf(ids + o, sizeof(ids) - o, "%s%d", s ? "," : "", (int) ub.seq_id_unq[s]);
+                }
+                const llama_pos p_first = (ub.n_tokens > 0 && ub.pos) ? ub.pos[0] : -1;
+                const llama_pos p_last  = (ub.n_tokens > 0 && ub.pos) ? ub.pos[ub.n_tokens - 1] : -1;
+                const llama_pos p_1     = (ub.n_tokens > 1 && ub.pos) ? ub.pos[1] : -1;
+                LLAMA_LOG_WARN("%s: RSPREP prep=%zu/%zu n_tokens=%u n_seq_tokens=%u n_seqs=%u n_seqs_unq=%u "
+                               "n_pos=%u pos=[%d..%d] pos0=%d pos1=%d seq_ids=[%s]\n",
+                               __func__, u + 1, ubatches.size(), ub.n_tokens, ub.n_seq_tokens, ub.n_seqs,
+                               ub.n_seqs_unq, ub.n_pos, (int) p_first, (int) p_last, (int) p_first, (int) p_1, ids);
+            }
+        }
+    }
+
     return success;
 }
 
@@ -646,6 +674,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            // the rollback bound belongs to the state, not to the cell index: a moved cell keeps the
+            // snapshots of the state that lived there (r195 moves planes 1..n_rs_seq by index), so the
+            // bound has to travel with pos/src/seq_id or a rollback after a move reads the wrong limit
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -1358,6 +1390,14 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
+}
+
+uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
+    return mem->n_rs_seq;
+}
+
+int32_t llama_memory_recurrent_context::s_src(int i) const {
+    return mem->cells[i + mem->head].src0;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
