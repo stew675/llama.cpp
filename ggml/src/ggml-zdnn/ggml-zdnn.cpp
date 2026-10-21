@@ -511,6 +511,13 @@ static ggml_backend_i ggml_backend_zdnn_i = {
     /* .graph_compute          = */ ggml_backend_zdnn_graph_compute,
     /* .event_record           = */ NULL,
     /* .event_wait             = */ NULL,
+    /* .stage_buffer            = */ NULL,
+    /* .stage_upload            = */ NULL,
+    /* .stage_gather            = */ NULL,
+    /* .stage_wait              = */ NULL,
+    /* .stage_d2d               = */ NULL,
+    /* .stage_h2d_gbps          = */ NULL,
+    /* .stage_input             = */ NULL,
     /* .graph_optimize         = */ NULL,
 };
 

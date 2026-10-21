@@ -69,6 +69,7 @@ static std::string llama_format_win_err(DWORD err) {
 struct llama_file::impl {
 #if defined(_WIN32)
     HANDLE fp_win32;
+    std::string fname;
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -84,7 +85,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -95,7 +96,7 @@ struct llama_file::impl {
         seek(0, SEEK_SET);
     }
 
-    impl(FILE * file) : owns_fp(false) {
+    impl(FILE * file) : fname("(file*)"), owns_fp(false) {
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -419,6 +420,8 @@ llama_file::~llama_file() = default;
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
 
+const std::string & llama_file::path() const { return pimpl->fname; }
+
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 
@@ -553,22 +556,24 @@ struct llama_mmap::impl {
         GGML_ASSERT(last % page_size == 0);
         GGML_ASSERT(last > first);
 
-        void * next_page_start = (uint8_t *) addr + first;
-
-        if (munmap(next_page_start, len)) {
-            LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-        }
-
+        // Only munmap the parts that are still mapped: a tensor whose data has been uploaded to a
+        // device is unmapped as soon as it is loaded, so the final offload cleanup must not munmap
+        // the same range twice (munmap of an unmapped range fails) and must keep the fragments
+        // pointing into the mapping intact.
         std::vector<std::pair<size_t, size_t>> new_mapped_fragments;
         for (const auto & frag : mapped_fragments) {
-            if (frag.first < first && frag.second > last) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first < first && frag.second > first) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-            } else if (frag.first < last && frag.second > last) {
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first >= first && frag.second <= last) {
+            const size_t lo = std::max(frag.first, first);
+            const size_t hi = std::min(frag.second, last);
+            if (lo < hi) {
+                if (munmap((char *) addr + lo, hi - lo)) {
+                    LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+                }
+                if (frag.first < first) {
+                    new_mapped_fragments.emplace_back(frag.first, first);
+                }
+                if (frag.second > last) {
+                    new_mapped_fragments.emplace_back(last, frag.second);
+                }
             } else {
                 new_mapped_fragments.push_back(frag);
             }
