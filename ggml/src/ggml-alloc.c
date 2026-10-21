@@ -1061,15 +1061,15 @@ static bool ggml_gallocr_reserve_n_impl(
             if (buffers_grown != NULL) {
                 *buffers_grown = true;
             }
-#ifndef NDEBUG
-            {
-                size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
-                if (cur_size > 0) {
-                    GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
-                        __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
-                }
+            const size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+            if (!no_alloc && cur_size > 0) {
+                // Growing an already-reserved compute buffer is rare (the reserve sizes for the
+                // worst-case graph) and is exactly what runs a nearly-full device out of memory, so
+                // keep the old size in the log at INFO level: this used to be a GGML_LOG_DEBUG inside
+                // `#ifndef NDEBUG`, so in a Release build a failed growth was unattributable.
+                GGML_LOG_INFO("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
+                    __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
             }
-#endif
             if (no_alloc) {
                 // sizing/probe path: leave the existing buffers untouched so that the layout can be
                 // computed (and whether a reallocation would be needed) without disturbing the memory
@@ -1082,11 +1082,20 @@ static bool ggml_gallocr_reserve_n_impl(
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    // the layout was rewritten for this (larger) graph above, but this buffer is now
+                    // gone and the not-yet-processed ones still have their old size; invalidate it so
+                    // that a later ggml_gallocr_alloc_graph() cannot hand a tensor an address that
+                    // does not even fit its buffer (or a NULL vbuffer) -- it must reserve again.
+                    galloc->layout_valid = false;
                     return false;
                 }
             }
         }
     }
+
+    // the layout matches the buffers that are now allocated (for the no_alloc/probe path this is
+    // only true when nothing had to grow, which is what *buffers_grown reports)
+    galloc->layout_valid = !(buffers_grown != NULL && *buffers_grown);
 
     return true;
 }
@@ -1118,6 +1127,31 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
     return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
+}
+
+void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc) {
+    // WIP r42 (TODO #42): release every compute buffer so a later reserve can size the layout DOWN,
+    // not just up (the buffers are otherwise grow-only).  Used to release a wide-prefill layout before
+    // the MoE expert cache arena is sized, so a big -ub and a big arena can coexist.  Buffer ids can
+    // alias one buffer (same pointer), so free each distinct pointer once: NULL the later aliases
+    // first, then free the first.
+    if (galloc == NULL || galloc->buffers == NULL) {
+        return;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] == NULL) {
+            continue;
+        }
+        for (int j = i + 1; j < galloc->n_buffers; j++) {
+            if (galloc->buffers[j] == galloc->buffers[i]) {
+                galloc->buffers[j] = NULL;
+            }
+        }
+        ggml_vbuffer_free(galloc->buffers[i]);
+        galloc->buffers[i] = NULL;
+    }
+    // force the next ggml_gallocr_alloc_graph() to re-reserve from the current graph
+    galloc->layout_valid = false;
 }
 
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
@@ -1160,6 +1194,13 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    if (!galloc->layout_valid) {
+#ifndef NDEBUG
+        GGML_LOG_DEBUG("%s: layout is not valid (a previous reserve failed)\n", __func__);
+#endif
+        return true;
+    }
+
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
@@ -1332,29 +1373,4 @@ size_t ggml_backend_alloc_ctx_tensors_from_buft_size(struct ggml_context * ctx, 
 
 ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors(struct ggml_context * ctx, ggml_backend_t backend) {
     return ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_get_default_buffer_type(backend));
-}
-
-void ggml_gallocr_drop_buffers(ggml_gallocr_t galloc) {
-    // WIP r42 (TODO #42): release every compute buffer so a later reserve can size the layout DOWN,
-    // not just up (the buffers are otherwise grow-only).  Used to release a wide-prefill layout before
-    // the MoE expert cache arena is sized, so a big -ub and a big arena can coexist.  Buffer ids can
-    // alias one buffer (same pointer), so free each distinct pointer once: NULL the later aliases
-    // first, then free the first.
-    if (galloc == NULL || galloc->buffers == NULL) {
-        return;
-    }
-    for (int i = 0; i < galloc->n_buffers; i++) {
-        if (galloc->buffers[i] == NULL) {
-            continue;
-        }
-        for (int j = i + 1; j < galloc->n_buffers; j++) {
-            if (galloc->buffers[j] == galloc->buffers[i]) {
-                galloc->buffers[j] = NULL;
-            }
-        }
-        ggml_vbuffer_free(galloc->buffers[i]);
-        galloc->buffers[i] = NULL;
-    }
-    // force the next ggml_gallocr_alloc_graph() to re-reserve from the current graph
-    galloc->layout_valid = false;
 }

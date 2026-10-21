@@ -1140,6 +1140,13 @@ struct common_memory {
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
+
+    // llama_memory_seq_park() on the target context (synchronized first).  The draft context is left as it is: the draft
+    // does not decide the output, and a draft with a sliding window (DFlash2) has a small cache that reuses its cells
+    bool seq_park(llama_seq_id seq_id, bool park) const;
+
+    // llama_memory_can_park() of the target context
+    bool can_park() const;
 };
 
 //
