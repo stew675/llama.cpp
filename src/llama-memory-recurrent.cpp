@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -25,6 +27,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_batch,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
@@ -32,8 +35,11 @@ llama_memory_recurrent::llama_memory_recurrent(
     size = mem_size;
     used = 0;
 
-    this->n_rs_seq = n_rs_seq;
+    this->n_rs_seq   = n_rs_seq;
+    this->n_rs_batch = n_rs_batch > 0 ? n_rs_batch : n_rs_seq + 1;
     rs_idx.assign(n_seq_max, 0);
+    last_ubatch_nseq_tokens_by_seq.assign(n_seq_max, 0);
+    last_ubatch_pos_last_by_seq.assign(n_seq_max, -1);
 
     cells.clear();
     cells.resize(mem_size);
@@ -192,6 +198,14 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
     if (rm_all) {
         set_rs_idx(seq_id, 0);
+        // issue #131: a fully removed sequence's last-batch shape is no longer meaningful
+        if (seq_id < 0) {
+            std::fill(last_ubatch_nseq_tokens_by_seq.begin(), last_ubatch_nseq_tokens_by_seq.end(), 0);
+            std::fill(last_ubatch_pos_last_by_seq.begin(), last_ubatch_pos_last_by_seq.end(), -1);
+        } else if ((size_t) seq_id < last_ubatch_nseq_tokens_by_seq.size()) {
+            last_ubatch_nseq_tokens_by_seq[seq_id] = 0;
+            last_ubatch_pos_last_by_seq[seq_id]    = -1;
+        }
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -219,7 +233,38 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 const llama_pos rollback = cell.pos - (p0 - 1);
                 // pending rollback is single-use
                 const bool pending = rs_idx[seq_id] != 0;
+                // The sequence's own last batch (issue #131), not the global last batch.
+                const uint32_t  last_seq_nseq = ((size_t) seq_id < last_ubatch_nseq_tokens_by_seq.size())
+                        ? last_ubatch_nseq_tokens_by_seq[seq_id] : 0;
+                const llama_pos last_seq_pos  = ((size_t) seq_id < last_ubatch_pos_last_by_seq.size())
+                        ? last_ubatch_pos_last_by_seq[seq_id] : -1;
                 if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
+                    if (getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr) {
+                        LLAMA_LOG_WARN("%s: RSROLL seq=%d rollback=%d p0=%d last_global_nseq=%u last_global_pos=%d "
+                                       "last_seq_nseq=%u last_seq_pos=%d n_rs_seq=%u n_rs_batch=%u\n",
+                                       __func__, (int) seq_id, (int) rollback, (int) p0,
+                                       last_ubatch_nseq_tokens, (int) last_ubatch_pos_last,
+                                       last_seq_nseq, (int) last_seq_pos, n_rs_seq, n_rs_batch);
+                    }
+                    // Guard: the snapshot path assumes a rollback only removes tokens the last
+                    // batch decoded, i.e. that only batches at or below n_rs_batch -- speculative
+                    // verify batches -- are rolled back into.  A larger batch is not a verify
+                    // batch, and the whole-batch chunked GDN prefill (gated_delta_net.cu,
+                    // GDN_CHUNKED_MIN_TOKENS) writes only the newest snapshot for it, so restoring
+                    // snapshot `rollback` would read an unwritten slot.  Warn once rather than
+                    // corrupt silently.
+                    if (!warned_rollback_boundary && last_seq_nseq > n_rs_batch) {
+                        warned_rollback_boundary = true;
+                        LLAMA_LOG_WARN("%s: rollback crossed a batch boundary: seq %d rollback=%d but "
+                                "the sequence's last batch decoded %u tokens (last pos %d, n_rs_seq=%u, n_rs_batch=%u). The "
+                                "recurrent snapshot path assumes only verify batches (<= n_rs_batch "
+                                "tokens) are rolled back into; if that batch exceeded the chunked-GDN "
+                                "threshold it wrote no usable snapshot and the restored state is "
+                                "wrong -- set GGML_CUDA_GDN_CHUNKED=0 for the sequential kernel. "
+                                "Please report this at github.com/stew675/llama-cpp-rdna-boosts/issues\n",
+                                __func__, (int) seq_id, (int) rollback, last_seq_nseq,
+                                (int) last_seq_pos, n_rs_seq, n_rs_batch);
+                    }
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
                     return true;
@@ -529,6 +574,63 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+
+    // remember the shape of the batch that is about to run, for the rollback guard in seq_rm()
+    if (!ubatches.empty()) {
+        // wip/rs-rollback-boundary instrumentation (`LLAMA_RS_ROLLBACK_DEBUG=1`): one line per prepared
+        // ubatch, so a server log shows the prepare order that leads into a partial rollback.  Used to
+        // answer open question 1 ("whose prepare is the large one, and does the MTP verify batch go
+        // through this path at all?").
+        const bool rs_debug = getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr;
+        if (rs_debug) {
+            for (size_t u = 0; u < ubatches.size(); ++u) {
+                const llama_ubatch & ub = ubatches[u];
+                char ids[128] = {0};
+                size_t o = 0;
+                for (uint32_t s = 0; s < ub.n_seqs_unq && o + 12 < sizeof(ids); ++s) {
+                    o += (size_t) snprintf(ids + o, sizeof(ids) - o, "%s%d", s ? "," : "", (int) ub.seq_id_unq[s]);
+                }
+                const llama_pos p_first = (ub.n_tokens > 0 && ub.pos) ? ub.pos[0] : -1;
+                const llama_pos p_last  = (ub.n_tokens > 0 && ub.pos) ? ub.pos[ub.n_tokens - 1] : -1;
+                const llama_pos p_1     = (ub.n_tokens > 1 && ub.pos) ? ub.pos[1] : -1;
+                LLAMA_LOG_WARN("%s: RSPREP prep=%zu/%zu n_tokens=%u n_seq_tokens=%u n_seqs=%u n_seqs_unq=%u "
+                               "n_pos=%u pos=[%d..%d] pos0=%d pos1=%d seq_ids=[%s]\n",
+                               __func__, u + 1, ubatches.size(), ub.n_tokens, ub.n_seq_tokens, ub.n_seqs,
+                               ub.n_seqs_unq, ub.n_pos, (int) p_first, (int) p_last, (int) p_first, (int) p_1, ids);
+            }
+        }
+        const llama_ubatch & ub = ubatches.back();
+        last_ubatch_nseq_tokens = ub.n_seq_tokens;
+        last_ubatch_pos_last    = ub.n_tokens > 0 ? ub.pos[ub.n_tokens - 1] : -1;
+        // issue #131: per-sequence last-batch shape.  A sequence's entry is its own most recent batch, so
+        // EVERY ubatch in this prepare list is folded in, oldest first -- not just `ubatches.back()`.
+        // Why (wip/rs-rollback-boundary, 2026-10-19): one decode call can carry several ubatches (a
+        // two-slot server under `--kv-unified` builds one per distinct graph shape), e.g. `[seq 1 verify
+        // (4 tokens)] [seq 2 prefill (6136 tokens)]`.  Reading only the back ubatch left seq 1's entry at
+        // whatever it was the last time seq 1 happened to BE the back ubatch -- typically its own prefill
+        // chunk -- so the next rejection rollback for seq 1 was compared against a 4571-token prefill it
+        // had already finished, and the guard warned about a batch boundary that never happened.  That is
+        // the whole of the "large prefill as the last prepared batch before a rollback" ordering: a stale
+        // tracker entry, not a real scheduling order.
+        for (const llama_ubatch & u : ubatches) {
+            for (uint32_t s = 0; s < u.n_seqs_unq; ++s) {
+                const llama_seq_id sid = u.seq_id_unq[s];
+                if (sid >= 0 && (size_t) sid < last_ubatch_nseq_tokens_by_seq.size()) {
+                    last_ubatch_nseq_tokens_by_seq[sid] = 0;
+                    last_ubatch_pos_last_by_seq[sid]    = -1;
+                }
+            }
+            for (uint32_t i = 0; i < u.n_tokens; ++i) {
+                const llama_seq_id sid = u.seq_id[i][0];
+                if (sid >= 0 && (size_t) sid < last_ubatch_nseq_tokens_by_seq.size()) {
+                    last_ubatch_nseq_tokens_by_seq[sid]++;
+                    if (u.pos != nullptr) {
+                        last_ubatch_pos_last_by_seq[sid] = u.pos[i * u.n_pos];
+                    }
+                }
+            }
+        }
+    }
 
     return success;
 }
