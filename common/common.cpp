@@ -1846,6 +1846,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 
+    // issue #238: a multimodal projector feeds 2-D (M-RoPE) positions into this context, and the packed KQ
+    // mask must be part of the compute reserve for those.  Without a projector the context only ever sees
+    // text positions, which are degenerate even on an M-RoPE model, so the much smaller derived layout is
+    // reserved instead (the draft context clears this in common_base_params_to_speculative).
+    cparams.pos_2d            = !params.mmproj.path.empty();
+
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 

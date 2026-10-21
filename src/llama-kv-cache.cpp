@@ -1803,6 +1803,271 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+// V3 derived kq mask ==========================================================================
+//
+// The packed mask costs n_kv x n_tps F16 per GPU *and* the same in host memory, and it is rewritten
+// on every ubatch.  The derived form replaces it with two tiny per-token bounds and one per-cell
+// position, and lets the flash attention kernel compute the same visibility on the fly:
+//
+//   visible(cell j, token i)  <=>  cell_pos[j] >= tok_lo[i] && cell_pos[j] <= tok_hi[i]
+//
+// cell_pos is INT32_MIN for a cell that is empty or belongs to another sequence (which is exactly
+// what "not visible" needs: INT32_MIN fails the >= lo test for every lo >= 0), and otherwise the
+// cell's position.  tok_hi is the causal bound (or INT32_MAX when not causal) and tok_lo is the
+// visibility floor: 0, or the sliding-window floor, or (for LLAMA_NON_CAUSAL_TYPE_SWA_FULL) the
+// minimum batch position of the sequence.
+//
+// The predicate below is the *only* shape the phase-1 host oracle proved value-identical to the
+// packed fill (cell-by-cell, including both SWA cache variants and the non-causal path), so it
+// deliberately stays narrow: one sequence, one stream, prefill-sized batches, no alibi, no 2-D
+// (M-RoPE) positions with a live ext clause.  Everything else keeps the packed mask.  Note that
+// this is not a correctness escape hatch - the host oracle has to be re-run on every model when
+// this predicate is extended.
+// Several sequences in one batch (`--kv-unified` with more than one slot: two slots verifying together, or one slot's
+// prefill next to another's decode) derive their mask with the same predicate: sequence k of the ubatch (seq_idx) has
+// its cells and its tokens' window shifted by k*KQ_DERIVED_SEQ_STRIDE, so a token's [tok_lo, tok_hi] never reaches
+// another sequence's cells and the kernels need no change.  This holds when every cell carries at most one of the
+// batch's sequences (a cell copied to two of them with llama_memory_seq_cp would have to be visible to both ranges)
+// and every position stays below the stride; 2^23 positions per sequence keep all LLAMA_MAX_SEQ ranges inside int32.
+static constexpr llama_pos KQ_DERIVED_SEQ_STRIDE = 1 << 23;
+static_assert((int64_t) KQ_DERIVED_SEQ_STRIDE*LLAMA_MAX_SEQ - 1 <= INT32_MAX, "the shifted ranges must fit in int32");
+
+bool llama_kv_cache::kq_mask_derived_multiseq_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_KQ_MASK_DERIVED_MULTISEQ");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+bool llama_kv_cache::kq_mask_derivable_seqs(const llama_seq_id * seqs, uint32_t n_seqs, llama_pos pos_max) const {
+    if (!kq_mask_derived_multiseq_enabled() || n_stream != 1 || n_seqs > LLAMA_MAX_SEQ || pos_max >= KQ_DERIVED_SEQ_STRIDE) {
+        return false;
+    }
+
+    const auto & cells = v_cells[0];
+
+    llama_kv_cells::seq_set_t in_batch;
+    for (uint32_t k = 0; k < n_seqs; ++k) {
+        if (seqs[k] < 0 || seqs[k] >= LLAMA_MAX_SEQ || cells.seq_pos_max(seqs[k]) >= KQ_DERIVED_SEQ_STRIDE) {
+            return false;
+        }
+        in_batch.set(seqs[k]);
+    }
+
+    // no cell carries two sequences at all (the common case: nothing was copied with llama_memory_seq_cp)
+    if (cells.get_n_multi_seq() == 0) {
+        return true;
+    }
+
+    // O(used cells): about 2 ms at 245760 cells, so only when some cell is shared
+    const uint32_t n_used = cells.used_max_p1();
+    for (uint32_t j = 0; j < n_used; ++j) {
+        if ((cells.seq_get_all(j) & in_batch).count() > 1) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool llama_kv_cache::kq_mask_derivable(const llama_ubatch & ubatch) const {
+    // alibi writes a distance into the mask, that is a value, not a predicate
+    if (hparams.use_alibi) {
+        return false;
+    }
+
+    // a single KV stream too: build_attn_mha derives the attention stream count from the KV tensor
+    // (k->ne[3] == the cache's n_stream), so a multi-stream cache (n_seq_max > 1 without kv_unified)
+    // cannot use the derived form even when the ubatch holds a single sequence.  Without this the
+    // derived tok_lo is built for one stream while Q is reshaped for n_seq_max streams and the
+    // shape assert in ggml_flash_attn_ext_add_kq_derived fires at context creation.
+    if (n_stream != 1) {
+        return false;
+    }
+
+    // prefill-shaped batches only: below this the packed mask is a few hundred KiB, the launcher may
+    // pick the vec/tile kernels and decode has to stay on the packed path
+    if (ubatch.n_tokens <= 8) {
+        return false;
+    }
+
+    // one sequence: every cell is either "own" or "foreign", which is what the INT32_MIN sentinel encodes.
+    // Several sequences (one KV stream, as checked above): each gets its own position range, see
+    // kq_mask_derivable_seqs - every token in one sequence, no cell shared between two of them
+    if (ubatch.n_seqs_unq != 1) {
+        if (ubatch.n_tokens <= KQ_DERIVED_MULTISEQ_MIN_TOKENS) {
+            return false;
+        }
+        llama_pos pos_max = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (ubatch.n_seq_id[i] != 1) {
+                return false;
+            }
+            pos_max = std::max(pos_max, ubatch.pos[i]);
+        }
+        if (!kq_mask_derivable_seqs(ubatch.seq_id_unq, ubatch.n_seqs_unq, pos_max)) {
+            return false;
+        }
+    }
+
+    // M-RoPE: the derived form carries no 2-D ext clause, so it is only usable while the positions
+    // are degenerate (x == y == pos).  qwen35 is IMROPE, so this is hit even for text input.
+    if (ubatch.is_pos_2d()) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            const llama_pos p = ubatch.pos[i];
+
+            if (p != ubatch.pos[i + ubatch.n_tokens    ] ||
+                p != ubatch.pos[i + 2*ubatch.n_tokens]) {
+                return false;
+            }
+        }
+
+        const auto & cells = v_cells.at(seq_to_stream[ubatch.seq_id[0][0]]);
+
+        llama_kv_cells::seq_set_t in_batch;
+        for (uint32_t k = 0; k < ubatch.n_seqs_unq; ++k) {
+            in_batch.set(ubatch.seq_id_unq[k]);
+        }
+
+        for (uint32_t j = 0; j < cells.size(); ++j) {
+            if (cells.is_empty(j) || (cells.seq_get_all(j) & in_batch).none()) {
+                continue;
+            }
+
+            const auto & e = cells.ext_get(j);
+
+            if (e.x != e.y || e.x != cells.pos_get(j)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+void llama_kv_cache::set_input_kq_derived(
+        ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+        const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(cell_pos->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(tok_lo->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(tok_hi->buffer));
+
+    const int64_t n_kv     = cell_pos->ne[0];
+    const int64_t n_stream_l = cell_pos->ne[1];
+    const int64_t n_tps    = tok_lo->ne[0];
+
+    GGML_ASSERT(tok_hi->ne[0] == n_tps && tok_lo->ne[1] == n_stream_l && tok_hi->ne[1] == n_stream_l);
+    GGML_ASSERT(n_tps*n_stream_l == (int64_t) ubatch->n_tokens);
+
+    // the derived form is only created for the shape kq_mask_derivable() accepts; the asserts above
+    // and here keep the fill aligned with the packed fill in set_input_kq_mask
+    GGML_ASSERT(n_stream_l == 1);
+
+    // several sequences: sequence k of the ubatch lives in [k*KQ_DERIVED_SEQ_STRIDE, (k + 1)*KQ_DERIVED_SEQ_STRIDE)
+    // (see kq_mask_derivable_seqs); one sequence keeps offset 0 and the unbounded non-causal window
+    const bool multi_seq = ubatch->n_seqs_unq > 1;
+    auto seq_offset = [&](llama_seq_id s) -> int32_t {
+        return multi_seq ? ubatch->seq_idx[s]*KQ_DERIVED_SEQ_STRIDE : 0;
+    };
+
+    // see llama_non_causal_type - same adjustment as set_input_kq_mask
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
+    // the min position in the batch for each sequence
+    llama_pos seq_pos_min[LLAMA_MAX_SEQ];
+    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+        seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
+    }
+
+    const bool swa = swa_type != LLAMA_SWA_TYPE_NONE;
+    const bool swa_full = !causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL;
+
+    int32_t * cell_pos_data = (int32_t *) cell_pos->data;
+    int32_t * tok_lo_data   = (int32_t *) tok_lo->data;
+    int32_t * tok_hi_data   = (int32_t *) tok_hi->data;
+
+    // per-cell positions (INT32_MIN = never visible)
+    if (!multi_seq) {
+        const llama_seq_id seq_id = ubatch->seq_id[0][0];
+
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const bool own = !cells.is_empty(j) && cells.seq_has(j, seq_id);
+
+            cell_pos_data[j] = own ? (int32_t) cells.pos_get(j) : INT32_MIN;
+        }
+    } else {
+        const auto & cells = v_cells.at(seq_to_stream[ubatch->seq_id[0][0]]);
+
+        llama_kv_cells::seq_set_t in_batch;
+        for (uint32_t k = 0; k < ubatch->n_seqs_unq; ++k) {
+            in_batch.set(ubatch->seq_id_unq[k]);
+        }
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            cell_pos_data[j] = INT32_MIN;
+
+            if (cells.is_empty(j) || (cells.seq_get_all(j) & in_batch).none()) {
+                continue;
+            }
+
+            // kq_mask_derivable_seqs: exactly one of the batch's sequences
+            for (uint32_t k = 0; k < ubatch->n_seqs_unq; ++k) {
+                if (cells.seq_has(j, ubatch->seq_id_unq[k])) {
+                    cell_pos_data[j] = (int32_t) cells.pos_get(j) + seq_offset(ubatch->seq_id_unq[k]);
+                    break;
+                }
+            }
+        }
+    }
+
+    // per-token visibility window
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        const llama_seq_id seq_id = ubatch->seq_id[ii][0];
+
+        const llama_pos p1   = ubatch->pos[ii];
+        const llama_pos hi   = causal_attn ? p1 : (multi_seq ? KQ_DERIVED_SEQ_STRIDE - 1 : INT32_MAX);
+
+              llama_pos lo   = 0;
+
+        if (swa) {
+            switch (swa_type) {
+                case LLAMA_SWA_TYPE_STANDARD:
+                    lo = p1 - (llama_pos) n_swa + 1;
+                    break;
+                case LLAMA_SWA_TYPE_CHUNKED:
+                    lo = (p1/(llama_pos) n_swa)*(llama_pos) n_swa;
+                    break;
+                default:
+                    lo = 0;
+                    break;
+            }
+
+            // LLAMA_NON_CAUSAL_TYPE_SWA_FULL keeps every cell at or after the batch's first position
+            // of this sequence, i.e. a union of two ranges - the floor lowers to seq_pos_min
+            if (swa_full) {
+                lo = std::min(lo, seq_pos_min[seq_id]);
+            }
+        }
+
+        if (lo < 0) {
+            lo = 0;
+        }
+
+        tok_lo_data[ii] = (int32_t) lo + seq_offset(seq_id);
+        tok_hi_data[ii] = (int32_t) hi + seq_offset(seq_id);
+    }
+}
+// ==============================================================================================
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2944,6 +3209,16 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::kq_mask_derivable(const llama_ubatch & ubatch) const {
+    return kv->kq_mask_derivable(ubatch);
+}
+
+void llama_kv_cache_context::set_input_kq_derived(
+        ggml_tensor * cell_pos, ggml_tensor * tok_lo, ggml_tensor * tok_hi,
+        const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->set_input_kq_derived(cell_pos, tok_lo, tok_hi, ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
