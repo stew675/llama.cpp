@@ -45,15 +45,15 @@ void llama_model_jamba::load_arch_tensors(llama_model_loader &) {
     }
 
     for (int i = 0; i < n_layer; ++i) {
-        const int64_t n_head_kv = hparams.n_head_kv(i);
-        const int64_t n_embd_gqa = hparams.n_embd_v_gqa(i);
+        const int64_t n_head_kv_l = hparams.n_head_kv(i);
+        const int64_t n_embd_gqa_l = hparams.n_embd_v_gqa(i);
 
         auto & layer = layers[i];
 
         // norm
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-        if (n_head_kv == 0) {
+        if (n_head_kv_l == 0) {
             // Mamba layer
             layer.ssm_in = create_tensor(tn(LLM_TENSOR_SSM_IN, "weight", i), {n_embd, 2*d_inner}, 0);
 
@@ -79,7 +79,7 @@ void llama_model_jamba::load_arch_tensors(llama_model_loader &) {
         } else {
             // Attention layers
 
-            create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa, n_embd_gqa, 0);
+            create_tensor_qkv(layer, i, n_embd, n_embd, n_embd_gqa_l, n_embd_gqa_l, 0);
             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd, n_embd}, 0);
         }
 

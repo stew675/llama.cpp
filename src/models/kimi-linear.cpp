@@ -299,11 +299,11 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
             ggml_tensor * q_w = layer.wq, * k_w = layer.wk, * v_w = layer.wv;
             if (layer.wqkv) {
                 ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.wqkv, cur);
-                const int64_t d_inner = head_dim * n_head;
+                const int64_t d_inner_qkv = head_dim * n_head;
                 const size_t esize = ggml_element_size(qkv);
-                q_in = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, d_inner, n_tokens, qkv->nb[1], 0));
-                k_in = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, d_inner, n_tokens, qkv->nb[1], d_inner * esize));
-                v_in = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, d_inner, n_tokens, qkv->nb[1], 2 * d_inner * esize));
+                q_in = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, d_inner_qkv, n_tokens, qkv->nb[1], 0));
+                k_in = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, d_inner_qkv, n_tokens, qkv->nb[1], d_inner_qkv * esize));
+                v_in = ggml_cont(ctx0, ggml_view_2d(ctx0, qkv, d_inner_qkv, n_tokens, qkv->nb[1], 2 * d_inner_qkv * esize));
                 q_w = nullptr; k_w = nullptr; v_w = nullptr;
             }
             ggml_tensor * Qcur = causal_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, q_in, q_w, layer.ssm_q_conv, d_conv, head_dim, n_head, n_seq_tokens, n_seqs, n_tokens, kv_head);

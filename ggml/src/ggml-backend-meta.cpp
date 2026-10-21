@@ -491,13 +491,43 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
+// [TAG_META_UNALLOC_ALIAS]
+// A view tensor does not own its buffer: `ggml_gallocr_init_tensor()` gives it the buffer of the root
+// of its view chain (`ggml_backend_view_init()`).  A *nested* view, however, is never visited by the
+// allocator: the graph builder reaches an intermediate alias only through `view_src`, and the
+// allocator initialises views from `view_src`, not from `src[0]`.  `build_attn_mha()` builds exactly
+// such a pair -- `ggml_view_4d(Qcur, ...)` followed by `ggml_permute()` -- and the permuted tensor is a
+// plain alias (GGML_OP_NONE, no node), so its `src[0]` (the intermediate view) stays unallocated for
+// the whole run.  The split-state walk below does look at `src[]` of an alias, so it must resolve such
+// a tensor the way the allocator eventually will: through its view chain to the buffer it inherits.
+// This is reachable whenever an op with host-resident weights runs on the meta backend (a CPU-offloaded
+// dense layer under `-sm tensor`, i.e. a --fit that reduced n_gpu_layers): the split-state walk then
+// inspects the classic attention `ggml_view_4d` -> `ggml_permute` pair and aborted on the unallocated
+// intermediate view (issue #170).
+static ggml_backend_buffer_t ggml_backend_meta_view_chain_buffer(const struct ggml_tensor * tensor) {
+    while (tensor != nullptr && tensor->buffer == nullptr && tensor->view_src != nullptr) {
+        tensor = tensor->view_src;
+    }
+    return tensor != nullptr ? tensor->buffer : nullptr;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         ggml_backend_meta_simple_tensor_container & stc, const struct ggml_tensor * tensor, bool assume_sync) {
+    // [TAG_META_UNALLOC_ALIAS] an alias tensor may not have been given its inherited buffer yet
+    ggml_backend_buffer_t buffer = tensor->buffer;
+    if (buffer == nullptr) {
+        buffer = ggml_backend_meta_view_chain_buffer(tensor);
+        if (buffer == nullptr || !ggml_backend_buffer_is_meta(buffer)) {
+            // nothing in the view chain is in a meta buffer (host, another device's buffer, or not
+            // allocated anywhere): the tensor is not split across the sub-devices
+            return {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
+        }
+    }
     // FIXME Currently this function preserves/erases the information in n_segments and nr in an inconsistent way.
     // Since the operations in question are developed specifically for llama.cpp this currently does not manifest as a bug there.
     // However, in a broader ggml context with arbitrary ggml graphs this can lead to unexpected results.
-    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
 
     auto split_states_equal = [&](const ggml_backend_meta_split_state & a, const ggml_backend_meta_split_state & b) -> bool {
         if (a.axis != b.axis) {
@@ -1075,7 +1105,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
             bool first_src_split_by_axis = true;
-            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
 
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
                 if (tensor->src[i] == nullptr || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
@@ -1181,20 +1211,49 @@ static bool ggml_backend_meta_is_host_view(const struct ggml_tensor * tensor) {
     return ggml_is_view(tensor) && ggml_backend_buffer_is_host(tensor->view_src->buffer);
 }
 
-static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+// [TAG_META_UNALLOC_ALIAS] cold path of the split-state lookup -- a tensor that is *not* in a meta
+// buffer: a host tensor/view, another device's buffer, or (issue #170) a nested alias that the
+// allocator has not given its inherited buffer yet.  Out of line on purpose: the hot dispatcher below
+// runs on every tensor of every graph allocation (~10k lookups per decode step under `-sm tensor`), so
+// it keeps the exact pre-#170 two-test shape and this path -- which only the #170 alias case and host
+// tensors take -- is kept out of it (issue #184).
+#if defined(__GNUC__)
+#  define GGML_META_COLD __attribute__((noinline, cold))
+#else
+#  define GGML_META_COLD
+#endif
+static GGML_META_COLD struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state_cold(
+        const struct ggml_tensor * tensor, bool assume_sync) {
+    // [TAG_META_UNALLOC_ALIAS] a nested alias may not have its inherited buffer yet: resolve the chain
+    // to the buffer the allocator will give it, so it is classified like the tensor it aliases
+    ggml_backend_buffer_t buffer = tensor->buffer;
+    if (buffer == nullptr) {
+        buffer = ggml_backend_meta_view_chain_buffer(tensor);
+        if (buffer == nullptr || !ggml_backend_buffer_is_meta(buffer)) {
+            // nothing in the view chain is in a meta buffer (host, another device's buffer, or not
+            // allocated anywhere): the tensor is not split across the sub-devices
+            return {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1};
+        }
+    }
+
     // [TAG_META_HOST_VIEWS]
     // TODO: technically, this check should not be needed if the backend scheduler correctly prevents assigning
     //       such host-buffer views to the meta backend. figure out how to update the scheduler logic to achieve that
     //       ref: https://github.com/ggml-org/llama.cpp/pull/30217
-    if (!ggml_backend_buffer_is_meta(tensor->buffer)) {
-        GGML_ASSERT(ggml_backend_meta_is_host_view(tensor));
+    GGML_ASSERT(tensor->buffer == nullptr || ggml_backend_meta_is_host_view(tensor));
 
-        // the view is not allocated in the meta buffer, it is not split across the sub-devices
-        return { GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1 };
+    // the view is not allocated in the meta buffer, it is not split across the sub-devices
+    return { GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1 };
+}
+#undef GGML_META_COLD
+
+static inline struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync) {
+    // hot path: a tensor in a meta buffer -- unchanged from the pre-#170 dispatcher
+    if (ggml_backend_buffer_is_meta(tensor->buffer)) {
+        ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
+        return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
     }
-
-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
-    return ggml_backend_meta_get_split_state(buf_ctx->get_simple_tensor_container(tensor), tensor, assume_sync);
+    return ggml_backend_meta_get_split_state_cold(tensor, assume_sync);
 }
 
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -1743,7 +1802,12 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors) {
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
-    constexpr size_t compute_headroom = 16; // Maximum number of views per statically allocated tensor that can be created between evals.
+    // Views of the static tensors that are created between graph evals are stored in the compute
+    // containers. The number of such views is proportional to the number of tensors in the graph
+    // that share the buffer, which for hybrid recurrent models with n_rs_seq snapshotting can be
+    // much larger than 16 per static tensor (e.g. Qwen35: ~2*(n_rs_seq+1) views per recurrent
+    // layer are created for the conv-state snapshot copies). Size the headroom accordingly.
+    constexpr size_t compute_headroom = 128;
     const ggml_init_params params_static = {
         /*.mem_size   =*/ n_tensors * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -1789,7 +1853,22 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
                 t->buffer = meta_buf_ctx->bufs[i].get();
             }
         }
-        GGML_ASSERT(meta_buf_ctx->bufs[i]);
+        // [TAG_META_ALLOC_FAIL] a constituent allocation that fails (a KV cache, or a set of weights,
+        // that does not fit) is reported, not fatal: the caller turns the NULL into a clean
+        // "failed to allocate buffer" error instead of aborting (issue #170).  Tear down what was
+        // already built -- the tensors must not keep pointing at the meta buffer we are about to free,
+        // and freeing it releases the sub-buffers allocated so far.
+        if (meta_buf_ctx->bufs[i] == nullptr) {
+            GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu (%zu of %zu sub-buffers allocated)\n",
+                __func__, ggml_backend_buft_name(simple_buft),
+                ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, simple_buft), i, n_simple_bufts);
+            for (int t = 0; t < n_tensors; t++) {
+                tensors[t]->buffer = nullptr;
+                tensors[t]->data   = nullptr;
+            }
+            ggml_backend_buffer_free(meta_buf);
+            return nullptr;
+        }
         meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }
     return meta_buf;

@@ -1712,21 +1712,30 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         compute_type = GGML_TYPE_F32;
     }
 
-    const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
-    if (env_c != nullptr) {
+    // Parse GGML_CUDA_CUBLAS_COMPUTE_TYPE once: this runs for every cuBLAS matmul, and getenv() is
+    // expensive on Windows (whose getenv returns a pointer that must not be retained across calls).
+    static const ggml_type cublas_compute_type_env = []() -> ggml_type {
+        const char * env_c = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+        if (env_c == nullptr) {
+            return GGML_TYPE_COUNT;
+        }
         std::string env_cpp = env_c;
         for (char & c : env_cpp) {
             c = std::tolower(c);
         }
         if (env_cpp == "f32" || env_cpp == "fp32") {
-            compute_type = GGML_TYPE_F32;
+            return GGML_TYPE_F32;
         } else if (env_cpp == "f16" || env_cpp == "fp16") {
-            compute_type = GGML_TYPE_F16;
+            return GGML_TYPE_F16;
         } else if (env_cpp == "bf16") {
-            compute_type = GGML_TYPE_BF16;
+            return GGML_TYPE_BF16;
         } else if (env_cpp != "auto") {
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
+        return GGML_TYPE_COUNT;
+    }();
+    if (cublas_compute_type_env != GGML_TYPE_COUNT) {
+        compute_type = cublas_compute_type_env;
     }
 
     constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
@@ -2194,11 +2203,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                 assert(expert_to_use >= 0 && expert_to_use < ne02);
+                // an id may repeat within a row: each occurrence is a separate dst column with its own src1 column
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
                 }
             }
         }

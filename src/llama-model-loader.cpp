@@ -97,8 +97,8 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path, 
         throw std::runtime_error(format("invalid split file: %s", path.c_str()));
     }
 
-    for (int idx = 0; idx < n_split; ++idx) {
-        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), idx, n_split);
+    for (int i = 0; i < n_split; ++i) {
+        int ret = llama_split_path(buf.data(), buf.size(), split_prefix.c_str(), i, n_split);
         paths.push_back(std::string(buf.data(), ret));
     }
 
@@ -1123,14 +1123,26 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+void llama_model_loader::lazy_read::add_resident(const std::string & name, const llama_tensor_weight & w) {
+    // Deliberately NOT added to `ranges`: that set gets POSIX_MADV_RANDOM, which disables
+    // readahead on the mapping.  The tensor is not served from the mapping at all -- the
+    // loader reads it straight into its own host buffer -- and the direct read is the fast
+    // path (measured ~3.9 GB/s here vs ~0.2 GB/s for a MADV_RANDOM fault-in + copy).
+    resident.insert(name);
+
+    LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) kept resident (--lazy-mode off, not mapped)\n",
+            __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
-    bool is_lazy = false;
+    bool is_lazy     = false;
+    bool is_resident = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, is_resident };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1351,7 +1363,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     if (flags & TENSOR_READ_LAZY) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        // note: the user path (llama_model_init_from_user) is not handled here yet; the
+        //   files-empty guard arrives with the managed reader (block 11).
+        const llama_tensor_weight * w = no_alloc ? nullptr : &require_weight(tn.str().c_str());
+        is_lazy = lazy.add(tn.str(), cur, w);
+
+        // an explicit `--lazy-mode off` overrides the mmap-backed buffer for these tensors, so
+        // `--load-mode mmap` keeps its fast mapped load for the bulk of the model while the
+        // PLE/engram table is still read into host RAM.  Only the explicit OFF does this: AUTO
+        // below its 4 GiB threshold stays on the normal (mapped) path, so default loads do not
+        // change.
+        if (!is_lazy && w != nullptr && lazy.mode == LLAMA_LAZY_MODE_OFF && use_mmap) {
+            lazy.add_resident(tn.str(), *w);
+            is_resident = true;
+        }
     }
 
     ggml_tensor t_meta = *cur;
@@ -1575,8 +1600,8 @@ bool llama_model_loader::load_all_data(
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
-    // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
-    // NVMe raid configurations might require more / larger buffers.
+    // 4 staging buffers for async uploads, each sized `buffer_size` below (LLAMA_LOAD_STAGE_MB,
+    // default 4 MiB).  NVMe raid configurations might require more / larger buffers.
     constexpr size_t n_buffers = 4;
 
     size_t alignment = 1;
@@ -1584,8 +1609,17 @@ bool llama_model_loader::load_all_data(
         alignment = std::max(file->read_alignment(), alignment);
     }
 
-    // Buffer size: balance between memory usage and I/O efficiency
-    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
+    // Buffer size: balance between memory usage and I/O efficiency.  `n_buffers` slots are
+    // allocated (4), so the staging ring holds n_buffers * buffer_size of pinned host memory.
+    // 4 MiB per slot measured best on gfx1201 + NVMe (Flash-Next, `-sm tensor --load-mode none`:
+    // 1 MiB 15.7 s, 2 MiB 13.7, 4 MiB 13.7, 8 MiB 14.8, 32 MiB 16.3, 64 MiB 16.8); larger slots
+    // scale better on faster disks at 4x the pinned footprint.  LLAMA_LOAD_STAGE_MB overrides.
+    static const size_t stage_size = [] {
+        const char * e = getenv("LLAMA_LOAD_STAGE_MB");
+        const long mb = e != nullptr ? strtol(e, nullptr, 10) : 0;
+        return mb > 0 ? (size_t) mb * 1024 * 1024 : (size_t) 4 * 1024 * 1024;
+    }();
+    const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : stage_size;
 
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
@@ -1634,16 +1668,16 @@ bool llama_model_loader::load_all_data(
 
         // If the backend is supported, create pinned memory buffers and events for synchronisation.
         for (size_t idx = 0; idx < n_buffers; ++idx) {
-            auto * buf = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
+            auto * buf_host = ggml_backend_buft_alloc_buffer(host_buft, buffer_size);
 
-            if (!buf) {
+            if (!buf_host) {
                 LLAMA_LOG_DEBUG("%s: failed to allocate host buffer for async uploads for device %s\n", func,
                     ggml_backend_dev_name(dev));
                 return nullptr;
             }
 
-            host_buffers.emplace_back(buf);
-            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf));
+            host_buffers.emplace_back(buf_host);
+            host_ptrs.emplace_back(ggml_backend_buffer_get_base(buf_host));
 
             auto * event = ggml_backend_event_new(dev);
             if (!event) {
@@ -1705,7 +1739,7 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        const bool from_mapping = use_mmap || lazy.has(cur);
+        const bool from_mapping = (use_mmap || lazy.has(cur)) && !lazy.is_resident(cur);
 
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);

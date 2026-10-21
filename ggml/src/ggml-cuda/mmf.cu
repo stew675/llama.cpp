@@ -69,7 +69,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         nchannels_y      = ids->ne[0];
     }
 
-    if (ids && ncols_dst > 16) {
+    if (ids) {
         const int64_t n_expert_used = ids->ne[0];
         const int64_t n_experts     = ne02;
         const int64_t n_tokens      = ne12;

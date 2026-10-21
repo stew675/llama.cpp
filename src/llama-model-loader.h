@@ -92,12 +92,25 @@ struct llama_model_loader {
         // pass w to also record it, or nullptr to only ask
         bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
 
+        // record a tensor that must be loaded into host RAM even though the load is
+        // file-mapped.  An explicit `--lazy-mode off` overrides the mmap-backed buffer for
+        // the tensors the arch marks TENSOR_READ_LAZY (the PLE / engram tables): without
+        // this the mapping wins and the table is only faulted in on access, so `off` does
+        // not deliver the residency it promises.  The bulk of the model stays mapped, so
+        // the load keeps mmap's speed.
+        void add_resident(const std::string & name, const llama_tensor_weight & w);
+
         bool any() const {
             return !ranges.empty();
         }
 
         bool has(const ggml_tensor * t) const {
             return tensors.count(ggml_get_name(t)) > 0;
+        }
+
+        // true for a tensor loaded into its own host buffer instead of the model mapping
+        bool is_resident(const ggml_tensor * t) const {
+            return resident.count(ggml_get_name(t)) > 0;
         }
 
         const llama_mmap::ranges & for_file(uint32_t idx) const {
@@ -111,8 +124,11 @@ struct llama_model_loader {
         static ggml_backend_buffer_type_t buft();
 
     private:
+        // ranges excluded from the load-time prefetch (lazy and managed-reader tables)
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
+        // tensors read into a private host buffer (not served from the mapping)
+        std::set<std::string>                  resident;
     } lazy;
 
     llama_files files;
@@ -145,16 +161,20 @@ struct llama_model_loader {
         }
     };
 
-    // lazy tensors need dedicated context
+    // lazy and resident tensors need dedicated contexts
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        bool resident;
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
+            }
+            if (lhs.resident != rhs.resident) {
+                return lhs.resident < rhs.resident;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }

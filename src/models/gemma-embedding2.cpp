@@ -42,17 +42,17 @@ void llama_model_gemma_embedding2::load_arch_tensors(llama_model_loader &) {
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
-        const int64_t n_head      = hparams.n_head(i);
+        const int64_t n_head_l      = hparams.n_head(i);
         const int64_t n_embd_head = hparams.n_embd_head_k(i);
         const int64_t n_embd_k    = hparams.n_embd_k_gqa(i);
         const int64_t n_embd_v    = hparams.n_embd_v_gqa(i);
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head * n_head}, 0);
+        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head * n_head_l}, 0);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, n_embd_k}, 0);
         layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, n_embd_v}, 0);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, 0);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head_l, n_embd}, 0);
 
         layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
         layer.attn_k_norm    = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM,    "weight", i), {n_embd_head}, 0);
