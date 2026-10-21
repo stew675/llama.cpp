@@ -2416,6 +2416,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
+        {"--wmma-verify"}, "off|auto|N",
+        "run the dense matvecs of a speculative verify batch (N..8 columns) on the RDNA4 WMMA iu8 kernel\n"
+        "family: each weight is dequantized once for all the verified columns, so the cost is nearly flat in\n"
+        "the column count where the K-split kernel becomes instruction bound\n"
+        "default: off (the delivery's own kernels); `auto` = the measured per-type floor (5 columns for Q4_K\n"
+        "and Q5_K, 8 for Q6_K, IQ4_XS and Q8_0), N = that floor for every type (see ENVIRONMENT.md)\n"
+        "WARNING: opt-in and width-split by design -- 1 column always keeps the K-split kernel, so while this\n"
+        "is on the byte-identical greedy/verify contract does NOT hold (see GREEDY-PURITY.md)",
+        [](common_params & params, const std::string & value) {
+            if (common_arg_utils::is_falsey(value) || value == "off") {
+                params.wmma_verify = 0;
+                return;
+            }
+            if (common_arg_utils::is_autoy(value)) {
+                params.wmma_verify = -1;   // auto: the ggml side resolves it PER TYPE (r312)
+                return;
+            }
+            const int n = std::atoi(value.c_str());
+            if (n <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            // clamped to the band the kernel family serves in ggml (1 column is decode and stays on the
+            // K-split kernel; > MMVQ_MAX_BATCH_SIZE = 8 is MMQ, so a larger floor simply never fires)
+            params.wmma_verify = n;
+        }
+    ));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"

@@ -1781,8 +1781,37 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
     llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
 }
 
+// block 07 (r290): `--wmma-verify off|auto|N` -- the verify band's WMMA iu8 floor (0 = off, the default;
+// -1 = `auto`, which the backend resolves PER TYPE from the measured crossover).  Applied to every device
+// through the backend registry's own proc-address table: this is a kernel-family selector, so it
+// must be in place before the model's launchers are chosen, and the registry lookup is how `common` reaches
+// the RDNA4 CUDA backend without a CUDA symbol and without a new cross-backend interface member.  A backend
+// that does not answer (anything but the RDNA4 CUDA backend) is left alone; with the floor at its default of
+// 0 nothing is called at all, so the delivery's kernels -- and its byte-identical greedy contract, which this
+// option breaks by design while it is on -- are untouched.
+//
+// Why here: `common_model_params_to_llama()` is the one funnel every tool (llama-cli, llama-server,
+// llama-bench, llama-batched-bench, llama-perplexity, ...) passes through AFTER `llama_backend_init()` has
+// registered the backends and BEFORE any model or context exists.  `common_init_from_params()` would not do:
+// the bench tools load the model themselves and never call it.
+static void common_apply_backend_options(const common_params & params) {
+    if (params.wmma_verify == 0) {
+        return;
+    }
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        auto * set_floor = (void (*)(int)) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_cuda_mmvq_wmma_set_min_cols");
+        if (set_floor != nullptr) {
+            set_floor(params.wmma_verify);
+        }
+    }
+}
+
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
+
+    common_apply_backend_options(params);
 
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
