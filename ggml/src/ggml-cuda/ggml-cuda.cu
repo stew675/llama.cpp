@@ -4514,12 +4514,12 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
+    // The cache type must be one the rope dispatch has an arm for.  Since r328 that is every pair of
+    // {F32, F16, BF16}: upstream #32387 supplied BF16->{BF16,F16} and the delivery's block 04 supplies
+    // F32->BF16 and F16->BF16.  Upstream also added a guard refusing every non-BF16 rope into a BF16 cache
+    // (its matrix had no such arm); with the arms present the guard is what would disable the fusion, so
+    // the pair test is the outer list below and nothing more.
     if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_BF16) {
-        return false;
-    }
-
-    // BF16 rope fuses into an F16 or BF16 cache, other ropes not into a BF16 cache
-    if (rope->type == GGML_TYPE_BF16 ? set_rows->type == GGML_TYPE_F32 : set_rows->type == GGML_TYPE_BF16) {
         return false;
     }
 
