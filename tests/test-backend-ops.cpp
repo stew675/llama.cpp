@@ -10667,6 +10667,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
 
+    // issue #277: shapes whose dispatch is a multiple of 256 blocks and CAN be padded by one more block row
+    // (one row is grid.x = r blocks, so r must not itself be a multiple of 256).  Each of the four GET_ROWS
+    // launches gets one: the vec float path, the plain float path, the sub-block dequantizing path and the
+    // super-block (k-quant) path.  `ggml_cuda_grid_stall_pad`'s y pad only re-partitions a grid-stride row
+    // loop, so these cases are also the oracle for "the extra block row writes nothing".
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32,     512, 8, 1, 256, 1, false)); // vec: (1,1,256)
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32,    1002, 8, 1,  64, 1, false)); // plain: (1,4,64)
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q4_0,   2048, 8, 1,  64, 1, false)); // q: (1,4,64)
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, 1024, 8, 1,  64, 1, false)); // kq: (1,4,64)
+
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
     for (ggml_type type : all_types) {
@@ -12058,9 +12068,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
 
-    // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
-#if 0
-    // repeated expert ids within a row
+    // [TAG_MUL_MAT_ID_DUPLICATE_ID] repeated expert ids within a row.  Upstream keeps these `#if 0` "until CUDA
+    // backend support is added"; the delivery has had that support since block 00 (every occurrence of a repeated
+    // id gets its own compact row), so they are enabled here as the standing oracle for the duplicate path
+    // (TODO #304: it was shipping untested and `f16` at ncols_dst = 9 was wrong).
+    {
     for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
         for (int n : {9, 16, 33, 64}) {
             test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
@@ -12071,7 +12083,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 1025, 10, false, 64, 33, 256, 0, true));
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
-#endif
+    }
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
@@ -12131,7 +12143,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3, false, true));
 
     for (int bs : {1, 4, 512}) {
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K}) {
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q3_K, GGML_TYPE_IQ2_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 // test with mul after (ffn_moe_weighted)
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));

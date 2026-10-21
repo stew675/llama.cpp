@@ -165,7 +165,12 @@ static void get_rows_cuda_q(
         cudaStream_t stream) {
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
     const int block_num_y = (ne00 + 2*CUDA_GET_ROWS_BLOCK_SIZE - 1) / (2*CUDA_GET_ROWS_BLOCK_SIZE);
-    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+    dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+    // issue #277: the y dimension is a grid-stride over the row, so an extra block row writes nothing (its threads
+    // start at or past ne00).  One row is grid.x blocks, hence the pad_blocks argument.
+    if (block_nums.y < UINT16_MAX && ggml_cuda_grid_stall_pad(block_nums, block_dims, "get_rows_q", block_nums.x)) {
+        block_nums.y++;
+    }
 
     // strides in elements
     // const size_t s0 = nb0 / sizeof(dst_t);
@@ -204,7 +209,12 @@ static void get_rows_cuda_kq(
     const int64_t nsb = ne00/QK_K;
 
     const dim3 block_dims(block_dim, 1, 1);
-    const dim3 block_nums(ne10, MIN(nsb, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+    dim3 block_nums(ne10, MIN(nsb, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+    // issue #277: the y dimension strides over the super-blocks (`ib += gridDim.y`), so one extra block row only
+    // re-partitions the same super-blocks between blocks -- every one of them is still computed exactly once.
+    if (block_nums.y < UINT16_MAX && ggml_cuda_grid_stall_pad(block_nums, block_dims, "get_rows_kq", block_nums.x)) {
+        block_nums.y++;
+    }
 
     // strides in elements
     // const size_t s0 = nb0 / sizeof(dst_t);
@@ -267,7 +277,14 @@ static void get_rows_cuda_float(
 
         if (can_vec) {
             const int block_num_y = vec_block_num_y;
-            const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+            dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+            // issue #277: the vec copy is a grid-stride over y (`i += gridDim.y*blockDim.x`, bounded by ne00v), so an
+            // extra block row copies nothing and the output stays bit-identical.  The grid's x is the token count, so
+            // one extra row adds grid.x blocks -- the helper refuses the pad when that keeps a multiple of 256.
+            if (block_nums.y < UINT16_MAX &&
+                ggml_cuda_grid_stall_pad(block_nums, block_dims, "get_rows_float_vec", block_nums.x)) {
+                block_nums.y++;
+            }
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
             ggml_cuda_kernel_launch(k_get_rows_float_vec<dst_t>, launch_params,
                 (const dst_t *) src0_d, src1_d, dst_d,
@@ -280,7 +297,11 @@ static void get_rows_cuda_float(
     }
 
     const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
-    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+    dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+    // issue #277: same grid-stride row loop as the vec kernel (`i00 += gridDim.y*blockDim.x`).
+    if (block_nums.y < UINT16_MAX && ggml_cuda_grid_stall_pad(block_nums, block_dims, "get_rows_float", block_nums.x)) {
+        block_nums.y++;
+    }
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
     ggml_cuda_kernel_launch(k_get_rows_float<src0_t, dst_t>, launch_params,
@@ -393,8 +414,16 @@ static void ggml_cuda_get_rows_switch_src0_type(
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            // iq4_nl is a 32-value sub-block type: a row that is a whole number of QK_K
+            // super-blocks takes the super-block kernel, any other width (e.g. the qwen4exp
+            // indexer key row, 128) takes the per-block dequantize_q4_nl path.
+            if (ne00 % QK_K == 0) {
+                get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            } else {
+                get_rows_cuda_q<QK4_NL, QR4_NL, dequantize_q4_nl>(src0_d, src1_d, dst_d,
+                    ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            }
             break;
         case GGML_TYPE_IQ4_XS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,

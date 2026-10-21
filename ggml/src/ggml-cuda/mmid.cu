@@ -14,6 +14,12 @@
 __device__ static void mm_ids_write_tile_spec(
         ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int expert, const int nex_prev, const int it_compact,
         const uint3 tile_width, const int n_tokens, const int n_expert_used) {
+    if (tile_spec == nullptr) {
+        // callers that only want the per-expert bounds (the MMB routed path, the delivery's pair fusion)
+        // pass no tile_spec
+        return;
+    }
+
     int col_low  = nex_prev;
     int col_high = nex_prev + min(int(tile_width.z), it_compact);
 
