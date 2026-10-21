@@ -732,6 +732,9 @@ struct llama_device {
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
+    // Once per model: the fitting pass loads its own model with logging silenced, so a process-wide flag would
+    // hide the `-of tp-ffn-even` line.  Per-model state lives here rather than in a file-static for that reason.
+    mutable bool               ffn_even_logged = false;
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
@@ -995,6 +998,9 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // wip/moe-cache-autosize: host-resident MoE expert bytes per device (from the loader)
+    std::map<ggml_backend_dev_t, size_t> moe_host_expert_bytes;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 
@@ -1030,6 +1036,14 @@ struct llama_model {
 
     // total number of parameters in the model
     uint64_t n_elements() const;
+    size_t max_host_weight_tensor_bytes() const;
+
+    // TODO #135: a load-time guard against a degenerate `-sm tensor` device count.  It refuses (throws) a
+    // split whose granularity-rounded per-device share of a HOST-RESIDENT expert table leaves a device with
+    // zero columns of that table, which measures a silent ~5x decode cliff.  Geometry-derived (the loader's
+    // own share rule + the quant's block size), so it carries no model list.  Called once at the end of
+    // `load_tensors`; `GGML_TENSOR_SPLIT_ALLOW_DEGENERATE=1` overrides.
+    void check_host_expert_split_shares() const;
 
     void print_info() const;
 
