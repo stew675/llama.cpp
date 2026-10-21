@@ -917,6 +917,12 @@ struct llm_graph_params {
             return false;
         }
 
+        // F1 (issue #240): an armed layer-input store changes the graph (a SET_ROWS per extracted layer instead
+        // of an output), so a graph built without them must not be reused once they exist
+        if (cparams.lf_layer_inp_dev_store.empty() != other.cparams.lf_layer_inp_dev_store.empty()) {
+            return false;
+        }
+
         if (!samplers_equal(samplers, other.samplers)) {
             return false;
         }
@@ -973,6 +979,15 @@ public:
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
+    // F1 (issue #240): the row-index input the in-graph layer-input stores write through, when they are armed
+    ggml_tensor * get_lf_rows() const { return t_lf_rows; }
+
+    // Record the input of layer `il`.  This replaces the direct `t_layer_inp[il] = t` assignment in the arch
+    // graphs so the layer-input extraction window can be closed: with F1's device stores armed, the previous
+    // layer's input is copied into its store as soon as the layer that reads it is complete, instead of being
+    // kept alive (as a graph output) to the end of the graph.
+    void set_layer_inp(int il, ggml_tensor * t);
+
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
@@ -1011,6 +1026,7 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+    ggml_tensor * t_lf_rows = nullptr; // I32 [n_tokens]: this batch's rows in the layer-input stores
 
     std::vector<ggml_tensor *> t_sampled;
     std::vector<ggml_tensor *> t_sampled_probs;
@@ -1032,6 +1048,17 @@ public:
     int64_t max_nodes;
 
 private:
+    // F1 (issue #240): write t_layer_inp[il] into its persistent device store from inside the graph, and expand
+    // the layer's own nodes first so the copy lands right after them in the graph order (the allocator frees a
+    // tensor after its last consumer, so that position is what lets it reuse the layer input's buffer)
+    void lf_emit_layer_inp_store(int il);
+
+    // the layer whose input is recorded but whose copy is not emitted yet (-1 = none)
+    int  lf_pending_il = -1;
+
+    // true when the target context armed its persistent layer-input stores (cparams.lf_layer_inp_dev_store)
+    bool lf_store_armed = false;
+
     // keep a copy of the previous graph parameters
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
     // note: these are updated after constructing the new graph

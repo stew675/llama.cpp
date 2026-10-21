@@ -3,6 +3,50 @@
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-context.h"
+
+// Llama-Frankenstein F1: during a device-feature injection (cparams.lf_dev_inject) the ubatch token ids are rows of
+// the target's last batch; the target keeps its extracted layer inputs on the device (ctx_other), so the concatenated
+// target features are gathered there instead of being uploaded from the host.
+class llm_graph_input_lf_rows : public llm_graph_input_i {
+public:
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(ubatch->token != nullptr && (int64_t) ubatch->n_tokens == rows->ne[0]);
+        ggml_backend_tensor_set(rows, ubatch->token, 0, ubatch->n_tokens*ggml_element_size(rows));
+    }
+    bool can_reuse(const llm_graph_params & params) override {
+        return params.cparams.lf_dev_inject && params.ubatch.token != nullptr && rows->ne[0] == (int64_t) params.ubatch.n_tokens;
+    }
+    ggml_tensor * rows = nullptr; // I32 [n_tokens]
+};
+
+// target features [n_embd_inp, n_tokens]: the host-provided embd input, or the device gather under F1
+static ggml_tensor * lf_dflash_target_features(llm_graph_context & g, const llama_model & model, int64_t n_embd_inp, int64_t n_tokens) {
+    if (!g.cparams.lf_dev_inject) {
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+        inp->embd = ggml_new_tensor_2d(g.ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+        ggml_set_input(inp->embd);
+        ggml_tensor * t = inp->embd;
+        g.res->add_input(std::move(inp));
+        return t;
+    }
+    GGML_ASSERT(g.cparams.ctx_other != nullptr && "F1 device injection needs the target context (ctx_other)");
+    auto inp = std::make_unique<llm_graph_input_lf_rows>();
+    inp->rows = ggml_new_tensor_1d(g.ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_input(inp->rows);
+    ggml_tensor * rows = inp->rows;
+    g.res->add_input(std::move(inp));
+
+    ggml_tensor * cur = nullptr;
+    for (const int32_t lid : model.target_layer_ids) {
+        ggml_tensor * src = g.cparams.ctx_other->get_lf_layer_inp_dev((uint32_t) lid);
+        GGML_ASSERT(src != nullptr && "F1: target layer input not kept on the device");
+        ggml_tensor * f = ggml_get_rows(g.ctx0, src, rows); // [n_embd, n_tokens]
+        cur = cur == nullptr ? f : ggml_concat(g.ctx0, cur, f, 0);
+    }
+    GGML_ASSERT(cur != nullptr && cur->ne[0] == n_embd_inp);
+    return cur;
+}
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -578,8 +622,25 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+    // Under `-sm tensor` the draft logits are vocabulary-split: the lm_head is the target's, whose
+    // placement is the target's policy (`output.weight` is split on its vocabulary axis), so a device
+    // holds only its share of the vocabulary.  The selector reduces along exactly that axis -- the
+    // `ggml_top_k` below picks the candidates and the `ggml_get_rows` reads their values back -- which a
+    // per-device op cannot do (the Meta backend aborts on a per-row op over a row that straddles a
+    // split).  All-gather the logits first: every device then holds the whole row, the selector runs
+    // locally and identically on all of them, and the candidate ids keep their global vocabulary
+    // positions.  Single-device/`-sm layer` graphs keep the plain path (the op is not built at all).
+    ggml_tensor * logits = res->t_logits;
+    // `devices` is the meta wrapper itself (one entry, `is_meta`) for a >= 2-device tensor split, so this
+    // is exactly "the logits are vocab-split": a single device has no split, and a tensor split over one
+    // device skips the wrapper (`llama_prepare_model_devices`).
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.devices.size() == 1 && model.devices[0].is_meta) {
+        logits = ggml_all_gather(ctx0, logits);
+        g.cb(logits, "dflash2_logits_gathered", -1);
+    }
+
+    ggml_tensor * candidates  = ggml_top_k(ctx0, logits, top_k);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_tokens);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
@@ -850,17 +911,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     };
 
     // KV cache injection
-    ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+    if (ubatch.embd || cparams.lf_dev_inject) {
+        ggml_tensor * inp_target = lf_dflash_target_features(*this, model, n_embd_inp, n_tokens);
         cb(inp_target, "inp_target_features", -1);
-
-        res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
@@ -1130,17 +1183,9 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     llm_graph_input_attn_k_iswa * inp_attn = build_attn_inp_k_iswa();
 
     // KV cache injection: fused target features from the encoder
-    ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
-
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
-
-        ggml_tensor * inp_target = inp->embd;
+    if (ubatch.embd || cparams.lf_dev_inject) {
+        ggml_tensor * inp_target = lf_dflash_target_features(*this, model, n_embd_inp, n_tokens);
         cb(inp_target, "inp_target_features", -1);
-
-        res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);

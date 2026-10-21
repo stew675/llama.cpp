@@ -170,6 +170,14 @@ struct llama_context {
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+
+    // batched state reads: a pinned host staging area of at least `size` bytes (nullptr if unavailable), and the
+    // backend that owns a state tensor's buffer (nullptr if none).  Fold (r96, PR #189).
+    uint8_t *      state_stage(size_t size);
+    ggml_backend_t state_backend(const ggml_tensor * t);
+    // events for the pipelined batched state copies (llama_state_pipe_groups): one per group, created on first use
+    static constexpr size_t n_state_pipe_events = 8;
+    ggml_backend_event_t state_pipe_event(ggml_backend_t backend, size_t group);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     bool state_load_file(
@@ -248,7 +256,15 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    // host_also: this ubatch carries embeddings, so a draft consuming it reads the host rows instead of the
+    //   device store (the store is still written; the host rows are filled as well, and reserved if needed)
+    bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens, bool host_also);
+
+    // pinned host rows the *host* layer-input extraction reads (allocated on first use, issue #240)
+    bool layer_inp_host_reserve();
+
+    // the pinned host buffer type the output buffer (and the host layer-input rows) are allocated from
+    ggml_backend_buffer_type_t output_host_buft() const;
 
 public:
     // Llama-Frankenstein F1: device-resident layer inputs (target) and device feature injection (draft)
@@ -256,6 +272,10 @@ public:
     ggml_tensor * get_lf_layer_inp_dev(uint32_t lid) const;
     const int32_t * get_lf_dev_rows(int32_t * n_rows) const;
     void          set_lf_dev_inject(bool enable);
+    // target context: create the persistent device layer-input stores before the first graph that writes them
+    bool            lf_layer_inp_dev_arm();
+    // target context: wait until the draft is done reading the stores before this ubatch overwrites its rows
+    void            lf_wait_features_consumed();
     // draft context: mark the target's device layer inputs as read (GPU-side event, no host wait)
     void          lf_signal_features_consumed();
     // target context: event the next extraction must wait for before overwriting the buffers
@@ -268,9 +288,16 @@ private:
     ggml_backend_buffer_ptr    lf_layer_buf;
     ggml_backend_event_t       lf_consumed_ev      = nullptr;
     bool                       lf_consumed_pending = false;
+    bool                       lf_layer_dev_armed  = false; // arm() ran (either it created the stores or it fell back)
+    // the in-graph row-index fill (issue #240): this ubatch's store rows, reused across ubatches
+    std::vector<int32_t>       lf_row_idx;
     // F1 with several sequences: the ubatches may reorder the batch (split_equal), the device buffers keep the ubatch
     // order (output_reorder() only fixes the host buffers): target batch row -> buffer row; empty when the order held
     std::vector<int32_t>       lf_dev_rows;
+
+    // pinned host rows of the host layer-input extraction path (issue #240: allocated on first use only, so F1 does
+    // not reserve n_embd x n_batch floats of pinned memory per extracted layer that it never reads)
+    ggml_backend_buffer_ptr    buf_layer_inp;
 
     //
     // graph
@@ -292,11 +319,20 @@ public:
     //   support probes must NOT set it - they verify the derived form is present in the graph.
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
-        bool packed_kq_mask = false);
+        bool packed_kq_mask = false, bool reserve_injection = false);
 
     // true when a batch the derived kq mask cannot serve is reachable at runtime, i.e. when the
     // compute reserve must be sized for the packed mask - see the definition for the full reasoning
     bool kq_mask_packed_reachable() const;
+
+    // TODO #96: the width of the decode/verify layout the slab must keep always-resident.
+    // `cparams.n_rs_batch` is the CORRECTNESS bound (the widest per-seq batch a partial rollback can land
+    // in) and is set from the UNCLAMPED speculator config, because whether the draft may stay wide is
+    // decided after the context exists.  The layout this run will actually issue is capped by the MoE
+    // expert cache's verify band when the arena is live (`common` clamps a draftless speculator to
+    // `band - 1`), and reserving the unclamped width would take ~5 GiB of arena for a verify the band
+    // forbids.  Returns `cparams.n_rs_batch` when there is no band (no arena: nothing to reserve for).
+    uint32_t verify_batch_width() const;
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -375,6 +411,13 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+
+        // per sequence, the node count of the backend sampler chain the compute buffers were last reserved with
+        // (llama_sampler_backend_n_nodes()).  A reserve is the only thing that recomputes graph_max_nodes(), which
+        // sizes the graph's node capacity (llm_graph_result::max_nodes -> ggml_new_graph_custom), the scheduler's
+        // node/leaf arrays and the compute-metadata arena, so a sequence that later gets a WIDER chain than this
+        // was reserved with has to reserve again.  A chain of the same or a smaller size cannot grow any of them.
+        std::map<llama_seq_id, uint32_t> reserved;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
@@ -470,6 +513,11 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // pinned staging for the batched state reads of llama_io_write_host (see state_stage).  Fold (r96, PR #189):
+    // retained across saves and one buffer per context (state saves on one context must not run concurrently).
+    ggml_backend_buffer_ptr buf_state_stage;
+    std::vector<std::pair<ggml_backend_t, std::array<ggml_backend_event_t, n_state_pipe_events>>> state_pipe_evs;
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
@@ -507,6 +555,10 @@ private:
     // without need (see the drop decision in `process_ubatch`).  Only written when a backend reports a slab
     // (`ggml_backend_dev_slab_work_size` != 0), so it stays empty on non-slab backends.
     std::map<ggml_backend_dev_t, size_t> slab_narrow_boundary;
+    // wip/slab-ring-region: the narrow (decode/verify) work floor was pinned before the first wide view
+    // was placed, so the slab could carve the H2D staging ring for the first prefill (not only after the
+    // first prefill -> decode transition).
+    bool slab_narrow_pinned = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;

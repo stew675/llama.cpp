@@ -293,7 +293,7 @@ llama_model_granite_switch::graph::graph(
     ggml_tensor * cur;
 
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = inpL;
+        res->set_layer_inp(il, inpL);
 
         ggml_tensor * inpSA = inpL;
 

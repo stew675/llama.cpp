@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -141,6 +142,19 @@ public:
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
+
+    // parking (unified cache only): the cells of an idle sequence move to the top of the cache, stacked below the
+    // sequences parked before it, and new cells are only taken below the lowest parked cell.  get_n_kv() stops below it
+    // too, so a sequence in the low cells attends over the same range, at the same cell indices, as in a cache that
+    // holds nothing else -- its results do not depend on what is parked.  seq_unpark() moves a parked sequence back
+    // to the lowest free run.  Both return false, changing nothing, when the move is not possible (not unified, the
+    // cells are shared or not contiguous, no room).  The K/V data are copied on the device.
+    bool seq_park  (llama_seq_id seq_id);
+    bool seq_unpark(llama_seq_id seq_id);
+    bool seq_parked(llama_seq_id seq_id) const;
+
+    // whether this cache supports parking at all: one stream, cells it does not share, V not transposed, no sliding window
+    bool can_park() const;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
@@ -339,6 +353,22 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    // parked sequences (stream 0 of a unified cache): [first cell, last cell + 1), see seq_park()
+    std::map<llama_seq_id, std::pair<uint32_t, uint32_t>> parked;
+
+    // the lowest parked cell, or the cache size
+    uint32_t park_bound() const;
+
+    // drops parked entries whose sequence is gone and narrows the others to the cells they still hold
+    void park_refresh();
+
+    // moves cells [src, src + n) to [dst, dst + n) on stream 0, K/V data and cell state, overlap-safe
+    void park_move(uint32_t src, uint32_t dst, uint32_t n);
+
+    // moves the parked sequences up so that they sit together at the top of the cache, in their order: a sequence that
+    // leaves the stack would otherwise leave a hole that the next one to come down cannot use
+    void park_compact();
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;

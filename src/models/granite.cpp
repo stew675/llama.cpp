@@ -159,7 +159,7 @@ llama_model_granite::graph::graph(
             cb(inpL, "deepstack_in", il);
         }
 
-        res->t_layer_inp[il] = inpL;
+        res->set_layer_inp(il, inpL);
 
         ggml_tensor * inpSA = inpL;
 

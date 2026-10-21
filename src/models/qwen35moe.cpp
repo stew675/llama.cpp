@@ -176,7 +176,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
-        res->t_layer_inp[il] = inpL;
+        res->set_layer_inp(il, inpL);
 
         ggml_tensor * inpSA = inpL;
 

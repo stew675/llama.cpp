@@ -298,6 +298,14 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+
+    // where the target's speculative checkpoints of this slot live (LLAMA_SERVER_SPEC_CKPT_DEVICE): 0 not decided yet,
+    // 1 device memory, -1 host memory; decided at the slot's first one and kept (a checkpoint is restored with the flags it
+    // was saved with, and the context keeps the slot's device buffer)
+    int spec_ckpt_device = 0;
+
+    // n_tokens of the context checkpoint this task restored, while nothing has been decoded since (-1: none)
+    int64_t n_tokens_ckpt_restored = -1;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
@@ -424,6 +432,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+
+        n_tokens_ckpt_restored = -1;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -1119,6 +1129,159 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
+    // starts and is saved to the prompt cache and cleared only once the KV cache runs out of room, so conversations that
+    // take turns on their own slots do not copy their whole state to host memory and back on every switch
+    const bool lazy_idle_slots = [] {
+        const char * e = getenv("LLAMA_SERVER_LAZY_IDLE_SLOTS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    // LLAMA_SERVER_PARK_IDLE_SLOTS (on unless 0, with the lazy idle slots above): when a task starts, the resident idle
+    // slots are parked at the top of the KV cache (llama_memory_seq_park, a device copy) and the slots that run are moved
+    // to the low cells.  A sequence that runs alone then sits in the same cells and attends over the same range as when
+    // the idle slots are saved and cleared, so its output no longer depends on which other conversations stay resident.
+    // An idle slot that cannot be parked is saved to the prompt cache and cleared, as without lazy idle slots.  A KV cache
+    // that does not support parking at all (a sliding window, cells shared with a draft model, no flash attention) keeps the
+    // lazy idle slots as they are (park_supported).
+    const bool park_idle_slots = [] {
+        const char * e = getenv("LLAMA_SERVER_PARK_IDLE_SLOTS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    int park_supported = -1; // -1: not asked yet
+
+    // LLAMA_SERVER_CKPT_REUSE (on unless 0): a context checkpoint is not saved again at the position it was just restored
+    // from, and the buffers of dropped checkpoints are kept for the next one of the same size, so a prompt that resumes
+    // from a checkpoint does not allocate and fault in fresh buffers of the recurrent state's size (150 MiB on
+    // Qwen3.8-27B) before its first token
+    const bool ckpt_reuse = [] {
+        const char * e = getenv("LLAMA_SERVER_CKPT_REUSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    std::vector<std::vector<uint8_t>> ckpt_spare;
+
+    // LLAMA_SERVER_SPEC_CKPT_DEVICE: where the target's speculative checkpoint is kept -- the one saved before a verify
+    // whose draft is longer than n_rs_seq (a recurrent or hybrid target: any n-gram draft longer than the rollback window,
+    // i.e. --spec-ngram-mod-n-max against --spec-draft-n-max) and overwritten by the next.  The same state costs
+    // Qwen3.8-27B's 150 MiB: in host memory a save is ~4 ms on this box and ~16 ms on the submitter's, and with
+    // LLAMA_STATE_SEQ_FLAGS_ON_DEVICE (one staging buffer per slot, kept and reused by the context) a save and a restore
+    // are device copies of the same bytes (~0.15 ms for 150 MiB), so the saved time is the host copy, i.e. as much as the
+    // host CPU is slow.  Device memory when the target is on exactly one GPU, its state is offloaded and, at the slot's
+    // first checkpoint, that GPU has the state's size plus SPEC_CKPT_DEVICE_HEADROOM free (the staging buffer is allocated
+    // later, after an expert-cache arena or other caches took the GPU, and a failed allocation inside the io class aborts);
+    // otherwise host memory as before.  Logged once per slot.  LLAMA_SERVER_SPEC_CKPT_DEVICE=0: host memory always.
+    // Context checkpoints are not touched.
+    //
+    // INVARIANT for the device arm: it is NOT a byte image.  The checkpoint's metadata (the io header, the cell ranges) is
+    // written into `data_tgt`, but the payload goes into the context's per-seq staging buffer (llama_context::mem_storage),
+    // keyed by seq id, which the next save overwrites and the restore copies back into the live cells.  So a save must be
+    // restored before the next save for the same sequence -- the speculative path does exactly that (a draft round saves
+    // once and only ever restores that save, including the replay rounds, which save nothing) -- and a checkpoint must not
+    // outlive a stage re-allocation.  A host-flagged save (a context checkpoint, the prompt cache) does not touch the
+    // stage, so those may interleave freely.  Saving one of these into anything persistent (a file, the prompt cache) would
+    // restore whatever the stage holds at load time, not the saved state.
+    const bool spec_ckpt_device = [] {
+        const char * e = getenv("LLAMA_SERVER_SPEC_CKPT_DEVICE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    static constexpr size_t SPEC_CKPT_DEVICE_HEADROOM = 512ull << 20;
+
+    // the one GPU the target runs on, nullptr when there are several (a split model) or none
+    ggml_backend_dev_t spec_ckpt_gpu() const {
+        std::vector<ggml_backend_dev_t> gpus;
+        auto add = [&](ggml_backend_dev_t d, enum ggml_backend_dev_type type) {
+            if (d != nullptr && ggml_backend_dev_type(d) == type) {
+                gpus.push_back(d);
+            }
+        };
+        for (enum ggml_backend_dev_type type : { GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_IGPU }) {
+            if (!params_base.devices.empty()) {
+                for (ggml_backend_dev_t d : params_base.devices) {
+                    add(d, type);
+                }
+            } else {
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    add(ggml_backend_dev_get(i), type);
+                }
+            }
+            if (!gpus.empty()) {
+                break;
+            }
+        }
+        if (params_base.split_mode == LLAMA_SPLIT_MODE_NONE && params_base.main_gpu >= 0 && params_base.main_gpu < (int) gpus.size()) {
+            return gpus[params_base.main_gpu];
+        }
+        return gpus.size() == 1 ? gpus[0] : nullptr;
+    }
+
+    // the flags to save the slot's next target checkpoint with (decides the slot's memory at its first one)
+    llama_state_seq_flags spec_ckpt_save_flags_tgt(server_slot & slot) {
+        if (slot.spec_ckpt_device == 0) {
+            bool dev = false;
+            if (spec_ckpt_device) {
+                // the state must actually be in device memory: with --no-kv-offload (or -ngl 0) the recurrent/attention
+                // state lives in a host buffer, so the device io class would allocate its staging buffer on the CPU buft
+                // and copy host-to-host, and the free-VRAM test below would be about a GPU this context does not use
+                const bool state_on_device = !params_base.no_kv_offload && params_base.n_gpu_layers != 0;
+                ggml_backend_dev_t gpu = state_on_device ? spec_ckpt_gpu() : nullptr;
+                if (gpu == nullptr) {
+                    SLT_INF(slot, "%s\n", state_on_device
+                            ? "speculative checkpoints of the target in host memory: the target is not on exactly one GPU"
+                            : "speculative checkpoints of the target in host memory: the context's state is not offloaded (--no-kv-offload / -ngl 0)");
+                } else {
+                    const size_t need = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    size_t free = 0;
+                    size_t total = 0;
+                    ggml_backend_dev_memory(gpu, &free, &total);
+                    dev = free >= need + SPEC_CKPT_DEVICE_HEADROOM;
+                    SLT_INF(slot, "speculative checkpoints of the target in %s memory (%.1f MiB; %.1f MiB free on %s)\n",
+                            dev ? "device" : "host", need / 1048576.0, free / 1048576.0, ggml_backend_dev_name(gpu));
+                }
+            }
+            slot.spec_ckpt_device = dev ? 1 : -1;
+        }
+        return spec_ckpt_load_flags_tgt(slot);
+    }
+
+    // the flags the slot's target checkpoints were saved with
+    static llama_state_seq_flags spec_ckpt_load_flags_tgt(const server_slot & slot) {
+        return LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (slot.spec_ckpt_device > 0 ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : 0);
+    }
+
+    void ckpt_recycle(common_prompt_checkpoint & ckpt) {
+        if (!ckpt_reuse) {
+            return;
+        }
+        for (auto * v : { &ckpt.data_tgt, &ckpt.data_dft }) {
+            if (v->empty()) {
+                continue;
+            }
+            if (ckpt_spare.size() < 4) {
+                ckpt_spare.push_back(std::move(*v));
+            } else {
+                auto it = std::min_element(ckpt_spare.begin(), ckpt_spare.end(),
+                        [](const auto & a, const auto & b) { return a.size() < b.size(); });
+                if (it->size() < v->size()) {
+                    *it = std::move(*v);
+                }
+            }
+            *v = {};
+        }
+    }
+
+    // a spare of exactly n bytes: no new allocation and no zero fill when the checkpoint is written into it
+    std::vector<uint8_t> ckpt_take(size_t n) {
+        for (auto it = ckpt_spare.begin(); it != ckpt_spare.end(); ++it) {
+            if (it->size() == n) {
+                std::vector<uint8_t> v = std::move(*it);
+                ckpt_spare.erase(it);
+                return v;
+            }
+        }
+        return {};
+    }
 
     server_metrics metrics;
 
@@ -1886,9 +2049,21 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                // the entry this task will restore is held out of the cache while the slot is saved, so the eviction
+                // that the save may cause cannot drop it
+                std::list<server_prompt_cache_state> held;
+                if (lazy_idle_slots) {
+                    auto it = prompt_cache->find(ret->prompt, task.tokens);
+                    if (it != prompt_cache->states.end()) {
+                        held.splice(held.begin(), prompt_cache->states, it);
+                    }
+                }
+
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                prompt_cache->states.splice(prompt_cache->states.end(), held);
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens) && !prompt_load_with_room(*ret, task.tokens)) {
                     ret->prompt_clear();
                 }
 
@@ -1901,16 +2076,103 @@ private:
         return ret;
     }
 
+    // a restore can fail for want of KV cells that another idle slot holds (unified KV cache): move idle slots to the prompt
+    // cache one at a time, with the entry being restored kept out of the eviction that their saving may cause, and retry
+    bool prompt_load_with_room(server_slot & slot, const server_tokens & tokens) {
+        if (!lazy_idle_slots || !params_base.kv_unified) {
+            return false;
+        }
+        while (true) {
+            auto it = prompt_cache->find(slot.prompt, tokens);
+            if (it == prompt_cache->states.end()) {
+                return false;
+            }
+            std::list<server_prompt_cache_state> held;
+            held.splice(held.begin(), prompt_cache->states, it);
+            const bool cleared = try_clear_idle_slots(&slot);
+            prompt_cache->states.splice(prompt_cache->states.end(), held);
+            if (!cleared) {
+                return false;
+            }
+            SLT_INF(slot, "%s", "retrying the prompt cache restore\n");
+            if (slot.prompt_load(*prompt_cache, tokens)) {
+                return true;
+            }
+        }
+    }
+
+    // park_idle_slots: the idle slots go up first, so the low cells are free, then the slots that run come down
+    void park_idle_slots_for_launch() {
+        if (park_supported < 0) {
+            park_supported = !slots.empty() && slots[0].mem.can_park() ? 1 : 0;
+            SRV_INF("idle slot parking: %s\n", park_supported ? "on" : "not supported by this KV cache, the idle slots stay where they are");
+        }
+        if (!park_supported) {
+            return;
+        }
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+            if (!slot.mem.seq_park(slot.id, true)) {
+                // with --no-cache-idle-slots the lazy idle slots are left resident (there is no saved copy to
+                // restore), so a slot that cannot be parked must stay resident too -- clearing it here would
+                // throw its KV away and change the behaviour the flag was chosen for
+                if (!params_base.cache_idle_slots) {
+                    SLT_DBG(slot, "%s", "cannot park the idle slot: leaving it resident (--no-cache-idle-slots)\n");
+                    continue;
+                }
+                SLT_INF(slot, "%s", "cannot park the idle slot: saving it to the prompt cache and clearing it\n");
+                if (prompt_cache && slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                }
+                slot.prompt_clear();
+            }
+        }
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            // no room below the parked slots: those go to the prompt cache, least recently used first
+            while (!slot.mem.seq_park(slot.id, false)) {
+                if (!try_clear_idle_slots(&slot)) {
+                    SLT_WRN(slot, "%s", "cannot move the parked context back down (the KV cache gives parking up)\n");
+                    break;
+                }
+            }
+        }
+    }
+
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    bool try_clear_idle_slots(const server_slot * keep = nullptr) {
         bool res = false;
 
         if (!params_base.kv_unified) {
             return res;
+        }
+
+        if (lazy_idle_slots) {
+            // the least recently used idle slot goes first, and it goes to the prompt cache, so it can be resumed
+            server_slot * lru = nullptr;
+            for (auto & slot : slots) {
+                if (&slot != keep && !slot.is_processing() && slot.prompt.n_tokens() > 0 &&
+                        (lru == nullptr || slot.t_last_used < lru->t_last_used)) {
+                    lru = &slot;
+                }
+            }
+            if (lru == nullptr) {
+                return res;
+            }
+            SRV_WRN("making room in the KV cache: saving and clearing idle slot %d with %zu tokens\n", lru->id, lru->prompt.tokens.size());
+            if (prompt_cache && params_base.cache_idle_slots && lru->prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+            }
+            lru->prompt_clear();
+            return true;
         }
 
         for (auto & slot : slots) {
@@ -2693,6 +2955,28 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // nothing decoded since this task restored the checkpoint at this position: it already holds the current state
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            const bool    unchanged    = ckpt_reuse && n_tokens_new == slot.n_tokens_ckpt_restored;
+            slot.n_tokens_ckpt_restored = -1;
+            if (unchanged) {
+                // a checkpoint that carries no target state was never a restore source (load_tgt is a no-op for it),
+                // so it cannot stand in for the current state either
+                auto it = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                        [&](const auto & cur) { return cur.n_tokens == n_tokens_new && !cur.data_tgt.empty(); });
+                if (it != slot.prompt.checkpoints.end()) {
+                    common_prompt_checkpoint ckpt = std::move(*it);
+                    slot.prompt.checkpoints.erase(it);
+                    ckpt.id_task = id_task;
+                    ckpt.update_pos(n_tokens_new, pos_min, pos_max);
+                    slot.prompt.checkpoints.push_back(std::move(ckpt));
+                    SLT_TRC(slot, "keeping the context checkpoint just restored at n_tokens = %" PRId64 " (nothing decoded since)\n", n_tokens_new);
+                    return;
+                }
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2704,6 +2988,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                ckpt_recycle(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2714,11 +2999,12 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto & cur = slot.prompt.checkpoints.front();
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            ckpt_recycle(cur);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2728,6 +3014,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    ckpt_recycle(*it);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2744,6 +3031,12 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        if (ckpt_reuse) {
+            cur.data_tgt = ckpt_take(llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            if (ctx_dft) {
+                cur.data_dft = ckpt_take(llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+            }
+        }
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
@@ -3031,7 +3324,11 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (lazy_idle_slots && park_idle_slots && params_base.kv_unified) {
+                        park_idle_slots_for_launch();
+                    }
+
+                    if (params_base.cache_idle_slots && !lazy_idle_slots) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -3859,7 +4156,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(ctx_tgt, slot.id, spec_ckpt_save_flags_tgt(slot));
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3929,6 +4226,8 @@ private:
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
+                        slot.n_tokens_ckpt_restored = -1;
 
                         if (spec) {
                             common_speculative_set_prompt_end(spec.get(), slot.id, slot.task->tokens.pos_next());
@@ -4183,6 +4482,8 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    slot.n_tokens_ckpt_restored = -1;
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         if (!it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
@@ -4202,6 +4503,7 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        slot.n_tokens_ckpt_restored = it->n_tokens;
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
@@ -4220,6 +4522,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        ckpt_recycle(*it);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -4898,7 +5201,7 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, spec_ckpt_load_flags_tgt(slot)));
 
                         if (slot.ctx_dft) {
                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
