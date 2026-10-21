@@ -2668,6 +2668,10 @@ extern "C" {
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
     // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
+    //
+    // n_rs_batch is the largest per-seq batch that can be rolled back into (0 = unset). Backends
+    // with a chunked prefill kernel may skip writing the snapshots for a batch above this bound,
+    // because such a batch is never rolled back into.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2676,7 +2680,8 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
-            int64_t               K);
+            int64_t               K,
+            int64_t               n_rs_batch);
 
     // DSA lightning indexer
     //
