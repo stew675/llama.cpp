@@ -416,6 +416,12 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool pos_2d;      // 2-D (M-RoPE) positions can be submitted to this context, e.g. when a multimodal
+                          // projector feeds it.  The compute reserve then also covers the packed KQ mask,
+                          // which is what a non-degenerate (x, y) position needs.  Leave it false for text
+                          // input: an M-RoPE model's text positions are degenerate, so the much smaller
+                          // derived mask serves every batch.  A 2-D batch that arrives anyway forces one
+                          // mid-run re-reserve instead (see llama_context::decode).
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

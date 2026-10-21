@@ -19,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_kv_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -258,8 +259,17 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // packed_kq_mask: build the measure graph with the packed kq mask even when the derived form is
+    //   enabled, so the reserved buffers cover a batch the derived form cannot serve (see the note in
+    //   graph_reserve).  Pass kq_mask_packed_reachable() for a worst-case reserve; the fused-op
+    //   support probes must NOT set it - they verify the derived form is present in the graph.
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool packed_kq_mask = false);
+
+    // true when a batch the derived kq mask cannot serve is reachable at runtime, i.e. when the
+    // compute reserve must be sized for the packed mask - see the definition for the full reasoning
+    bool kq_mask_packed_reachable() const;
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -369,6 +379,22 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // issue #238: latched by decode() when a 2-D (M-RoPE) batch actually arrives on a context that did not
+    // declare one (cparams.kq_mask_pos_2d), so the packed kq mask is reserved from then on - see
+    // kq_mask_packed_reachable()
+    bool kq_mask_pos_2d_seen = false;
+
+    // latched by decode() when a batch of several sequences arrives that the derived kq mask cannot serve (a cell shared
+    // between two of them, a token in several, a position past the stride - llama_kv_cache::kq_mask_derivable_seqs), so
+    // the packed kq mask is reserved from then on - see kq_mask_packed_reachable()
+    bool kq_mask_multiseq_seen = false;
+
+    // the attention KV caches the derived kq mask is decided on: the cache itself, the attention part of a hybrid memory, or
+    // both caches of an iSWA memory; empty for any other memory.  Resolved on the first call (see the .cpp)
+    const std::vector<llama_kv_cache *> & kq_mask_kvs() const;
+    mutable bool kq_mask_kvs_done = false;
+    mutable std::vector<llama_kv_cache *> kq_mask_kvs_store;
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
