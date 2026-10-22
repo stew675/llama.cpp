@@ -340,6 +340,12 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     } else if (ggml_cuda_mmb_wants_bf16_copy(dst)) {
         dst16 = ggml_cuda_mmb_reserve_auto(ctx, dst, (size_t) ggml_nelements(dst));
     }
+    // no MMB copy: leave the mixed stream's BF16 copy for the cuBLAS BF16 GEMMs that read it (router, indexer, beta/alpha)
+    if (dst16 == nullptr && store_f32 && ggml_cuda_bf16_producer_mode() != 0 && ggml_cuda_bf16_src1_cache_on() &&
+            dst->view_src == nullptr && ggml_is_contiguous(dst) && n_tokens >= 64 &&
+            nbd0 == sizeof(float) && nbd1 == (size_t) n_embd*sizeof(float)) {
+        dst16 = (uint16_t *) ctx.bf16_src1_cache_put(dst, ggml_nelements(dst));
+    }
     ggml_cuda_kernel_launch(kernel, launch_params,
             xptr, wptr, (float *) dst->data,
             n_embd, hc, n_tokens,

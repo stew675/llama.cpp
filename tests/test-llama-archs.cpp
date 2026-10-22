@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
@@ -247,7 +248,10 @@ struct kv_writer {
     }
 };
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0) {
+// `merged_hc`: write the post-#31028 qwen4exp layout (hc_{attn,ffn}_down and hc_*_inject as ONE
+// blk.N.hc_*_down_inject tensor) instead of relying on the virtual path's separate-tensor default.  The
+// declaration is what makes the loader materialise it on the no-file path (TENSOR_SKIP_IF_VIRTUAL).
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_layer_min = 0, const bool merged_hc = false) {
     gguf_context_ptr ret(gguf_init_empty());
     kv_writer ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -845,6 +849,27 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ggml_format_name(&t, "convnext.%" PRIu32 ".dw.weight", il);
         gguf_add_tensor(ms.gguf_ctx, &t);
     }
+    if (merged_hc) {
+        GGML_ASSERT(arch == LLM_ARCH_QWEN4EXP);
+        // hc = LLM_KV_HYPER_CONNECTION_COUNT, hc_lr = LLM_KV_HYPER_CONNECTION_LOW_RANK, as the qwen4exp
+        // block above sets them
+        const int64_t hc     = 4;
+        const int64_t hc_lr  = 8;
+        const int64_t hc_dim = hc * (int64_t) n_embd;
+        for (uint32_t il = 0; il < n_layer; il++) {
+            ggml_tensor t;
+            memset(&t, 0, sizeof(ggml_tensor));
+            t.type = GGML_TYPE_F32;
+            t.ne[0] = hc_dim;
+            t.ne[1] = hc_lr + hc;
+            t.ne[2] = 1;
+            t.ne[3] = 1;
+            ggml_format_name(&t, "%s", ("blk." + std::to_string(il) + ".hc_attn_down_inject.weight").c_str());
+            gguf_add_tensor(ms.gguf_ctx, &t);
+            ggml_format_name(&t, "%s", ("blk." + std::to_string(il) + ".hc_ffn_down_inject.weight").c_str());
+            gguf_add_tensor(ms.gguf_ctx, &t);
+        }
+    }
     return ret;
 }
 
@@ -861,10 +886,32 @@ static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr,
+        // block 11: the managed PLE reader's budget, handed over as LLAMA_LAZY_BUF_MB around the load
+        const size_t lazy_buf_size = 0) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    // the managed PLE reader budget is driven by LLAMA_LAZY_BUF_MB now (LAZY_MODE_AUTO); keep this
+    // parameter as an override by exporting the equivalent MiB value around the load.
+    // The export has to build on Windows too: clang-cl under the Windows HIP SDK uses the MSVC CRT,
+    // which has no setenv/unsetenv (only _putenv_s), and a Windows build that includes the tests
+    // would stop here otherwise (issue: reported in PR #310, caught by
+    // scripts/check-windows-portability.sh once it judged the lines the delivery inserts into an
+    // upstream file).  `mb == 0` means "no override": unset on both platforms, because _putenv_s with
+    // an empty value removes the variable just like unsetenv does.
+    {
+        const size_t mb = lazy_buf_size > 0 ? std::max<size_t>(lazy_buf_size / (1024*1024), 1) : 0;
+#if defined(_WIN32)
+        _putenv_s("LLAMA_LAZY_BUF_MB", mb > 0 ? std::to_string(mb).c_str() : "");
+#else
+        if (mb > 0) {
+            setenv("LLAMA_LAZY_BUF_MB", std::to_string(mb).c_str(), 1);
+        } else {
+            unsetenv("LLAMA_LAZY_BUF_MB");
+        }
+#endif
+    }
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -885,8 +932,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        const size_t lazy_buf_size = 0) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, lazy_buf_size);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -1535,7 +1583,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         GGML_ASSERT(file != nullptr);
 
                         {
-                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
+                            // the qwen4exp PLE n-gram table gets a managed lazy-reader budget
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, arch == LLM_ARCH_QWEN4EXP ? 256 << 10 : 0);
                             const std::vector<float> logits_roundtrip = get_logits(
                                 model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                             status_roundtrip = "\033[1;32mOK\033[0m";
@@ -1566,6 +1615,93 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_mixed.c_str(), mixed_str);
             }
         }
+    }
+
+    // ---- qwen4exp merged-HC layout (the post-#31028 converter shape) ----
+    // hc_{attn,ffn}_down and hc_*_inject are ONE GGUF tensor there, so build_hc_mix runs with w_down ==
+    // nullptr and takes its merged branch.  Nothing else in this suite reaches that shape: the virtual
+    // fixture path only materialises a merged tensor the fixture NAMES.  It used to SEGFAULT -- the
+    // fused-mixer gate read w_down->ne[1] before testing it, and sched_reserve's reservation probe
+    // (nt == 0) builds the graph -- and a text gate cannot see it, because the model never loads.  So the
+    // arm IS the graph build, plus a save -> reload round trip of the merged model (the saver must carry
+    // hc_*_down_inject; if it does not, the reload falls back to the separate tensors and the logits move).
+    if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP)) {
+        const std::string config_name = "merged HC";
+        LOG(template_row_cfg.c_str(), llama_arch_name(LLM_ARCH_QWEN4EXP), "CPU", config_name.c_str());
+        fflush(stdout);
+
+        const char * status_nmse     = "\033[1;32mOK\033[0m";
+        std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
+        char nmse_str[12] = {0};
+        bool test_ok = true;
+
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, /*moe*/ true, 0, /*merged_hc*/ true);
+        auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {});
+
+        // decode band + verify band: the graph build is the oracle, these logits only have to be finite
+        std::vector<float> logits_ref;
+        for (uint32_t n_tok : {4u, 64u}) {
+            // each width starts from an empty memory: get_logits() continues at the next position
+            llama_memory_clear(llama_get_memory(model_and_ctx.second.get()), true);
+            const std::vector<llama_token> part(tokens.begin(), tokens.begin() + n_tok);
+            const std::vector<float> l = get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), part);
+            if (n_tok == 64u) {
+                logits_ref = l;
+            }
+            for (const float v : l) {
+                if (!std::isfinite(v)) {
+                    test_ok = false;
+                    status_nmse = "\033[1;31mFAIL\033[0m (nan)";
+                }
+            }
+        }
+        snprintf(nmse_str, sizeof(nmse_str), "(merged)");
+
+        // the model must really carry the merged weights, or the arm is vacuous: save it and look
+        const std::string path = get_tmp_gguf_path();
+        llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
+        {
+            gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_context_ptr saved(gguf_init_from_file(path.c_str(), params));
+            GGML_ASSERT(saved);
+            if (gguf_find_tensor(saved.get(), "blk.0.hc_attn_down_inject.weight") < 0 ||
+                gguf_find_tensor(saved.get(), "blk.0.hc_attn_down.weight")          >= 0) {
+                test_ok = false;
+                status_nmse = "\033[1;31mFAIL\033[0m (separate)";
+            }
+        }
+
+        // reload the merged file: its logits must equal the in-memory model's, bit for bit
+        {
+            FILE * file = fopen(path.c_str(), "rb");
+            GGML_ASSERT(file != nullptr);
+            auto model_and_ctx_reload = get_model_and_ctx(nullptr, file, seed, stdev, {});
+            llama_memory_clear(llama_get_memory(model_and_ctx_reload.second.get()), true);
+            const std::vector<llama_token> part(tokens.begin(), tokens.begin() + 64);
+            const std::vector<float> logits_reload = get_logits(model_and_ctx_reload.first.get(), model_and_ctx_reload.second.get(), part);
+            status_roundtrip = "\033[1;32mOK\033[0m";
+            if (logits_reload.size() != logits_ref.size()) {
+                test_ok = false;
+                status_roundtrip = "\033[1;31mFAIL\033[0m";
+            } else {
+                for (size_t i = 0; i < logits_reload.size(); i++) {
+                    if (logits_reload[i] != logits_ref[i]) {
+                        test_ok = false;
+                        status_roundtrip = "\033[1;31mFAIL\033[0m";
+                        break;
+                    }
+                }
+            }
+            fclose(file);
+        }
+        std::filesystem::remove(path);
+
+        n_tests++;
+        if (!test_ok) {
+            n_failed++;
+            all_ok = false;
+        }
+        LOG(template_row_res.c_str(), status_nmse, nmse_str, status_roundtrip.c_str(), "\033[1;33mSKIP\033[0m", "");
     }
 
     if (n_tests == 0) {
