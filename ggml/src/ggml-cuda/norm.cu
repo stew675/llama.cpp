@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include "mmb.cuh"
+#include "mmvq.cuh"
 #include <cstdint>
 
 // RNE f32 -> bf16, bit-identical to mmb.cu's mmb_f2bf (used to emit the HC normalized stream's
@@ -257,6 +258,54 @@ static __global__ void rms_norm_f32(const float * x,
 
             if constexpr (block_size > WARP_SIZE) {
                 // sync is needed as we reuse s_sum across block_reduce invocations, see #26385
+                __syncthreads();
+            }
+        }
+    }
+}
+
+// Two RMS_NORM + SCALE pairs in one launch (the GDN q and k l2 norms of build_gdn_l2_norm): blocks [0, nrows) take
+// (x0, dst0), blocks [nrows, 2*nrows) take (x1, dst1).  The per-row body is rms_norm_f32<block_size, false, false, true>'s
+// (same reduction, same `scale_out * (scale * x)`), so each output is bit-identical to its own launch.
+template <int block_size>
+static __global__ void rms_norm_scale_pair_f32(const float * x0, float * dst0, const float * x1, float * dst1,
+        const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, const float scale_out) {
+    ggml_cuda_pdl_lc();
+    const int  pair = blockIdx.x >= nrows;
+    const int  row  = blockIdx.x - pair*nrows;
+    const int  tid  = threadIdx.x;
+    const float * x   = pair ? x1   : x0;
+    float       * dst = pair ? dst1 : dst0;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
+        for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
+            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+            float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+            float tmp = 0.0f; // partial sum for thread in warp
+
+            for (int col = tid; col < ncols; col += block_size) {
+                const float xi = xc[col];
+                tmp += xi * xi;
+            }
+
+            // sum up partial sums
+            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+            const float mean = tmp / ncols;
+            const float scale = rsqrtf(mean + eps);
+
+            for (int col = tid; col < ncols; col += block_size) {
+                dstc[col] = scale_out * (scale * xc[col]);
+            }
+
+            if constexpr (block_size > WARP_SIZE) {
                 __syncthreads();
             }
         }
@@ -989,6 +1038,34 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
+void ggml_cuda_op_rms_norm_scale_pair_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm0, ggml_tensor * scale0,
+        ggml_tensor * norm1, ggml_tensor * scale1) {
+    const ggml_tensor * x0 = norm0->src[0];
+    const ggml_tensor * x1 = norm1->src[0];
+    GGML_ASSERT(x0->type == GGML_TYPE_F32 && x1->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale0->type == GGML_TYPE_F32 && scale1->type == GGML_TYPE_F32);
+
+    float eps;
+    memcpy(&eps, norm0->op_params, sizeof(float));
+    float scale;
+    memcpy(&scale, (const float *) scale0->op_params + 0, sizeof(float));
+
+    const size_t ts0 = ggml_type_size(x0->type);
+    GGML_ASSERT(x0->nb[0] == ts0);
+    const int64_t s01 = x0->nb[1] / ts0;
+    const int64_t s02 = x0->nb[2] / ts0;
+    const int64_t s03 = x0->nb[3] / ts0;
+    const int ncols = (int) x0->ne[0], nrows = (int) x0->ne[1], nchannels = (int) x0->ne[2], nsamples = (int) x0->ne[3];
+    GGML_ASSERT(ncols < 1024);
+
+    const dim3 blocks_num(2*nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+    const dim3 block_dims(256, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32 * sizeof(float), ctx.stream()};
+    ggml_cuda_kernel_launch(rms_norm_scale_pair_f32<256>, launch_params,
+        (const float *) x0->data, (float *) scale0->data, (const float *) x1->data, (float *) scale1->data,
+        ncols, nrows, nchannels, nsamples, s01, s02, s03, eps, scale);
+}
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
@@ -1013,10 +1090,18 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
     GGML_ASSERT(eps >= 0.0f);
 
-    // The MMB BF16-activation copy hook (block-15 MMB extension) is not part of this block; the
-    // F32 output is stored and the GEMM converts it itself.
+    // HC16: when this norm+mul output is marked as an MMB GEMM activation, also emit the BF16 copy
+    // the GEMM will read, so it skips its own mmb_cvt pass.  The BF16 value is RNE-rounded exactly
+    // as mmb_cvt_f32_bf16 would, so the GEMM's arithmetic (and the whole output) is bit-identical.
     uint16_t * dst16 = nullptr;
     bool store_f32 = true;
+    if (ggml_cuda_mmb_is_bf16_only(mul_tensor)) {
+        // every consumer reads the BF16 copy -> the F32 output is dead
+        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_tensor, (size_t) ggml_nelements(mul_tensor));
+        store_f32 = false;
+    } else if (ggml_cuda_mmb_wants_bf16_copy(mul_tensor)) {
+        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul_tensor, (size_t) ggml_nelements(mul_tensor));
+    }
 
     const int64_t ne00 = rms_norm_src->ne[0];
     const int64_t ne01 = rms_norm_src->ne[1];
@@ -1179,6 +1264,73 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+// Verify band: the residual ADD in front of a narrow-band RMS_NORM whose product feeds an mmvq
+// matmul is folded into the norm kernel.  GGML_CUDA_FUSE_ADD_RMS_Q8=0 turns it off.
+int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool fuse_add_rms_q8 = getenv("GGML_CUDA_FUSE_ADD_RMS_Q8") == nullptr || atoi(getenv("GGML_CUDA_FUSE_ADD_RMS_Q8")) != 0;
+    ggml_tensor * node = cgraph->nodes[i];
+    if (!fuse_add_rms_q8 || node->op != GGML_OP_ADD || i + 2 >= cgraph->n_nodes ||
+            node->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+            cgraph->nodes[i + 1]->op != GGML_OP_RMS_NORM || cgraph->nodes[i + 1]->src[0] != node ||
+            cgraph->nodes[i + 2]->op != GGML_OP_MUL || cgraph->nodes[i + 2]->src[0] != cgraph->nodes[i + 1]) {
+        return 0;
+    }
+    ggml_tensor * norm = cgraph->nodes[i + 1];
+    const ggml_tensor * mul = cgraph->nodes[i + 2];
+    const int scan_end = std::min(cgraph->n_nodes, i + 33);
+    for (int j = i + 3; j < scan_end; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        const ggml_tensor * n_src1 = n->src[1];
+        while (n_src1 != nullptr && n_src1->view_src != nullptr) {
+            n_src1 = n_src1->view_src;
+        }
+        if (!(n->src[0] == mul || n_src1 == mul)) {
+            continue;
+        }
+        if (n->op == GGML_OP_MUL_MAT && ggml_cuda_should_fuse_mul_mat_vec_q(n, true) &&
+                ggml_cuda_op_add_rms_norm_q8_1(ctx, node, norm, mul)) {
+            return 2;
+        }
+        break;
+    }
+    return 0;
+}
+
+// rms_norm + norm-weight MUL whose output feeds an mmvq matmul: fold the Q8_1 quantize into the norm
+// kernel and pre-fill the matmul quantize cache.  GGML_CUDA_DISABLE_NORM_Q8_1=1 turns it off.
+int ggml_cuda_norm_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_norm_q8_1 = getenv("GGML_CUDA_DISABLE_NORM_Q8_1") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_NORM_Q8_1"));
+    ggml_tensor * node = cgraph->nodes[i];
+    if (disable_norm_q8_1 || node->op != GGML_OP_RMS_NORM || i + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * mul = cgraph->nodes[i + 1];
+    if (mul->op != GGML_OP_MUL || mul->src[0] != node) {
+        return 0;
+    }
+    const int scan_end = std::min(cgraph->n_nodes, i + 32);
+    for (int j = i + 2; j < scan_end; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        const ggml_tensor * n_src1 = n->src[1];
+        while (n_src1 != nullptr && n_src1->view_src != nullptr) {
+            n_src1 = n_src1->view_src;
+        }
+        const bool consumes_mul = n->src[0] == mul || n_src1 == mul;
+        if (!consumes_mul) {
+            continue;
+        }
+        const bool mmid_single = n->op != GGML_OP_MUL_MAT_ID || n->ne[2] == 1;
+        if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) &&
+                node->ne[0] % QK8_1 == 0 &&
+                ggml_cuda_should_fuse_mul_mat_vec_q(n, true) &&
+                mmid_single) {
+            ggml_cuda_op_rms_norm_q8_1(ctx, node, mul);
+            return 1;
+        }
+    }
+    return 0;
 }
 // Pair of L2 norms over two views of the same tensor (the SSM conv output q/k slices).  The view
 // source is an external compute tensor, so the subgraph helper cannot express the pattern.

@@ -10,6 +10,9 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
 
+void ggml_cuda_op_rms_norm_scale_pair_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm0, ggml_tensor * scale0,
+        ggml_tensor * norm1, ggml_tensor * scale1);
+
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,
@@ -27,4 +30,8 @@ void ggml_cuda_op_l2_norm_pair(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_node, const ggml_tensor * mul_node);
 
 bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node);
+
+int  ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+int  ggml_cuda_norm_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
 int  ggml_cuda_l2_norm_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
