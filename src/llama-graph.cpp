@@ -1525,8 +1525,12 @@ bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
 llm_graph_result::llm_graph_result(int64_t max_nodes) : max_nodes(max_nodes) {
     reset();
 
-    const char * LLAMA_GRAPH_RESULT_DEBUG = getenv("LLAMA_GRAPH_RESULT_DEBUG");
-    debug = LLAMA_GRAPH_RESULT_DEBUG ? atoi(LLAMA_GRAPH_RESULT_DEBUG) : 0;
+    // a per-graph read: latch it (issue #273's getenv audit)
+    static const int result_debug = [] {
+        const char * e = getenv("LLAMA_GRAPH_RESULT_DEBUG");
+        return e ? atoi(e) : 0;
+    }();
+    debug = result_debug;
 }
 
 int64_t llm_graph_result::get_max_nodes() const {
@@ -1717,6 +1721,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
     samplers         (params.samplers),
+    mtp_draft        (params.mtp_draft),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
