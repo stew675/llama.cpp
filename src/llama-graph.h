@@ -103,6 +103,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_mtp_draft_vocab;
 
 //
 // llm_graph_input
@@ -860,6 +861,8 @@ struct llm_graph_params {
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
+    const llama_mtp_draft_vocab * mtp_draft; // MTP draft vocabulary subset of the context (nullptr = full vocabulary)
+
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
           const std::map<llama_seq_id, llama_sampler *> & rhs) {
@@ -953,6 +956,9 @@ struct llm_graph_params {
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&
             model == other.model &&
+            cparams.mtp_draft_vocab         == other.cparams.mtp_draft_vocab         &&
+            mtp_draft == other.mtp_draft &&
+            // (`arch` is not compared any more: the model pointer above already implies it, #31733)
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
@@ -1144,6 +1150,8 @@ struct llm_graph_context {
     ggml_tensor * layer_inp_src;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const llama_mtp_draft_vocab * mtp_draft; // nullptr = full vocabulary
 
     const llm_graph_cb & cb_func;
 
