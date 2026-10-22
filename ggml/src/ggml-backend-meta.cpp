@@ -2337,6 +2337,59 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
+    // A 2-D tensor whose ROWS are split across the devices (axis 1 of a `[n_embd, n_vocab]` tensor -- e.g. a
+    // vocabulary-split LM head): the rows of each block are contiguous inside their device, so an arbitrary row
+    // range is spliced block by block, walking the segments/repeats in the order the split state defines
+    // (seg 0 dev 0 r0, seg 0 dev 1 r0, seg 0 dev 0 r1, ..., seg 1 dev 0 r0, ...).  The chunked path below can
+    // only serve a whole-tensor read of this shape, because its chunk is `nb[axis + 1]`, which for a 2-D tensor
+    // is the whole tensor (spec-draft-mtp-vocab: the MTP draft head's row subset is copied out of exactly this
+    // shape).
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_1 && tensor->ne[2] == 1 && tensor->ne[3] == 1) {
+        const size_t row_stride = tensor->nb[1];
+        GGML_ASSERT(offset % row_stride == 0);
+        GGML_ASSERT(size   % row_stride == 0);
+
+        const int64_t row_start = (int64_t) (offset / row_stride);
+        const int64_t row_end   = row_start + (int64_t) (size / row_stride);
+        GGML_ASSERT(row_end <= tensor->ne[1]);
+
+        size_t  offset_data = 0;
+        int64_t row_base    = 0; // first global row of the current segment
+        // Per-device byte offset, advanced exactly as the setter's `simple_offsets` are: a device's chunks
+        // (seg, repeat) are packed contiguously in its own slice, so repeat r of a segment does NOT start at
+        // `r * rows` of that slice.
+        std::vector<size_t> simple_offsets(n_bufs, 0);
+        for (uint32_t s = 0; s < split_state.n_segments; s++) {
+            int64_t rows_per_rep = 0;
+            for (size_t j = 0; j < n_bufs; j++) {
+                rows_per_rep += split_state.ne[s*n_bufs + j];
+            }
+            GGML_ASSERT(rows_per_rep > 0);
+            for (uint32_t r = 0; r < split_state.nr[s]; r++) {
+                int64_t base = row_base + (int64_t) r * rows_per_rep;
+                for (size_t j = 0; j < n_bufs; j++) {
+                    const int64_t rows_j = split_state.ne[s*n_bufs + j];
+                    const size_t  chunk  = (size_t) rows_j * row_stride;
+                    const int64_t r0 = std::max(row_start, base);
+                    const int64_t r1 = std::min(row_end,   base + rows_j);
+                    if (r1 > r0) {
+                        const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                        const size_t nbytes = (size_t) (r1 - r0) * row_stride;
+                        ggml_backend_meta_get_2d_any(backend, j, simple_tensor, (char *) data + offset_data,
+                            simple_offsets[j] + (size_t) (r0 - base) * simple_tensor->nb[1], nbytes, 1, nbytes, nbytes);
+                        offset_data += nbytes;
+                    }
+                    simple_offsets[j] += chunk;
+                    base += rows_j;
+                }
+            }
+            row_base += rows_per_rep * split_state.nr[s];
+        }
+        GGML_ASSERT(row_base == tensor->ne[1]);
+        GGML_ASSERT(offset_data == size);
+        return;
+    }
+
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
         GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
         GGML_ASSERT(split_state.nr[0] != 0);
