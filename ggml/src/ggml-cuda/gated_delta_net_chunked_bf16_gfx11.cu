@@ -977,7 +977,7 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
         (size_t) n_chunks * H * n_seqs * GDN_BF16_BT * GDN_BF16_BT);
 
     const int64_t hg_ratio = H / neqk1;
-    const int dbg = getenv("GDN_DBG_P") != nullptr ? 1 : (getenv("GDN_DBG_ONES") != nullptr ? 2 : 0);
+    static const int dbg = getenv("GDN_DBG_P") != nullptr ? 1 : (getenv("GDN_DBG_ONES") != nullptr ? 2 : 0);
     switch (hg_ratio) {
         case 1:  if (!launch_gdn_bf16_kkt<1>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
         case 2:  if (!launch_gdn_bf16_kkt<2>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
@@ -987,7 +987,8 @@ bool ggml_cuda_op_gated_delta_net_chunked_bf16_gfx11(ggml_backend_cuda_context &
         case 8:  if (!launch_gdn_bf16_kkt<8>(k_d, g_d, b_d, A_sc.get(), H, neqk1, n_tokens, n_seqs, sq1, sq2, sq3, stream, dbg)) return false; break;
         default: GGML_ABORT("gated_delta_net_chunked_bf16_gfx11: unsupported GQA ratio");
     }
-    if (getenv("GDN_DBG_A") != nullptr) {
+    static const bool dbg_a = getenv("GDN_DBG_A") != nullptr;
+    if (dbg_a) {
         // temp debug: dump the first A matrix per (chunk, head) for the first seq
         const size_t m = (size_t) std::min((int64_t) 2, n_chunks) * n_seqs * H * GDN_BF16_BT * GDN_BF16_BT;
         std::vector<unsigned short> dump(m);

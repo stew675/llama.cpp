@@ -336,12 +336,56 @@ void ggml_backend_dev_slab_ring_set(ggml_backend_dev_t dev, bool arm) {
     dev->iface.slab_ring_set(dev, arm);
 }
 
+size_t ggml_backend_dev_slab_ring_region(ggml_backend_dev_t dev) {
+    // wip/slab-ring-region (issue #164): 0 when the backend has no slab, no ring hole, or never set the
+    // hook -- how the caller tells "the ring can be armed here" from "the drop has nothing to do".
+    if (dev == nullptr || dev->iface.slab_ring_region == nullptr) {
+        return 0;
+    }
+    return dev->iface.slab_ring_region(dev);
+}
+
+void ggml_backend_dev_slab_set_ring_cap(ggml_backend_dev_t dev, size_t bytes) {
+    // wip/slab-ring-region (issue #164): hand the context's auto-sized ring cap to the backend.  Optional
+    // hook; a backend that is not the allocator owner (or never sets it) is a no-op.
+    if (dev == nullptr || dev->iface.slab_set_ring_cap == nullptr) {
+        return;
+    }
+    dev->iface.slab_set_ring_cap(dev, bytes);
+}
+
+bool ggml_backend_dev_slab_enabled(ggml_backend_dev_t dev) {
+    // issue #164: report whether this device's slab is enabled.  Optional hook; a backend without a slab
+    // reports false (the ring sizing then does not warn).
+    if (dev == nullptr || dev->iface.slab_enabled == nullptr) {
+        return false;
+    }
+    return dev->iface.slab_enabled(dev);
+}
+
+size_t ggml_backend_dev_slab_ring_slots(ggml_backend_dev_t dev) {
+    // issue #164: the ring depth, so the context can size the ring region for one staged table per slot.
+    // Optional hook; 0 means "unknown" and the caller falls back to the default depth.
+    if (dev == nullptr || dev->iface.slab_ring_slots == nullptr) {
+        return 0;
+    }
+    return dev->iface.slab_ring_slots(dev);
+}
+
 void ggml_backend_dev_slab_narrow_floor(ggml_backend_dev_t dev, size_t bytes) {
     // wip/slab-ring-region: pin the narrow (decode/verify) work floor.  Optional hook.
     if (dev == nullptr || dev->iface.slab_narrow_floor == nullptr) {
         return;
     }
     dev->iface.slab_narrow_floor(dev, bytes);
+}
+
+void ggml_backend_dev_slab_reserve_wide(ggml_backend_dev_t dev, size_t bytes) {
+    // wip/first-prefill-latency: reserve the wide prefill work region.  Optional hook.
+    if (dev == nullptr || dev->iface.slab_reserve_wide == nullptr) {
+        return;
+    }
+    dev->iface.slab_reserve_wide(dev, bytes);
 }
 
 void ggml_backend_dev_slab_narrow2_floor(ggml_backend_dev_t dev, size_t bytes) {
@@ -2218,15 +2262,49 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
-        // the re-allocation may cause the split inputs to be moved to a different address
-        // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        // Reserve the graph and check whether this requires growing (reallocating) one of the buffers.
+        // The buffers are grow-only, so when the graph fits within the already-reserved space (e.g.
+        // alternating dense/sparse ubatches of the same prompt) the reserve only recomputes the tensor
+        // layout and re-points the tensors of this graph.  Skipping the synchronization is only safe
+        // when a single device stream fully orders the compute: the probe/no-sync path is validated
+        // for single-GPU inference (gfx1151 / gfx1100).  With more than one device (tensor/layer
+        // split) a previous graph's kernels may still be in flight on other devices when the
+        // re-point happens, which races cross-device (in-kernel spin / memory faults at multi-ubatch
+        // prefill, reproduced on 3x R9700 gfx1201) - so the multi-device path keeps the full
+        // synchronization (upstream behavior).  Count the non-CPU (async-capable) devices rather than
+        // the raw backend count, so a single GPU plus a CPU backend keeps the fast path.
+        // A Meta backend (tensor split) presents as a single META device here, but it wraps
+        // multiple real devices and drives them on separate device streams.  Counting it as one
+        // async device would wrongly allow the no-sync re-point below on a tensor-split scheduler
+        // and race the previous ubatch's per-device kernels (in-kernel spin / memory faults,
+        // reproduced on 3x R9700).  A Meta device is only ever created for >1 device, so treat it
+        // as multi-device.
+        int n_async_devices = 0;
+        bool multi_device = false;
         for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+            const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[i]));
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_META) {
+                multi_device = true;
+            } else if (dev_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                n_async_devices++;
+            }
         }
+        // Only when a buffer must actually be grown is a full synchronization needed regardless,
+        // because the re-allocation moves the addresses of tensors that an in-flight graph may still
+        // be using.
+        const bool buffers_grown = ggml_gallocr_reserve_n_probe(
+                sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (buffers_grown || n_async_devices > 1 || multi_device) {
+            // the re-allocation may cause the split inputs to be moved to a different address
+            // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+            for (int i = 0; i < sched->n_backends; i++) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
 
-        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-            GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
-            return false;
+            if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+                GGML_LOG_ERROR("%s: failed to reserve graph buffers\n", __func__);
+                return false;
+            }
         }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
@@ -2804,7 +2882,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                 const bool took = split_backend->iface.moe_cache_update(
                         split_backend, input, input_cpy, ids.data(),
                         ids_tensor->ne[0], ids_tensor->ne[1],
-                        ids_tensor->nb[0], ids_tensor->nb[1], 0, -1);
+                        ids_tensor->nb[0], ids_tensor->nb[1], 0, -1, nullptr, 0);
                 if (took) {
                     // the cache filled its compact slots and staged the slot-remapped ids; the
                     // consuming op reads the arena (see `moe_cache_get_table`), so the whole
