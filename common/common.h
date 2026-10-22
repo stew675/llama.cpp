@@ -360,6 +360,9 @@ struct common_params_speculative_draft {
     bool cache_type_k_set = false;
     bool cache_type_v_set = false;
 
+    // MTP only: draft over token ids < N plus control tokens (0 = full vocabulary)
+    int32_t mtp_vocab = 0;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
