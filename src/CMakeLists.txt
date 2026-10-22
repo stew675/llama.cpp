@@ -22,6 +22,7 @@ set(LLAMA_CORE_SOURCES
     llama-impl.cpp
     llama-io.cpp
     llama-kv-cache.cpp
+    llama-lazy-reader.cpp
     llama-kv-cache-iswa.cpp
     llama-kv-cache-dsa.cpp
     llama-kv-cache-dsa-iswa.cpp
