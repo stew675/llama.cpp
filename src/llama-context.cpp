@@ -899,6 +899,22 @@ llama_context::llama_context(
             }
         }
 
+        // the draft vocabulary subset belongs to this context; contexts that ask for the same N share one copy
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.mtp_draft_vocab > 0) {
+            mtp_draft = model.mtp_draft_vocab_get(params.mtp_draft_vocab);
+            if (mtp_draft == nullptr && model.output == nullptr && !model.hparams.no_alloc && cparams.ctx_other != nullptr) {
+                // shared-NextN sidecar (nextn_shared_target_tensors): this draft owns no LM head and its graph scores
+                // with the head it borrows from the target model (see qwen4exp.cpp) - build the subset from that same
+                // head. Fit-probe contexts (no_alloc) never see an allocated head; skipping them keeps the fitting
+                // pass from allocating the subset outside its estimate
+                mtp_draft = llama_get_model(cparams.ctx_other)->mtp_draft_vocab_get(params.mtp_draft_vocab,
+                        /*shared_target_head=*/true);
+            }
+            if (mtp_draft) {
+                cparams.mtp_draft_vocab = mtp_draft->n_keep;
+            }
+        }
+
         sched_reserve();
 
         // wip/first-prefill-latency: reserve the wide prefill work region in the slab BEFORE the MoE
@@ -4225,6 +4241,7 @@ llm_graph_params llama_context::graph_params(
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
+        /*.mtp_draft   =*/ mtp_draft.get(),
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -6070,6 +6087,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.mtp_draft_vocab             =*/ 0,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

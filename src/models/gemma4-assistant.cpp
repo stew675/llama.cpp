@@ -193,7 +193,21 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    ggml_tensor * logits = build_lora_mm(model.output, cur);
+    ggml_tensor * logits;
+    if (mtp_draft != nullptr && model.output == mtp_draft->src && n_outputs == 1) {
+        // --spec-draft-mtp-vocab: this context drafts over a row subset of the LM head (the assistant's tied
+        // token embedding) and scatters its logits into a full-vocab row of -inf, as the qwen35/qwen35moe/
+        // qwen4exp MTP graphs do.  Only the draft changes; the target still verifies the full vocabulary.
+        GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
+        const int64_t n_sel = mtp_draft->head->ne[1];
+        const int64_t n_row = model.output->ne[1];
+        ggml_tensor * sub = build_lora_mm(mtp_draft->head, cur);
+        logits = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
+        logits = ggml_set_rows(ctx0, logits, ggml_reshape_2d(ctx0, sub, 1, n_sel), mtp_draft->ids);
+        logits = ggml_reshape_2d(ctx0, logits, n_row, 1);
+    } else {
+        logits = build_lora_mm(model.output, cur);
+    }
     cb(logits, "result_output", -1);
     res->t_logits = logits;
 
