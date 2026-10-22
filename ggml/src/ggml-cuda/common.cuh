@@ -1765,6 +1765,7 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
 bool ggml_cuda_fusion_disabled();
 
 #define GGML_CUDA_HC_Q8_CNT 1024
+#define GGML_CUDA_HC_DOWN_DONE 1024   // >= n_tokens * (hc_lr/32) of the Q8_0 hc_mix band
 #define GGML_CUDA_MOE_GLU_Q8_CNT 4096
 #define GGML_CUDA_MOE_RED_CNT 4096
 
@@ -1856,6 +1857,11 @@ struct ggml_backend_cuda_context {
     // hc_mix_bf16_up_collapse2 Q8_1 epilogue: per-group row counters, one slice per stream (zeroed once, the
     // kernel resets every counter it completes)
     int * hc_q8_cnt = nullptr;
+    // Q8_0 hc_mix_down_dots: per (token, v group) row counters, one slice per stream; zeroed ONCE at allocation,
+    // for EVERY stream slice, by a synchronous memset (so no stream can ever observe an unzeroed slice, which an
+    // async memset on the allocating stream alone could not promise), and the finisher block resets each counter it
+    // completes.  Hence no per-call memset launch.
+    unsigned int * hc_down_done = nullptr;
     int * moe_glu_q8_cnt = nullptr;
     int * moe_red_cnt = nullptr;
     // The packed FA KV-group bitmap (`flash_attn_mask_to_KV_blocks`) shared by the attention layers of ONE graph
@@ -1920,6 +1926,15 @@ struct ggml_backend_cuda_context {
             CUDA_CHECK(cudaMemsetAsync(hc_q8_cnt, 0, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_Q8_CNT*sizeof(int), stream()));
         }
         return hc_q8_cnt + curr_stream_no*GGML_CUDA_HC_Q8_CNT;
+    }
+
+    unsigned int * hc_down_done_counters() {
+        if (hc_down_done == nullptr) {
+            CUDA_CHECK(ggml_cuda_device_malloc((void **) &hc_down_done, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_DOWN_DONE*sizeof(unsigned int), device));
+            CUDA_CHECK(cudaMemset(hc_down_done, 0, GGML_CUDA_MAX_STREAMS*GGML_CUDA_HC_DOWN_DONE*sizeof(unsigned int)));
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        return hc_down_done + curr_stream_no*GGML_CUDA_HC_DOWN_DONE;
     }
 
     // GLU -> Q8_1 (verify band): ggml_cuda_try_fuse sets these for the GLU node it is about to leave to the regular
@@ -2860,6 +2875,29 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
 // BF16 src1 cache (GGML_CUDA_BF16_SRC1_CACHE=0: off), shared by the MMB / HC producers.
 static inline bool ggml_cuda_bf16_src1_cache_on() {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_BF16_SRC1_CACHE"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// Producer-written BF16 src1 (GGML_CUDA_BF16_PRODUCER, default 1; 0: off; 2: also verify every hit against the
+// conversion it replaces, debug only, slow): the qwen4exp prefill producers of the cuBLAS/rocBLAS BF16 GEMM
+// activations (dsv4_hc_post_rms's xn, dsv4_hc_pre's mixed stream) write the RNE BF16 copy in the same pass and leave
+// it in bf16_src1_cache, so the GEMM skips its F32 -> BF16 pass.  The F32 output is always written too.
+static inline int ggml_cuda_bf16_producer_mode() {
+    static const int m = [] { const char * e = getenv("GGML_CUDA_BF16_PRODUCER"); return e == nullptr ? 1 : atoi(e); }();
+    return m;
+}
+
+// The qwen4exp prefill fusion DSV4_HC_POST -> RMS_NORM -> MUL(gamma) (norm.cu, ggml-cuda-try-fuse.cu).
+// GGML_CUDA_HC_POST_RMS=0 disables it (the unfused three-op chain, byte-identical output).
+static inline bool ggml_cuda_hc_post_rms_on() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_HC_POST_RMS"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// Diagnostic only (never a behaviour switch): GGML_CUDA_HC_POST_RMS_DEBUG=1 logs one decision line per candidate
+// node, fused or declined, so a gate can prove the fusion is live (and that an arm reached the range check).
+static inline bool ggml_cuda_hc_post_rms_debug() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_HC_POST_RMS_DEBUG"); return e != nullptr && atoi(e) != 0; }();
     return on;
 }
 
