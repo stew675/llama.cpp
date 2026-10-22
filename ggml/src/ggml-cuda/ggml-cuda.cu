@@ -27,6 +27,9 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-qsa.cuh"
+#include "ggml-cuda/indexer-topk.cuh"
+#include "ggml-cuda/indexer-score.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/gdn-conv.cuh"
 #include "ggml-cuda/ple-conv.cuh"
@@ -70,6 +73,8 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/hc-mix.cuh"
+#include "ggml-cuda/hyperconn.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -4832,6 +4837,19 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;
+        case GGML_OP_FLASH_ATTN_QSA:
+            ggml_cuda_flash_attn_qsa(ctx, dst);
+            break;
+        case GGML_OP_INDEXER_TOPK:
+            ggml_cuda_indexer_top_k(ctx, dst);
+            break;
+            break;
+        case GGML_OP_INDEXER_SCORE:
+            ggml_cuda_indexer_score(ctx, dst);
+            break;
+        case GGML_OP_INDEXER_FILL:
+            ggml_cuda_indexer_fill(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
@@ -4855,6 +4873,12 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_HC_MIX:
+            ggml_cuda_op_hc_mix(ctx, dst);
+            break;
+        case GGML_OP_HC_COMBINE:
+            ggml_cuda_op_hc_combine(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -6428,10 +6452,124 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
     }
 
+    // HC BF16 streams (LLAMA_HC_BLK16 / LLAMA_HC_RES16, both default OFF).  Mark the combine+norm's
+    // block_out (attention out-proj / MoE reduction) and residual tensors BF16-only so their
+    // producers store BF16 in place and the fused combine reads/writes BF16.  Guards mirror the
+    // reference: prefill only (>= 512 rows) and only when every consumer can read a BF16 copy.
+    if (ggml_cuda_mmb_blk16() || ggml_cuda_mmb_res16()) {
+        auto reads_any = [](const ggml_tensor * t, const ggml_tensor * x) {
+            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) if (t->src[s] == x || t->src[s]->view_src == x) return true;
+            return false;
+        };
+        std::vector<ggml_cuda_hc_combine_norm_args> comb;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_hc_combine_norm_args ca;
+            if (ggml_cuda_hc_combine_norm_identify(cgraph, i, ca)) comb.push_back(ca);
+        }
+        static const int blk_dbg = getenv("GGML_CUDA_HC_BLK16_DEBUG") ? atoi(getenv("GGML_CUDA_HC_BLK16_DEBUG")) : 0;
+        if (blk_dbg) fprintf(stderr, "HC_BLK16 comb=%zu\n", comb.size());
+        if (ggml_cuda_mmb_blk16()) {   // block_out (attention out-proj / MoE merge) is read only by the fused combine
+            std::vector<const ggml_tensor *> blks;
+            for (const auto & ca : comb) blks.push_back(ca.block_out->view_src ? ca.block_out->view_src : ca.block_out);
+            for (const ggml_tensor * b : blks) {
+                if (ggml_nrows(b) < 512 || b->ne[0] % 8 != 0) continue;
+                // the producer must honour a BF16 mark (MMB dense GEMM or the MoE reduction, possibly
+                // through the shared-expert ADD the fusion folds in).  Our qwen4exp graph keeps the
+                // shared-expert ADD apart from the reduction chain, so only the MUL_MAT block_out
+                // arms are taken here (the reduction/merge arm is retained for trees where they are
+                // adjacent, as in the reference).
+                bool producer_ok = false;
+                if (b->op == GGML_OP_MUL_MAT && ggml_cuda_mmb_supported_mm(b->src[0], b->src[1], b)) producer_ok = true;
+                if (blk_dbg) fprintf(stderr, "HC_BLK16 blk %s op=%s prod=%d\n", b->name, ggml_op_name(b->op), (int) producer_ok);
+                if (!producer_ok) {
+                    for (int k = 0; k < cgraph->n_nodes && !producer_ok; ++k) {
+                        ggml_moe_weighted_reduction_match mm;
+                        if (cgraph->nodes[k]->op != GGML_OP_MUL) continue;
+                        if (!ggml_match_moe_weighted_reduction(cgraph, k, mm)) continue;
+                        if (mm.dst == b) producer_ok = true;
+                        else if (k + mm.node_count < cgraph->n_nodes &&
+                                 cgraph->nodes[k + mm.node_count] == b && b->op == GGML_OP_ADD &&
+                                 ggml_node_has_n_uses(cgraph, k + mm.node_count - 1, 1) &&
+                                 (b->src[0] == mm.dst || b->src[1] == mm.dst)) producer_ok = true;
+                    }
+                }
+                if (!producer_ok) continue;
+                int bi = -1;
+                for (int k = 0; k < cgraph->n_nodes; ++k) if (cgraph->nodes[k] == b) { bi = k; break; }
+                if (bi < 0) continue;
+                bool ok = true; int nread = 0;
+                for (int n = bi + 1; n < cgraph->n_nodes && ok; ++n) {
+                    const ggml_tensor * t = cgraph->nodes[n];
+                    if (!reads_any(t, b)) continue;
+                    ++nread;
+                    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_REPEAT) continue;
+                    if (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD) continue;
+                    ok = false;
+                }
+                if (ok && nread > 0 && elide_f32) ggml_cuda_mmb_mark_bf16_only(b);
+            }
+        }
+        if (ggml_cuda_mmb_res16()) {   // residual stream: readers are the fused norm and the next combine
+            std::vector<std::pair<const ggml_tensor *, const ggml_tensor *>> combp;
+            for (const auto & ca : comb) combp.emplace_back(ca.residual, ca.out_res);
+            for (const auto & c : combp) {
+                const ggml_tensor * r = c.second;
+                if (ggml_nrows(r) < 512) continue;
+                int ri = -1;
+                for (int k = 0; k < cgraph->n_nodes; ++k) if (cgraph->nodes[k] == r) { ri = k; break; }
+                if (ri < 0) continue;
+                bool ok = true; int nread = 0;
+                for (int n = ri + 1; n < cgraph->n_nodes && ok; ++n) {
+                    const ggml_tensor * t = cgraph->nodes[n];
+                    if (!reads_any(t, r)) continue;
+                    ++nread;
+                    if (t->op == GGML_OP_RMS_NORM) continue;
+                    if (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) continue;
+                    bool next_combine = false;
+                    for (const auto & d : combp) {
+                        const ggml_tensor * dr = d.first->view_src ? d.first->view_src : d.first;
+                        if (dr == r && d.second == t) { next_combine = true; break; }
+                    }
+                    if (next_combine) continue;
+                    ok = false;
+                }
+                if (ok && nread > 0 && elide_f32) ggml_cuda_mmb_mark_bf16_only(r);
+            }
+        }
+    }
     }   // !allocs_only (marking passes)
 
     if (marks_only) {
         return;
+    }
+
+    // The in-place residual stream (LLAMA_HC_RES16) needs the producer/consumer on different
+    // buffers.  It is a *marking* dependency, so it must be registered by the alloc-deps pass the
+    // meta backend runs before allocation -- the marking pass alone cannot reach the graft
+    // allocator.  Re-run the structural matcher here so it lands in the same place as the other
+    // fusion deps.
+    if (ggml_cuda_mmb_res16()) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_hc_combine_norm_args ca;
+            if (ggml_cuda_hc_combine_norm_identify(cgraph, i, ca)) {
+                ggml_tensor * rr = const_cast<ggml_tensor *>(ca.residual->view_src ? ca.residual->view_src : ca.residual);
+                params->add_alloc_dep(params->user_data, rr, ca.out_res);
+                params->add_alloc_dep(params->user_data, rr, ca.out_xn);
+            }
+        }
+    }
+
+    // Prefill indexer relu-sum: keep the pre-relu scores alive until the summed output, so the
+    // allocator cannot reuse that buffer for the fused destination.
+    {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op != GGML_OP_UNARY) continue;
+            ggml_cuda_idx_relu_sum_args ia;
+            if (ggml_cuda_match_idx_relu_sum(cgraph, i, ia) > 0 && ia.score && ia.dst) {
+                ggml_tensor * root = ia.score->view_src ? ia.score->view_src : const_cast<ggml_tensor *>(ia.score);
+                params->add_alloc_dep(params->user_data, root, ia.dst);
+            }
+        }
     }
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -7704,8 +7842,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_HC_MIX:
+            if (op->src[2]->type == GGML_TYPE_BF16) {
+                // the BF16 arm replays the K = 320 mmvf block (hc_lr == 320); other low-ranks
+                // take the unfused chain rather than aborting in the kernel
+                return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                    op->src[3]->type == GGML_TYPE_BF16 && op->src[0]->ne[1] == 4 &&
+                    op->src[2]->ne[1] == 320 && op->src[3]->ne[0] == 320 &&
+                    (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_BF16) &&
+                    op->type == GGML_TYPE_F32;
+            }
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_Q8_0 && op->src[3]->type == GGML_TYPE_Q8_0 &&
+                (op->src[4] == nullptr || op->src[4]->type == GGML_TYPE_F32 || op->src[4]->type == GGML_TYPE_Q8_0) &&
+                op->type == GGML_TYPE_F32;
+        case GGML_OP_HC_COMBINE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_FLASH_ATTN_QSA:
+            return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
+        case GGML_OP_INDEXER_TOPK:
+            return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
+        case GGML_OP_INDEXER_SCORE:
+            return ggml_cuda_indexer_score_supported(dev_ctx->device, op);
+        case GGML_OP_INDEXER_FILL:
+            return ggml_cuda_indexer_fill_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:

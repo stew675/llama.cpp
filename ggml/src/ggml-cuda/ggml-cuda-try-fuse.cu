@@ -30,6 +30,9 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-qsa.cuh"
+#include "ggml-cuda/indexer-topk.cuh"
+#include "ggml-cuda/indexer-score.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/gdn-conv.cuh"
 #include "ggml-cuda/ple-conv.cuh"
@@ -72,6 +75,8 @@
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
+#include "ggml-cuda/hc-mix.cuh"
+#include "ggml-cuda/hyperconn.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -79,6 +84,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/ggml-cuda-try-fuse.cuh"
 #include "ggml.h"
 #include <algorithm>
@@ -1554,6 +1560,17 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Structural identification of the qwen4exp hyper-connection combine+norm subgraph for the BF16 HC
+// streams (LLAMA_HC_BLK16 / LLAMA_HC_RES16, both default OFF).  graph_optimize runs before the
+// buffers are assigned, so this is structure/shape only (no alias checks); the fusion site
+// re-checks everything.  Only the repeat-anchored form qwen4exp emits is recognised (the narrow
+// block_out base is a graph output and the REPEAT is consumed inside the fused window); if it does
+// not match, the caller simply does not mark and the two flags stay inert.
+
+// Prefill indexer head reduction: relu + head-sum.  Anchored at the RELU.  Our qwen4exp graph (the
+// L2a memory win) puts the relu BEFORE the 4-D reshape, so an optional RESHAPE between the relu and
+// the head views is accepted; the reference's relu-on-4-D form matches with no reshape.  The fused
+// kernel recomputes the relu from the pre-relu scores and sums in graph order, so it is bit-identical.
 // wip/moe-expert-cache (H1): while the cache is active, only the fusions that read a routed
 // expert table in the cache band stand down; every other backend fusion (router/topk, GDN, QSA,
 // rope, norms, and the *prefill* MoE fusions) stays on.  The decode/verify MoE must run through
@@ -1937,6 +1954,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // HC_COMBINE -> BF16 HC_MIX (GGML_CUDA_FUSE_HC_COMBINE_MIX=0: off): the combine and the mixer's norm in one kernel
+    if (const int n_hc_combine_mix = ggml_cuda_hc_combine_mix_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_hc_combine_mix;
+    }
 
     // GDN snapshot CPYs already written by the direct conv kernel (GGML_CUDA_DISABLE_GDN_CONV_SNAP=1: off)
     if (ggml_cuda_gdn_conv_snap_try_fuse(cgraph, i)) {
@@ -1959,6 +1980,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
         return n_shared_expert;
     }
 
+    // Prefill indexer head reduction (relu + head-sum) for the qwen4exp sparse-attention graph.
+    if (const int n_idx_relu_sum = ggml_cuda_indexer_relu_sum_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_idx_relu_sum;
+    }
 
     // Depthwise causal conv1d fusions (qwen4exp GDN + PLE), ported from the halo-box
     // reference: the CONCAT(state, x) materialization and the SSM_CONV / tap-mul-add
@@ -2945,6 +2970,29 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     // then read inject's data as block_out. It now reads the live REPEAT output (mul operand).
     // Opt-outs: GGML_CUDA_DISABLE_HC_FUSION=1 (all), GGML_CUDA_DISABLE_HC_MIX=1 / GGML_CUDA_DISABLE_HC_COMB=1.
 
+    // qwen4exp hyper-connection gate GEMM + sigmoid + stream mix: when the HC gate MUL_MAT's only
+    // consumer is the sigmoid that opens an hc_mix window, fold the GEMM into the mix kernel - it
+    // removes the gate tensor materialization and one launch per layer.  RDNA3 (gfx1100/gfx1151) and,
+    // since 2026-09-24, RDNA4 (gfx120x) - the kernel dequantizes the IQ4_NL gate weight and replays
+    // the GEMM's BF16 epilogue rounding via the arch-aware `mmb_frag_t`/`mmb_wmma_bf16`/`MMB_ACC_M`
+    // shim, so the fusion is bit-identical to the GEMM + sigmoid + mix chain on both.  A/B / bisect:
+    // LLAMA_HC_GATEMIX=0.
+    // gfx1100 is a port candidate: the gfx11 WMMA builtin is shared with gfx1151, but `gatemix` stays
+    // default OFF on RDNA3_0 (mmb_arch_defaults) until a gfx1151/gfx1201 session A/Bs qwen4exp
+    // end-to-end; LLAMA_HC_GATEMIX=1 is the opt-in on gfx1100.
+    // qwen4exp HC gate GEMM + sigmoid + stream mix (owned by hyperconn.cu). LLAMA_HC_GATEMIX=0 off.
+    if (const int n_hc_gate_mix = ggml_cuda_hc_gate_mix_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_hc_gate_mix;
+    }
+    // qwen4exp hyper-connection stream mix (HC_MIX, prefill): one kernel reads xn/gate once and
+    // writes the [n_embd, T] mean of the gated streams.  (hc-mix surface, owner block 10.)
+    if (const int n_hc_mix = ggml_cuda_hc_mix_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_hc_mix;
+    }
+    // qwen4exp hyper-connection combine+norm fusions (owned by hyperconn.cu).
+    if (const int n_hc_comb = ggml_cuda_hc_combine_norm_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_hc_comb;
+    }
 
     // UNARY(sigmoid) -> MUL -> ADD with a per-row gate (GGML_CUDA_FUSE_SIGMOID_MUL_ADD=0: off): one kernel
     if (const int n_sig_mul_add = ggml_cuda_sigmoid_mul_add_try_fuse(*cuda_ctx, cgraph, i)) {

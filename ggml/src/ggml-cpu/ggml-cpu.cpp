@@ -666,6 +666,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_FLASH_ATTN_QSA:
+            // the CPU reference implements the mask form only; the derived-visibility form
+            // (cell_vis/q_vis, src[5]/src[6]) is CUDA-only and aborts here.  Refuse it so the
+            // graph builder's supports_op probe (qsa_derived_vis_supported) and the scheduler
+            // keep it on a CUDA device, or the model takes the dense masked path instead.
+            return op->src[5] == nullptr;
         default:
             return true;
     }
