@@ -1,3 +1,4 @@
+#include "gdn-conv.cuh"
 #include "cpy-batch.cuh"
 
 namespace {
@@ -73,6 +74,7 @@ int ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, c
         const ggml_tensor * b = cgraph->nodes[j];
         if (cb_noop(b)) continue;
         if (!cb_member(b) || !cb_same(b->src[0], first->src[0]) || !cb_same(b->src[1], first->src[1])) break;
+        if (ggml_cuda_gdn_conv_snap_try_fuse(cgraph, j)) break;   // written by the GDN direct conv (snapshot fold)
         idx[n++] = j; last = j;
     }
     if (n < 2) return 0;
@@ -106,4 +108,14 @@ int ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, c
     static const bool dbg = getenv("GGML_CUDA_FUSE_CPY_BATCH_DEBUG") != nullptr;
     if (dbg) fprintf(stderr, "cpy_batch: %d copies over nodes %d..%d (%lld elements each)\n", n, i, last, (long long) ne);
     return last - i + 1;
+}
+
+// GGML_CUDA_FUSE_CPY_BATCH=0: off.  Returns the number of graph nodes to skip when a run was
+// batched (>= 1), 0 otherwise.  The env check lives in ggml_cuda_cpy_batch().
+int ggml_cuda_cpy_batch_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (cgraph->nodes[i]->op != GGML_OP_CPY || !ctx.stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    const int taken = ggml_cuda_cpy_batch(ctx, cgraph, i);
+    return taken >= 2 ? taken - 1 : 0;
 }

@@ -1308,7 +1308,10 @@ static __global__ void flash_attn_tile(
                             // V3 derived kq mask (ggml_flash_attn_ext_add_kq_derived): the compact
                             // per-cell visibility state, read instead of the packed mask when present.
                             const int * cell_pos_ptr, const int * tok_lo_ptr, const int * tok_hi_ptr,
-                            const int, const int) {
+                            const int, const int,
+                            // wip/fa-stage-chunking (TODO #114): the per-row partial contract is
+                            // MMA-prefill only; the tile kernel keeps its single whole-prefix launch.
+                            float2 *, const int) {
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
