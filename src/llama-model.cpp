@@ -399,7 +399,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    // The scheduler's per-split input copies are named `<backend>#<tensor name>#<copy index>`
+    // (`ggml_backend_sched_alloc_splits`).  Under `-sm tensor` that copy is the only form in which a
+    // host-resident, op-offloaded weight reaches the meta backend, so strip the wrapper to let the
+    // copy inherit the split state of the weight it duplicates -- otherwise it defaults to mirrored and
+    // the whole tensor is uploaded to every device and every device computes all experts.  Any other
+    // name (every activation copy) is left alone and falls through to the mirrored default below.
+    std::string tensor_name = tensor->name;
+    {
+        const size_t first = tensor_name.find('#');
+        const size_t last  = tensor_name.rfind('#');
+        if (first != std::string::npos && last > first + 1 && last + 1 < tensor_name.size()) {
+            bool trailing_index = true;
+            for (size_t i = last + 1; i < tensor_name.size(); i++) {
+                trailing_index = trailing_index && tensor_name[i] >= '0' && tensor_name[i] <= '9';
+            }
+            if (trailing_index) {
+                // wip/tensor-split-expert-split experiment gate:
+                //   0 = off (r12 behaviour: the copy stays mirrored)
+                //   1 = every weight copy inherits its weight's split
+                //   2 = only the axis-1 copies (gate/up: column-parallel, no reduction), leaving the
+                //       axis-0 `ffn_down_exps` copies mirrored -- the bisection for the memory fault
+                static const int split_copy = [] {
+                    const char * e = getenv("GGML_META_SPLIT_COPY");
+                    return e != nullptr ? atoi(e) : 1;
+                }();
+                if (split_copy != 0) {
+                    const std::string stripped = tensor_name.substr(first + 1, last - first - 1);
+                    const bool is_down = stripped.find("ffn_down_exps") != std::string::npos;
+                    // 2 = keep only the axis-0 down copies mirrored; 3 = the inverse bisection:
+                    // split only the axis-0 down copies, leave gate/up mirrored (tests the reduce path
+                    // in isolation).
+                    const bool axis0_only = split_copy == 2 && is_down;
+                    const bool down_only  = split_copy == 3 && !is_down;
+                    if (!axis0_only && !down_only) {
+                        tensor_name = stripped;
+                    }
+                }
+            }
+        }
+    }
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -2494,6 +2533,26 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
     return ret;
 }
 
+size_t llama_model::max_host_weight_tensor_bytes() const {
+    size_t max_bytes = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(t);
+            if (bytes > max_bytes) {
+                max_bytes = bytes;
+            }
+        }
+    }
+    return max_bytes;
+}
+
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
@@ -4155,22 +4214,3 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
     return n_tokens * (uint32_t) tensor->ne[0];
 }
 
-size_t llama_model::max_host_weight_tensor_bytes() const {
-    size_t max_bytes = 0;
-    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
-        ggml_context * c = ctx.get();
-        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
-            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
-                continue;
-            }
-            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-                continue;
-            }
-            const size_t bytes = ggml_nbytes(t);
-            if (bytes > max_bytes) {
-                max_bytes = bytes;
-            }
-        }
-    }
-    return max_bytes;
-}

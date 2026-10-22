@@ -64,6 +64,8 @@
 // dispatch calls `moe_cache_heat_observe()` (routing tally, both bands) and the scheduler hook
 // `moe_cache_update_host()` drives the policy; see wip/ and archive/work/moe-expert-cache/.
 
+#include "ggml-backend-impl.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -194,9 +196,13 @@ bool moe_cache_is_sized();
 // and `split_axis` is the master's split axis (0/1, or -1 for an unsplit whole-expert table).  For a
 // contiguous axis-1 slice `host_pitch` is 0 and the fill is one 1-D copy; for a strided axis-0 slice
 // `host_pitch` is the host row pitch and the fill is a 2-D copy.
+// wip/fix-gemma-4 (TODO #77/C): `slices`/`n_slices` describe a FUSED table whose device slot is the
+// concatenation of several ranges of the host expert blob (gemma4 `ffn_gate_up_exps` under `-sm tensor`).
+// `n_slices == 0` keeps the historical single-slice geometry (`src_off`/`host_pitch`/`split_axis`).
 int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                     size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
-                    const void * host, int device);
+                    const void * host, int device,
+                    const struct ggml_backend_moe_slice * slices = nullptr, int n_slices = 0);
 
 // wip/host-expert-dio-cache Phase 1 (plumbing, inert): register the on-disk source of a host-resident
 // expert tensor, keyed by its host data pointer (== the `host` passed to `moe_cache_table`).  Called by
@@ -248,7 +254,8 @@ void moe_cache_heat_observe(const struct ggml_tensor * op, const struct ggml_ten
 bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
                            const int32_t * ids, int64_t n_used, int64_t n_tok,
                            size_t ids_nb0, size_t ids_nb1, void * stream,
-                           int device, size_t slice_off, int split_axis);
+                           int device, size_t slice_off, int split_axis,
+                           const struct ggml_backend_moe_slice * slices = nullptr, int n_slices = 0);
 
 // Host-weight expert gather (B2, session 15).  For a `-ncmoe` `MUL_MAT_ID` prefill whose expert upload is
 // NOT staged, copy only the routed experts from the host master into the scheduler's device `input_cpy`,

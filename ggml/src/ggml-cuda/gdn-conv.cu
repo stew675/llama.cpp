@@ -11,7 +11,9 @@
 // single-device graphs only.  GGML_CUDA_CONV_FUSION_MULTI=1 forces it back on (A/B / fix validation)
 // and GGML_CUDA_DISABLE_CONV_FUSION=1 is the explicit off switch.
 static bool gdn_conv_enabled() {
-    if (getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr) return false;
+    // Cache the switches: this runs once per conv launch, and getenv() is expensive on Windows.
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr;
+    if (disabled) return false;
     static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
     return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
 }
@@ -26,9 +28,19 @@ static __global__ void gdn_concat_tail(const float * __restrict__ state, const f
     out[(size_t) c * row_stride + j] = (j < 3) ? state[c * 3 + j] : x[(size_t) (j - 3) * C + c];
 }
 
-template <bool apply_silu, int TT>
+// The GDN q / k l2 norms (RMS_NORM + SCALE over 128-wide heads, rms_norm_scale_pair_f32<256>) folded into the conv: channels
+// [0, nk*128) are the q heads, [nk*128, 2*nk*128) the k heads, and a 256-thread block holds two whole heads (warps 0-3, 4-7).
+struct gdn_conv_norm_args {
+    float * dst0 = nullptr;   // q: [128, nk, T] contiguous
+    float * dst1 = nullptr;   // k
+    int     nk = 0;
+    float   eps = 0.0f;
+    float   scale_out = 0.0f;
+};
+
+template <bool apply_silu, int TT, bool fuse_norm = false>
 static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float * __restrict__ state, const float * __restrict__ x,
-        const float * __restrict__ w, float * __restrict__ y, const int C, const int T) {
+        const float * __restrict__ w, float * __restrict__ y, const int C, const int T, const gdn_conv_norm_args norm) {
     const int c  = blockIdx.x * 256 + threadIdx.x;
     const int t0 = blockIdx.y * TT;
     if (c >= C) return;
@@ -45,7 +57,41 @@ static __global__ void __launch_bounds__(256) gdn_conv_direct_kernel(const float
 #pragma unroll
         for (int j = 0; j < 4; ++j) sumf += xw[j] * wr[j];
         sumf += b;
-        y[(size_t) t * C + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        const float yv = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+        y[(size_t) t * C + c] = yv;
+        if constexpr (fuse_norm) {
+            // rms_norm_scale_pair_f32<256> on a 128-column row: thread col holds 0 + x*x (threads 128..255 hold 0), the
+            // warp butterfly, then warp 0 butterflies the 8 warp sums (warps 4..7 are 0, lanes 8..31 the 0 sentinel).
+            // Here the head's 4 warp sums sit in lanes 0..3 and 0 in the rest: the same values in the same lanes, so the
+            // same mean, scale and outputs.
+            __shared__ float s_w[256/WARP_SIZE];
+            const int  lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE;
+            const bool qk   = c < 2*norm.nk*128;
+            float tmp = 0.0f;
+            if (qk) {
+                tmp += yv * yv;
+            }
+            tmp = warp_reduce_sum(tmp);
+            if (lane == 0) {
+                s_w[warp] = tmp;
+            }
+            __syncthreads();
+            const int half = warp / (128/WARP_SIZE);
+            float val = 0.0f;
+            if (lane < 256/WARP_SIZE) {
+                val = lane < 128/WARP_SIZE ? s_w[half*(128/WARP_SIZE) + lane] : 0.0f;
+            }
+            val = warp_reduce_sum(val);
+            if (qk) {
+                const float mean  = val / 128;
+                const float scale = rsqrtf(mean + norm.eps);
+                const int   is_k  = c >= norm.nk*128;
+                const int   h     = c / 128 - is_k*norm.nk;
+                float * dst = is_k ? norm.dst1 : norm.dst0;
+                dst[((size_t) t*norm.nk + h)*128 + c % 128] = norm.scale_out * (scale * yv);
+            }
+            __syncthreads();
+        }
         xw[0] = xw[1]; xw[1] = xw[2]; xw[2] = xw[3];
         const int jp = t + 4; xw[3] = (jp < 3) ? state[c * 3 + jp] : ((jp - 3) < T ? x[(size_t) (jp - 3) * C + c] : 0.0f);
     }
@@ -64,7 +110,12 @@ static bool gdn_conv_check(const ggml_cgraph * cgraph, int i, ggml_cuda_gdn_conv
     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != 1 || st->ne[3] != 1 || !ggml_is_contiguous(st)) return false;
     if (tr->ne[0] != T || tr->ne[1] != C || tr->view_offs != 0) return false;
     if (cc->ne[0] != T + 3 || cc->ne[1] != C || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) return false;
-    if (T < 256 || C % 256 != 0) return false;
+    // On RDNA4 and RDNA3_0 the 2..255-token batches (the speculative verify step) take the fused path too; otherwise their CONCAT is a
+    // generic non-contiguous copy per layer.  Same kernels, bit-identical.  GGML_CUDA_FUSE_GDN_CONV_VERIFY=0 turns it off.
+    static const bool conv_verify = getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_VERIFY")) != 0;
+    const int  cc_verify = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool verify_ok = conv_verify && T >= 2 && (GGML_CUDA_CC_IS_RDNA4(cc_verify) || GGML_CUDA_CC_IS_RDNA3_0(cc_verify));
+    if ((T < 256 && !verify_ok) || C % 256 != 0) return false;
     if (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_VIEW || cgraph->nodes[i + 1]->view_src != cc) return false;
     int64_t tail_from = T + 3; int conv = -1;
     for (int n = i + 1; n < cgraph->n_nodes && n < i + 64; ++n) {
@@ -124,12 +175,114 @@ void ggml_cuda_gdn_conv_write_tail(ggml_backend_cuda_context & ctx, const ggml_c
     CUDA_CHECK(cudaGetLastError());
 }
 
-void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m) {
+void ggml_cuda_gdn_conv_direct(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_match & m, const gdn_conv_norm_args * norm) {
     static bool dbg = getenv("GGML_CUDA_CONV_DEBUG") != nullptr;
     if (dbg) { fprintf(stderr, "GDN_CONV_DIRECT C=%lld T=%lld tail_from=%lld silu=%d\n", (long long) m.C, (long long) m.T, (long long) m.tail_from, (int) m.silu); dbg = false; }
     constexpr int TT = 128;
     dim3 grid((unsigned) (m.C / 256), (unsigned) ((m.T + TT - 1) / TT));
-    gdn_conv_direct_kernel<true, TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
-        (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T);
+    if (norm) {
+        gdn_conv_direct_kernel<true, TT, true><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
+            (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, *norm);
+    } else {
+        gdn_conv_direct_kernel<true, TT><<<grid, 256, 0, ctx.stream()>>>((const float *) m.state->data, (const float *) m.x->data,
+            (const float *) m.w->data, (float *) m.conv_out->data, (int) m.C, (int) m.T, gdn_conv_norm_args{});
+    }
     CUDA_CHECK(cudaGetLastError());
+}
+
+static bool gdn_conv_noop_op(const ggml_tensor * t) {
+    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE ||
+           t->op == GGML_OP_NONE;
+}
+
+// RMS_NORM + SCALE (scale only) over a 128-wide head view of the conv output, the view starting at channel `ch0`
+static bool gdn_conv_norm_one(const ggml_cgraph * cgraph, int j, const ggml_cuda_gdn_conv_match & m, int64_t ch0, int64_t nk,
+                              float & eps, float & scale) {
+    if (j + 1 >= cgraph->n_nodes) return false;
+    const ggml_tensor * rn = cgraph->nodes[j];
+    const ggml_tensor * sc = cgraph->nodes[j + 1];
+    if (rn->op != GGML_OP_RMS_NORM || sc->op != GGML_OP_SCALE || sc->src[0] != rn || rn->type != GGML_TYPE_F32 ||
+            sc->type != GGML_TYPE_F32 || !ggml_is_contiguous(sc)) return false;
+    const ggml_tensor * v = rn->src[0];
+    if (!v || v->op != GGML_OP_VIEW || v->view_src != m.conv_out || v->type != GGML_TYPE_F32) return false;
+    if (v->ne[0] != 128 || v->ne[1] != nk || v->ne[2] != m.T || v->ne[3] != 1 || v->nb[0] != sizeof(float) ||
+            v->nb[1] != 128*sizeof(float) || v->nb[2] != (size_t) m.C*sizeof(float) || v->view_offs != (size_t) ch0*sizeof(float)) return false;
+    if (sc->ne[0] != 128 || sc->ne[1] != nk || sc->ne[2] != m.T || sc->ne[3] != 1) return false;
+    float bias;
+    memcpy(&eps,   rn->op_params, sizeof(float));
+    memcpy(&scale, sc->op_params, sizeof(float));
+    memcpy(&bias,  (const float *) sc->op_params + 1, sizeof(float));
+    // only rms_norm / scale outputs that nothing else reads (the views between are no-ops)
+    return bias == 0.0f && eps >= 0.0f && (rn->flags & GGML_TENSOR_FLAG_COMPUTE) && (sc->flags & GGML_TENSOR_FLAG_COMPUTE);
+}
+
+// The q / k l2 norm pair right after the conv (only no-op nodes between): the direct kernel also writes both normalized
+// outputs.  Returns the index of the second SCALE, -1 when the pattern is not there.  GGML_CUDA_FUSE_GDN_CONV_NORM=0: off.
+static int gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m, gdn_conv_norm_args & na) {
+    static const bool fuse = getenv("GGML_CUDA_FUSE_GDN_CONV_NORM") == nullptr || atoi(getenv("GGML_CUDA_FUSE_GDN_CONV_NORM")) != 0;
+    if (!fuse || !m.silu || m.C % 256 != 0) return -1;
+    int j = m.conv_idx + 2;
+    while (j < cgraph->n_nodes && gdn_conv_noop_op(cgraph->nodes[j])) ++j;
+    if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_RMS_NORM) return -1;
+    const ggml_tensor * v0 = cgraph->nodes[j]->src[0];
+    if (!v0 || v0->ne[0] != 128 || v0->view_offs != 0) return -1;
+    const int64_t nk = v0->ne[1];
+    if (nk < 1 || 2*nk*128 > m.C) return -1;
+    float eps0, sc0, eps1, sc1;
+    if (!gdn_conv_norm_one(cgraph, j, m, 0, nk, eps0, sc0)) return -1;
+    int j2 = j + 2;
+    while (j2 < cgraph->n_nodes && gdn_conv_noop_op(cgraph->nodes[j2])) ++j2;
+    if (!gdn_conv_norm_one(cgraph, j2, m, nk*128, nk, eps1, sc1) || eps0 != eps1 || sc0 != sc1) return -1;
+    // nothing after the pair reads the RMS_NORM outputs (only the SCALEs are produced)
+    for (int n = j2 + 2; n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * t = cgraph->nodes[n];
+        for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+            if (t->src[s] == cgraph->nodes[j] || t->src[s] == cgraph->nodes[j2] ||
+                    t->src[s]->view_src == cgraph->nodes[j] || t->src[s]->view_src == cgraph->nodes[j2]) return -1;
+        }
+    }
+    // the SCALE outputs are written while the conv still reads x / state / w straight from their buffers; the allocator
+    // can place them over the state or x (both dead after the CONCAT in graph order), so the fold needs disjoint memory
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a), b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    for (const ggml_tensor * d : { cgraph->nodes[j + 1], cgraph->nodes[j2 + 1] }) {
+        for (const ggml_tensor * src : { m.x, m.state, m.w, (const ggml_tensor *) m.conv_out }) {
+            if (overlap(d, src)) return -1;
+        }
+    }
+    na.dst0 = (float *) cgraph->nodes[j + 1]->data;
+    na.dst1 = (float *) cgraph->nodes[j2 + 1]->data;
+    na.nk = (int) nk; na.eps = eps0; na.scale_out = sc0;
+    return j2 + 1;
+}
+
+// Depthwise causal conv1d fusion entry point (GDN).  Returns the number of graph nodes to skip
+// when fused, 0 otherwise.  A/B / bisect kill switch: GGML_CUDA_DISABLE_CONV_FUSION=1.
+int ggml_cuda_gdn_conv_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_conv_fusion = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_CONV_FUSION"));
+    if (disable_conv_fusion) {
+        return 0;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_CONCAT && node->op != GGML_OP_SSM_CONV) {
+        return 0;
+    }
+    ggml_cuda_gdn_conv_match gm;
+    if (node->op == GGML_OP_CONCAT && ggml_cuda_gdn_conv_match_at_concat(cgraph, i, gm)) {
+        ggml_cuda_gdn_conv_write_tail(ctx, gm);
+        return 1;
+    }
+    if (node->op == GGML_OP_SSM_CONV && ggml_cuda_gdn_conv_match_at_conv(cgraph, i, gm)) {
+        gdn_conv_norm_args na;
+        const int last = gdn_conv_norm_match(cgraph, gm, na);
+        if (last > 0) {
+            ggml_cuda_gdn_conv_direct(ctx, gm, &na);
+            return last - i;
+        }
+        ggml_cuda_gdn_conv_direct(ctx, gm);
+        return 1;
+    }
+    return 0;
 }

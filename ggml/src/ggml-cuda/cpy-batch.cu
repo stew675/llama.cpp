@@ -107,3 +107,13 @@ int ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, c
     if (dbg) fprintf(stderr, "cpy_batch: %d copies over nodes %d..%d (%lld elements each)\n", n, i, last, (long long) ne);
     return last - i + 1;
 }
+
+// GGML_CUDA_FUSE_CPY_BATCH=0: off.  Returns the number of graph nodes to skip when a run was
+// batched (>= 1), 0 otherwise.  The env check lives in ggml_cuda_cpy_batch().
+int ggml_cuda_cpy_batch_try_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (cgraph->nodes[i]->op != GGML_OP_CPY || !ctx.stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    const int taken = ggml_cuda_cpy_batch(ctx, cgraph, i);
+    return taken >= 2 ? taken - 1 : 0;
+}

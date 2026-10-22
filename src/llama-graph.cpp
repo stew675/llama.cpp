@@ -3639,14 +3639,15 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
+    // expand k later to enable rope fusion which directly writes into k-v cache
     ggml_build_forward_expand(gf, q_cur);
-
-    if (k_cur) {
-        ggml_build_forward_expand(gf, k_cur);
-    }
 
     if (v_cur) {
         ggml_build_forward_expand(gf, v_cur);
+    }
+
+    if (k_cur) {
+        ggml_build_forward_expand(gf, k_cur);
     }
 
     const auto * mctx_iswa = inp->mctx;
@@ -4055,6 +4056,9 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
+    // also an output so the allocator never reuses it: a backend may skip the state gather and read these
+    // row ids later, in the op that consumes the state (CUDA: GET_ROWS -> GATED_DELTA_NET)
+    ggml_set_output(inp->s_copy);
     ggml_set_name(inp->s_copy, "rs_s_copy");
 
     inp->s_copy_main = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);

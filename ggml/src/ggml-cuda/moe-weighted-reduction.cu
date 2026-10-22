@@ -1,4 +1,5 @@
 #include "moe-weighted-reduction.cuh"
+#include "ggml-moe-weighted-reduction.h"
 #include "mmb.cuh"
 
 // HIP's float4 is a struct, and __builtin_nontemporal_load/_store only accept builtin scalar or
@@ -296,4 +297,45 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                   (const float *) weights->data,
                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// MoE weighted expert reduction (the MUL over the expert weights): returns the number of graph
+// nodes to skip when fused, 0 otherwise.  GGML_CUDA_DISABLE_MWR=1 turns it off.
+int ggml_cuda_moe_weighted_reduction_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_mwr = getenv("GGML_CUDA_DISABLE_MWR") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MWR"));
+    if (disable_mwr || cgraph->nodes[i]->op != GGML_OP_MUL) {
+        return 0;
+    }
+    ggml_moe_weighted_reduction_match match;
+    static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
+    if (!ggml_match_moe_weighted_reduction(cgraph, i, match)) {
+        return 0;
+    }
+    int count = match.node_count;
+    const ggml_tensor * merge = nullptr;
+    // shared-expert merge (LLAMA_HC_BLK16, default OFF): the ADD(reduction, ffn_shexp_gated)
+    // right after is folded into the reduction, which then writes the BF16 block_out stream.
+    if (ggml_cuda_mmb_blk16()) {
+        const int nadd = i + match.node_count;
+        if (nadd < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + match.node_count - 1, 1)) {
+            const ggml_tensor * add = cgraph->nodes[nadd];
+            if (add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
+                    ggml_are_same_shape(add, match.dst) && ggml_cuda_mmb_is_bf16_only(add)) {
+                const ggml_tensor * o = add->src[0] == match.dst ? add->src[1] :
+                                        (add->src[1] == match.dst ? add->src[0] : nullptr);
+                if (o && o->type == GGML_TYPE_F32 && ggml_is_contiguous(o) && ggml_are_same_shape(o, match.dst)) {
+                    merge = o;
+                    match.dst = const_cast<ggml_tensor *>(add);
+                    count = match.node_count + 1;
+                }
+            }
+        }
+    }
+    const int output_idx = i + count - 1;
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output_idx, 1)) {
+        return 0;
+    }
+    if (mwr_dbg2) GGML_LOG_INFO("MWR FUSED %s\n", cgraph->nodes[i]->name);
+    ggml_cuda_op_moe_weighted_reduction(ctx, match.experts, match.expert_scale, match.weights, match.dst, merge);
+    return count - 1;
 }

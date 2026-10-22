@@ -45,7 +45,9 @@ static __global__ void flash_attn_ext_vec(
                             // V3 derived kq mask: not implemented in this kernel (this kernel is only
                             // selected for batches with n_tps <= 8, which keep the packed mask).
                             const int *, const int *, const int *,
-                            const int, const int) {
+                            const int, const int,
+                            // wip/fa-stage-chunking (TODO #114): MMA-prefill only.
+                            float2 *, const int) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
