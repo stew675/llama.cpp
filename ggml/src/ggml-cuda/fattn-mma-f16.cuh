@@ -1763,6 +1763,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const int zt_gqa,
         const int kb0_start,
         const int kb0_stop, const kq_derived_t derived, const fattn_kv_native_t kv_native,
+        // wip/fa-stage-chunking: element-major (max, rowsum) target for the PARTIAL contract; non-null
+        // means this launch publishes partials (no normalize, and the no-seam case must publish meta)
+        // -- see the kernel signature.  `kv_start` is this launch's first KV row in the whole op's
+        // cell space (0 unless KV-chunked).
+        float2 * const meta_kv, const int kv_start,
         // > 1 only in the decode/verify band, where the block processes the KV iterations
         // kb0_start, kb0_start + kb0_step, ... (< kb0_stop) and may own none of them.
         const int kb0_step = 1) {
@@ -1920,7 +1925,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             // the bitmap is produced only where that pipeline does not exist (AMD has no cp_async),
             // so every block can take last_iter=false and the accumulation is unchanged.
             for (; kb0 < kb0_stop; kb0 += kb0_step) {
-                if (fattn_kq_group_masked(kq_blocks, kb0, nbatch_fa)) {
+                if (fattn_kq_group_masked(kq_blocks, kb0, nbatch_fa, kv_start)) {
                     continue;
                 }
                 constexpr bool last_iter = false;
@@ -1980,7 +1985,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
           if constexpr (band_depth == 1) {
             // The next iteration is the next KV block that is not fully masked (the stream continues into it).
             auto unmasked = [&](int k) {
-                while (k < kb0_stop && fattn_kq_group_masked(kq_blocks, k, nbatch_fa)) {
+                while (k < kb0_stop && fattn_kq_group_masked(kq_blocks, k, nbatch_fa, kv_start)) {
                     k += kb0_step;
                 }
                 return k;
@@ -2003,7 +2008,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             }
           } else {
             for (; kb0 < kb0_stop; kb0 += kb0_step) {
-                if (fattn_kq_group_masked(kq_blocks, kb0, nbatch_fa)) {
+                if (fattn_kq_group_masked(kq_blocks, kb0, nbatch_fa, kv_start)) {
                     continue;
                 }
                 constexpr bool last_iter = false;
@@ -2210,7 +2215,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         if (((!needs_fixup && !is_fixup) || np > 1) && thread_should_write) {
             ((float2 *) tile_Q)[jc_cwm*(tile_stride/2) + nbatch_combine/2] = KQ_cmr;
         }
-
         __syncthreads();
 
         if (np == 1) {
@@ -2284,6 +2288,12 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                     // Combined KQ max scale + rowsum.
                     meta_ptr[imeta * warp_size * tile_stride/2] = make_float2(KQ_cms[imeta], KQ_crs);
                 }
+            }
+            // wip/fa-stage-chunking: with np > 1 the combined max (KQ_cmn) is not otherwise readable
+            // by the data write below, and the no-seam partial contract has to publish it.  The row's
+            // 16 bytes of padding hold one float2 of meta, so the 3rd float is free.
+            if (meta_kv != nullptr && (np*cols_per_warp >= warp_size || threadIdx.x < np*cols_per_warp)) {
+                ((float *) meta_ptr)[2] = KQ_cmn;
             }
 
             // Combined KQ max + rowsum.
@@ -2410,8 +2420,21 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
                         if (!needs_fixup && !is_fixup) {
                             const float KQ_rowsum_j = meta_j[1];
-                            dstk_val.x /= KQ_rowsum_j;
-                            dstk_val.y /= KQ_rowsum_j;
+                            if (meta_kv == nullptr) {
+                                dstk_val.x /= KQ_rowsum_j;
+                                dstk_val.y /= KQ_rowsum_j;
+                            }
+                        }
+
+                        // wip/fa-stage-chunking: a tile that sits entirely inside one block has no
+                        // stream-K seam, so no fixup visits it -- it is the publisher of its own rows
+                        // and must hand back (max, rowsum) too, or a chunked consumer has a value it
+                        // cannot weight.  One thread per column writes it (idempotent value).
+                        // `k == 0` selects the first DV element of the column whichever stride_k pass
+                        // owns it (a small nbatch_combine, e.g. 16, leaves the warp_size pass empty).
+                        if (meta_kv != nullptr && !needs_fixup && !is_fixup && k00 == 0 && k == 0) {
+                            meta_kv[(jt*ncols1 + j_dst)*ne02 + c_dst] =
+                                make_float2(np == 1 ? meta_j[0] : meta_j[2], meta_j[1]);
                         }
 
                         if (is_fixup) {
@@ -2483,7 +2506,12 @@ static __global__ void flash_attn_ext_f16(
         const int    * __restrict__ tok_hi_ptr,
         // Native (V4 q8_0 / block-15 bf16) K/V: byte-addressed rows, read natively by the loaders
         // (null / FATTN_KV_NATIVE_NONE when the launcher staged F16).
-        const int kv_native_K, const int kv_native_V) {
+        const int kv_native_K, const int kv_native_V,
+        // wip/fa-stage-chunking (TODO #114): non-null enables the per-row partial contract -- every
+        // block publishes (unnormalized numerator, max, rowsum) for its rows here (element-major) and
+        // the launcher merges KV chunks.  nullptr = the shipping behaviour, bit-identical.  `kv_start`
+        // is the first KV row of the launched extent in the whole op's cell space (0 unless chunked).
+        float2 * __restrict__ kv_partial_meta_ptr, const int kv_start) {
     ggml_cuda_pdl_sync(); // TODO optimize placement
 #if defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
     const char * GGML_CUDA_RESTRICT Q              = Q_ptr;
@@ -2502,6 +2530,8 @@ static __global__ void flash_attn_ext_f16(
     const int  * GGML_CUDA_RESTRICT KV_max        = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst            = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta       = dst_meta_ptr;
+    // wip/fa-stage-chunking: element-major per-row partial meta (see the kernel signature).
+    float2     * GGML_CUDA_RESTRICT kv_partial_meta = kv_partial_meta_ptr;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
@@ -2609,20 +2639,24 @@ static __global__ void flash_attn_ext_f16(
             const int kb0_stop  = iter_k;
             const int kb0_step  = gridDim.y;
 
+            // wip/fa-stage-chunking: the band is a decode/verify path and is never launched with the
+            // partial contract (the launcher only sets it for a wide, staged prefill); a device-side
+            // assert would not be compiled there, so the band simply ignores it (see the call sites).
+
             if (blockIdx.y == gridDim.y - 1) {
                 constexpr bool needs_fixup = true;
                 constexpr bool is_fixup    = false;
                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
                     (Q_f2, K_h2, V_h2, mask_h, nullptr, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                      ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa,
-                     kb0_start, kb0_stop, derived, kv_native, kb0_step);
+                     kb0_start, kb0_stop, derived, kv_native, nullptr, 0, kb0_step);
             } else {
                 constexpr bool needs_fixup = false;
                 constexpr bool is_fixup    = true;
                 flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
                     (Q_f2, K_h2, V_h2, mask_h, nullptr, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                      ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa,
-                     kb0_start, kb0_stop, derived, kv_native, kb0_step);
+                     kb0_start, kb0_stop, derived, kv_native, nullptr, 0, kb0_step);
             }
             return;
         }
@@ -2655,6 +2689,11 @@ static __global__ void flash_attn_ext_f16(
         const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
             (const half *) (mask + nb33*(sequence % ne33));
         float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+        // wip/fa-stage-chunking: this tile's rows of the element-major partial meta buffer.  The
+        // per-sequence/per-head base is folded in here because process_tile has no `sequence`/`zt_Q`
+        // (its dstk is pre-rebased the same way).
+        float2 * const meta_kv = kv_partial_meta != nullptr ?
+            kv_partial_meta + int64_t(sequence*ne01.z*ne02) + zt_Q : nullptr;
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
 
@@ -2678,19 +2717,23 @@ static __global__ void flash_attn_ext_f16(
         if (use_sparse) {
             kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
         } else if (KV_max) {
-            kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
+            // wip/fa-stage-chunking: KV_max is a whole-op column bound; a chunk's own bound is what
+            // remains above its first row.  kv_start is a whole tile, so this stays exact.
+            kb0_stop = min(kb0_stop, max(0, KV_max[sequence*iter_j + jt] - kv_start) / nbatch_fa);
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
                 (Q_f2, K_h2, V_h2, mask_h, indices, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, derived, kv_native);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, derived, kv_native,
+                 meta_kv, kv_start);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
                 (Q_f2, K_h2, V_h2, mask_h, indices, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, derived, kv_native);
+                 ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, derived, kv_native,
+                 meta_kv, kv_start);
         }
 
         // The next process_tile call reuses the tile_Q buffer for its Q/K tiles, so all warps must
@@ -2722,6 +2765,9 @@ static __global__ void flash_attn_ext_f16(
     const half   * mask_h = ncols2 == 1 && !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33));
     float2       * dstk   = ((float2 *) dst) + (sequence*ne01.z*ne02 + zt_Q) * (DV/2);
+    // wip/fa-stage-chunking: this tile's rows of the element-major partial meta buffer (see above).
+    float2 * const meta_kv = kv_partial_meta != nullptr ?
+        kv_partial_meta + int64_t(sequence*ne01.z*ne02) + zt_Q : nullptr;
 
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
     const fattn_kv_native_t kv_native = {
@@ -2743,14 +2789,16 @@ static __global__ void flash_attn_ext_f16(
     if (use_sparse) {
         kb0_stop = min(kb0_stop, (KV_max[(sequence % ne33)*iter_j + jt] + nbatch_fa - 1) / nbatch_fa);
     } else if (KV_max) {
-        kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
+        // wip/fa-stage-chunking: slice the whole-op column bound to this launch's extent.
+        kb0_stop = min(kb0_stop, max(0, KV_max[sequence*iter_j + jt] - kv_start) / nbatch_fa);
     }
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup, band_fetch_ahead, band_wide>
         (Q_f2, K_h2, V_h2, mask_h, indices, kq_blocks_tile, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
-         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, derived, kv_native);
+         ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, derived, kv_native,
+         meta_kv, kv_start);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, kq_blocks_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -2760,7 +2808,8 @@ static __global__ void flash_attn_ext_f16(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33,
+        kv_partial_meta_ptr, kv_start);
     NO_DEVICE_CODE;
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
@@ -2923,7 +2972,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 
     const bool async_kv_preload = nstages == 2 && !use_sparse;
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, FATTN_KV_NATIVE_PER_OPERAND, warp_size_host, async_kv_preload);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, FATTN_KV_NATIVE_PER_OPERAND, warp_size_host, async_kv_preload,
+         // q_h2: this kernel reads Q from the tensor (the tile kernel's pre-scaled half2 copy is
+         // tile-only), and it is the only kernel with the per-row partial contract (wip/fa-stage-chunking).
+         false, true);
 }
 
 

@@ -2535,7 +2535,6 @@ extern "C" {
     // friendly instead of compute-optimal for a whole card.  Set once per context; default false.
     GGML_API void ggml_set_fa_tensor_parallel(bool enable);
     GGML_API bool ggml_get_fa_tensor_parallel(void);
-
     // kq mask derived from compact state: when cell_pos/tok_lo/tok_hi are given, the mask tensor
     // may be NULL and each cell's value is derived in the kernel as
     //     cell_pos[cell] >= tok_lo[token] && cell_pos[cell] <= tok_hi[token]  ->  0.0f, else -INF

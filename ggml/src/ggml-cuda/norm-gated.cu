@@ -58,6 +58,66 @@ static bool norm_rows_enabled() {
     return enabled;
 }
 
+// Diagnostic only (never a behaviour switch): GGML_CUDA_NORM_ROWS_DEBUG=1 logs one decision line per
+// candidate node, fused or declined, so a gate can prove both that the fusion is live and that an
+// arm really reached the aliasing guard below.
+static bool norm_rows_debug() {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_NORM_ROWS_DEBUG");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// The byte extent a tensor's elements actually span.  ggml_nbytes() is the DENSE size and understates a
+// padded view, which is a real shape here: x is frequently a strided reshape of a projection output.
+static size_t norm_rows_span(const ggml_tensor * t) {
+    size_t span = ggml_type_size(t->type);
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        span += (size_t) (t->ne[d] - 1) * t->nb[d];
+    }
+    return span;
+}
+
+static bool norm_rows_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr) {
+        return false;
+    }
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + norm_rows_span(b) && b0 < a0 + norm_rows_span(a);
+}
+
+// The fused launch reads x, w and z (the gate output) and writes dst, all as the dense
+// [ncols, rows] layout the kernel indexes, so it may only run when none of those buffers is behind
+// another one -- with ONE exception: an exact alias of x with dst is a read-then-write of the same
+// address by the same thread (both tensors then have x's dense layout), which is what the allocator
+// hands out when it recycles x's block for the output (the common case for the x -> MUL form).
+//
+// issue #276: the gated form dispatches the gate MUL_MAT before the fused kernel runs, and in graph
+// order x is dead as soon as the RMS_NORM has consumed it while the gate output has exactly x's
+// shape, so the allocator's best fit is x's own block (measured on Ling-3.0-tiny: with the
+// scheduler's alloc deps disabled the gate output takes x's block outright and the greedy text
+// collapses from 172 to 52 characters).  The scheduler's optimize pass keeps x/w/z alive until dst
+// (ggml_backend_cuda_graph_optimize, "add alloc deps ... for performance positive fusions"), which
+// is what makes the shipped configuration safe -- but this function must not depend on a pass it
+// cannot see: ggml_backend_graph_compute() can be driven with no scheduler and therefore no deps at
+// all, and a fusion copied from this one inherits the hazard without inheriting the deps.  Verify the
+// aliasing here instead and fall back to the unfused chain, which computes the same text.
+static const char * norm_rows_alias_conflict(const ggml_cuda_norm_gated_match & m, const ggml_tensor * pre_out) {
+    if (pre_out != nullptr &&
+            (norm_rows_overlap(pre_out, m.x) || norm_rows_overlap(pre_out, m.w) || norm_rows_overlap(pre_out, m.dst))) {
+        return "gate-out";
+    }
+    if (norm_rows_overlap(m.dst, m.x) && !(m.x->data == m.dst->data && ggml_are_same_layout(m.x, m.dst) && ggml_is_contiguous(m.x))) {
+        return "dst-x";
+    }
+    if (norm_rows_overlap(m.dst, m.w)) {
+        return "dst-w";
+    }
+    return nullptr;
+}
+
 static bool rows_shape_ok(const ggml_tensor * x, const ggml_tensor * w, const ggml_tensor * out) {
     if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || out->type != GGML_TYPE_F32) return false;
     if (x->ne[0] > 256 || x->ne[0] % 32 != 0 || x->nb[0] != 4 || !ggml_is_contiguous(w) || !ggml_is_contiguous(out)) return false;
@@ -125,4 +185,48 @@ void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_no
             (int) x->ne[0], x->ne[1], x->ne[2], total,
             (int64_t) (x->nb[1] / 4), (int64_t) (x->nb[2] / 4), (int64_t) (x->nb[3] / 4), m.eps);
     }
+}
+
+// Narrow-row RMS norm (+ sigmoid-gated form) fusion entry point.  Returns the number of graph
+// nodes to skip when fused, 0 otherwise.  A/B / bisect kill switch: GGML_CUDA_DISABLE_NORM_ROWS=1.
+int ggml_cuda_norm_rows_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_norm_rows = [] { const char * e = getenv("GGML_CUDA_DISABLE_NORM_ROWS"); return e != nullptr && std::atoi(e); }();
+    if (disable_norm_rows) {
+        return 0;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (node->op != GGML_OP_RMS_NORM) {
+        return 0;
+    }
+    ggml_cuda_norm_gated_match nm;
+    int sk = ggml_cuda_norm_gated_match_at(cgraph, i, nm);
+    if (sk == 0) {
+        sk = ggml_cuda_norm_rows_match_at(cgraph, i, nm);
+    }
+    if (sk == 0) {
+        return 0;
+    }
+    // Aliasing guard (issue #276): see norm_rows_alias_conflict().  Never fires on the delivery's own
+    // path (the scheduler's alloc deps prevent it); it is the safety net for a caller that computes
+    // this graph without them.
+    const ggml_tensor * pre_out = nm.pre >= 0 ? cgraph->nodes[nm.pre] : nullptr;
+    if (const char * conflict = norm_rows_alias_conflict(nm, pre_out)) {
+        if (norm_rows_debug()) {
+            GGML_LOG_INFO("norm-rows: i=%d declined=%s gated=%d x=%p z=%p dst=%p\n",
+                    i, conflict, (int) (nm.pre >= 0), nm.x->data, pre_out ? pre_out->data : nullptr, nm.dst->data);
+        }
+        return 0;
+    }
+    if (pre_out != nullptr) {
+        if (!ggml_cuda_compute_forward(ctx, cgraph->nodes[nm.pre])) {
+            GGML_ABORT("norm-gated: gate MUL_MAT dispatch failed");
+        }
+    }
+    if (norm_rows_debug()) {
+        GGML_LOG_INFO("norm-rows: i=%d fused=1 gated=%d rows=%lld ncols=%lld x=%p z=%p dst=%p\n",
+                i, (int) (nm.pre >= 0), (long long) (nm.x->ne[1] * nm.x->ne[2] * nm.x->ne[3]),
+                (long long) nm.x->ne[0], nm.x->data, pre_out ? pre_out->data : nullptr, nm.dst->data);
+    }
+    ggml_cuda_op_norm_gated(ctx, nm);
+    return sk;
 }

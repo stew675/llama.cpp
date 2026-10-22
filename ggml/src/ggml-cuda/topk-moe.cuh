@@ -31,3 +31,14 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * weights,
                                    const ggml_tensor * logits,
                                    const ggml_tensor * ids);
+
+bool ggml_cuda_router_topk_moe_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * router, const ggml_tensor * logits,
+                                  const ggml_tensor * bias, const ggml_cuda_topk_moe_args & args);
+
+void ggml_cuda_op_router_topk_moe(ggml_backend_cuda_context &     ctx,
+                                  const ggml_tensor *             router,
+                                  ggml_tensor *                   weights,
+                                  ggml_tensor *                   ids,
+                                  const ggml_tensor *             clamp,
+                                  const ggml_tensor *             scale,
+                                  const ggml_cuda_topk_moe_args & args);

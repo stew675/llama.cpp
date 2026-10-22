@@ -100,7 +100,8 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
                                  ggml_tensor * unary_node, ggml_tensor * mul_node,
-                                 const ggml_tensor * mm);
+                                 const ggml_tensor * mm, const ggml_tensor * unary_view = nullptr,
+                                 const ggml_tensor * norm = nullptr);
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
@@ -148,3 +149,6 @@ __device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float g
 
 int ggml_cuda_add_softplus_mul_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 int ggml_cuda_scale_unary_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+bool ggml_cuda_sigmoid_mul_add_fusable(const ggml_tensor * sig, const ggml_tensor * mul, const ggml_tensor * add);
+void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sig, ggml_tensor * mul, ggml_tensor * add);
+int  ggml_cuda_sigmoid_mul_add_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

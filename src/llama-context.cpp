@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -344,6 +345,11 @@ llama_context::llama_context(
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
+    // TEMP diagnostic (wip/moe-verify-fusions): force the target's snapshot depth independently of the
+    // spec config, to A/B the n_rs_seq=0 (plain) vs n_rs_seq>0 (MTP) GDN/conv path with the cache armed.
+    if (const char * e = getenv("GGML_FORCE_N_RS_SEQ")) {
+        cparams.n_rs_seq = (uint32_t) atoi(e);
+    }
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
@@ -398,7 +404,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH || model.arch == LLM_ARCH_QWEN4EXP) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -522,8 +528,52 @@ llama_context::llama_context(
 
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
-    cparams.fused_dsv4_hc_post = true;
+    // The hc_combine_norm chain spelled out (the plain scale->sigmoid->scale->repeat->mul->add->rms->mul
+    // form of DSV4_HC_POST) is faster on ONE device: measured +0.9..+1.8 % prefill on qwen4exp IQ4_NL,
+    // gfx1151, which is why it is the default there.  It is NOT correct under the Meta (tensor-split)
+    // device -- the chain's broadcasts are split-state sensitive, and `test-llama-archs -a deepseek4`
+    // on 3x gfx1201 read NMSE 1.74e-01 vs the CPU reference (-sm tensor) while the DSV4_HC_POST op is
+    // rounding-level on one device, on -sm layer and (with this default) on -sm tensor (6.5e-06, the
+    // same as the op arm has always measured there).  So the op is the default whenever a Meta device
+    // is in play; `LLAMA_FUSED_DSV4_HC_POST` still forces either arm for A/B.
+    bool meta_split_active = false;
+    for (const auto & dev : model.devices) {
+        meta_split_active = meta_split_active || dev.is_meta;
+    }
+    cparams.fused_dsv4_hc_post = meta_split_active;
     cparams.auto_fhc           = true;
+    {
+        // gap-closing WIP: LLAMA_FUSED_DSV4_HC_PRE/_POST=1 force the DSV4 HC ops (the env only ever
+        // re-enables the slower op path, for A/B and bisection).
+        const char * env_pre = getenv("LLAMA_FUSED_DSV4_HC_PRE");
+        if (env_pre) {
+            cparams.fused_dsv4_hc_pre = atoi(env_pre) != 0;
+            LLAMA_LOG_INFO("%s: fused dsv4_hc_pre = %d (env)\n", __func__, cparams.fused_dsv4_hc_pre);
+        }
+        const char * env_post = getenv("LLAMA_FUSED_DSV4_HC_POST");
+        if (env_post) {
+            cparams.fused_dsv4_hc_post = atoi(env_post) != 0;
+            LLAMA_LOG_INFO("%s: fused dsv4_hc_post = %d (env)\n", __func__, cparams.fused_dsv4_hc_post);
+        }
+    }
+
+    cparams.fused_hc_mix = true;
+    {
+        const char * LLAMA_FUSED_HC_MIX = getenv("LLAMA_FUSED_HC_MIX");
+        if (LLAMA_FUSED_HC_MIX) {
+            cparams.fused_hc_mix = atoi(LLAMA_FUSED_HC_MIX) != 0;
+            LLAMA_LOG_INFO("%s: fused hc_mix = %d (env)\n", __func__, cparams.fused_hc_mix);
+        }
+    }
+
+    cparams.fused_hc_combine = true;
+    {
+        const char * LLAMA_FUSED_HC_COMBINE = getenv("LLAMA_FUSED_HC_COMBINE");
+        if (LLAMA_FUSED_HC_COMBINE) {
+            cparams.fused_hc_combine = atoi(LLAMA_FUSED_HC_COMBINE) != 0;
+            LLAMA_LOG_INFO("%s: fused hc_combine = %d (env)\n", __func__, cparams.fused_hc_combine);
+        }
+    }
 
     // only the indexer models build this mask, skip the probe for the others
     cparams.fused_top_k_mask = true;
@@ -776,6 +826,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (lf_consumed_ev != nullptr) {
+        ggml_backend_event_free(lf_consumed_ev);
+        lf_consumed_ev = nullptr;
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -789,6 +843,12 @@ llama_context::~llama_context() {
             const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
             if (size_exp == size_act) {
                 LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
+                    __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+            } else if (size_act < size_exp) {
+                // The buffers were RE-RESERVED smaller during the run (the post-prefill compute-buffer
+                // drop, or a narrower later reserve).  A legitimate shrink is not an accounting error.
+                LLAMA_LOG_DEBUG("%s: %10s compute buffer size of %8.4f MiB after a mid-run re-reserve "
+                    "(the reserve-time expectation was %8.4f MiB)\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
             } else {
                 LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
@@ -975,6 +1035,46 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+// The derived kq mask is a *per-batch* optimization, not a property of the context, but the reverse is
+// not true either: not every batch shape is reachable in every context.  This predicate answers the
+// reserve-time question "can a batch the derived form cannot serve actually be decoded here?" - if it
+// cannot, the reserve stays with the (much smaller) derived layout and keeps V3's memory win.
+//
+// The reserve's own measure batch is 1-D and holds `n_seq_max` sequences of `n_tokens` tokens each
+// (graph_reserve() -> llama_batch_allocr::ubatch_reserve()), so the runtime triggers have to be reasoned
+// about from the model/context, not from a real ubatch:
+//   * 2-D (M-RoPE) batches - an image/audio chunk decode carries 2-D positions (mtmd), which is only
+//     possible for an M-RoPE model: llama_batch::is_pos_2d() is `n_pos >= 3`, and n_pos_per_embd() is
+//     4 only for MROPE/IMROPE.  The packed mask's ext-based causal clause cannot be derived.  This is
+//     the reason the M-RoPE term is NOT "any M-RoPE model" (issue #238): Qwen3.x is IMROPE even for
+//     text, so that form reserved ~2 bytes per cell per ubatch token for a batch a text-only context
+//     can never produce.  It is now `cparams.kq_mask_pos_2d` (the caller declared 2-D positions, e.g.
+//     a multimodal projector) or the `kq_mask_pos_2d_seen` latch that decode() sets on the first 2-D
+//     batch - which re-reserves once with the packed mask instead of relying on a per-graph growth.
+//   * multi-sequence batches (ubatch.n_seqs_unq != 1), e.g. `--kv-unified` with several slots, when the
+//     derived cell encoding cannot separate them (r172): a cell that carries two of the batch's
+//     sequences (a prefix copied with llama_memory_seq_cp), a token in more than one sequence, a position
+//     past KQ_DERIVED_SEQ_STRIDE, or at most KQ_DERIVED_MULTISEQ_MIN_TOKENS tokens.  That is exactly
+//     llama_kv_cache::kq_mask_derivable_seqs(), and a multi-sequence batch is the one shape whose refusal
+//     depends on the *cache* rather than only on the batch - which is why the decode() latch exists.
+//   * alibi, which encodes a *value* (the distance) rather than a predicate.
+// Every other reason the derived form is skipped is already covered without this predicate:
+//   * the `allow_derived == false` builders (MLA / lightning-indexer / MSA) never take the derived
+//     branch at all, so their reserve graph already holds the packed mask;
+//   * alibi, a multi-stream KV cache and a disabled flash attention disable the derived form globally
+//     (resolve_fused_ops()'s probe), so those reserves are packed anyway - the alibi term above is
+//     belt-and-braces for that path;
+//   * `n_kv % LLM_KQ_MASK_DERIVED_KV_STRIDE == 0` is not a runtime variable: llama_kv_cache::get_n_kv()
+//     pads to at least 256 cells, so the stride gate always holds (verified on gfx1100 with a
+//     text-only append at an off-stride position: every prefill graph logged DERIVED);
+//   * a `n_tokens <= 8` batch, and a multi-sequence batch of at most KQ_DERIVED_MULTISEQ_MIN_TOKENS (32)
+//     tokens - the multi-slot verify steps - take a packed mask, but it is a few MiB and fits the reserved
+//     layout's slack (the same was true before the derived form existed).
+// If a new reason to reject the derived form is ever added to kq_mask_derivable(), it must be added
+// here too - otherwise a later batch can force the growth this predicate exists to prevent.  The
+// ggml-alloc layout invalidation + the compute-buffer growth log are the safety net if that happens.
+// upstream #29943/#29887: (re)create the scheduler and (re)install the expert-copy and graph-realloc
+// callbacks.  The delivery's scheduler keeps its own copy path, but the realloc callback is load-bearing.
 void llama_context::sched_new(size_t max_nodes, bool parallel) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
@@ -1222,6 +1322,24 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
+        }
+    }
+
+    // wip/moe-verify-fusions (narrow-2): re-affirm the pinned narrow-2 floor for the MTP draft context
+    // from its measured compute size.  The region is established lazily on the draft's first allocation
+    // (its widest reserve); this keeps the pin at least as large as that layout.  A no-op for the target
+    // and when the slab is not live on a device.
+    if (cparams.ctx_other != nullptr && !model.hparams.no_alloc) {
+        size_t narrow2_bytes = 0;
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (backend_buf_exp_size[i] > narrow2_bytes) {
+                narrow2_bytes = backend_buf_exp_size[i];
+            }
+        }
+        if (narrow2_bytes > 0) {
+            for (const auto & d : model.devices) {
+                ggml_backend_dev_slab_narrow2_floor(d.dev, narrow2_bytes);
+            }
         }
     }
 
@@ -1908,12 +2026,12 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-// OPEN 2: how much wider than the last settled narrow layout the live work region must be before the
-// compute reserve is dropped and re-reserved.  A material difference only -- the narrow layout varies a
-// little between a 1-token decode and an `n_rs_batch`-token verify pass, and dropping for that would
-// thrash the layout every token.  The real cases are GiBs (a 6.75 GiB wide reserve vs a ~1 GiB narrow
-// one), so 512 MiB is comfortably below anything worth reclaiming.
-static const size_t GGML_DROP_RESERVE_SLACK_BYTES = (size_t) 512 << 20;
+    // OPEN 2: how much wider than the last settled narrow layout the live work region must be before the
+    // compute reserve is dropped and re-reserved.  A material difference only -- the narrow layout varies a
+    // little between a 1-token decode and an `n_rs_batch`-token verify pass, and dropping for that would
+    // thrash the layout every token.  The real cases are GiBs (a 6.75 GiB wide reserve vs a ~1 GiB narrow
+    // one), so 512 MiB is comfortably below anything worth reclaiming.
+    static const size_t GGML_DROP_RESERVE_SLACK_BYTES = (size_t) 512 << 20;
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
@@ -1944,6 +2062,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // settled on" -- self-calibrating, no history guess, and it fires on the FIRST narrow pass of a
     // short-prompt workload.  Without a slab the classic wide-pass condition is kept, because there
     // reclaiming the wide layout is exactly what used to abort.
+    // The dsv4 compressed cache builds its raw attention from the per-stream index fanout, so its
+    // synthetic reserve probe has always used ubatch.n_seqs (a multi-stream shape) and must keep
+    // doing so: a one-stream reserve left the next real decode reading a one-stream sinfo and
+    // aborting in cpy_k.  Every other arch uses the real sequence count below, because the 4-D kq
+    // mask derives its stream dim from it and must agree with the single-stream query tensor.
+    const bool dsv4_cache = model.arch == LLM_ARCH_DEEPSEEK4 ||
+            (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0);
     bool drop_now = false;
     // The work region actually observed before the drop.  The reference must be at least this: the narrow
     // layout varies with the graph (the MTP decode/verify graph is wider than the `n_rs_batch` reserve the
@@ -2003,7 +2128,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // (`mctx`) spans this ubatch's streams, and `build_attn_mha`/`ggml_flash_attn_ext` require the
         // query and the cache to agree on the stream dim (`q->ne[3] == k->ne[3]`).  A hard-coded 1
         // against a multi-sequence batch took `q->ne[2]/n_stream` to zero and aborted (issue #48).
-        const uint32_t n_rs_seqs = std::max<uint32_t>(1, ubatch.n_seqs);
+        const uint32_t n_rs_seqs = std::max<uint32_t>(1, dsv4_cache ? ubatch.n_seqs : ubatch.n_seqs_unq);
         // wip/slab-ring-region: measure the narrow (decode/verify) layout BEFORE allocating it, so the slab
         // can pin its narrow floor AHEAD of the cache's deferred sizing (which runs later in this same pass).
         // `split_only` + a `sizes` array is a size-only reserve (no allocation); the real reserve follows.
@@ -2145,7 +2270,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        // wip/moe-verify-fusions (narrow-2): route the MTP draft context's compute allocation to the
+        // slab's pinned narrow-2 region (the reserve-time toggle in `graph_reserve` does not cover the
+        // first `alloc_graph`).
+        const bool is_draft = cparams.ctx_other != nullptr;
+        if (is_draft) {
+            for (const auto & d : model.devices) {
+                ggml_backend_dev_slab_compute_narrow2(d.dev, true);
+                // the second scheduler's small buffer is never served by the slab (narrow-2 holds one view)
+                ggml_backend_dev_slab_compute_plain(d.dev, sched_alt_in_use);
+            }
+        }
+        const bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (is_draft) {
+            for (const auto & d : model.devices) {
+                ggml_backend_dev_slab_compute_narrow2(d.dev, false);
+                ggml_backend_dev_slab_compute_plain(d.dev, false);
+            }
+        }
+        if (!alloc_ok) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -2171,6 +2314,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    n_tokens_prev = ubatch.n_tokens;
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2520,6 +2664,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
+    lf_dev_rows.clear();
 
     // issue #238: a 2-D (M-RoPE) position can only come from a multimodal chunk, and the compute reserve
     // covers the packed kq mask for such a batch only when the caller declared it at context creation.
@@ -2876,6 +3021,22 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     } while (true);
 
+    // F1: the device buffers hold the rows in ubatch order; keep the inverse of embd_batch_idxs for the
+    // draft (output_reorder() permutes only the host buffers, and clears embd_batch_idxs when it runs)
+    if (cparams.lf_layer_inp_dev && !lf_layer_dev.empty()) {
+        bool same = true;
+        for (size_t d = 0; d < embd_batch_idxs.size() && same; ++d) {
+            same = embd_batch_idxs[d] == (int32_t) d;
+        }
+        if (!same) {
+            lf_dev_rows.assign(embd_batch_idxs.size(), -1);
+            for (size_t d = 0; d < embd_batch_idxs.size(); ++d) {
+                GGML_ASSERT(embd_batch_idxs[d] >= 0 && (size_t) embd_batch_idxs[d] < lf_dev_rows.size());
+                lf_dev_rows[embd_batch_idxs[d]] = (int32_t) d;
+            }
+        }
+    }
+
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
@@ -3107,8 +3268,130 @@ uint32_t llama_context::output_reserve(int32_t n_outputs_l) {
     return n_outputs_max;
 }
 
+void llama_context::set_lf_layer_inp_dev(bool enable) {
+    cparams.lf_layer_inp_dev = enable;
+}
+
+ggml_tensor * llama_context::get_lf_layer_inp_dev(uint32_t lid) const {
+    return lid < lf_layer_dev.size() ? lf_layer_dev[lid] : nullptr;
+}
+
+const int32_t * llama_context::get_lf_dev_rows(int32_t * n_rows) const {
+    *n_rows = (int32_t) lf_dev_rows.size();
+    return lf_dev_rows.empty() ? nullptr : lf_dev_rows.data();
+}
+
+void llama_context::set_lf_dev_inject(bool enable) {
+    cparams.lf_dev_inject = enable;
+}
+
+ggml_backend_t llama_context::lf_backend_for(ggml_backend_dev_t dev) const {
+    for (const auto & b : backends) {
+        if (ggml_backend_get_device(b.get()) == dev) {
+            return b.get();
+        }
+    }
+    return nullptr;
+}
+
+void llama_context::lf_set_consumed_event(ggml_backend_t backend_reader) {
+    if (!lf_layer_buf || backend_reader == nullptr) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend_reader);
+    if (lf_consumed_ev == nullptr) {
+        lf_consumed_ev = ggml_backend_event_new(dev);
+    }
+    if (lf_consumed_ev == nullptr) {
+        // no event support: fall back to a host wait
+        ggml_backend_synchronize(backend_reader);
+        return;
+    }
+    ggml_backend_event_record(lf_consumed_ev, backend_reader);
+    lf_consumed_pending = true;
+}
+
+void llama_context::lf_signal_features_consumed() {
+    llama_context * tgt = cparams.ctx_other;
+    if (tgt == nullptr || !tgt->lf_layer_buf) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tgt->lf_layer_buf.get()));
+    ggml_backend_t reader = lf_backend_for(dev);
+    if (reader == nullptr) {
+        synchronize();
+        return;
+    }
+    tgt->lf_set_consumed_event(reader);
+}
+
 bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    if (cparams.lf_layer_inp_dev) {
+        // Llama-Frankenstein F1: device-to-device copy into persistent per-layer buffers [n_embd, n_batch] on the
+        // layer's own backend, so a draft context reads them in place instead of a device -> host -> device trip
+        for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+            if (!cparams.embeddings_layer_inp[il]) {
+                continue;
+            }
+            ggml_tensor * t = res->get_layer_inp((int) il);
+            if (!t) {
+                GGML_ABORT("layer input tensor not found");
+            }
+            GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->ne[1] == (int64_t) n_tokens);
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+            GGML_ASSERT(backend != nullptr);
+
+            if (lf_layer_dev.empty()) {
+                const size_t n_layers = cparams.embeddings_layer_inp.size();
+                lf_layer_dev.assign(n_layers, nullptr);
+                ggml_init_params ip = { ggml_tensor_overhead() * n_layers, nullptr, true };
+                lf_layer_ctx.reset(ggml_init(ip));
+                size_t need = 0;
+                for (uint32_t l = 0; l < n_layers; ++l) {
+                    if (cparams.embeddings_layer_inp[l]) {
+                        lf_layer_dev[l] = ggml_new_tensor_2d(lf_layer_ctx.get(), GGML_TYPE_F32, t->ne[0], cparams.n_batch);
+                        ggml_format_name(lf_layer_dev[l], "lf_layer_inp_dev-%u", l);
+                        need += ggml_nbytes(lf_layer_dev[l]);
+                    }
+                }
+                lf_layer_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(lf_layer_ctx.get(), ggml_backend_get_default_buffer_type(backend)));
+                if (!lf_layer_buf) {
+                    // not enough device memory: stay on the host path for the rest of this context (the host buffers
+                    // are always reserved). The draft sees llama_lf_get_layer_inp_dev() return null and gathers the
+                    // features from the host buffers instead, so the output does not change.
+                    LLAMA_LOG_WARN("%s: F1: could not allocate the device layer-input buffers (%.1f MiB), using the host path\n",
+                        __func__, need / (1024.0 * 1024.0));
+                    lf_layer_dev.clear();
+                    lf_layer_ctx.reset();
+                    cparams.lf_layer_inp_dev = false;
+                    return extract_layer_inputs(res, token_offset, n_tokens);
+                }
+                LLAMA_LOG_INFO("%s: F1 device layer-input buffers: %.1f MiB\n", __func__,
+                    ggml_backend_buffer_get_size(lf_layer_buf.get()) / (1024.0 * 1024.0));
+            }
+
+            if (lf_consumed_pending) {
+                // the draft may still be reading the previous batch's rows on its own stream
+                ggml_backend_event_wait(backend, lf_consumed_ev);
+                lf_consumed_pending = false;
+            }
+
+            ggml_tensor * buf = lf_layer_dev[il];
+            GGML_ASSERT(buf != nullptr && buf->ne[0] == t->ne[0] && token_offset + n_tokens <= (size_t) buf->ne[1]);
+            ggml_tensor dst = *buf;
+            dst.ne[1] = (int64_t) n_tokens;
+            dst.nb[2] = dst.nb[1] * dst.ne[1];
+            dst.nb[3] = dst.nb[2] * dst.ne[2];
+            dst.data  = (char *) buf->data + token_offset * buf->nb[1];
+            dst.view_src  = buf;
+            dst.view_offs = token_offset * buf->nb[1];
+            ggml_backend_tensor_copy_async(backend, backend, t, &dst);
+        }
+        return true;
+    }
+
     bool extracted = false;
+
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -3209,7 +3492,8 @@ void llama_context::output_reorder() {
                 }
             }
             for (auto & layer : embd_layer_inp) {
-                if (layer.has_data()) {
+                // F1 keeps the rows on the device (its own row map, see decode()); the host rows are unused there
+                if (layer.has_data() && !cparams.lf_layer_inp_dev) {
                     for (size_t k = 0; k < n_embd; ++k) {
                         std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
                     }
@@ -3412,10 +3696,34 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-        GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        return nullptr;
+    } else {
+        // wip/moe-verify-fusions (narrow-2): the MTP draft context (identified by `ctx_other`, set for
+        // every speculative draft context) routes its COMPUTE buffer to the slab's pinned narrow-2 region
+        // at the top of the reserved VA.  The slab used to hand a single narrow base to every narrow view,
+        // so the draft's buffer aliased the target's narrow verify buffer at base 0 (the MTP-vs-plain
+        // near-tie drift).  `GGML_CUDA_SLAB_NARROW2=0` is the A/B arm (the draft bypasses the slab).
+        const bool is_draft = cparams.ctx_other != nullptr;
+        // read once: this runs on every reserve; getenv() is expensive on Windows
+        static const bool work_alloc_debug = getenv("GGML_CUDA_WORK_ALLOC_DEBUG") != nullptr;
+        if (work_alloc_debug) {
+            LLAMA_LOG_WARN("GRAPH_RESERVE ctx=%p is_draft=%d n_tokens=%u\n", (void *) this, (int) is_draft, n_tokens);
+        }
+        if (is_draft) {
+            for (const auto & d : model.devices) {
+                ggml_backend_dev_slab_compute_narrow2(d.dev, true);
+            }
+        }
+        const bool reserved = ggml_backend_sched_reserve(sched.get(), gf);
+        if (is_draft) {
+            for (const auto & d : model.devices) {
+                ggml_backend_dev_slab_compute_narrow2(d.dev, false);
+            }
+        }
+        if (!reserved) {
+            GGML_ASSERT(!sizes);
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            return nullptr;
+        }
     }
 
     return gf;
@@ -4750,6 +5058,26 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
+// True for the KV cache types whose flash-attention kernels have a native read path on the
+// HIP/CUDA backends and can therefore be used with SPLIT_MODE_TENSOR (see the gate below).
+// Keep in sync with ggml_cuda_fattn_kv_type_supported() in ggml/src/ggml-cuda/fattn.cu.
+static bool llama_kv_type_has_native_fa(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params) {
@@ -4785,10 +5113,49 @@ llama_context * llama_init_from_model(
         if (model->get_split_state_ud.n_devices == 1) {
             LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
         }
+
+        // SPLIT_MODE_TENSOR runs the attention through the flash-attention kernels split across
+        // the tensor-parallel devices. Those kernels have a native read path only for a subset of
+        // quantized types (see llama_kv_type_has_native_fa below, which must mirror
+        // ggml_cuda_fattn_kv_type_supported() in ggml/src/ggml-cuda/fattn.cu); for the rest
+        // (the k-quants and the remaining i-quants) the graph cannot express a splittable
+        // attention and the meta splitter aborts during reserve. This is only a problem when
+        // the Meta device is actually used
+        // (tensor split over >= 2 GPUs; a single-device "tensor" mode skips the Meta wrapper and
+        // is fine).
+        const bool use_meta_device =
+            [&]() {
+                for (const auto & dev : model->devices) {
+                    if (dev.is_meta) {
+                        return true;
+                    }
+                }
+                return false;
+            }();
+        if (use_meta_device) {
+            for (ggml_type type_kv : { params.type_k, params.type_v }) {
+                if (ggml_is_quantized(type_kv) && !llama_kv_type_has_native_fa(type_kv)) {
+                    LLAMA_LOG_ERROR("%s: KV cache type %s is not supported with tensor parallelism "
+                            "(SPLIT_MODE_TENSOR, %zu GPUs): flash attention cannot read this type from a "
+                            "split KV cache\n", __func__, ggml_type_name(type_kv), model->get_split_state_ud.n_devices);
+                    LLAMA_LOG_ERROR("%s: use f32/f16/bf16/q4_0/q4_1/q5_0/q5_1/q8_0/iq4_nl KV cache types, "
+                            "or switch to SPLIT_MODE_LAYER which supports every KV cache type\n", __func__);
+                    return nullptr;
+                }
+            }
+        }
     }
 
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
-        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+    // Every model requires the same K and V cache types (rdna-boosts, 2026-09-11).  Upstream enforces
+    // this for MLA and DeepSeek4 only; here it is general: every mixed pair measured 1.7-3.6x slower
+    // than the same-type equivalent and never smaller, and the attention path - including the
+    // split/flash-attention one - assumes type_k == type_v, so a mixed configuration is rejected
+    // rather than accepted as a slow-but-valid one.  Both types default to f16, so only an explicit
+    // --cache-type-k (or --cache-type-v) can trigger this.
+    if (params.type_k != params.type_v) {
+        LLAMA_LOG_ERROR("%s: models require the same K and V cache types, got K=%s and V=%s; "
+                "set --cache-type-v to match --cache-type-k (both default to f16)\n",
+                __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
     }
 
@@ -5019,6 +5386,26 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+void llama_lf_set_layer_inp_dev(llama_context * ctx, bool enable) {
+    ctx->set_lf_layer_inp_dev(enable);
+}
+
+ggml_tensor * llama_lf_get_layer_inp_dev(llama_context * ctx, uint32_t lid) {
+    return ctx->get_lf_layer_inp_dev(lid);
+}
+
+const int32_t * llama_lf_get_dev_rows(llama_context * ctx, int32_t * n_rows) {
+    return ctx->get_lf_dev_rows(n_rows);
+}
+
+void llama_lf_set_dev_inject(llama_context * ctx, bool enable) {
+    ctx->set_lf_dev_inject(enable);
+}
+
+void llama_lf_signal_features_consumed(llama_context * ctx_dft) {
+    ctx_dft->lf_signal_features_consumed();
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
