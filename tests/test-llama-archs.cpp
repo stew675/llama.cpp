@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
@@ -818,10 +819,32 @@ static llama_model_ptr get_model(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr) {
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr,
+        // block 11: the managed PLE reader's budget, handed over as LLAMA_LAZY_BUF_MB around the load
+        const size_t lazy_buf_size = 0) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    // the managed PLE reader budget is driven by LLAMA_LAZY_BUF_MB now (LAZY_MODE_AUTO); keep this
+    // parameter as an override by exporting the equivalent MiB value around the load.
+    // The export has to build on Windows too: clang-cl under the Windows HIP SDK uses the MSVC CRT,
+    // which has no setenv/unsetenv (only _putenv_s), and a Windows build that includes the tests
+    // would stop here otherwise (issue: reported in PR #310, caught by
+    // scripts/check-windows-portability.sh once it judged the lines the delivery inserts into an
+    // upstream file).  `mb == 0` means "no override": unset on both platforms, because _putenv_s with
+    // an empty value removes the variable just like unsetenv does.
+    {
+        const size_t mb = lazy_buf_size > 0 ? std::max<size_t>(lazy_buf_size / (1024*1024), 1) : 0;
+#if defined(_WIN32)
+        _putenv_s("LLAMA_LAZY_BUF_MB", mb > 0 ? std::to_string(mb).c_str() : "");
+#else
+        if (mb > 0) {
+            setenv("LLAMA_LAZY_BUF_MB", std::to_string(mb).c_str(), 1);
+        } else {
+            unsetenv("LLAMA_LAZY_BUF_MB");
+        }
+#endif
+    }
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -842,8 +865,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false,
-        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0) {
-    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides);
+        const llama_model_tensor_buft_override * tensor_buft_overrides = nullptr, const size_t moe_cache_size = 0,
+        const size_t lazy_buf_size = 0) {
+    llama_model_ptr model = get_model(gguf_ctx, file, seed, stdev, devs, split_mode, tensor_buft_overrides, lazy_buf_size);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -1422,7 +1446,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         GGML_ASSERT(file != nullptr);
 
                         {
-                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size);
+                            // the qwen4exp PLE n-gram table gets a managed lazy-reader budget
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode, overrides, dc.moe_cache_size, arch == LLM_ARCH_QWEN4EXP ? 256 << 10 : 0);
                             const std::vector<float> logits_roundtrip = get_logits(
                                 model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                             status_roundtrip = "\033[1;32mOK\033[0m";

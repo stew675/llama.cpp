@@ -4591,15 +4591,34 @@ void llm_graph_context::build_h_nextn_dev() const {
         return;
     }
 
-    // the device buffer is only enabled for the unmasked extraction, which has a row per batch token
-    GGML_ASSERT(src->ne[0] == h_nextn_dev->ne[0] && ggml_nrows(src) == n_tokens);
+    // The device buffer holds one FOLDED row per batch token: [n_embd_out, n_tokens].  The export is handed
+    // over in one of two equivalent layouts, and the check has to accept both:
+    //   * [n_embd_out, n_tokens]          -- every arch without hyper-connections;
+    //   * [n_embd, hc, n_tokens]          -- a hyper-connection model (qwen4exp).  It exports the
+    //     `build_hc_combine()` result itself rather than a view of it, because a pure view gets no backend
+    //     assignment from the graph scheduler and the host readback looks one up
+    //     (`src/models/qwen4exp.cpp`).  That tensor is contiguous, so its memory layout IS
+    //     [n_embd*hc, n_tokens] = [n_embd_out, n_tokens] -- the same bytes in the same order.
+    // The invariant is therefore "one folded row per batch token", which the element count states exactly;
+    // the per-layout assertions below keep the original width/row checks where they are meaningful.
+    const int64_t n_embd_out = h_nextn_dev->ne[0];
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_nelements(src) == n_embd_out*n_tokens);
+    if (src->ne[0] == n_embd_out) {
+        GGML_ASSERT(ggml_nrows(src) == n_tokens);
+    } else {
+        // the folded hyper-connection layout: [n_embd, hc, n_tokens] (ne[1] is the stream count, so it is NOT
+        // a token axis -- a single-token graph is [n_embd, hc, 1] and a wide one is [n_embd, hc, n_tokens])
+        GGML_ASSERT(src->ne[0]*src->ne[1] == n_embd_out);
+        GGML_ASSERT(src->ne[2]*src->ne[3] == n_tokens);
+    }
 
     auto inp = std::make_unique<llm_graph_input_batch_idxs>();
 
     inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
     ggml_set_input(inp->idxs);
 
-    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, h_nextn_dev, ggml_reshape_2d(ctx0, src, src->ne[0], n_tokens), inp->idxs));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, h_nextn_dev, ggml_reshape_2d(ctx0, src, n_embd_out, n_tokens), inp->idxs));
 
     res->add_input(std::move(inp));
 }
