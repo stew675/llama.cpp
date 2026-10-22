@@ -180,6 +180,8 @@ set(LLAMA_CONTEXT_TEST_SRC
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
 llama_build(test-recurrent-state-depth.cpp)
 llama_build(test-logits-width-probe.cpp)
+# multi-sequence gate/beta fusion regression (issue #204): no model needed, skips without a CUDA device
+llama_build_and_test(test-fusion-gate-beta-multiseq.cpp LINK ggml)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -228,6 +230,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # TODO: after `test-llama-archs` is refactored to not link internal symbols, we can move all related tests out of
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
+    llama_build_and_test(test-lazy-reader.cpp)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
