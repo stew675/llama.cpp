@@ -717,6 +717,21 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
+// MTP draft vocabulary subset (llama_context_params::mtp_draft_vocab): the rows of the LM head for token ids < n_keep
+// plus control and user-defined tokens. Immutable once built. Contexts that request the same n_keep share one.
+struct llama_mtp_draft_vocab {
+    int32_t n_keep = 0;
+
+    const ggml_tensor * src = nullptr; // the LM head tensor the rows were taken from; a graph may score with the
+                                       // subset only when its own head pointer is identical to it
+
+    ggml_tensor * head = nullptr; // [n_embd, n_rows], same type as the LM head
+    ggml_tensor * ids  = nullptr; // [n_rows] I64, token id of each row
+
+    ggml_context_ptr        ctx;
+    ggml_backend_buffer_ptr buf;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -920,6 +935,12 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+
+    // draft vocabulary subset for mtp_draft_vocab = n_keep, built on first request and freed with the last context
+    // holding it; nullptr if the subset cannot be used with this model (thread-safe).
+    // shared_target_head = true: this model is the target of a shared-NextN sidecar whose MTP graph borrows this
+    // output as its LM head - the consumer is that sidecar's graph, so the model's own MTP-block checks are skipped
+    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep, bool shared_target_head = false) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
