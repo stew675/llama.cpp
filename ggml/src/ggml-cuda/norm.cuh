@@ -8,6 +8,10 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
 
+// DSV4_HC_POST -> RMS_NORM -> MUL(gamma) as one kernel (tensor-split prefill); false: shape not supported, run unfused
+bool ggml_cuda_op_dsv4_hc_post_rms_fused(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post,
+        const ggml_tensor * rms, ggml_tensor * mul);
+
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
 
 void ggml_cuda_op_rms_norm_scale_pair_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm0, ggml_tensor * scale0,

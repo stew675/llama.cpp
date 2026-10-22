@@ -2893,6 +2893,29 @@ static inline bool ggml_cuda_bf16_src1_cache_on() {
     return on;
 }
 
+// Producer-written BF16 src1 (GGML_CUDA_BF16_PRODUCER, default 1; 0: off; 2: also verify every hit against the
+// conversion it replaces, debug only, slow): the qwen4exp prefill producers of the cuBLAS/rocBLAS BF16 GEMM
+// activations (dsv4_hc_post_rms's xn, dsv4_hc_pre's mixed stream) write the RNE BF16 copy in the same pass and leave
+// it in bf16_src1_cache, so the GEMM skips its F32 -> BF16 pass.  The F32 output is always written too.
+static inline int ggml_cuda_bf16_producer_mode() {
+    static const int m = [] { const char * e = getenv("GGML_CUDA_BF16_PRODUCER"); return e == nullptr ? 1 : atoi(e); }();
+    return m;
+}
+
+// The qwen4exp prefill fusion DSV4_HC_POST -> RMS_NORM -> MUL(gamma) (norm.cu, ggml-cuda-try-fuse.cu).
+// GGML_CUDA_HC_POST_RMS=0 disables it (the unfused three-op chain, byte-identical output).
+static inline bool ggml_cuda_hc_post_rms_on() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_HC_POST_RMS"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// Diagnostic only (never a behaviour switch): GGML_CUDA_HC_POST_RMS_DEBUG=1 logs one decision line per candidate
+// node, fused or declined, so a gate can prove the fusion is live (and that an arm reached the range check).
+static inline bool ggml_cuda_hc_post_rms_debug() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_HC_POST_RMS_DEBUG"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
 // Fusion-window alias check (defined in ggml-cuda.cu): true when none of the output nodes alias
 // an input that is not produced inside the window.  Shared by the extracted fusion helpers.
 bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,

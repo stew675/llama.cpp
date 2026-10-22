@@ -182,6 +182,8 @@ set(LLAMA_CONTEXT_TEST_SRC
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
 llama_build(test-recurrent-state-depth.cpp)
 llama_build(test-logits-width-probe.cpp)
+# multi-sequence gate/beta fusion regression (issue #204): no model needed, skips without a CUDA device
+llama_build_and_test(test-fusion-gate-beta-multiseq.cpp LINK ggml)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -230,6 +232,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 endif()
 
 llama_build(test-llama-archs.cpp)
+llama_build_and_test(test-lazy-reader.cpp)
 if (GGML_CPU AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     llama_build(test-fp8.cpp)
     set(FP8_MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models-fp8")

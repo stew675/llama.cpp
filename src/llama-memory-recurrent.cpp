@@ -167,6 +167,13 @@ void llama_memory_recurrent::clear(bool data) {
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
 }
 
+// LLAMA_RS_ROLLBACK_DEBUG=1: instrumentation for the recurrent rollback boundary (the RSMTP lines below).  Read
+// ONCE: seq_rm() and prepare() run on every speculative step, and getenv() is slow on Windows (issue #273).
+static bool rs_rollback_debug() {
+    static const bool debug = getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr;
+    return debug;
+}
+
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     uint32_t new_head = size;
 
@@ -517,7 +524,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     // leads into a rollback.  The rollback bound itself is upstream's (see seq_rm(), rs_max); this is the
     // instrument that showed a large batch can precede a small sequence's rollback in one prepare list.
     if (!ubatches.empty()) {
-        const bool rs_debug = getenv("LLAMA_RS_ROLLBACK_DEBUG") != nullptr;
+        const bool rs_debug = rs_rollback_debug();
         if (rs_debug) {
             for (size_t u = 0; u < ubatches.size(); ++u) {
                 const llama_ubatch & ub = ubatches[u];
@@ -541,6 +548,17 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 }
 
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+    // A qwen4exp MTP context carries a hybrid-idx memory whose recurrent filter matches nothing
+    // (the nextn layer is not recurrent), so its cells are never read back - the graph only gives
+    // the unused recurrent inputs a trivial use, and llama_memory_hybrid_idx skips the recurrent
+    // in seq_rm/state.  The bookkeeping below still runs (the graph input sizes need `n`), but the
+    // speculative verify positions must not spam the non-consecutive-position warning.
+    const bool has_recr = [&] {
+        for (ggml_tensor * t : r_l) { if (t) { return true; } }
+        for (ggml_tensor * t : s_l) { if (t) { return true; } }
+        return false;
+    }();
+
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
@@ -698,7 +716,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (has_recr && cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",

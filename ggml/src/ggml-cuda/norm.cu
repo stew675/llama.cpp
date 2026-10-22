@@ -1375,3 +1375,116 @@ int ggml_cuda_l2_norm_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
     }
     return 0;
 }
+
+// qwen4exp under tensor split (prefill): DSV4_HC_POST (no comb, not gated) -> RMS_NORM -> MUL(gamma) in one kernel.
+// One block of `block_size` threads per (hc row, token).  Each thread computes the hc_post sum for col = tid,
+// tid + block_size, ... exactly as dsv4_hc_post_f32 does (same two statements, so the same contraction), stores it
+// (it is the next layer's residual), and accumulates the square sum in the order of rms_norm_f32's scalar path; the
+// reduction, scale and gamma product are rms_norm_f32's, so the output is bit-identical to the three-kernel chain.
+template <int block_size>
+static __global__ void dsv4_hc_post_rms_f32(
+        const float * x, const float * residual, const float * post, const float * gamma,
+        float * dst_res, float * dst_xn, uint16_t * dst16, const bool store_f32,
+        const int ncols, const int hc, const int n_tokens,
+        const int64_t sx0, const int64_t sx1,
+        const int64_t sr0, const int64_t sr1, const int64_t sr2,
+        const int64_t sp0, const int64_t sp1,
+        const int64_t sd0, const int64_t sd1, const int64_t sd2,
+        const int64_t sg1, const float eps) {
+    ggml_cuda_pdl_lc();
+    constexpr int max_per_thread = 4;
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    for (int it = blockIdx.y; it < n_tokens; it += gridDim.y) {
+        const float p = post[row*sp0 + it*sp1];
+        float sv[max_per_thread];
+        float tmp = 0.0f;
+        int k = 0;
+        for (int col = tid; col < ncols; col += block_size, ++k) {
+            float sum = x[col*sx0 + it*sx1] * p;
+            sum += residual[col*sr0 + row*sr1 + it*sr2];
+            dst_res[col*sd0 + row*sd1 + it*sd2] = sum;
+            sv[k] = sum;
+            tmp += sum * sum;
+        }
+
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+        const int64_t   o    = ((int64_t) it*hc + row)*ncols;
+        const float   * g    = gamma + row*sg1;
+        k = 0;
+        for (int col = tid; col < ncols; col += block_size, ++k) {
+            const float v = scale * sv[k] * g[col];
+            if (store_f32) {
+                dst_xn[o + col] = v;
+            }
+            if (dst16 != nullptr) {
+                dst16[o + col] = norm_f2bf(v);
+            }
+        }
+        // s_sum is reused by the next token's block_reduce
+        __syncthreads();
+    }
+}
+
+bool ggml_cuda_op_dsv4_hc_post_rms_fused(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post,
+        const ggml_tensor * rms, ggml_tensor * mul) {
+    constexpr int block_size = 1024;
+    const ggml_tensor * x        = hc_post->src[0];
+    const ggml_tensor * residual = hc_post->src[1];
+    const ggml_tensor * post     = hc_post->src[2];
+    const ggml_tensor * gamma    = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+
+    const int64_t ncols    = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t hc       = residual->ne[1];
+    if (hc_post->src[3] != nullptr || x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 ||
+        post->type != GGML_TYPE_F32 || gamma == nullptr || gamma->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+        ncols < block_size || ncols > 4*block_size || ncols > INT32_MAX || n_tokens > INT32_MAX ||
+        gamma->ne[0] != ncols || gamma->ne[1] != hc || gamma->ne[2] != 1 || gamma->ne[3] != 1 || gamma->nb[0] != sizeof(float) ||
+        !ggml_is_contiguous(mul) || !ggml_are_same_shape(mul, hc_post) || hc_post->ne[3] != 1) {
+        return false;
+    }
+    // GGML_CUDA_RMS_NORM_VEC=1 makes the stock rms_norm sum squares per float4, a different order than this kernel's
+    // scalar sum: leave the ops unfused then, so the result stays the one the unfused graph computes.
+    if (ggml_cuda_rms_norm_vec()) {
+        return false;
+    }
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    uint16_t * dst16 = nullptr;
+    bool store_f32 = true;
+    if (ggml_cuda_mmb_is_bf16_only(mul)) {
+        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul, (size_t) ggml_nelements(mul));
+        store_f32 = false;
+    } else if (ggml_cuda_mmb_wants_bf16_copy(mul)) {
+        dst16 = ggml_cuda_mmb_reserve_auto(ctx, mul, (size_t) ggml_nelements(mul));
+    }
+    // no MMB copy: leave xn's BF16 copy for the cuBLAS BF16 hc_down GEMM that follows (same gates as its lookup)
+    if (dst16 == nullptr && store_f32 && ggml_cuda_bf16_producer_mode() != 0 && ggml_cuda_bf16_src1_cache_on() &&
+            mul->view_src == nullptr && ggml_nrows(mul) / hc >= 64) {
+        dst16 = (uint16_t *) ctx.bf16_src1_cache_put(mul, ggml_nelements(mul));
+    }
+
+    const dim3 grid_dims((unsigned) hc, (unsigned) std::min<int64_t>(n_tokens, UINT16_MAX), 1);
+    const dim3 block_dims(block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params(grid_dims, block_dims, 32*sizeof(float), ctx.stream());
+    ggml_cuda_kernel_launch(dsv4_hc_post_rms_f32<block_size>, launch_params,
+            (const float *) x->data, (const float *) residual->data, (const float *) post->data, (const float *) gamma->data,
+            (float *) hc_post->data, (float *) mul->data, dst16, store_f32,
+            (int) ncols, (int) hc, (int) n_tokens,
+            (int64_t) (x->nb[0]/sizeof(float)), (int64_t) (x->nb[1]/sizeof(float)),
+            (int64_t) (residual->nb[0]/sizeof(float)), (int64_t) (residual->nb[1]/sizeof(float)), (int64_t) (residual->nb[2]/sizeof(float)),
+            (int64_t) (post->nb[0]/sizeof(float)), (int64_t) (post->nb[1]/sizeof(float)),
+            (int64_t) (hc_post->nb[0]/sizeof(float)), (int64_t) (hc_post->nb[1]/sizeof(float)), (int64_t) (hc_post->nb[2]/sizeof(float)),
+            (int64_t) (gamma->nb[1]/sizeof(float)), eps);
+    return true;
+}

@@ -116,7 +116,10 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
         // lightning indexer keys are rotated with the indexer RoPE parameters
-                       bool   is_indexer = false);
+                       bool   is_indexer = false,
+        // set to false for keys-only caches (e.g. the qwen4exp QSA indexer store):
+        // no V tensor is allocated, and no V-side op may be issued against the cache
+                         bool   v_enabled = true);
 
     ~llama_kv_cache() = default;
 
@@ -192,7 +195,7 @@ public:
     // graph_build API
     //
 
-    uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const;
 
     // attention over the cells of each sequence of the ubatch instead of the whole cache (see ggml_flash_attn_ext_rows)
     // the ubatch splits into n_slices groups of tokens with one sequence each
@@ -298,6 +301,10 @@ private:
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
+
+    // env: LLAMA_KV_N_PAD_PREFILL (0 when inactive).  The per-allocation floor itself is upstream's
+    // hardcoded 256 now (#31200 removed the n_pad parameter); this is the prefill-only widening.
+    const uint32_t n_pad_prefill = 0;
 
     // SWA
     const uint32_t n_swa = 0;
