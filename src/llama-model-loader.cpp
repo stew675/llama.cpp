@@ -16,16 +16,34 @@
 #include <regex>
 #include <unordered_set>
 
-// wip/host-expert-dio-cache Phase 1 (plumbing, inert): the host-expert on-disk source registry lives in
-// ggml-cuda.  libllama already links libggml-hip, so declaring it here avoids a layering include.  The
-// call is a no-op unless MOE_HOST_POOL_MIB > 0, so with the env unset/0 nothing is created.
-void moe_cache_set_host_source(const void * tensor_data, const char * path, size_t offs,
-                               int n_experts, size_t host_bytes, size_t total_bytes);
-void moe_cache_set_host_pool(bool on);
+// wip/host-expert-dio-cache Phase 1 (plumbing, inert): the host-expert on-disk source registry and the
+// host-pool enable live in ggml-cuda.  They are routed through the device API (issue #130) instead of a
+// direct forward declaration, because libllama must not reference a ggml-cuda symbol on a backend-DL
+// build (and a Windows DLL only exports what is marked GGML_API).  Both calls are no-ops unless the host
+// pool is requested, and are served by whichever device provides the callback.
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+// Host-resident expert weights are always pinned (`ROCm_Host`): the GPU reads the host master in
+// place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
+// `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
+static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_mode, const char * func) {
+    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP) {
+        LLAMA_LOG_WARN("%s: host_experts_mode=MMAP is unsupported (a pageable host master cannot be read "
+                       "by a no-XNACK GPU, issue #116); using pinned instead\n", func);
+    }
+    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL) {
+        // issue #130: route through the device API (the pool is global in ggml-cuda, so any device serves;
+        // a backend without the callback is a no-op).
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
+        }
+        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: bounded pinned host pool enabled "
+                       "(MOE_HOST_POOL_MIB, default 25%% of the MoE host expert bytes)\n", func);
+    }
+}
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -578,15 +596,7 @@ llama_model_loader::llama_model_loader(
     // Host-resident expert weights are always pinned (`ROCm_Host`): the GPU reads the host master in
     // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
     // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
-    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP) {
-        LLAMA_LOG_WARN("%s: host_experts_mode=MMAP is unsupported (a pageable host master cannot be read "
-                       "by a no-XNACK GPU, issue #116); using pinned instead\n", __func__);
-    }
-    if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL) {
-        moe_cache_set_host_pool(true);
-        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: bounded pinned host pool enabled "
-                       "(MOE_HOST_POOL_MIB, default 25%% of the MoE host expert bytes)\n", __func__);
-    }
+    llama_host_experts_mode_apply(host_experts_mode, __func__);
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -1160,6 +1170,14 @@ void llama_model_loader::lazy_read::add_resident(const std::string & name, const
             __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
 }
 
+void llama_model_loader::lazy_read::add_range(const std::string & name, const llama_tensor_weight & w) {
+    ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(w.tensor));
+    tensors.insert(name);
+
+    LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) excluded from the load-time prefetch\n",
+            __func__, name.c_str(), ggml_nbytes(w.tensor)/1024/1024);
+}
+
 // wip/fit-slab-accounting: account a host-resident MoE expert tensor's bytes per REAL device, so the
 // fit's G1/G2 reservation and the post-prefill drop/rearm cover every device.  Under `-sm tensor` the
 // layer's device is the Meta wrapper and the tensor is split across its simple devices, so distribute the
@@ -1175,9 +1193,19 @@ void llama_model_loader::lazy_read::add_resident(const std::string & name, const
 // model has no device to reserve a staging ring or expert-cache arena on, and inserting a null key
 // made `llama_context` abort in `ggml_backend_dev_memory`.
 static void moe_host_expert_account(std::map<ggml_backend_dev_t, size_t> & acc,
-        const std::string & name, size_t bytes, ggml_backend_buffer_type_t buft,
+        const std::string & name, size_t bytes, int64_t n_experts, ggml_backend_buffer_type_t buft,
         const buft_list_t * buft_list_layer) {
     if (buft == nullptr || !ggml_backend_buft_is_host(buft) || name.find("exps") == std::string::npos) {
+        return;
+    }
+    // Only a routed EXPERT BANK is accounted.  The name filter above also matches the per-expert
+    // side tensors some arches carry -- gemma4's `ffn_down_exps.scale` is 128 x F32 = 512 B per layer,
+    // i.e. 30 x 512 B = 15360 B of a 23.1 GiB host-expert set.  The expert cache only ever registers a
+    // `MUL_MAT_ID` bank (`weight->ne[2] >= 2`), so such a tensor made the cache's completeness check
+    // unsatisfiable by exactly that residue: no arena was ever sized and gemma4 paid a full per-op
+    // expert upload with zero residency (TODO #77).  A bank has an expert axis; a scale/bias vector has
+    // `ne[2] == 1`.
+    if (n_experts < 2) {
         return;
     }
     ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
@@ -1277,9 +1305,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // skip unused tensors
-        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
+        if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP) || (flags & TENSOR_SKIP_MANAGED)) {
             const size_t nbytes = ggml_nbytes(t_meta);
-            LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            if (!(flags & TENSOR_SKIP_MANAGED)) {
+                LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
+            }
 
             size_data -= nbytes;
             n_created++;
@@ -1529,7 +1559,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return nullptr;
         }
         if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
-            moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), buft, buft_list_layer);
+            moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), t_meta.ne[2], buft, buft_list_layer);
         }
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
@@ -1543,10 +1573,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    if (flags & TENSOR_READ_LAZY && !files.empty()) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        // note: the user path (llama_model_init_from_user) is not handled here yet; the
-        //   files-empty guard arrives with the managed reader (block 11).
+        // note: the user path (llama_model_init_from_user) has no files to lazy-read from, so the
+        //   tensor is created normally there and filled via set_tensor_data
         const llama_tensor_weight * w = no_alloc ? nullptr : &require_weight(tn.str().c_str());
         is_lazy = lazy.add(tn.str(), cur, w);
 
@@ -1582,7 +1612,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
     if (ggml_backend_buft_is_host(buft) && tn.str().find("exps") != std::string::npos) {
-        moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), buft, buft_list_layer);
+        moe_host_expert_account(moe_host_expert_bytes, tn.str(), ggml_nbytes(&t_meta), t_meta.ne[2], buft, buft_list_layer);
     }
 
     ggml_context * ctx = ctx_for_buft(buft);
@@ -2110,8 +2140,10 @@ bool llama_model_loader::load_all_data(
         if (cur->data != nullptr && cur->buffer != nullptr && cur->ne[2] > 1 &&
                 ggml_backend_buffer_is_host(cur->buffer) &&
                 std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
-            moe_cache_set_host_source(cur->data, files.at(weight->idx)->path().c_str(), weight->offs,
-                                      (int) cur->ne[2], (size_t) cur->nb[2], ggml_nbytes(cur));
+            ggml_backend_dev_moe_cache_set_host_source(
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer)),
+                    cur->data, files.at(weight->idx)->path().c_str(), weight->offs,
+                    (int) cur->ne[2], (size_t) cur->nb[2], ggml_nbytes(cur));
         }
 
         size_done += n_size;
