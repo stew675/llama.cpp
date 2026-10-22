@@ -1,4 +1,5 @@
 #include "moe-weighted-reduction.cuh"
+#include "ggml-moe-weighted-reduction.h"
 #include "mmb.cuh"
 
 // HIP's float4 is a struct, and __builtin_nontemporal_load/_store only accept builtin scalar or
@@ -296,4 +297,86 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                   (const float *) weights->data,
                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
     CUDA_CHECK(cudaGetLastError());
+}
+
+// MoE weighted expert reduction (the MUL over the expert weights): returns the number of graph
+// nodes to skip when fused, 0 otherwise.  GGML_CUDA_DISABLE_MWR=1 turns it off.
+int ggml_cuda_moe_weighted_reduction_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disable_mwr = getenv("GGML_CUDA_DISABLE_MWR") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MWR"));
+    if (disable_mwr || cgraph->nodes[i]->op != GGML_OP_MUL) {
+        return 0;
+    }
+    ggml_moe_weighted_reduction_match match;
+    static const bool mwr_dbg2 = getenv("GGML_CUDA_MWR_DEBUG") != nullptr;
+    if (!ggml_match_moe_weighted_reduction(cgraph, i, match)) {
+        return 0;
+    }
+    int count = match.node_count;
+    const ggml_tensor * merge = nullptr;
+    // shared-expert merge (LLAMA_HC_BLK16, default OFF): the ADD(reduction, ffn_shexp_gated)
+    // right after is folded into the reduction, which then writes the BF16 block_out stream.
+    if (ggml_cuda_mmb_blk16()) {
+        const int nadd = i + match.node_count;
+        if (nadd < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i + match.node_count - 1, 1)) {
+            const ggml_tensor * add = cgraph->nodes[nadd];
+            if (add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
+                    ggml_are_same_shape(add, match.dst) && ggml_cuda_mmb_is_bf16_only(add)) {
+                const ggml_tensor * o = add->src[0] == match.dst ? add->src[1] :
+                                        (add->src[1] == match.dst ? add->src[0] : nullptr);
+                if (o && o->type == GGML_TYPE_F32 && ggml_is_contiguous(o) && ggml_are_same_shape(o, match.dst)) {
+                    merge = o;
+                    match.dst = const_cast<ggml_tensor *>(add);
+                    count = match.node_count + 1;
+                }
+            }
+        }
+    }
+    const int output_idx = i + count - 1;
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, &output_idx, 1)) {
+        return 0;
+    }
+    // the down projection's mmvq launch already wrote this reduction (ggml_cuda_mwr_fold_mark)
+    if (ctx.mwr_done_graph == cgraph && ctx.mwr_done_idx == i && merge == nullptr) {
+        ctx.mwr_done_graph = nullptr;
+        ctx.mwr_done_idx   = -1;
+        return count - 1;
+    }
+    if (mwr_dbg2) GGML_LOG_INFO("MWR FUSED %s\n", cgraph->nodes[i]->name);
+    ggml_cuda_op_moe_weighted_reduction(ctx, match.experts, match.expert_scale, match.weights, match.dst, merge);
+    return count - 1;
+}
+
+// MoE down + weighted reduction fold: arm the context when node i is a 1-token MUL_MAT_ID whose output is exactly the experts
+// operand of the weighted reduction at node i + 1 (no shared-expert merge); its mmvq launch then writes the reduction and the
+// reduction fusion launches nothing.  Runs for every node (it clears the arming).  GGML_CUDA_MWR_FOLD=0: off.
+void ggml_cuda_mwr_fold_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool on = getenv("GGML_CUDA_MWR_FOLD") == nullptr || atoi(getenv("GGML_CUDA_MWR_FOLD")) != 0;
+    static const bool disable_mwr = getenv("GGML_CUDA_DISABLE_MWR") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_MWR"));
+    ctx.mwr_fold_experts = nullptr;
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!on || disable_mwr || node->op != GGML_OP_MUL_MAT_ID || node->type != GGML_TYPE_F32 || node->ne[2] != 1 ||
+            i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_MUL || ggml_cuda_mmb_blk16()) {
+        return;
+    }
+    ggml_moe_weighted_reduction_match match;
+    if (!ggml_match_moe_weighted_reduction(cgraph, i + 1, match) || match.experts != node) {
+        return;
+    }
+    const int output_idx = i + 1 + match.node_count - 1;
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i + 1, match.node_count, &output_idx, 1)) {
+        return;
+    }
+    // the fold writes match.dst during the down launch, whose later blocks still read the expert ids
+    const ggml_tensor * ids = node->src[2];
+    const char * d0 = (const char *) match.dst->data;
+    const char * i0 = (const char *) ids->data;
+    if (d0 < i0 + ggml_nbytes(ids) && i0 < d0 + ggml_nbytes(match.dst)) {
+        return;
+    }
+    ctx.mwr_fold_experts = node;
+    ctx.mwr_fold_weights = match.weights;
+    ctx.mwr_fold_scale   = match.expert_scale;
+    ctx.mwr_fold_dst     = match.dst;
+    ctx.mwr_fold_graph   = cgraph;
+    ctx.mwr_fold_idx     = i + 1;
 }

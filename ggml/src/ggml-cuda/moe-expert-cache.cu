@@ -67,6 +67,11 @@ struct table_t {
     size_t      host_pitch  = 0;    // host row pitch (nb[1]) for a strided axis-0 slice; 0 => contiguous 1-D fill
     int         split_axis  = -1;   // -1 = whole expert; 0/1 = the master axis this slice was split on
     bool        cold_safe   = true; // false: the host geometry is not representable by a single UVA read
+    // wip/fix-gemma-4 (TODO #77/C): a FUSED table under `-sm tensor` (gemma4 `ffn_gate_up_exps`, whose
+    // device slot is `[gate_slice | up_slice]`).  The slot is assembled by concatenating these host
+    // ranges in order; `n_slices == 0` means the historical single slice (`src_off`/`host_pitch`).
+    int         n_slices    = 0;
+    struct { size_t src_off; size_t len; } slice[GGML_BACKEND_MOE_MAX_SLICES];
     // wip/host-expert-dio-cache Phase 1: the on-disk source of this table's host master, registered by
     // the loader (`moe_cache_set_host_source`).  Empty unless `MOE_HOST_POOL_MIB > 0`.
     std::string src_path;
@@ -1446,6 +1451,40 @@ static void pool_rank_from_prefill_locked() {
 // an eviction victim.  Without this, an expert admitted earlier in the same token can be evicted by a later
 // one (its freshly-seeded count is the smallest), which is what made the hook's `all` flag flip from token
 // to token - and that variability is what broke CUDA graph replay.
+// wip/fix-gemma-4 (TODO #77/C): copy ONE expert's device slot from the host master.  One place for the
+// three geometries a table can have, so the eager fill, the identity fill and any future fill cannot
+// disagree: a FUSED table (multi-slice, concatenated in order), a strided axis-0 slice (2-D copy) and a
+// contiguous slice (1-D copy).
+static cudaError_t fill_slot_from_host(const table_t & t, void * dst, size_t expert, cudaStream_t stream) {
+    if (t.host == nullptr || t.host_bytes == 0 || t.expert_bytes == 0) {
+        return cudaErrorInvalidDeviceFunction;
+    }
+    if (t.n_slices > 0) {
+        const char * base = (const char *) t.host + expert * t.host_bytes;
+        size_t dst_o = 0;
+        for (int k = 0; k < t.n_slices; k++) {
+            const cudaError_t err = cudaMemcpyAsync((char *) dst + dst_o, base + t.slice[k].src_off,
+                                                    t.slice[k].len, cudaMemcpyHostToDevice, stream);
+            if (err != cudaSuccess) {
+                return err;
+            }
+            dst_o += t.slice[k].len;
+        }
+        return cudaSuccess;
+    }
+    const char * src = (const char *) t.host + expert * t.host_bytes + t.src_off;
+    if (t.split_axis == 0 && t.host_pitch > 0) {
+        const int64_t rows = (int64_t) (t.host_bytes / t.host_pitch);
+        const size_t  row  = rows > 0 ? (t.expert_bytes / (size_t) rows) : 0;
+        if (row == 0) {
+            return cudaErrorInvalidDeviceFunction;
+        }
+        return cudaMemcpy2DAsync(dst, row, src, t.host_pitch, row, (size_t) rows,
+                                 cudaMemcpyHostToDevice, stream);
+    }
+    return cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyHostToDevice, stream);
+}
+
 moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
                               const int32_t * protect = nullptr, int n_protect = 0,
                               bool * out_cold = nullptr) {
@@ -1602,6 +1641,22 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
             const bool pool_sync = (n_protect > pool->slots);
             pool_expert = pool_slot_locked(*pool, expert, &pool_slot, pool_sync);
         }
+        // wip/fix-gemma-4 (TODO #77/C): a fused table's slot is assembled from several host ranges
+        // (`[gate_slice | up_slice]`), concatenated in order.  It is filled from the master only: the
+        // host pool holds whole host experts and would need the same slicing, and the pool is the
+        // `--host-experts pool` path, which does not run fused tables today.
+        if (t.n_slices > 0) {
+            g_acc_fills++;
+            g_fill_bytes += (int64_t) t.expert_bytes;
+            void * dst_f = (char *) t.arena + (size_t) slot * t.expert_bytes;
+            const cudaError_t err_f = fill_slot_from_host(t, dst_f, (size_t) expert, (cudaStream_t) stream);
+            if (err_f != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_WARN("%s: fused async fill failed table layer=%d role=%s expert=%d\n",
+                              __func__, t.layer, t.role.c_str(), expert);
+            }
+            return { (char *) t.arena + (size_t) slot * t.expert_bytes, true };
+        }
         const bool from_pool = pool_expert != nullptr;
         const cudaMemcpyKind kind = from_pool ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
         const char * src = from_pool
@@ -1651,6 +1706,25 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
 
 // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): one-shot bulk admission of the
 // experts the prefill routing touched most, applied at arena sizing (after the arena/policy state exist).
+// wip/first-prefill-latency: the arena is sized against the full slab region, but a wide prefill reclaims
+// the band `[narrow_floor, narrow_floor + ring + wide)`.  A table whose arena starts inside that band is
+// the coldest (heat-ordered last) and must NOT be pre-seeded -- the seed would be thrown away on the very
+// next prefill.  Leave it empty; it fills lazily during decode.  Returns true when seeding is allowed.
+static bool heat_seed_above_floor(const table_t & t) {
+    if (t.device < 0 || t.arena == nullptr) {
+        return true;
+    }
+    const size_t floor = ggml_cuda_slab_seed_floor(t.device);
+    if (floor == 0) {
+        return true;   // layout not established (non-slab path): seed as before
+    }
+    const char * base = (const char *) ggml_cuda_slab_work_base(t.device);
+    if (base == nullptr) {
+        return true;
+    }
+    return (size_t) ((const char *) t.arena - base) >= floor;
+}
+
 // `t.prefill_count` was accumulated in `moe_cache_update_host`'s prefill branch; here it is ranked
 // (count desc, expert id asc), the top `min(slots, cap)` are placed in slots 0.. and copied from the
 // pinned host master - the same bytes a decode fill would fetch, just front-loaded.  The host mirrors are
@@ -1659,7 +1733,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
 void apply_prefill_seed_locked(table_t & t) {
     const bool from_tally = g_prefill_seed;
     if (!g_prefill_seed || t.identity || t.slots <= 0 || t.host == nullptr ||
-        !t.expert_slot.empty()) {
+        !t.expert_slot.empty() || !heat_seed_above_floor(t)) {
         return;
     }
     if (from_tally && (int) t.prefill_count.size() != t.n_experts) {
@@ -1748,7 +1822,8 @@ void apply_prefill_seed_locked(table_t & t) {
 // MOE_EXPERT_CACHE_PREFILL_SEED.  Call it BEFORE `apply_prefill_seed_locked` so the persisted prior
 // wins the (empty-arena) race for slots 0...
 void apply_heat_seed_locked(table_t & t) {
-    if (!g_heat_on || t.identity || t.slots <= 0 || t.host == nullptr || !t.expert_slot.empty()) {
+    if (!g_heat_on || t.identity || t.slots <= 0 || t.host == nullptr || !t.expert_slot.empty() ||
+        !heat_seed_above_floor(t)) {
         return;
     }
     if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
@@ -2578,23 +2653,11 @@ void alloc_table_locked(table_t & t, int slots) {
     // because the arena is not read until a later token.  A partial copy rolls the table back to the
     // normal remap path.
     t.identity = false;
-    if (slots == t.n_experts && t.host != nullptr && t.expert_bytes > 0) {
+    if (slots == t.n_experts && t.host != nullptr && t.expert_bytes > 0 && heat_seed_above_floor(t)) {
         bool ok = true;
-        const int64_t rows = (t.split_axis == 0 && t.host_pitch > 0 && t.host_bytes > 0)
-                                 ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
-        const size_t  row  = (rows > 0) ? (t.expert_bytes / (size_t) rows) : 0;
         for (int e = 0; e < t.n_experts && ok; ++e) {
-            void *       dst = (char *) t.arena + (size_t) e * t.expert_bytes;
-            const char * src = (const char *) t.host + (size_t) e * t.host_bytes + t.src_off;
-            cudaError_t err = cudaSuccess;
-            if (t.split_axis != 0 || t.host_pitch == 0) {
-                err = cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyHostToDevice, (cudaStream_t) 0);
-            } else if (row > 0) {
-                err = cudaMemcpy2DAsync(dst, row, src, t.host_pitch, row, (size_t) rows,
-                                        cudaMemcpyHostToDevice, (cudaStream_t) 0);
-            } else {
-                ok = false;
-            }
+            void * dst = (char *) t.arena + (size_t) e * t.expert_bytes;
+            const cudaError_t err = fill_slot_from_host(t, dst, (size_t) e, (cudaStream_t) 0);
             if (err != cudaSuccess) {
                 (void) cudaGetLastError();
                 ok = false;
@@ -2670,7 +2733,24 @@ static bool moe_cache_tables_complete_locked() {
             expected += g_preflight_device_bytes[d];
         }
     }
-    return registered >= expected;
+    if (expected <= 0) {
+        return true;
+    }
+    // Small slack for rounding between the loader's account and the sum of the registered tables: the
+    // account is per host tensor (`ggml_nbytes`) while the cache adds `n_experts x expert_bytes` per
+    // device, and under `-sm tensor` the loader can only guess the per-device proportion
+    // (`bytes / n_dev`) that the Meta backend later decides exactly.  The TOTALS agree exactly for a
+    // fully registered set, which is what this compares (see the invariant above).
+    //
+    // It must stay well below one table: an earlier `expected/128` version silently accepted a 35B-A3B
+    // sizing pass with one 36.4 MiB table still unregistered (240 -> 239 tables, -3.6 % tg128), which is
+    // exactly the partial-set latch this guard exists to prevent.  The `moe_host_expert_account` filter
+    // is what keeps the gemma4 class (`ffn_down_exps.scale`, 512 B/layer, the reason an EXACT comparison
+    // once failed) out of the expectation in the first place.
+    const int64_t slack = moe_cache_min_i64(
+        moe_cache_max_i64((int64_t) 1 << 20, expected / 4096),
+        (int64_t) 16 << 20);
+    return registered + slack >= expected;
 }
 
 // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
@@ -4283,7 +4363,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
 
 int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                     size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
-                    const void * host, int device) {
+                    const void * host, int device,
+                    const struct ggml_backend_moe_slice * slices, int n_slices) {
     if (!g_enabled) {
         return -1;
     }
@@ -4300,6 +4381,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
     if (host_pitch != 0) {
         cold_safe = host_bytes > 0 && host_bytes % host_pitch == 0 &&
                     expert_bytes > 0 && expert_bytes % (host_bytes / host_pitch) == 0;
+    }
+    // A fused table's slot is several host ranges, so a single cold (UVA) read cannot express it: every
+    // miss is filled from the master instead.  That is the same cost as a resident-set miss on any other
+    // table, and it keeps the device-side cold encoding (`id - n_res_slots` -> one host stride) honest.
+    const bool fused = slices != nullptr && n_slices > 0;
+    if (fused) {
+        cold_safe = false;
     }
 
     const std::pair<const void*, int> key = { src0, device };
@@ -4330,6 +4418,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
     t.host_pitch   = host_pitch;
     t.split_axis   = split_axis;
     t.cold_safe    = cold_safe;
+    t.n_slices     = fused ? std::min(n_slices, (int) GGML_BACKEND_MOE_MAX_SLICES) : 0;
+    for (int k = 0; k < t.n_slices; k++) {
+        t.slice[k].src_off = slices[k].src_off;
+        t.slice[k].len     = slices[k].len;
+    }
     // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
     // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
     if (ggml_cuda_cache_geom_debug()) {
@@ -4366,7 +4459,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
     if (it != t.expert_slot.end()) {
         return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
     }
-    if (t.host != nullptr && expert >= 0 && expert < t.n_experts && t.host_pitch == 0) {
+    if (t.host != nullptr && expert >= 0 && expert < t.n_experts && t.host_pitch == 0 && t.n_slices == 0) {
         return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
     }
     return { nullptr, false };
@@ -4640,6 +4733,27 @@ static bool moe_cache_slice_addr_ok(size_t host_bytes, size_t expert_bytes, size
     return span <= host_bytes - src_off;
 }
 
+// wip/fix-gemma-4 (TODO #77/C): every range of a fused table's slot must lie inside one host expert blob,
+// and the ranges must tile the device slot exactly (they are concatenated into it).
+static bool moe_cache_slices_addr_ok(size_t host_bytes, size_t expert_bytes,
+                                    const struct ggml_backend_moe_slice * slices, int n_slices) {
+    if (slices == nullptr || n_slices <= 0 || n_slices > GGML_BACKEND_MOE_MAX_SLICES) {
+        return false;
+    }
+    if (host_bytes == 0 || expert_bytes == 0) {
+        return false;
+    }
+    size_t total = 0;
+    for (int k = 0; k < n_slices; k++) {
+        const size_t len = slices[k].len;
+        if (len == 0 || slices[k].src_off > host_bytes || len > host_bytes - slices[k].src_off) {
+            return false;
+        }
+        total += len;
+    }
+    return total == expert_bytes;
+}
+
 bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                            const ggml_tensor * ids, void * stream, int device,
                            size_t slice_off, int split_axis) {
@@ -4887,7 +5001,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
 bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                            const int32_t * ids, int64_t n_used, int64_t n_tok,
                            size_t ids_nb0, size_t ids_nb1, void * stream,
-                           int device, size_t slice_off, int split_axis) {
+                           int device, size_t slice_off, int split_axis,
+                           const struct ggml_backend_moe_slice * slices, int n_slices) {
     g_write_seq++;
     if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
         return false;
@@ -4930,7 +5045,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
             host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
         }
     }
-    if (!moe_cache_slice_addr_ok(host_bytes, expert_bytes, slice_off, host_pitch)) {
+    const bool fused = slices != nullptr && n_slices > 0;
+    if (fused) {
+        // A fused table (`ffn_gate_up_exps` under `-sm tensor`) carries the whole geometry in `slices`;
+        // reject a list that does not tile the device slot, so a caller bug declines instead of filling
+        // an under-filled arena slot.
+        if (!moe_cache_slices_addr_ok(host_bytes, expert_bytes, slices, n_slices)) {
+            static bool warned_fused = false;
+            if (!warned_fused) {
+                warned_fused = true;
+                GGML_LOG_WARN("%s: declining a fused MoE expert table with an inconsistent slice list "
+                              "(layer=%d role=%s host_bytes=%zu expert_bytes=%zu n_slices=%d); the "
+                              "scheduler's per-op copy will serve it.  Please report this geometry.\n",
+                              __func__, layer, name_role(weight).c_str(), host_bytes, expert_bytes, n_slices);
+            }
+            moe_cache_note_unregisterable(weight, device, (int) n_experts, expert_bytes);
+            return false;
+        }
+    } else if (!moe_cache_slice_addr_ok(host_bytes, expert_bytes, slice_off, host_pitch)) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -4947,7 +5079,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
         return false;
     }
     const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
-                                      host_bytes, slice_off, host_pitch, split_axis, weight->data, device);
+                                      host_bytes, slice_off, host_pitch, split_axis, weight->data, device,
+                                      fused ? slices : nullptr, fused ? n_slices : 0);
     if (table < 0) {
         return false;
     }
@@ -4998,7 +5131,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
     // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
     // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
     // left alone.
-    if (t.host_dev == nullptr && t.split_axis == 0 && t.host_pitch > 0 && !t.identity) {
+    if (t.n_slices == 0 && t.host_dev == nullptr && t.split_axis == 0 && t.host_pitch > 0 && !t.identity) {
         g_decline_all++;
         return false;
     }
@@ -5243,7 +5376,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
     }
     std::lock_guard<std::mutex> lock(g_mutex);
     for (const table_t & t : g_tables) {
-        if (t.arena != arena || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe) {
+        if (t.arena != arena || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe || t.n_slices > 0) {
             continue;
         }
         // Fold in this device's slice offset so the kernel never needs to know the tensor-split

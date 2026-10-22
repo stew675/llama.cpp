@@ -18,3 +18,4 @@ struct ggml_cuda_norm_gated_match {
 int  ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
 int  ggml_cuda_norm_rows_match_at (const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
 void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
+int  ggml_cuda_norm_rows_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
