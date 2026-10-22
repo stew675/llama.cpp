@@ -3186,7 +3186,8 @@ common_speculative_init_result::common_speculative_init_result(
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
-        cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.ctx_type        = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.mtp_draft_vocab = params.speculative.draft.mtp_vocab;
 
         // LLAMA_MTP_DRAFT_OP_OFFLOAD=0: keep the draft context's host-resident ops (e.g. the MTP
         // layer's experts under -otd exps=CPU) on the host instead of offloading them to the device

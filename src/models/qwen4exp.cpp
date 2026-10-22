@@ -1377,7 +1377,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
         GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
     }
 
-    cur = build_lora_mm(head_w, cur, head_s);
+    if (mtp_draft != nullptr && head_w == mtp_draft->src && n_outputs == 1) {
+        // --spec-draft-mtp-vocab: this context drafts over a row subset of the LM head and scatters
+        // its logits into a full-vocab row of -inf (as in the qwen35/qwen35moe MTP graphs). Only the
+        // draft changes; the target still verifies against the full vocabulary. head_w may be the head
+        // borrowed from the target model (shared-NextN sidecar without its own output.weight): the
+        // context hook builds the subset from that same head, so src identifies both shapes.
+        GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
+        const int64_t n_sel = mtp_draft->head->ne[1];
+        const int64_t n_row = head_w->ne[1];
+        ggml_tensor * sub = build_lora_mm(mtp_draft->head, cur, head_s);
+        cur = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
+        cur = ggml_set_rows(ctx0, cur, ggml_reshape_2d(ctx0, sub, 1, n_sel), mtp_draft->ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_row, 1);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
