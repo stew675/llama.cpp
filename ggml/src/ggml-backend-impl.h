@@ -162,6 +162,17 @@ extern "C" {
         bool allocs_only;
     };
 
+    // wip/fix-gemma-4 (TODO #77/C): one device's view of a FUSED (multi-segment) routed expert table.
+    // The device's expert slot is the CONCATENATION of `len[0..n-1]` byte ranges of one host expert
+    // blob, taken at `src_off[k]` (gemma4 `ffn_gate_up_exps` under `-sm tensor`, whose slot is
+    // `[gate_slice | up_slice]`).  A backend that cannot express such a table leaves `n == 0`, and the
+    // historical single-slice geometry (`slice_off`, `split_axis`) describes it instead.
+    #define GGML_BACKEND_MOE_MAX_SLICES 8
+    struct ggml_backend_moe_slice {
+        size_t src_off;   // byte offset inside one host expert blob
+        size_t len;       // byte length in the device expert slot (slices are concatenated in order)
+    };
+
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);
 
@@ -251,7 +262,11 @@ extern "C" {
         // inside one host expert blob.  When the split backend is the Meta backend it does not
         // implement the policy itself; it computes these per device from the meta split state and
         // forwards to each simple backend's hook with that device's simple tensor as `weight_cpy`.
-        bool (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis);
+        //
+        // `slices`/`n_slices` supersede that geometry for a FUSED table whose device slot is several
+        // ranges of the host expert (see `ggml_backend_moe_slice`); `n_slices == 0` means "use
+        // `slice_off`/`split_axis`".  The Meta backend builds the list per device.
+        bool (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices);
 
         // wip/moe-expert-cache (session 7) identity fast path.  Return true iff this expert input is
         // cache-managed and the consumer can read the arena WITHOUT the host routing (an identity table:

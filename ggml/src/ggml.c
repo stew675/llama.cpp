@@ -7902,19 +7902,29 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
                                 const int *                outputs,
                                 int                        num_outputs) {
     GGML_ASSERT(outputs && num_outputs > 0);
+    // Read the diagnostic flag once: this predicate runs on every candidate fusion window (millions
+    // of calls per pass), and getenv() takes a lock and rescans the environment block on Windows.
+    static int dbg_state = -1;   // C requires a constant initializer, so cache the lookup by hand
+    if (dbg_state < 0) {
+        dbg_state = getenv("LLAMA_HC_CN_DEBUG") != NULL;
+    }
+    const bool dbg = dbg_state != 0;
 
     for (int i = 0; i < count; ++i) {
         if (node_idxs[i] >= cgraph->n_nodes) {
+            if (dbg) fprintf(stderr, "canf: i=%d idx>=n_nodes\n", i);
             return false;
         }
 
         const struct ggml_tensor * node = cgraph->nodes[node_idxs[i]];
 
         if (node->op != ops[i]) {
+            if (dbg) fprintf(stderr, "canf: i=%d op mismatch %s vs %s\n", i, ggml_op_name(node->op), ggml_op_name(ops[i]));
             return false;
         }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            if (dbg) fprintf(stderr, "canf: i=%d %s not COMPUTE\n", i, ggml_op_name(node->op));
             return false;
         }
 
@@ -7923,6 +7933,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         }
 
         if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            if (dbg) fprintf(stderr, "canf: i=%d %s is OUTPUT but not declared\n", i, ggml_op_name(node->op));
             return false;
         }
 
@@ -7937,6 +7948,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         }
 
         if (subgraph_uses != ggml_node_get_use_count(cgraph, node_idxs[i])) {
+            if (dbg) fprintf(stderr, "canf: i=%d %s uses %d != count %d\n", i, ggml_op_name(node->op), subgraph_uses, ggml_node_get_use_count(cgraph, node_idxs[i]));
             return false;
         }
 
@@ -7945,6 +7957,7 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
         struct ggml_tensor * view_src = node->view_src;
         while (view_src) {
             if (ggml_node_list_find_tensor(cgraph, node_idxs, count, view_src) == -1 && !ggml_is_constant(view_src)) {
+                if (dbg) fprintf(stderr, "canf: i=%d %s external view_src %s\n", i, ggml_op_name(node->op), view_src->name);
                 return false;
             }
             view_src = view_src->view_src;

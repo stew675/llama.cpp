@@ -324,6 +324,10 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .moe_cache_set_host_pool   = */ nullptr,
     /* .moe_cache_set_host_source = */ nullptr,
     /* .slab_compute_plain   = */ ggml_backend_meta_device_slab_compute_plain,
+    /* .slab_ring_region     = */ nullptr,
+    /* .slab_set_ring_cap    = */ nullptr,
+    /* .slab_enabled         = */ nullptr,
+    /* .slab_ring_slots      = */ nullptr,
 };
 
 bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -341,6 +345,42 @@ ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev,
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) meta_dev->context;
     GGML_ASSERT(index < meta_dev_ctx->simple_devs.size());
     return meta_dev_ctx->simple_devs[index];
+}
+
+// issue #164: the byte size of device `dev`'s slice of a tensor under the meta split.  THIS is the
+// definition of the per-device split size.  `ggml_backend_meta_stage_input` sizes the H2D ring slot with
+// it, and `llama_model::max_host_expert_slice_bytes` sizes the slab ring hole from the same rule, so the
+// ring can always hold the largest upload the staging will ask for.  `extent` is the same per-segment sum
+// `ggml_backend_meta_buffer_init_tensor_impl` uses to build each device's tensor (the split is
+// granularity-rounded, so it need not be even), and the byte size scales linearly with it because the
+// tensor is contiguous.
+size_t ggml_backend_meta_split_dev_bytes(const struct ggml_tensor * tensor,
+        const struct ggml_backend_meta_split_state * split_state, size_t n_devs, size_t dev) {
+    if (tensor == nullptr || split_state == nullptr || dev >= n_devs) {
+        return 0;
+    }
+    if (split_state->axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return ggml_nbytes(tensor);
+    }
+    if (split_state->axis < 0 || split_state->axis >= GGML_MAX_DIMS) {
+        return 0;
+    }
+    const int64_t ne_axis = tensor->ne[split_state->axis];
+    if (ne_axis <= 0) {
+        return 0;
+    }
+    int64_t extent = 0;
+    for (uint32_t s = 0; s < split_state->n_segments; s++) {
+        extent += split_state->ne[s*n_devs + dev] * split_state->nr[s];
+    }
+    if (extent <= 0) {
+        return 0;
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes % (size_t) ne_axis != 0) {
+        return nbytes;   // non-contiguous tensor: the whole tensor is the safe bound
+    }
+    return (nbytes / (size_t) ne_axis) * (size_t) extent;
 }
 
 ggml_backend_dev_t ggml_backend_meta_device(
@@ -880,7 +920,27 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops process data on a per-row bases:
     auto handle_per_row = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_0);
+        // dim 0 is the reduction axis, so an axis-0 split is normally a CROSS-DEVICE reduction.  The exception is
+        // a split that no device straddles: if every per-device extent is either empty or the WHOLE row, each
+        // device owns complete rows and reduces them locally, and the state passes through unchanged.
+        // gemma4's full-attention layers have a single KV head, so their 512-wide K/V projection row is placed
+        // whole on one device (measured `ne_per_dev = [0, 512]`); the per-head K norm, the V rms_norm and the
+        // rope then find an axis-0 split whose every row is whole.  A genuine straddle (e.g. [256, 256] over a
+        // 512 row) is still rejected -- that one really would need a cross-device reduction.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            bool whole_rows = true;
+            for (size_t s = 0; s < src_ss[0].n_segments && whole_rows; s++) {
+                for (size_t j = 0; j < n_bufs; j++) {
+                    const int64_t extent = src_ss[0].ne[s*n_bufs + j] * src_ss[0].nr[s];
+                    if (extent != 0 && extent != tensor->src[0]->ne[0]) {
+                        whole_rows = false;
+                        break;
+                    }
+                }
+            }
+            GGML_ASSERT(whole_rows && "per-row op over a row STRADDLING an axis-0 split needs a cross-device "
+                                      "reduction (not implemented)");
+        }
         return src_ss[0];
     };
 
@@ -893,6 +953,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[0].axis == src_ss[1].axis ||
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
             return src_ss[0]; // GGML_OP_ADD_ID
+        }
+        // An elementwise op whose OTHER operand is MIRRORED and of the same shape: the result follows the split
+        // operand, whatever its split is, because nothing is reduced and the mirrored operand is present in full
+        // on every backend.  A per-head norm weight is exactly this: gemma4's full-attention K/V row is 512 wide
+        // with a single KV head, so the row lands whole on one device (axis-0 split, extents [0, 512]) while the
+        // [512] norm weight is MIRRORED -- the broadcast case above only covers ne[axis] == 1.
+        if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && tensor->src[1] != nullptr &&
+                ggml_are_same_shape(tensor->src[0], tensor->src[1])) {
+            return src_ss[0];
+        }
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && tensor->src[1] != nullptr &&
+                ggml_are_same_shape(tensor->src[0], tensor->src[1])) {
+            return src_ss[1];
         }
         GGML_ASSERT(tensor->src[2] == nullptr || src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return handle_generic(src_ss, /*scalar_only =*/ false);
@@ -926,6 +999,32 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return ret;
         }
         if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[1];
+        }
+        // The rotated-KV cache (`-ctk q8_0`, n_rot_k > 0) rotates K with a MIRRORED n_rot_k x n_rot_k matrix:
+        //     out[rot_row, i1] = sum_k rot[k, rot_row] * cur[k, i1],  cur = Kcur reshaped to [n_rot_k, rows]
+        // so the contraction axis of `cur` is axis 0.  Usually the head axis gives that split (gemma4's
+        // single-KV-head full-attention layers reshape a whole [512, 1] row set, i.e. axis-0 extents are
+        // `[0, 512]`): no device straddles the contraction, the device holding the whole range computes the
+        // complete dot product (every rot column is available to it, src0 is MIRRORED) and the others hold an
+        // empty slice, so the reduction is local and nothing is summed across devices.  The output follows
+        // `cur`'s split, which is exactly the state the unrotated Kcur has after the same reshape: gemma4's
+        // 512-wide row is whole on one device, so the rotation's output is whole on that device too.
+        // A *straddling* axis-0 split (e.g. [256, 256] over a 512-wide contraction) is a genuine cross-device
+        // partial sum; it is rejected rather than silently wrong.
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            const ggml_tensor * cur = tensor->src[1];
+            GGML_ASSERT(tensor->ne[0] == cur->ne[0] &&
+                    "mul_mat of a MIRRORED src0 over an axis-0-split src1 needs out->ne[0] == src1->ne[0] "
+                    "(a square contraction) so each device's output slice maps 1:1 onto its contraction slice");
+            for (size_t s = 0; s < src_ss[1].n_segments; s++) {
+                for (size_t j = 0; j < n_bufs; j++) {
+                    const int64_t extent = src_ss[1].ne[s*n_bufs + j] * src_ss[1].nr[s];
+                    GGML_ASSERT((extent == 0 || extent == cur->ne[0]) &&
+                            "mul_mat of a MIRRORED src0 over an axis-0 split that STRADDLES the contraction "
+                            "needs a cross-device reduction (not implemented)");
+                }
+            }
             return src_ss[1];
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
@@ -1125,7 +1224,42 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2;
         const bool kv_mirrored = src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
                 src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED;
-        GGML_ASSERT(kv_split || kv_mirrored);
+        // A KV slice that is empty-or-whole on every device: gemma4's single-KV-head full-attention layers
+        // put the whole 512-wide K/V row (granularity == the whole row) and therefore the whole KV cache on
+        // ONE device.  Depending on how the cache is viewed that state arrives split on the kv-head axis
+        // (`[0, 1]`, already accepted above) or on the cache's embd axis (`[0, 512]`, reached when the ubatch
+        // carries several sequences and the view spans the cache's stream dimension -- llama-server
+        // `-np > 1`, `llama-batched-bench -npl > 1`, `llama-perplexity --kl-divergence`).  Both mean the same
+        // thing: nothing is reduced, the owning device computes the whole op, and a device with a zero-sized
+        // source has its node disabled (`GGML_TENSOR_FLAG_COMPUTE` clear) exactly as in the axis-2 case.
+        // The query must be empty-or-whole *on the same devices* as the KV: a device holding queries but no
+        // K/V would compute rows nothing serves, which is the genuinely-broken combination this rejects.
+        auto whole_mask = [&](const ggml_backend_meta_split_state & ss, const ggml_tensor * t, uint32_t & mask) -> bool {
+            mask = 0;
+            if (ss.axis < 0 || ss.axis >= GGML_MAX_DIMS || t == nullptr) {
+                return false;
+            }
+            for (size_t j = 0; j < n_bufs; j++) {
+                int64_t extent = 0;
+                for (size_t s = 0; s < ss.n_segments; s++) {
+                    extent += ss.ne[s*n_bufs + j] * ss.nr[s];
+                }
+                if (extent == 0) {
+                    continue;
+                }
+                if (extent != t->ne[ss.axis]) {
+                    return false;
+                }
+                mask |= 1u << j;
+            }
+            return mask != 0;
+        };
+        uint32_t mask_k = 0, mask_v = 0, mask_q = 0;
+        const bool kv_whole = whole_mask(src_ss[1], tensor->src[1], mask_k) &&
+                whole_mask(src_ss[2], tensor->src[2], mask_v) &&
+                whole_mask(src_ss[0], tensor->src[0], mask_q) &&
+                mask_k == mask_v && (mask_q & mask_k) == mask_k;
+        GGML_ASSERT(kv_split || kv_mirrored || kv_whole);
         GGML_ASSERT(tensor->src[4] == nullptr || src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_0);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
@@ -2582,8 +2716,105 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
         // splitter would treat the remainder as a <=512-byte MMQ tail, so any other mid-row caller would
         // corrupt the tensor.  The reverted `size % row_stride <= 512` attempt tried to divert such a
         // range into a whole-tensor accumulator; a partial per-op upload never reached `total`, stranding
-        // its bytes (the rear-placement hang).  With the sync setter generalized there is nothing to
-        // classify: hand it the whole range.
+        // its bytes (the rear-placement hang).
+        //
+        // TODO #77 (fix-gemma-4 campaign): the HOT caller of this arm is the scheduler's per-op expert
+        // upload (`copy_experts`), a ROW-ALIGNED range of a fused table (gemma4's `ffn_gate_up_exps`: two
+        // segments, each split across the devices).  Handing it to the synchronous setter made every
+        // 8-token run pay 3.8 s of host-blocking copies.  A row-aligned range is served here with the
+        // same head/full/tail splice asynchronously (per device, on that device's stream, so the H2D
+        // overlaps the compute that follows).  A MID-ROW range stays on the synchronous setter: that is
+        // the loader's chunked upload (load-time, and its pinned staging ring may be reused as soon as
+        // the call returns).  The async arm therefore requires (a) `offset` on a row boundary and (b) a
+        // caller whose source outlives the queued copies -- which the scheduler guarantees: it uploads
+        // from the immutable pinned host master.
+        // Kill switch (`GGML_META_SEG_ASYNC=0`) for the async arm: it exists so the synchronous splice can
+        // be the A/B reference and the bisect arm for a decode-path regression.
+        static const bool seg_async_on = [] {
+            const char * e = getenv("GGML_META_SEG_ASYNC");
+            return e == nullptr || atoi(e) != 0;
+        }();
+        const int   split_axis_s = (int) split_state.axis;
+        const bool  seg_axis0    = split_axis_s == GGML_BACKEND_SPLIT_AXIS_0;
+        const int   seg_dst_dim  = split_axis_s + 1;
+        const size_t seg_row_stride = seg_axis0 ? tensor->nb[1] : tensor->nb[2];
+        if (seg_async_on && split_axis_s >= GGML_BACKEND_SPLIT_AXIS_0 &&
+            split_axis_s <= GGML_BACKEND_SPLIT_AXIS_1 &&
+            seg_row_stride != 0 && (offset % seg_row_stride) == 0) {
+            const int64_t seg_blck     = ggml_blck_size(tensor->type);
+            const size_t  seg_n_rows   = (size_t) (seg_axis0 ? tensor->ne[1] : tensor->ne[2]);
+
+            auto seg_chunk_bytes = [&](size_t s, size_t j) -> size_t {
+                if (seg_axis0) {
+                    GGML_ASSERT(split_state.ne[s*n_backends + j] % seg_blck == 0);
+                    return (size_t) (split_state.ne[s*n_backends + j] / seg_blck) * tensor->nb[0];
+                }
+                return (size_t) split_state.ne[s*n_backends + j] * tensor->nb[1];
+            };
+
+            size_t pos       = offset;
+            size_t remaining = size;
+
+            // Full rows: one strided 2-D async dispatch per (segment, repeat, device), exactly the
+            // offsets the synchronous setter's `write_full_rows` uses.
+            const int64_t seg_row0 = (int64_t) (pos / seg_row_stride);
+            const int64_t seg_rows = (int64_t) (remaining / seg_row_stride);
+            if (seg_rows > 0) {
+                GGML_ASSERT(seg_row0 + seg_rows <= (int64_t) seg_n_rows);
+                size_t offset_data = 0;
+                std::vector<size_t> dst_off(n_backends, 0);
+                for (size_t s = 0; s < split_state.n_segments; s++) {
+                    for (size_t r = 0; r < split_state.nr[s]; r++) {
+                        for (size_t j = 0; j < n_backends; j++) {
+                            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                            ggml_tensor *  simple_tensor  = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            const size_t nbytes = seg_chunk_bytes(s, j);
+                            ggml_backend_tensor_set_2d_async(simple_backend, simple_tensor,
+                                (const char *) data + ((size_t) seg_row0 * seg_row_stride + offset_data - offset),
+                                dst_off[j] + (size_t) seg_row0 * simple_tensor->nb[seg_dst_dim],
+                                nbytes, (size_t) seg_rows, simple_tensor->nb[seg_dst_dim], seg_row_stride);
+                            offset_data += nbytes;
+                            dst_off[j]  += nbytes;
+                        }
+                    }
+                }
+                const size_t consumed = (size_t) seg_rows * seg_row_stride;
+                pos       += consumed;
+                remaining -= consumed;
+            }
+
+            // Tail: the remaining bytes at column 0 of the next row.  This is the `copy_experts` MMQ
+            // guard pad (`min(expert_size, 512)`), not real data, so a 1-D async copy per device chunk
+            // is sufficient and keeps its exact flat placement.
+            if (remaining > 0) {
+                GGML_ASSERT((pos % seg_row_stride) == 0);
+                const int64_t R = (int64_t) (pos / seg_row_stride);
+                GGML_ASSERT(R < (int64_t) seg_n_rows);
+                size_t p_src = 0;
+                std::vector<size_t> p_dst(n_backends, 0);
+                for (size_t s = 0; s < split_state.n_segments; s++) {
+                    for (size_t r = 0; r < split_state.nr[s]; r++) {
+                        for (size_t j = 0; j < n_backends; j++) {
+                            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                            ggml_tensor *  simple_tensor  = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                            const size_t nbytes = seg_chunk_bytes(s, j);
+                            const size_t lo = std::max(p_src, (size_t) 0);
+                            const size_t hi = std::min(p_src + nbytes, remaining);
+                            if (lo < hi) {
+                                ggml_backend_tensor_set_async(simple_backend, simple_tensor,
+                                    (const char *) data + ((size_t) R * seg_row_stride + lo - offset),
+                                    p_dst[j] + (size_t) R * simple_tensor->nb[seg_dst_dim] + (lo - p_src),
+                                    hi - lo);
+                            }
+                            p_src += nbytes;
+                            p_dst[j] += nbytes;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         ggml_backend_tensor_set(tensor, data, offset, size);
         return;
     }
@@ -2775,7 +3006,10 @@ static bool ggml_backend_meta_stage_input(ggml_backend_t backend, ggml_tensor * 
         if (chunk_size_j == 0) {
             continue;
         }
-        const size_t copy_bytes = gather ? n_chunks * chunk_size_j : chunk_size_j;
+        // The ring slot request comes from the shared split-size rule, so the slab hole (sized from the
+        // same rule, `llama_model::max_host_expert_slice_bytes`) always holds it.
+        const size_t copy_bytes = ggml_backend_meta_split_dev_bytes(input_cpy, &split_state, n_backends, j);
+        GGML_ASSERT(copy_bytes == (gather ? n_chunks * chunk_size_j : chunk_size_j));
         void * slot_ptr = simple_backend->iface.stage_buffer(simple_backend, slot, copy_bytes);
         if (slot_ptr == nullptr) {
             return false;
@@ -3529,11 +3763,57 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 // filled).
 static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend);
 
+// wip/fix-gemma-4 (TODO #77/C): the per-device source geometry of a FUSED expert table.  The device's
+// expert slot is the concatenation of one chunk per (segment, repeat) -- exactly the layout the
+// synchronous segmented setter writes: `write_full_rows`/`write_partial_row` accumulate `chunk(s, j)` into
+// the device row over (s, r) in order, while the host row walks (s, r, j).  `chunk(s, j)` is
+// `ne[s*n_bufs + j]` elements, bytes `(ne / blck_size) * nb[0]` on an axis-0 split and `ne * nb[1]` on
+// axis 1.  Returns false when the geometry is not expressible (too many slices, zero-length chunk, or a
+// list that does not tile the device row), in which case the caller declines the table and the
+// scheduler's per-op copy serves it.
+static bool ggml_backend_meta_moe_slices(const ggml_backend_meta_split_state & ss, const ggml_tensor * host,
+        const ggml_tensor * device, size_t j, size_t n_bufs,
+        struct ggml_backend_moe_slice * slices, int * n_slices) {
+    const int   axis  = (int) ss.axis;
+    const bool  axis0 = axis == GGML_BACKEND_SPLIT_AXIS_0;
+    const int64_t blck = ggml_blck_size(host->type);
+    int    n     = 0;
+    size_t p_src = 0;
+    size_t total = 0;
+    for (size_t s = 0; s < ss.n_segments; s++) {
+        for (size_t r = 0; r < ss.nr[s]; r++) {
+            for (size_t d = 0; d < n_bufs; d++) {
+                const size_t ne_d = (size_t) ss.ne[s*n_bufs + d];
+                const size_t nbytes = axis0 ? (size_t) (ne_d / (size_t) blck) * host->nb[0]
+                                            : (size_t) ne_d * host->nb[1];
+                if (d == j) {
+                    if (nbytes == 0 || n >= GGML_BACKEND_MOE_MAX_SLICES) {
+                        return false;
+                    }
+                    slices[n].src_off = p_src;
+                    slices[n].len     = nbytes;
+                    total            += nbytes;
+                    n++;
+                }
+                p_src += nbytes;
+            }
+        }
+    }
+    if (n == 0 || total != (size_t) device->nb[axis + 1]) {
+        return false;
+    }
+    *n_slices = n;
+    return true;
+}
+
 static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const struct ggml_tensor * weight,
         const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok,
-        size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis) {
+        size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis,
+        const struct ggml_backend_moe_slice * slices_in, int n_slices_in) {
     GGML_UNUSED(slice_off);
     GGML_UNUSED(split_axis);
+    GGML_UNUSED(slices_in);
+    GGML_UNUSED(n_slices_in);
     // Only a routed expert table (a `MUL_MAT_ID` weight with an expert axis) is cacheable, and only the
     // decode/verify band (the narrowest band of the simple backends, see ggml_backend_meta_moe_cache_band).
     if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2 || n_tok > ggml_backend_meta_moe_cache_band(backend)) {
@@ -3543,13 +3823,33 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
         return false;
     }
     const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
-    // A single-segment axis split is what the expert weights use (gate/up axis 1, down axis 0).  A
-    // mirrored or multi-segment layout has no single per-device contiguous slice; leave it to the
-    // scheduler's normal copy.
-    if (ss.n_segments != 1 || ss.nr[0] != 1 || ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+    if (ss.axis < 0 || ss.axis >= GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        // A mirrored table has no per-device slice geometry; leave it to the scheduler's normal copy.
         return false;
     }
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    if (ss.n_segments != 1 || ss.nr[0] != 1) {
+        // FUSED table (gemma4 `ffn_gate_up_exps`): the device slot is `[seg0_slice | seg1_slice | ...]`.
+        // Register it with an explicit per-device slice list so the cache can hold it at all -- without
+        // this it never registers, the cache's completeness check never passes, no arena is sized and the
+        // config pays a full per-op upload with zero residency (TODO #77).
+        struct ggml_backend_moe_slice slice[GGML_BACKEND_MOE_MAX_SLICES];
+        int    n_slices = 0;
+        bool   all      = true;
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+            ggml_tensor *  simple_tensor  = ggml_backend_meta_buffer_simple_tensor(weight_cpy, j);
+            if (simple_tensor == nullptr || simple_backend->iface.moe_cache_update == nullptr ||
+                !ggml_backend_meta_moe_slices(ss, weight, simple_tensor, j, n_backends, slice, &n_slices)) {
+                return false;
+            }
+            const bool took = simple_backend->iface.moe_cache_update(
+                    simple_backend, weight, simple_tensor, ids, n_used, n_tok, ids_nb0, ids_nb1,
+                    0, (int) ss.axis, slice, n_slices);
+            all = all && took;
+        }
+        return all;
+    }
     size_t off = 0;
     bool all = true;
     for (size_t j = 0; j < n_backends; j++) {
@@ -3559,7 +3859,8 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
             return false;
         }
         const bool took = simple_backend->iface.moe_cache_update(
-                simple_backend, weight, simple_tensor, ids, n_used, n_tok, ids_nb0, ids_nb1, off, (int) ss.axis);
+                simple_backend, weight, simple_tensor, ids, n_used, n_tok, ids_nb0, ids_nb1, off, (int) ss.axis,
+                nullptr, 0);
         all = all && took;
         off += simple_tensor->nb[ss.axis + 1];
     }
