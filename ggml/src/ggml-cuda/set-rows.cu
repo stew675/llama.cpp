@@ -127,20 +127,7 @@ static __global__ void k_set_rows_q8_0_group(const float * __restrict__ src0,
     const float * src_block = src0 + i01*s01 + i02*s02 + i03*s03 + i00;
     block_q8_0  * dst_block = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_q8_0) + i00 / QK8_0;
 
-    const float v = src_block[lane];
-    float amax = fmaxf(0.0f, fabsf(v));   // seeded with 0 like quantize_f32_q8_0_block (all-NaN block -> d = 0)
-#pragma unroll
-    for (int offset = QK8_0/2; offset > 0; offset >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset, QK8_0));
-    }
-
-    const float d  = amax / ((1 << 7) - 1);
-    const float id = d ? 1.0f/d : 0.0f;
-
-    if (lane == 0) {
-        dst_block->d = d;
-    }
-    dst_block->qs[lane] = roundf(v*id);
+    ggml_cuda_quantize_q8_0_group(src_block[lane], dst_block, lane);
 }
 
 // Template dispatch function for quantized set_rows

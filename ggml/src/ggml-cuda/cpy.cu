@@ -423,7 +423,24 @@ static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tens
     spitch = src0->nb[d];
     dpitch = src1->nb[d];
 
-    return spitch >= width && dpitch >= width;
+    if (spitch < width || dpitch < width) {
+        return false;
+    }
+    // Conservative guard for a driver refusal that is characterised empirically: leave the 2D path only while
+    // the padded span (height*pitch, i.e. including the last row's padding) fits the tensor's own allocation.
+    // A 2D copy of a *view of a mirrored model weight* then fails with "invalid argument" when the weight sits
+    // in the movable-boundary slab -- measured on gfx1201 with Flash-Next `-sm tensor -ncmoe 48`: the
+    // blk.1.ple_conv1d.weight column view (w=2, h=10240, spitch=8, dpitch=2) is refused on the last device of
+    // the split, while the identical copy on device 0 succeeds and the same run loads with GGML_CUDA_SLAB=0.
+    // The scalar kernels below are the bit-identical fallback, and nothing else we hold reaches this path
+    // (0 2D copies in a decode+prefill run of 35B-A3B, 4B Q8_0, 27B and gpt-oss).
+    if (src0->buffer != nullptr && height*spitch > ggml_backend_buffer_get_alloc_size(src0->buffer, src0)) {
+        return false;
+    }
+    if (src1->buffer != nullptr && height*dpitch > ggml_backend_buffer_get_alloc_size(src1->buffer, src1)) {
+        return false;
+    }
+    return true;
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
