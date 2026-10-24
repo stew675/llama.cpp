@@ -1360,6 +1360,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn_masked = masked;
 }
 
+void llama_context::set_embeddings_nextn_from(llama_seq_id seq_id, llama_pos pos) {
+    if (seq_id >= 0 && seq_id < LLAMA_MAX_SEQ) {
+        embd_nextn_from[seq_id] = std::max<llama_pos>(0, pos);
+    }
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -1995,6 +2001,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev_l  = 0;
 
+    // LLAMA_MTP_TAIL_READBACK=0: disable the prompt-tail readback skip on both halves (this ubatch's nextn copy and
+    // the MTP hook's early return, which is what stops llama_get_embeddings_nextn() from draining the backends).  That
+    // is the pre-r118 behaviour with LLAMA_MTP_INGEST_TAIL still set.  Bisect/debug kill-switch; the skip is on by
+    // default, and without LLAMA_MTP_INGEST_TAIL no row's threshold is above 0, so it cannot trigger.
+    static const bool nextn_readback_skip = [] {
+        const char * e = getenv("LLAMA_MTP_TAIL_READBACK");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
     // complete the async device->host readbacks issued for one ubatch
     auto sync_readback = [&](ggml_tensor * t) {
         if (t == nullptr) {
@@ -2150,6 +2165,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
         bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev_l, ubatch.n_tokens);
+        const bool layer_inp_read = extract_all_idxs;
+        bool nextn_read = false;
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2157,8 +2174,34 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const bool masked    = cparams.embeddings_nextn_masked;
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev_l;
+            const bool nextn_rows = embd_nextn.data && t_h_nextn && n_rows > 0 &&
+                                    cparams.pooling_type == LLAMA_POOLING_TYPE_NONE;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            // set_embeddings_nextn_from: an unmasked ubatch whose every row is below its sequence's threshold is not
+            // read back (its host rows stay stale).  Embedding (vision) rows are always read: under M-RoPE the text
+            // after an image resumes at a jumped section-0 position, so the last image row can be the h(p - 1) of an
+            // ingested row although its own position is below the threshold.  The scan runs only when the nextn rows
+            // are extracted at all, so a decode without them (every non-MTP run) is untouched.
+            bool nextn_unneeded = false;
+            if (nextn_rows && !masked && nextn_readback_skip) {
+                nextn_unneeded = true;
+                for (uint32_t i = 0; i < ubatch.n_tokens && nextn_unneeded; ++i) {
+                    if (ubatch.type ? ubatch.type[i] != 0 : ubatch.token == nullptr) {
+                        nextn_unneeded = false;
+                        break;
+                    }
+                    for (int32_t j = 0; j < ubatch.n_seq_id[i] && nextn_unneeded; ++j) {
+                        const llama_seq_id s = ubatch.seq_id[i][j];
+                        nextn_unneeded = s >= 0 && s < LLAMA_MAX_SEQ && ubatch.pos[i] < embd_nextn_from[s];
+                    }
+                }
+            }
+
+            if (nextn_rows && nextn_unneeded) {
+                // the host row bookkeeping below is kept: embd_batch_idxs must stay aligned with the dense unmasked
+                // host rows, or output_reorder()'s nextn permutation would place a later ubatch's rows wrongly
+                extract_all_idxs = true;
+            } else if (nextn_rows) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -2167,6 +2210,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                nextn_read = true;
                 extract_all_idxs = extract_all_idxs || !masked;
             }
         }
@@ -2208,7 +2252,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // upload waits only for this graph's compute, not for the copies queued after it, and was observed (Windows, ROCm)
         // to overwrite a layer input before its copy had read it.
         static const bool readback_sync = getenv("GGML_READBACK_SYNC") == nullptr || atoi(getenv("GGML_READBACK_SYNC")) != 0;
-        if (readback_sync && (n_outputs > 0 || extract_all_idxs)) {
+        if (readback_sync && (n_outputs > 0 || layer_inp_read || nextn_read)) {
             sync_readback(t_logits);
             sync_readback(t_embd);
             sync_readback(t_h_nextn);
@@ -4043,6 +4087,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.n_rs_batch                  =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
@@ -4314,6 +4359,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+void llama_set_embeddings_nextn_from(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    ctx->set_embeddings_nextn_from(seq_id, pos);
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
