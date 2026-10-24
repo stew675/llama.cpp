@@ -273,7 +273,7 @@ Use exactly one of these options:
 ### General Speculative Parameters
 
 ```
---spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dflash2|draft-dspark|draft-lilicorr|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+--spec-type [none|draft-simple|draft-eagle3|draft-mtp|draft-mtp-adaptive|draft-dflash|draft-dspark|draft-dflash2|draft-lilicorr|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|ngram-cache]
                                         comma-separated list of types of speculative decoding to use
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -299,6 +299,12 @@ Use exactly one of these options:
 --spec-draft-n-ubatch                   N
                                         physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH)
+--spec-draft-n-min-adaptive                     N
+                                        minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: 3)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE)
+--spec-draft-n-start                    N
+                                        initial adaptive MTP draft depth: the first verify round of each generation starts here instead of the default cold start.  Clamped to [--spec-draft-n-min-adaptive, --spec-draft-n-max].  Use it to start deeper when the workload settles high (e.g. verbatim recall) or shallower for a short generation at a deep context, where a wide verify batch costs more.  Unset: three steps below the ceiling, bounded by the floor.
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_START)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
@@ -421,6 +427,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
 | `draft-lilicorr` | Use a LiliCorr draft model (DFlash + candidate scorer conditioned on the target's hidden state) |
 | `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
+| `draft-mtp-adaptive` | Use MTP heads from the main model with an adaptive draft depth that tracks the current acceptance rate |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |
 | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |
