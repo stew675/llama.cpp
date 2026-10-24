@@ -123,6 +123,11 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
+// Unmasked nextn rows of `seq_id` at positions < `pos` are not needed by the caller: a ubatch whose every row is
+// such a row skips the device->host copy of the nextn embeddings (and the readback wait).  Those host rows then hold
+// stale data.  0 (the default) = every row is needed.  Used by the MTP prompt-tail ingest (LLAMA_MTP_INGEST_TAIL);
+// the skip it enables is a bisect kill-switch away (LLAMA_MTP_TAIL_READBACK=0 reads every row again).
+LLAMA_API void llama_set_embeddings_nextn_from(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0
@@ -144,6 +149,11 @@ LLAMA_API const char * llama_model_decision_label(const struct llama_model * mod
 // model/context data extraction
 //
 
+// layers whose input embeddings contexts created from this model extract from the start (as if
+// llama_set_embeddings_layer_inp(ctx, lid, true) had been called before the context's first graph reserve).
+// For a target whose draft will turn the extraction on (DFlash): the compute buffers are then sized for it once,
+// instead of being freed and allocated again, larger, at the first decode after the draft attaches.
+LLAMA_API void llama_model_set_embeddings_layer_inp_preset(struct llama_model * model, const int32_t * lids, uint32_t n);
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error
 // if out is nullptr, returns the number of tokens without writing to out
