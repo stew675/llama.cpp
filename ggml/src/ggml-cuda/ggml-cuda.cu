@@ -168,7 +168,7 @@ static bool ggml_cuda_register_host_enabled() {
     return enabled;
 }
 
-static bool ggml_cuda_fusion_disabled() {
+bool ggml_cuda_fusion_disabled() {
     static const bool disabled = ggml_cuda_env_flag("GGML_CUDA_DISABLE_FUSION");
     return disabled;
 }
