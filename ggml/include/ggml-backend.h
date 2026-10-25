@@ -503,6 +503,18 @@ extern "C" {
         GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
         GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
 
+        // Same shape and element positions on every backend, but each backend holds its OWN values: a
+        // per-device scalar.  Produced only by a reduction that no single backend can complete, currently
+        // the MoE amax row max (`build_amax_src1_f16`) pooled over an axis-0 split, where each backend can
+        // only see its own slice of the row.
+        //
+        // It is legal ONLY to consume it elementwise on the backend that produced it, with its inverse
+        // applied to that backend's own partial BEFORE the cross-device reduction (which is what makes the
+        // per-device value cancel exactly: `e` is a power of two, so the scaling commutes with the sum).
+        // It must never be copied, gathered, reconciled or read back as one tensor, and only `-sm
+        // relaxed-tensor` permits it -- the graph is otherwise rejected rather than silently relaxed.
+        GGML_BACKEND_SPLIT_AXIS_PER_DEVICE = 12,
+
         // for internal bookkeeping only:
         GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
         GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
