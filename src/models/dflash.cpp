@@ -329,7 +329,6 @@ static ggml_tensor * build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-
 static void build_lilicorr_scores(llm_graph_context & g, const llama_model & model,
         ggml_tensor * tok_embd, ggml_tensor * anchors) {
     ggml_context * ctx0 = g.ctx0;
