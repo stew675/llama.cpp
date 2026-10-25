@@ -265,7 +265,7 @@ struct llama_moe_cache::impl {
         if (devices.empty()) {
             throw std::runtime_error("MoE cache requires a GPU backend");
         }
-        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        if (llm_split_mode_is_tensor_like(model.split_mode())) {
             throw std::runtime_error("MoE cache does not support tensor parallelism");
         }
         if (model.hparams.n_expert == 0 || n_expert_used == 0) {
