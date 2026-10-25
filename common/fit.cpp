@@ -515,7 +515,7 @@ static void common_params_fit_impl(
     // tensor_split proportional to each device's free memory minus its margin (so the loader's
     // proportional sharding leaves every device at the same fill fraction), then reduces n_ctx and,
     // if needed, n_gpu_layers until the estimate fits the summed targets.
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR || mparams->split_mode == LLAMA_SPLIT_MODE_RELAXED_TENSOR) {
         std::vector<ggml_backend_dev_t> tdevs; // the "simple" devices behind the Meta wrapper
         for (ggml_backend_dev_t dev : devs) {
             if (ggml_backend_dev_is_meta(dev)) {

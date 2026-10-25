@@ -292,7 +292,7 @@ static void llama_context_set_fa_tensor_parallel_hint(const llama_model & model)
             n_cuda_dev++;
         }
     }
-    ggml_set_fa_tensor_parallel(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1);
+    ggml_set_fa_tensor_parallel(llm_split_mode_is_tensor_like(model.split_mode()) && n_cuda_dev > 1);
 }
 
 // true when this build exposes the CUDA/HIP backend at all
@@ -2123,7 +2123,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (sampler && llm_split_mode_is_tensor_like(model.split_mode())) {
         static bool warned = false;
         if (!warned) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
@@ -6167,7 +6167,7 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
-    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+    if (llm_split_mode_is_tensor_like(model->split_mode())) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
