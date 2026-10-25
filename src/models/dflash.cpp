@@ -634,7 +634,7 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     // `devices` is the meta wrapper itself (one entry, `is_meta`) for a >= 2-device tensor split, so this
     // is exactly "the logits are vocab-split": a single device has no split, and a tensor split over one
     // device skips the wrapper (`llama_prepare_model_devices`).
-    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.devices.size() == 1 && model.devices[0].is_meta) {
+    if (llm_split_mode_is_tensor_like(model.split_mode()) && model.devices.size() == 1 && model.devices[0].is_meta) {
         logits = ggml_all_gather(ctx0, logits);
         g.cb(logits, "dflash2_logits_gathered", -1);
     }
