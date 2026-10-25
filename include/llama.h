@@ -202,6 +202,15 @@ extern "C" {
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
         LLAMA_SPLIT_MODE_ROW    = 2, // split layers and KV across GPUs, use tensor parallelism if supported
         LLAMA_SPLIT_MODE_TENSOR = 3,
+        // Same weight placement as TENSOR, but also admits a replicated tensor whose VALUES differ per
+        // device (a per-device scalar).  Currently that is only the MoE amax rescale's row max: no device
+        // holds a complete row, so each one computes the max of its own slice and `e` differs per device.
+        // The value cancels exactly (it is a power of two and its inverse is applied to each device's own
+        // partial before the all-reduce), so the result is exact on backends whose src1 rescale is linear.
+        // It is NOT expected to be bit-identical to a single device on a backend whose in-kernel src1
+        // rescale is non-linear (e.g. Vulkan's clamp), which is why this is opt-in and not part of TENSOR.
+        // Needed by the arches that build that rescale: flint, mellum, mistral4.
+        LLAMA_SPLIT_MODE_RELAXED_TENSOR = 4,
     };
 
     enum llama_load_mode {
