@@ -54,6 +54,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
             return "MIRRORED";
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
             return "PARTIAL";
+        case GGML_BACKEND_SPLIT_AXIS_PER_DEVICE:
+            return "PER_DEVICE";
         case GGML_BACKEND_SPLIT_AXIS_NONE:
             return "NONE";
         case GGML_BACKEND_SPLIT_AXIS_UNKNOWN:
@@ -925,6 +927,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (scalar_only && ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
             ret = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
+        if (ret.axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+            // the operands' splits disagree and the op is not one that can reconcile them
+            std::string ops;
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (tensor->src[i] != nullptr) {
+                    ops += " src" + std::to_string(i) + "=" + ggml_backend_meta_split_axis_name(src_ss[i].axis);
+                }
+            }
+            GGML_LOG_ERROR("%s: no split state for %s (%s)%s\n", __func__, tensor->name, ggml_op_name(tensor->op), ops.c_str());
+        }
         GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
         return ret;
     };
@@ -957,21 +969,35 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
 
     // Some ops broadcast the src1 data across src0:
     auto handle_bin_bcast = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // GGML_BACKEND_SPLIT_AXIS_PER_DEVICE (the MoE amax rescale, see the enum comment) is only ever
+        // consumed elementwise and carries its own value on the backend that produced it, so an elementwise
+        // op simply follows the other operand's split.
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS &&
-                tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                tensor->src[1]->ne[src_ss[0].axis] == 1 && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                                                            src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PER_DEVICE)) {
             return src_ss[0];
         }
         if (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[0].axis == src_ss[1].axis ||
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
             return src_ss[0]; // GGML_OP_ADD_ID
         }
+        // A per-device scalar broadcast over any other split: the result follows the other operand.  This is
+        // the MoE amax rescale's undo `y * e`, whose other operand is PARTIAL in the real graph (the partial
+        // down-projection sum, the factor must be applied before the all-reduce) and MIRRORED in the
+        // allocation-time `assume_sync` view.  PER_DEVICE and MIRRORED have identical per-backend extents, so
+        // returning the other operand's state keeps the layout -- and the reduce point -- unchanged.
+        if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PER_DEVICE && tensor->src[0] != nullptr &&
+                ggml_can_repeat(tensor->src[1], tensor->src[0])) {
+            return src_ss[0];
+        }
+
         // An elementwise op whose OTHER operand is MIRRORED and of the same shape: the result follows the split
         // operand, whatever its split is, because nothing is reduced and the mirrored operand is present in full
         // on every backend.  A per-head norm weight is exactly this: gemma4's full-attention K/V row is 512 wide
         // with a single KV head, so the row lands whole on one device (axis-0 split, extents [0, 512]) while the
         // [512] norm weight is MIRRORED -- the broadcast case above only covers ne[axis] == 1.
-        if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && tensor->src[1] != nullptr &&
-                ggml_are_same_shape(tensor->src[0], tensor->src[1])) {
+        if ((src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PER_DEVICE) &&
+                tensor->src[1] != nullptr && ggml_are_same_shape(tensor->src[0], tensor->src[1])) {
             return src_ss[0];
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && tensor->src[1] != nullptr &&
@@ -1205,6 +1231,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     // slice is written into every device's copy at that slice's own offset, which keeps the element
     // positions of a split axis-0 input (the Draft/DFlash2 selector's global vocabulary indices).
     auto handle_all_gather = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_PER_DEVICE &&
+                "a per-device (relaxed-tensor) tensor cannot be gathered: every backend already holds a full,\n"
+                "different copy -- the value is only defined for elementwise use on its own backend");
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
                 (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_0 && src_ss[0].axis < GGML_MAX_DIMS));
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
@@ -1226,6 +1255,31 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (src_ss[0].axis >= 0 && src_ss[0].axis < GGML_MAX_DIMS) {
             GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 0] == 0);
             GGML_ASSERT(tensor->op_params[2*src_ss[0].axis + 1] == 0);
+        }
+        return src_ss[0];
+    };
+
+    // The MoE amax rescale (`build_amax_src1_f16`) pools a whole matmul row to one value per [expert, token]:
+    //     amax = pool_1d(abs(cur), POOL_MAX, k = s = cur->ne[0])   // [1, n_expert_used, n_tokens]
+    // and the graph then divides `cur` by a power-of-two function of it and multiplies the down-projection
+    // result back by the same value.  Over an axis-0 split no backend holds a complete row, so each backend
+    // computes the max of its own slice (the kernels clamp the window to `src->ne[0]`, i.e. the slice).
+    //
+    // The result is therefore the SAME SHAPE everywhere with DIFFERENT values -> PER_DEVICE, never MIRRORED
+    // (claiming MIRRORED here would be a false claim; upstream #31081 removed exactly such a case).  It is
+    // sound because the value is only consumed elementwise on the backend that produced it and its inverse is
+    // applied to that backend's own partial before the all-reduce: `e` is a power of two, so `sum(w . (x/e)) * e
+    // == sum(w . x)`, exactly, and `e_local <= e_global` means every backend keeps at least the reference's
+    // f16 headroom.  See GGML_BACKEND_SPLIT_AXIS_PER_DEVICE and `-sm relaxed-tensor`.
+    auto handle_pool_1d = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            // Only the full-row MAX reduction that the amax rescale builds is understood.  A windowed pool
+            // over a split axis would change the OUTPUT shape per backend, which no split state can express.
+            const int32_t * p = (const int32_t *) tensor->op_params;
+            GGML_ASSERT(p[0] == GGML_OP_POOL_MAX);
+            GGML_ASSERT(p[1] == p[2] && p[1] >= tensor->src[0]->ne[0] + 2*p[3] &&
+                    "POOL_1D over an axis-0 split is only supported for the whole-row amax max reduction");
+            return {GGML_BACKEND_SPLIT_AXIS_PER_DEVICE, {0}, {1}, 1};
         }
         return src_ss[0];
     };
@@ -1513,11 +1567,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_CONV_3D:
             case GGML_OP_CONV_2D_DW:
             case GGML_OP_CONV_TRANSPOSE_2D:
-            case GGML_OP_POOL_1D:
             case GGML_OP_POOL_2D:
             case GGML_OP_POOL_2D_BACK:
             case GGML_OP_UPSCALE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_POOL_1D: {
+                split_state = handle_pool_1d(src_ss);
             } break;
             case GGML_OP_PAD: {
                 split_state = handle_pad(src_ss);
@@ -2135,6 +2191,9 @@ static void ggml_backend_meta_buffer_memset_tensor(
             GGML_ASSERT(value == 0);
             [[fallthrough]];
         }
+        case GGML_BACKEND_SPLIT_AXIS_PER_DEVICE: {
+            GGML_ABORT("%s: a per-device (relaxed-tensor) tensor cannot be memset as one tensor", __func__);
+        }
         case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
             for (size_t j = 0; j < n_bufs; j++) {
                 ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
@@ -2284,6 +2343,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 ggml_backend_tensor_set(simple_tensor, data, offset, size);
             }
         } break;
+        case GGML_BACKEND_SPLIT_AXIS_PER_DEVICE: {
+            GGML_ABORT("%s: a per-device (relaxed-tensor) tensor cannot be written as one tensor", __func__);
+        }
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
             GGML_ASSERT(tensor->type == GGML_TYPE_F32);
             GGML_ASSERT(offset % sizeof(float) == 0);
@@ -2483,6 +2545,10 @@ static void ggml_backend_meta_get_tensor_impl(ggml_backend_t backend, ggml_backe
                 ggml_backend_tensor_get(simple_tensor, data, offset, size);
             }
         } break;
+        case GGML_BACKEND_SPLIT_AXIS_PER_DEVICE: {
+            // There is no single value to return: every backend holds its own.
+            GGML_ABORT("%s: a per-device (relaxed-tensor) tensor cannot be read back as one tensor", __func__);
+        }
         default: {
             GGML_ABORT("fatal error");
         }
@@ -3475,7 +3541,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     ggml_tensor * next = cgraph->nodes[id+1];
                     if (next->op == GGML_OP_MUL && next->src[0] == node &&
-                            ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                            (ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                             ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_PER_DEVICE)) {
+                        // A per-device operand (the MoE amax rescale's undo factor) must be included in the
+                        // branch, so the reduce point stays AFTER it: each backend then applies its own
+                        // factor to its own partial, which is what makes the per-device value cancel.
+                        // Stopping before this MUL would reduce the unscaled partials and then multiply the
+                        // sum by one backend's factor -- wrong, and silently so whenever every factor is 1.
                         node = next;
                         id++;
                         idr = id;
