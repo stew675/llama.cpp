@@ -382,7 +382,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
     if (model != nullptr) {
         model->arch = arch;
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
-            throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
+            // [TAG_MOE_AMAX_SCALE] flint/mellum/mistral4 are denied here only because of the MoE amax
+            // rescale, whose row max no device can complete under a tensor split.  -sm relaxed-tensor
+            // admits the per-device scalar that results, so point at it instead of a dead end.
+            const bool amax_only = arch == LLM_ARCH_FLINT || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_MISTRAL4;
+            throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") +
+                    llm_arch_name(arch) + "'" +
+                    (amax_only ? "; this arch's MoE amax rescale needs '-sm relaxed-tensor'" : ""));
         }
     }
 

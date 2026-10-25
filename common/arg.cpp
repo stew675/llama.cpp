@@ -2845,12 +2845,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
-        {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
+        {"-sm", "--split-mode"}, "{none,layer,row,tensor,relaxed-tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
         "- layer (default): split layers and KV across GPUs (pipelined)\n"
         "- row: split weight across GPUs by rows (parallelized)\n"
-        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
+        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)\n"
+        "- relaxed-tensor: tensor split that also admits a replicated tensor whose values differ per GPU\n"
+        "  (a per-device scalar, undone per GPU before the reduction). Not bit-identical to a single GPU\n"
+        "  on backends whose src1 rescale is non-linear; needed for the MoE amax arches (flint, mellum,\n"
+        "  mistral4), which plain tensor split refuses",
         [](common_params & params, const std::string & value) {
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
@@ -2860,6 +2864,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.split_mode = LLAMA_SPLIT_MODE_ROW;
             } else if (value == "tensor") {
                 params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            } else if (value == "relaxed-tensor") {
+                params.split_mode = LLAMA_SPLIT_MODE_RELAXED_TENSOR;
             } else {
                 throw std::invalid_argument("invalid value");
             }
