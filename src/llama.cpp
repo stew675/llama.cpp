@@ -159,7 +159,7 @@ int64_t llama_time_us(void) {
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
     if (params.devices) {
-        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        if (llm_split_mode_is_tensor_like(params.split_mode)) {
             size_t n_devs = 0;
             while (params.devices[n_devs]) {
                 n_devs++;
@@ -196,7 +196,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         std::vector<llama_device> igpus;
         std::vector<llama_device> rpc_servers;
 
-        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        if (llm_split_mode_is_tensor_like(params.split_mode)) {
             std::vector<ggml_backend_dev_t> devs;
             devs.reserve(ggml_backend_dev_count());
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {

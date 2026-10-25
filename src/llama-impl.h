@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama.h"
+
 #include "ggml.h" // for ggml_log_level
 
 #include <string>
@@ -40,6 +42,13 @@ struct no_init {
     T value;
     no_init() = default;
 };
+
+// TENSOR and RELAXED_TENSOR place the weights identically (a single Meta device wrapping the sub-devices,
+// FA required, no host-resident expert table, ...).  They differ only in the replication contract: see
+// LLAMA_SPLIT_MODE_RELAXED_TENSOR.  Every "is this the tensor path?" check must use this, not `== TENSOR`.
+static inline bool llm_split_mode_is_tensor_like(llama_split_mode split_mode) {
+    return split_mode == LLAMA_SPLIT_MODE_TENSOR || split_mode == LLAMA_SPLIT_MODE_RELAXED_TENSOR;
+}
 
 template <typename dst_t, typename src_t>
 static inline dst_t llama_cast(src_t v) {
