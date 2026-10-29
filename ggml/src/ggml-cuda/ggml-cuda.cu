@@ -110,6 +110,7 @@
 #include <vector>
 #include "ggml-cuda-try-fuse.cuh"
 #include "ggml-cuda-vmm.h"
+#include "ggml-cuda-vmm-region.h"
 #include "ggml-cuda-moe-cache-hooks.cuh"
 #include "ggml-cuda-arena.cuh"
 
@@ -8381,6 +8382,21 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
 
     // wip/moe-expert-cache Phase 1a: parse the env, allocate/report the arena (no-op if disabled).
     moe_cache_init(device);
+
+    // wip/kv-residency (TODO #117): the grow-only VMM region's oracle.  Nothing in the delivery consumes
+    // the primitive yet (the KV buffer type that will is the next slice), so this is the only place it can
+    // be exercised in-tree.  One-shot, env-gated, and it never changes a run's behaviour or allocation.
+    {
+        static bool vmm_st_done = false;
+        if (!vmm_st_done) {
+            vmm_st_done = true;
+            const char * e = getenv("GGML_CUDA_VMM_REGION_SELFTEST");
+            if (e != nullptr && atoi(e) != 0) {
+                (void) ggml_cuda_vmm_region_available(device);
+                (void) ggml_cuda_vmm_region_selftest(device);
+            }
+        }
+    }
 
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),
