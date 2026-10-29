@@ -18,6 +18,61 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+//
+// wip/kv-residency (TODO #117): provider P1 for the KV cache -- a growable VMM region instead of one
+// `cudaMalloc` of the whole context.
+//
+// The KV buffer is allocated BEFORE the movable-boundary slab exists, so `SLAB_INIT` maps `free VRAM -
+// reserve` and every token of context comes out of the MoE expert arena 1:1.  A region reserves the KV's VA
+// up front and maps physical only for the cells a run reaches, which keeps that arithmetic exact at any
+// context length without touching a kernel: the region's base never moves, so a captured graph's baked
+// pointers stay valid, and the graph's existing "view is [0, n_kv) cells" contract is exactly the mapped
+// extent.
+//
+// Gated OFF (`LLAMA_KV_REGION=1` enables).  When the backend cannot provide a region -- no VMM, a driver
+// refusal, or no such hook at all -- the plain device buffer type is used and the numbers are the old ones.
+//
+
+typedef ggml_backend_buffer_type_t (*llama_kv_region_buft_fn)(ggml_backend_dev_t dev);
+typedef int                      (*llama_kv_region_grow_fn)(ggml_backend_buffer_t buffer, uint32_t n_cells);
+
+static bool llama_kv_region_enabled() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_KV_REGION");
+        return s != nullptr && s[0] != '\0' && strcmp(s, "0") != 0;
+    }();
+    return on;
+}
+
+// The backend's region buffer type for this device, or nullptr (feature off / unsupported / driver refused).
+static ggml_backend_buffer_type_t llama_kv_region_buft(ggml_backend_dev_t dev) {
+    if (!llama_kv_region_enabled() || dev == nullptr) {
+        return nullptr;
+    }
+    auto fn = (llama_kv_region_buft_fn) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+            "ggml_backend_cuda_kv_region_buft");
+    return fn != nullptr ? fn(dev) : nullptr;
+}
+
+// The grow hook is the same for every device, so resolve it once.
+static llama_kv_region_grow_fn llama_kv_region_grow_hook() {
+    static llama_kv_region_grow_fn fn = nullptr;
+    static bool done = false;
+    if (!done) {
+        done = true;
+        if (llama_kv_region_enabled()) {
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+                fn = (llama_kv_region_grow_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_region_grow");
+                if (fn != nullptr) {
+                    break;
+                }
+            }
+        }
+    }
+    return fn;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -243,6 +298,15 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // wip/kv-residency (TODO #117): take the growable KV region when the backend offers one.  It is a
+            // device buffer type with the plain type's vtable contract (same device, same name predicate), so
+            // everything downstream -- the scheduler's placement, `memory_breakdown()`, `--fit` -- sees a KV
+            // buffer of the same size; only WHEN its physical is committed changes.
+            if (ggml_backend_buffer_type_t buft_region = llama_kv_region_buft(dev)) {
+                buft = buft_region;
+                kv_region = true;
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -1610,6 +1674,26 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return seq_to_stream[seq_id];
+}
+
+void llama_kv_cache::grow_regions(uint32_t n_kv) const {
+    if (!kv_region || ctxs_bufs.empty()) {
+        return;
+    }
+    llama_kv_region_grow_fn fn = llama_kv_region_grow_hook();
+    if (fn == nullptr) {
+        return;
+    }
+    for (const auto & [_, buf] : ctxs_bufs) {
+        if (fn(buf.get(), n_kv) < 0) {
+            // A refused grow is not something to continue past: the graph this batch would build reads cells
+            // above the mapped extent, and that faults the GPU (it does not return an error).  The backend has
+            // already logged the numbers; refuse loudly instead of hanging the card.
+            GGML_ABORT("%s: the KV region cannot be grown to %u cells and a batch that needs more than the "
+                       "mapped extent would fault the GPU.  Lower -c, raise LLAMA_KV_REGION_MAP_MAX_MIB, or "
+                       "unset LLAMA_KV_REGION.\n", __func__, n_kv);
+        }
+    }
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
@@ -3486,6 +3570,11 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
+
+    // wip/kv-residency (TODO #117): this is the last point before the graph is built, and `n_kv` is the PADDED
+    // extent its views use -- so it is also exactly the extent the region must have mapped.  Growing to the
+    // used cells instead would leave a kernel reading unmapped VA (a GPU fault, not an error).
+    kv->grow_regions(n_kv);
 
     return true;
 }
