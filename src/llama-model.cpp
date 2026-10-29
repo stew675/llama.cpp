@@ -3109,6 +3109,32 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// wip/kv-residency (TODO #117): O3 -- the drafter ring, the requested window in cells.
+//
+// `LLAMA_SPEC_DRAFT_WINDOW` (cells, 0/unset = off) asks for the MTP draft context's KV cache to be a sliding
+// window instead of a full `-c` cache.  The window is floored at a padded ubatch, because
+// `llama_kv_cache::find_slot` needs room to place a whole ubatch (`n_tokens > n_cells` refuses it) and the
+// reclaim predicate only frees cells whose position is already more than the window behind.  A request
+// larger than the context is honoured as the context (no change).  Consumers: the MTP branches of
+// `create_memory` below; the design, rationale and gates are `wip/kv-residency/O3-DRAFTER-RING.md`.
+static uint32_t llama_draft_window_cells(uint32_t n_ubatch) {
+    static const uint32_t requested = [] {
+        const char * env = getenv("LLAMA_SPEC_DRAFT_WINDOW");
+        if (env == nullptr || env[0] == '\0') {
+            return 0u;
+        }
+        const long v = atol(env);
+        return v > 0 ? (uint32_t) v : 0u;
+    }();
+    if (requested == 0) {
+        return 0;
+    }
+    // headroom for one ubatch, so a prompt ingest can always be placed (the `n_swa + n_ubatch` shape
+    // `llama_kv_cache_iswa` uses for its SWA cache)
+    const uint32_t floor_cells = GGML_PAD(n_ubatch + 256, 256);
+    return std::max(requested, floor_cells);
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -3679,6 +3705,43 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // wip/kv-residency (TODO #117): O3 -- the drafter ring.  The MTP draft context's KV is
+                        // sized by `-c` exactly like the main one, although the drafter only ever needs its
+                        // recent prefix (measured: 256 MiB of a 27B's 4 GiB KV at `-c 65536`, 1 GiB at
+                        // 262144).  A sliding window makes it `O(window)`.
+                        //
+                        // This reuses shipped machinery rather than adding a ring allocator:
+                        //   * `llama_kv_cache::find_slot` ALREADY reclaims a cell whose position is more than
+                        //     `n_swa` behind the newest one for its sequence (llama-kv-cache.cpp:1470-1477) --
+                        //     that IS the ring, and every SWA model runs it;
+                        //   * `llama_kv_cache::set_input_kq_mask` reads THIS CACHE's `n_swa`/`swa_type` (it is a
+                        //     member function), so the packed mask windows consistently and `hparams` (shared
+                        //     with the target context, which is why a draft-only window cannot come from there)
+                        //     is untouched;
+                        //   * no mask change is otherwise needed: after reclamation every cell holds an
+                        //     in-window position, so causality from absolute positions stays exact and the
+                        //     derived-mask predicate remains valid.
+                        //
+                        // It is an APPROXIMATION -- the drafter attends only its last `window` tokens -- legal
+                        // only because the target verifies every token: it can change speed, never an answer.
+                        // Default OFF (`LLAMA_SPEC_DRAFT_WINDOW`, in cells); see
+                        // `wip/kv-residency/O3-DRAFTER-RING.md`.
+                        uint32_t mtp_kv_size = cparams.n_ctx_seq;
+                        uint32_t mtp_n_swa   = hparams.n_swa;
+                        llama_swa_type mtp_swa_type = hparams.swa_type;
+                        if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            if (const uint32_t win = llama_draft_window_cells(cparams.n_ubatch)) {
+                                // the iswa formula (`n_swa + n_ubatch` cells) is the tested shape: a full
+                                // ubatch must always find room to be placed
+                                mtp_kv_size = GGML_PAD(std::min(cparams.n_ctx_seq, win + cparams.n_ubatch), 256);
+                                mtp_n_swa   = win;
+                                mtp_swa_type = LLAMA_SWA_TYPE_STANDARD;
+                                LLAMA_LOG_INFO("%s: MTP draft KV window = %u cells (draft cache %u of %u cells, "
+                                               "LLAMA_SPEC_DRAFT_WINDOW; the target still verifies every token)\n",
+                                               __func__, win, mtp_kv_size, cparams.n_ctx_seq);
+                            }
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -3687,11 +3750,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                mtp_kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                mtp_n_swa,
+                                mtp_swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
