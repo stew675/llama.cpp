@@ -216,3 +216,21 @@ LLAMA_API uint32_t llama_model_get_tok_embd_rows(const struct llama_model * mode
 
 // realtime models: number of tokens the output lags behind the audio input, used by mtmd; 0 if not applicable
 LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
+
+//
+// wip/kv-residency (TODO #118): the windowed KV cache.  Nothing here is in the delivery.
+//
+// `LLAMA_KV_RESIDENT_CELLS=<cells>` keeps the newest <cells> cells of the KV in VRAM and puts everything
+// older in pinned system RAM; `=auto` leaves the number to `--fit`, which sizes it against the device memory
+// it has left after the expert arena's reserve and the pinned-RAM ceiling on the spill.
+//
+// Is the KV region provider available (`LLAMA_KV_REGION=1` and a device that offers VMM)?
+LLAMA_API bool llama_kv_region_is_enabled(void);
+
+// The window the cache would use: 0 = none, UINT32_MAX = `auto` (fit decides), else the cell count.
+// Reads the fit decision first, then the environment.
+LLAMA_API uint32_t llama_kv_region_resident_cells_requested(void);
+
+// Hand a window (in cells) down to every context created afterwards; 0 clears it.  `common_params_fit` calls
+// this before the real contexts exist.  One W covers every cache in the process (the A2 rule).
+LLAMA_API void llama_kv_region_set_resident_cells(uint32_t cells);

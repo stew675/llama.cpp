@@ -369,6 +369,11 @@ private:
     // the graph is about to read/write.  Zero cost (and no proc lookup) when the feature is off.
     bool kv_region = false;
 
+    // wip/kv-residency (TODO #118) A2/A3: the windowed KV's resident window, in CELLS (0 = no window).
+    // `memory_breakdown()` reports only the resident part against the device buffer type, because that is
+    // all the buffer ever COMMITS -- the rest is pinned host memory.
+    size_t kv_resident_cells = 0;
+
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;

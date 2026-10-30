@@ -40,9 +40,35 @@ struct ggml_cuda_vmm_region {
     // pinned staging for a remap (grow-only, one unit's worth is enough for the sliding window)
     void *   stage       = nullptr;
     size_t   stage_bytes = 0;
+    // device scratch of the same size: a restore into a freshly mapped HOST-location chunk must go through a
+    // device write (see `vmm_attach`)
+    void *   dev_stage       = nullptr;
+    size_t   dev_stage_bytes = 0;
 };
 
 namespace {
+
+__global__ void vmm_copy_kernel(uint4 * __restrict__ dst, const uint4 * __restrict__ src, size_t n4) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+// Copy `bytes` between device addresses (either side may be a HOST-location mapping) with a kernel.
+// `cudaMemcpy` is NOT usable here: an H2D into a freshly mapped host-location chunk, and a D2D whose source is
+// one, both complete "successfully" and leave zeros (measured 2026-10-30: stage=0x53, read=0x00 at byte 0 of a
+// 4 MiB restore).  A kernel read/write of that VA is what the probes measured working (device write 53 GB/s).
+static bool vmm_device_copy(void * dst, const void * src, size_t bytes) {
+    if (bytes % 16 != 0) {
+        return false;   // every mapping is a multiple of the driver's minimum granularity (>= 4 KiB)
+    }
+    vmm_copy_kernel<<<512, 256>>>((uint4 *) dst, (const uint4 *) src, bytes / 16);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return true;
+}
 
 size_t vmm_up(size_t x, size_t a) {
     return a == 0 ? x : ((x + a - 1) / a) * a;
@@ -220,30 +246,44 @@ const vmm_mapping * vmm_next(const ggml_cuda_vmm_region * r, size_t off) {
 }
 
 bool vmm_find(const ggml_cuda_vmm_region * r, size_t off, size_t bytes, size_t * end, bool * host) {
-    const vmm_mapping * m = vmm_at(r, off);
-    if (m == nullptr || bytes > m->bytes - (off - m->off)) {
-        return false;
+    // "Is every byte of [off, off+bytes) mapped?" -- a range may span several mappings (they are one per
+    // `cuMemMap`, so a multi-unit extent is a run of them).  `end`/`host` describe the FIRST mapping.
+    size_t a = off;
+    const size_t b = off + bytes;
+    bool first = true;
+    while (a < b) {
+        const vmm_mapping * m = vmm_at(r, a);
+        if (m == nullptr) {
+            return false;
+        }
+        if (first) {
+            if (end  != nullptr) { *end  = m->off + m->bytes; }
+            if (host != nullptr) { *host = m->host; }
+            first = false;
+        }
+        a = m->off + m->bytes;
     }
-    if (end  != nullptr) { *end  = m->off + m->bytes; }
-    if (host != nullptr) { *host = m->host; }
     return true;
 }
 
-// Insert a mapping and keep the table sorted and coalesced.
+// Insert a mapping and keep the table sorted.  Entries are NOT coalesced: one entry is exactly one driver
+// mapping, i.e. exactly one `cuMemMap` -- and that is what a kind flip can safely rewrite.
+//
+// The table used to coalesce same-kind neighbours, which made a flip move (and re-map) a *range of driver
+// mappings* as one: `cuMemUnmap`/`cuMemMap` over several prior map calls, and the H2D copy that restores the
+// staged bytes then landed only in the first of them (measured 2026-10-30: a 24 MiB entry re-mapped and
+// re-filled read back zeros everywhere except the first 8 MiB).  A table entry that matches the driver's own
+// granularity keeps every flip a single, well-defined operation.
 void vmm_insert(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host) {
+    // One entry per DRIVER mapping, i.e. per `cuMemMap`.  The table used to coalesce same-kind neighbours,
+    // which looks harmless but makes a kind flip rewrite a *range* of prior map calls as one: the unmap/map
+    // pair then spans several mappings and the H2D copy that restores the staged bytes lands only in the first
+    // of them (measured 2026-10-30: an 8 MiB unit inside a coalesced 24 MiB entry read back all zeros after its
+    // flip).  Keeping the entries 1:1 also makes "does this request coincide with a mapping?" -- the question a
+    // flip has to answer -- exact.
     size_t i = 0;
     while (i < r->maps.size() && r->maps[i].off < off) { ++i; }
     r->maps.insert(r->maps.begin() + (long) i, vmm_mapping{off, bytes, host});
-    // coalesce with the neighbours when they touch and share a kind
-    for (size_t k = 0; k + 1 < r->maps.size(); ) {
-        if (r->maps[k].host == r->maps[k+1].host && r->maps[k].off + r->maps[k].bytes >= r->maps[k+1].off) {
-            r->maps[k].bytes = std::max(r->maps[k].bytes, r->maps[k+1].off + r->maps[k+1].bytes - r->maps[k].off);
-            r->maps.erase(r->maps.begin() + (long) (k+1));
-            if (k > 0) { --k; }
-            continue;
-        }
-        ++k;
-    }
     r->mapped += bytes;
     if (host) { r->mapped_host += bytes; }
 }
@@ -292,49 +332,132 @@ bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t 
     return true;
 }
 
-// Preserve a mapping's bytes across a kind change.  A remap is unmap + map, and the driver hands back fresh
-// physical with no relation to what was there (measured: stale on device chunks, zero on host ones), so the
-// bytes are staged through a pinned scratch.  Only the sliding window takes this path, once per unit per
-// few thousand tokens, so a blocking round trip is the right trade for simplicity here.
-bool vmm_remap(ggml_cuda_vmm_region * r, const vmm_mapping & m, bool host) {
-    if (m.bytes > r->stage_bytes) {
+// Grow the pinned scratch to hold `bytes` (the staged bytes of one mapping).
+static bool vmm_ensure_stage(ggml_cuda_vmm_region * r, size_t bytes) {
+    if (bytes > r->stage_bytes) {
         if (r->stage != nullptr) { (void) cudaFreeHost(r->stage); r->stage = nullptr; r->stage_bytes = 0; }
         void * st = nullptr;
-        if (cudaMallocHost(&st, m.bytes) != cudaSuccess) {
+        if (cudaMallocHost(&st, bytes) != cudaSuccess) {
             (void) cudaGetLastError();
             return false;
         }
         r->stage = st;
-        r->stage_bytes = m.bytes;
+        r->stage_bytes = bytes;
+    }
+    return true;
+}
+
+// Grow the device scratch (the staging copy's device-side leg).
+static bool vmm_ensure_dev_stage(ggml_cuda_vmm_region * r, size_t bytes) {
+    if (bytes > r->dev_stage_bytes) {
+        if (r->dev_stage != nullptr) { (void) cudaFree(r->dev_stage); r->dev_stage = nullptr; r->dev_stage_bytes = 0; }
+        void * d = nullptr;
+        if (cudaMalloc(&d, bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        r->dev_stage = d;
+        r->dev_stage_bytes = bytes;
+    }
+    return true;
+}
+
+// Stage a mapping's bytes to the pinned scratch, unmap it and drop its table entry (updating the counters).
+// A remap is unmap + map, and the driver hands back fresh physical with no relation to what was there
+// (measured: stale on device chunks, zero on host ones), so everything that changes a mapping's KIND -- or
+// cuts one in two -- goes through this.
+static bool vmm_detach(ggml_cuda_vmm_region * r, const vmm_mapping & m) {
+    if (!vmm_ensure_stage(r, m.bytes)) {
+        return false;
     }
     // nothing may be in flight while the VA is unmapped (the VA stays valid for graphs, the *physical* does not)
     if (cudaDeviceSynchronize() != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
-    if (cudaMemcpy(r->stage, (const char *) r->base + m.off, m.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+    // mapping -> device scratch -> host stage.  A direct copy whose SOURCE is a host-location mapping is not
+    // trusted either (see `vmm_attach`); the device-to-device leg is the one the probes measured as reliable.
+    if (!vmm_ensure_dev_stage(r, m.bytes)) {
+        return false;
+    }
+    if (!vmm_device_copy(r->dev_stage, (const char *) r->base + m.off, m.bytes) ||
+        cudaMemcpy(r->stage, r->dev_stage, m.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
     vmm_unmap(r, m.off, m.bytes);
-    // drop the table entry by hand (we are holding a reference into the vector)
     const size_t off = m.off, bytes = m.bytes;
-    const bool was_host = m.host;
+    const bool   was_host = m.host;
     r->maps.erase(std::find_if(r->maps.begin(), r->maps.end(),
             [off](const vmm_mapping & e) { return e.off == off; }));
     r->mapped      -= bytes;
     r->mapped_host -= was_host ? bytes : 0;
+    return true;
+}
 
+// Map [off, off+bytes) from `host` and restore its bytes from the scratch (starting at `stage_off`).
+static bool vmm_attach(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host, size_t stage_off = 0) {
     if (!vmm_map(r, off, bytes, host)) {
         return false;   // left unmapped: the caller's next batch will refuse loudly rather than read garbage
     }
-    if (cudaMemcpy((char *) r->base + off, r->stage, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    // stage -> device scratch -> mapping.  A DIRECT H2D into a freshly mapped HOST-location chunk does not
+    // land: measured 2026-10-30, the write is silent and the bytes read back as zeros (stage=0x53, read=0x00 at
+    // byte 0 of a 4 MiB restore), which corrupted every spilled KV cell it touched -- a prefill-logit KLD of
+    // 0.005 at ctx 8192 and a changed greedy text on the deep arm.  A DEVICE write to the same VA works (the
+    // KV's own `set_rows` path writes host-backed cells), so the restore goes through a device scratch.
+    if (!vmm_ensure_dev_stage(r, bytes)) {
+        return false;
+    }
+    if (cudaMemcpy(r->dev_stage, (const char *) r->stage + stage_off, bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+        !vmm_device_copy((char *) r->base + off, r->dev_stage, bytes)) {
         (void) cudaGetLastError();
         return false;
     }
-    vmm_insert(r, off, bytes, host);   // re-insert (and coalesce with its new neighbours of the same kind)
+    // The restore must be COMPLETE before any kernel touches the mapping.  The compute graph is enqueued on
+    // the backend's own stream, and a copy that is only ordered on the legacy default stream is not ordered
+    // against it -- so a batch could read a mapping whose staged bytes are still in flight.
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    vmm_insert(r, off, bytes, host);   // re-insert
+    if (getenv("LLAMA_KV_REGION_DEBUG") != nullptr) {
+        // verify the restore landed (a debug-only readback: an H2D into a freshly mapped VA was measured to
+        // land only partially in an earlier revision of this code)
+        std::vector<char> chk(bytes);
+        if (vmm_device_copy(r->dev_stage, (char *) r->base + off, bytes) &&
+                cudaMemcpy(chk.data(), r->dev_stage, bytes, cudaMemcpyDeviceToHost) == cudaSuccess) {
+            size_t first_bad = bytes;
+            for (size_t i = 0; i < bytes; i += 512) {
+                if (chk[i] != ((const char *) r->stage + stage_off)[i]) { first_bad = i; break; }
+            }
+            GGML_LOG_INFO("%s: VERIFY device %d off=%.2f MiB bytes=%.2f MiB -> %s%s\n", __func__, r->device,
+                    off / 1048576.0, bytes / 1048576.0, first_bad == bytes ? "ok" : "MISMATCH at %.3f MiB",
+                    first_bad == bytes ? "" : "");
+            if (first_bad != bytes) {
+                GGML_LOG_ERROR("%s: mismatch at byte %zu of %.2f MiB (stage=%02x read=%02x)\n", __func__,
+                        first_bad, bytes / 1048576.0, (unsigned char) ((const char *) r->stage + stage_off)[first_bad],
+                        (unsigned char) chk[first_bad]);
+            }
+        }
+    }
     return true;
 }
+
+// Preserve a mapping's bytes across a kind change.  Only the sliding window takes this path, once per unit
+// per few thousand tokens, so a blocking round trip is the right trade for simplicity here.
+bool vmm_remap(ggml_cuda_vmm_region * r, const vmm_mapping & m, bool host) {
+    const vmm_mapping saved = m;
+    if (getenv("LLAMA_KV_REGION_DEBUG") != nullptr) {
+        GGML_LOG_INFO("%s: FLIP device %d off=%.3f bytes=%.3f -> %s\n", __func__, r->device,
+                saved.off / 1048576.0, saved.bytes / 1048576.0, host ? "host" : "vram");
+    }
+    if (!vmm_detach(r, saved)) {
+        return false;
+    }
+    return vmm_attach(r, saved.off, saved.bytes, host, 0);
+}
+
 
 bool ggml_cuda_vmm_region_ensure_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host) {
     if (r == nullptr) {
@@ -352,18 +475,36 @@ bool ggml_cuda_vmm_region_ensure_span(ggml_cuda_vmm_region * r, size_t off, size
     if (b > r->size) { b = r->size; }
 
     while (a < b) {
-        if (const vmm_mapping * cur = vmm_at(r, a)) {
-            if (cur->host == host) {
-                a = cur->off + cur->bytes;    // this piece is already the KIND we need
-                continue;
+        const vmm_mapping * cur = vmm_at(r, a);
+        if (cur != nullptr) {
+            const size_t cur_end = cur->off + cur->bytes;
+            const size_t seg_end = b < cur_end ? b : cur_end;   // the part of [a,b) this mapping covers
+            if (cur->host != host) {
+                // The kind is wrong for [a, b): flip the mapping, preserving its bytes.
+                //
+                // A flip is a WHOLE-mapping operation.  The driver refuses a sub-range unmap, and rewriting
+                // one mapping as several pieces of mixed kinds (detach, then re-attach head/mid/tail) is NOT
+                // safe here: the pieces after the first read back as zeros, i.e. the staged bytes are lost
+                // (measured 2026-10-30).  The spill boundary therefore has to land ON a mapping boundary, and
+                // it does by construction -- the window quantises the spilled BYTES down to a whole map unit
+                // and every mapping in a windowed region is unit-aligned (`grow_cells`/`init_tensor` round
+                // their extents up).  A request that still straddles is refused loudly: silently flipping the
+                // whole mapping is how the window once spilled NOTHING at all (VRAM unchanged, `mapped_host`
+                // 0) while its warning claimed the tail was in system RAM.
+                if (cur->off != a || cur_end != b) {
+                    GGML_LOG_ERROR("%s: device %d: refusing to flip [%.2f, %.2f) MiB: the mapping [%.2f, %.2f) "
+                                   "MiB covers it only in part, and a partial rewrite of a mapping is not safe on "
+                                   "this driver.  A windowed KV keeps every mapping on the map-unit grid; an "
+                                   "unaligned request here is a caller bug.\n", __func__, r->device,
+                                   a / 1048576.0, b / 1048576.0, cur->off / 1048576.0, cur_end / 1048576.0);
+                    return false;
+                }
+                if (!vmm_remap(r, *cur, host)) {
+                    return false;
+                }
             }
-            // The kind is wrong for the whole mapping: flip it, preserving its bytes.  Flipping the whole
-            // mapping (not just this range) keeps the table one-entry-per-mapping and avoids a sub-range
-            // unmap, which the driver refuses.
-            if (!vmm_remap(r, *cur, host)) {
-                return false;
-            }
-            continue;                          // `a` is unchanged; the entry is gone/rewritten
+            a = seg_end;                       // [a, seg_end) is the kind we want now
+            continue;
         }
         size_t n = r->unit;
         if (const vmm_mapping * nxt = vmm_next(r, a)) {
@@ -461,6 +602,11 @@ void ggml_cuda_vmm_region_free(ggml_cuda_vmm_region * r) {
         (void) cudaFreeHost(r->stage);
         r->stage = nullptr;
         r->stage_bytes = 0;
+    }
+    if (r->dev_stage != nullptr) {
+        (void) cudaFree(r->dev_stage);
+        r->dev_stage = nullptr;
+        r->dev_stage_bytes = 0;
     }
     if (r->base != nullptr) {
         if (cuMemAddressFree((CUdeviceptr) (uintptr_t) r->base, r->size) != cudaSuccess) {
@@ -653,12 +799,68 @@ bool ggml_cuda_vmm_region_selftest(int device) {
         }
     }
 
+    // SLIDING WINDOW (A2/A3): the spill boundary must land ON a mapping boundary, and a flip must keep every
+    // byte.  The first version of the slide assumed the boundary was unit-quantised (it is) and that mappings
+    // were too (they were NOT: the VRAM extent was mapped to its exact byte end, and the first growth of a KV
+    // tensor is sub-unit, so a coalesced mapping straddled the boundary and the next VRAM step flipped it back
+    // WHOLE -- the window silently spilled nothing at all, `mapped_host` 0, VRAM unchanged, measured on a
+    // 4B/hybrid KV).  The fix is at the source: the window's resident extent and every growth are rounded up
+    // to whole units, so no mapping straddles the (unit-quantised) boundary.  These arms pin both halves: the
+    // aligned flip moves exactly its mapping, and a request that still straddles degrades loudly and keeps
+    // every byte (never a wrong answer).
+    {
+        const size_t u2 = (size_t) 8 << 20;
+        ggml_cuda_vmm_region * w = ggml_cuda_vmm_region_create(device, 4 * u2, u2, err, sizeof(err));
+        check(w != nullptr, "window selftest: create");
+        if (w != nullptr) {
+            // three adjacent pieces, which `vmm_insert` coalesces into ONE mapping [0, 3*u2)
+            check(ggml_cuda_vmm_region_map_span(w, 0,      u2, false), "window: span piece 0");
+            check(ggml_cuda_vmm_region_map_span(w, u2,     u2, false), "window: span piece 1");
+            check(ggml_cuda_vmm_region_map_span(w, 2 * u2, u2, false), "window: span piece 2");
+            st_fill_kernel<<<256, 256>>>((uint32_t *) ggml_cuda_vmm_region_base(w), 3 * u2 / 4, 0x12345678u);
+            check(cudaDeviceSynchronize() == cudaSuccess, "window: fill the coalesced span");
+
+            // an ALIGNED flip (a whole unit, the shape the window produces): exactly that unit changes kind
+            check(ggml_cuda_vmm_region_ensure_span(w, u2, u2, true), "window: flip a whole mapping to host");
+            check(ggml_cuda_vmm_region_mapped_host(w) == u2, "window: only the flipped mapping is host");
+            check(ggml_cuda_vmm_region_ensure_span(w, u2, u2, false), "window: flip it back");
+            check(ggml_cuda_vmm_region_mapped_host(w) == 0, "window: nothing is host after flipping back");
+
+            // every byte survives both flips, in every unit
+            for (size_t at = 0; at < 3 * u2; at += u2) {
+                (void) cudaMemset(d_bad, 0, sizeof(int));
+                st_check_kernel<<<256, 256>>>((const uint32_t *) ((char *) ggml_cuda_vmm_region_base(w) + at),
+                        u2 / 4, 0x12345678u, d_bad);
+                int bad = -1;
+                (void) cudaDeviceSynchronize();
+                (void) cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost);
+                check(bad == 0, "window: every byte survives a flip");
+            }
+
+            // a request that straddles a mapping (a caller bug -- a windowed KV always lands on the unit grid)
+            // is REFUSED: flipping only part of a mapping is not safe on this driver, and flipping all of it
+            // silently is how the window once mapped nothing to host
+            check(!ggml_cuda_vmm_region_ensure_span(w, u2 + 4096, 4096, true), "window: a straddling request is refused");
+            check(ggml_cuda_vmm_region_mapped_host(w) == 0, "window: a refused request changes no kind");
+            for (size_t at = 0; at < 3 * u2; at += u2) {
+                (void) cudaMemset(d_bad, 0, sizeof(int));
+                st_check_kernel<<<256, 256>>>((const uint32_t *) ((char *) ggml_cuda_vmm_region_base(w) + at),
+                        u2 / 4, 0x12345678u, d_bad);
+                int bad = -1;
+                (void) cudaDeviceSynchronize();
+                (void) cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost);
+                check(bad == 0, "window: a refused request moves no byte");
+            }
+            ggml_cuda_vmm_region_free(w);
+        }
+    }
+
     // and it must survive its own teardown (with holes in the mapped set)
     ggml_cuda_vmm_region_free(r);
     (void) cudaFree(d_bad);
 
     GGML_LOG_INFO("%s: device %d: %s (reserved %zu MiB in %zu x %zu MiB units, prefix + span growth, "
-                  "a HOST-backed span, the watermark contract and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
+                  "a HOST-backed span, a partial (window-boundary) flip, the watermark contract and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
                   (n_units * unit) >> 20, n_units, unit >> 20);
     return ok;
 }

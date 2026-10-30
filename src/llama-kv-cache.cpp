@@ -70,14 +70,83 @@ static ggml_backend_buffer_type_t llama_kv_region_buft_split(ggml_backend_dev_t 
 // wip/kv-residency (TODO #118): the windowed KV's resident window, in CELLS.  0/unset = off.
 //
 // The resident window is the LAST `W` cells of the context, so the spill is the low cells [0, kv_size - W).
-// A3 sizes it from free VRAM and makes it the opt-in flag (O2-PLAN.md §6.1); until then it is the explicit
-// lever, and `LLAMA_KV_REGION=1` is still what turns the provider on at all.
-static uint32_t kv_split_resident_cells() {
-    static const uint32_t v = []() {
-        const char * e = getenv("LLAMA_KV_RESIDENT_CELLS");
-        return e != nullptr ? (uint32_t) strtoul(e, nullptr, 10) : 0u;
-    }();
-    return v;
+// A3 (this session) makes `W` a decision `--fit` can take instead of the user's arithmetic:
+//   - a number         -> that window, exactly as before;
+//   - `auto`           -> `--fit` sizes it (`llama_kv_region_set_resident_cells` below).  Without `--fit`
+//                         there is nobody to decide, so the cache declines the window and says so;
+//   - unset / 0        -> no window (today's fully resident cache, today's OOM).
+static uint32_t kv_split_resident_cells_env() {
+    const char * e = getenv("LLAMA_KV_RESIDENT_CELLS");
+    if (e == nullptr || e[0] == '\0') {
+        return 0u;
+    }
+    if (strcmp(e, "auto") == 0) {
+        return UINT32_MAX;
+    }
+    return (uint32_t) strtoul(e, nullptr, 10);
+}
+
+// The fit-produced window (`--fit` with `LLAMA_KV_RESIDENT_CELLS=auto`), 0 = none decided.  A process
+// global on purpose: `common_params_fit` runs before the contexts exist and hands the decision down here,
+// and one W covers every KV cache the process creates (the A2 rule: one window for every tensor and
+// cache).
+static uint32_t g_kv_resident_cells_override = 0;
+
+void llama_kv_region_set_resident_cells(uint32_t cells) {
+    g_kv_resident_cells_override = cells;
+}
+
+bool llama_kv_region_is_enabled(void) {
+    return llama_kv_region_enabled();
+}
+
+// UINT32_MAX = `auto`: fit sizes it (see above).
+uint32_t llama_kv_region_resident_cells_requested(void) {
+    if (g_kv_resident_cells_override != 0) {
+        return g_kv_resident_cells_override;
+    }
+    return kv_split_resident_cells_env();
+}
+
+// How much pinned host RAM the spill may take (bytes), 0 = no ceiling / unknown.  The backend owns the
+// number (`LLAMA_KV_SPILL_RAM_PCT` % of MemAvailable, shared by every cache in the process).
+typedef size_t (*llama_kv_spill_budget_fn)(void);
+
+typedef float (*llama_kv_link_gbps_fn)(ggml_backend_dev_t dev);
+
+// The PCIe link constant every spill cost model divides by: the backend's own calibrated H2D number
+// (~28.8 GB/s when the campaign was written, ~55 GB/s after the 2026-10 PCIe rework).  0 = unknown.
+static float llama_kv_region_link_gbps(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return 0.0f;
+    }
+    auto fn = (llama_kv_link_gbps_fn) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_link_gbps");
+    return fn != nullptr ? fn(dev) : 0.0f;
+}
+
+typedef void (*llama_kv_spill_reserve_fn)(size_t bytes);
+
+// What is left of the pinned-spill ceiling for a NEW cache to plan, in bytes (SIZE_MAX = no ceiling).
+static size_t llama_kv_region_spill_budget(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return SIZE_MAX;
+    }
+    auto fn = (llama_kv_spill_budget_fn) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_spill_ram_budget");
+    return fn != nullptr ? fn() : SIZE_MAX;
+}
+
+// Account this cache's planned worst-case spill against that ceiling.
+static void llama_kv_region_spill_reserve(ggml_backend_dev_t dev, size_t bytes) {
+    if (dev == nullptr || bytes == 0) {
+        return;
+    }
+    auto fn = (llama_kv_spill_reserve_fn) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_spill_ram_reserve");
+    if (fn != nullptr) {
+        fn(bytes);
+    }
 }
 
 // The grow hook is the same for every device, so resolve it once.
@@ -275,11 +344,19 @@ llama_kv_cache::llama_kv_cache(
     //   Default W = kv_size -> no spill, i.e. today's fully resident cache (the opt-in is what spills).
     //   One W covers every tensor, so the cell geometry has to be uniform across the layers this cache holds
     //   (K and V included).  Anything else DECLINES the window -- no spill, today's fit-or-fail -- not a guess.
-    size_t kv_resident_cells = 0;
     if (llama_kv_region_enabled() && other == nullptr && !v_trans && !hparams.no_alloc) {
-        const uint32_t w = kv_split_resident_cells();
-        const uint32_t n_tail = (w != 0 && kv_size > w) ? kv_size - w : 0;
+        const uint32_t w = llama_kv_region_resident_cells_requested();
+        if (w == UINT32_MAX) {
+            // `LLAMA_KV_RESIDENT_CELLS=auto` with nobody to decide: `--fit` owns the sizing (it is the only
+            // thing that knows the free-VRAM budget the ARENA also draws on, and the RAM budget the spill
+            // draws on).  Declining keeps the run honest -- today's fully resident cache, today's OOM.
+            LLAMA_LOG_WARN("%s: LLAMA_KV_RESIDENT_CELLS=auto is sized by --fit, which did not run (or could not "
+                           "decide); the KV stays fully resident.  Pass the window explicitly "
+                           "(LLAMA_KV_RESIDENT_CELLS=<cells>) or run with --fit.\n", __func__);
+        }
+        const uint32_t n_tail = (w != 0 && w != UINT32_MAX && kv_size > w) ? kv_size - w : 0;
         size_t cell = 0;
+        size_t n_tens = 0;
         bool   uniform = n_tail != 0;
         for (uint32_t il = 0; uniform && il < n_layer; ++il) {
             if (!hparams.has_kv(il) || (filter && !filter(il))) {
@@ -291,20 +368,59 @@ llama_kv_cache::llama_kv_cache(
                 cell = ck;
             }
             uniform = ck == cell && cv == cell;
+            if (uniform) {
+                n_tens += (!is_mla && v_enabled) ? 2 : 1;
+            }
+        }
+        size_t spill_cap_bytes = 0;   // > 0 when the RAM budget clamped the window
+        size_t w_eff = w;
+        if (uniform) {
+            // A3/item 3: the spill is PINNED, non-swappable RAM, so the window is clamped UP (fewer spilled
+            // cells) until the worst case -- every tail cell of the context -- fits the RAM budget the
+            // backend's `LLAMA_KV_SPILL_RAM_PCT` ceiling allows.  This is the creation-time decision; the
+            // backend keeps a run-time check for RAM that disappears under a running process.
+            const size_t cell_all = cell * n_tens * n_stream;              // one cell, every tensor
+            const size_t budget   = llama_kv_region_spill_budget(model.dev_layer(0));
+            const size_t spill_worst = (size_t) n_tail * cell_all;
+            if (budget != SIZE_MAX && spill_worst > budget) {
+                spill_cap_bytes = budget;
+                const size_t tail_cells = budget / (cell_all != 0 ? cell_all : 1);
+                w_eff = kv_size > tail_cells ? (size_t) kv_size - tail_cells : (size_t) kv_size;
+                LLAMA_LOG_WARN("%s: the windowed KV's spill would need %.2f MiB of pinned, NON-SWAPPABLE RAM at "
+                               "full context (%.0f KiB per cell x %u tail cells in the cache), but only %.2f MiB "
+                               "is available (the LLAMA_KV_SPILL_RAM_PCT ceiling on pinned RAM).  The resident "
+                               "window is raised from %u to %zu of %u cells, so the spill is %.2f MiB.\n",
+                               __func__, (double) spill_worst / 1048576.0, (double) cell_all / 1024.0, n_tail,
+                               (double) budget / 1048576.0,
+                               w, w_eff, kv_size, (double) ((size_t) kv_size - w_eff) * cell_all / 1048576.0);
+                if (w_eff >= kv_size) {
+                    LLAMA_LOG_ERROR("%s: even with the whole KV resident the RAM budget leaves no room for this "
+                                   "window; the KV stays fully resident (today's fit-or-fail).  Lower -c, raise "
+                                   "LLAMA_KV_SPILL_RAM_PCT, or free RAM.\n", __func__);
+                }
+            }
+            // account the plan, so a second cache (Flash-Next has two) sizes against what is left
+            llama_kv_region_spill_reserve(model.dev_layer(0), (size_t) ((size_t) kv_size - w_eff) * cell_all);
         }
         if (!uniform) {
             LLAMA_LOG_WARN("%s: the windowed KV is unavailable for this cache (%s); the KV stays fully "
                            "resident\n", __func__,
                            n_tail == 0 ? "no spilled cells" : "non-uniform K/V cell geometry across layers");
-        } else {
-            kv_resident_cells = w;
-            LLAMA_LOG_WARN("%s: WINDOWED KV ENABLED: the newest %u of up to %u cells stay in VRAM, everything "
+        } else if (w_eff < kv_size) {
+            const size_t tail = (size_t) kv_size - w_eff;
+            const float  gbps = llama_kv_region_link_gbps(model.dev_layer(0));
+            const size_t cell_all = cell * n_tens * n_stream;
+            this->kv_resident_cells = w_eff;
+            LLAMA_LOG_WARN("%s: WINDOWED KV ENABLED: the newest %zu of up to %u cells stay in VRAM, everything "
                            "older spills to pinned system RAM (%.1f KiB per cell%s).  The spill grows with the "
-                           "used extent, up to %.2f MiB per tensor at full context, and every spilled cell is "
-                           "read over the PCIe link per step (~28.8 GB/s).  Unset LLAMA_KV_RESIDENT_CELLS or "
-                           "LLAMA_KV_REGION to keep the KV fully resident.\n",
-                           __func__, w, kv_size, cell / 1024.0, n_stream > 1 ? ", per stream" : "",
-                           (double) n_tail * cell / 1048576.0);
+                           "used extent, up to %.2f MiB at full context, and every spilled cell is read over "
+                           "the PCIe link per step (%s).  Unset LLAMA_KV_RESIDENT_CELLS or LLAMA_KV_REGION to "
+                           "keep the KV fully resident.%s\n",
+                           __func__, w_eff, kv_size, cell / 1024.0, n_stream > 1 ? ", per stream" : "",
+                           (double) tail * cell_all / 1048576.0,
+                           gbps > 0.0f ? (std::to_string((int) (gbps + 0.5f)) + " GB/s, calibrated").c_str()
+                                       : "the link's measured rate",
+                           spill_cap_bytes != 0 ? "  (The window was widened by the RAM budget -- see above.)" : "");
         }
     }
 
@@ -370,6 +486,16 @@ llama_kv_cache::llama_kv_cache(
             // everything downstream -- the scheduler's placement, `memory_breakdown()`, `--fit` -- sees a KV
             // buffer of the same size; only WHEN its physical is committed changes.
             ggml_backend_buffer_type_t buft_region = kv_resident_cells != 0 ? llama_kv_region_buft_split(dev, kv_resident_cells) : nullptr;
+            if (kv_resident_cells != 0 && buft_region == nullptr) {
+                // A silent fallback here means a warning above that promises a window the buffer does not have.
+                static bool warned_split = false;
+                if (!warned_split) {
+                    warned_split = true;
+                    LLAMA_LOG_WARN("%s: the backend declined the windowed KV buffer type for %zu cells; the KV is "
+                                   "fully resident (no spill), so the VRAM saving does not happen\n",
+                                   __func__, kv_resident_cells);
+                }
+            }
             if (buft_region == nullptr) {
                 buft_region = llama_kv_region_buft(dev);
             }
@@ -1160,6 +1286,19 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
         if (hparams.no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else if (kv_resident_cells != 0 && get_size() != 0) {
+            // wip/kv-residency (TODO #118) A3: a WINDOWED buffer only *commits* its resident window, so report
+            // the split instead of the whole reservation (the buffer's size is the VA range).  The geometry is
+            // uniform by construction (the ctor declines the window otherwise), so the split is proportional to
+            // the cells.  The spill is charged to the host/CPU bucket, which is what makes `--fit` size a
+            // context around the window and what makes the memory table show where the KV really lives.
+            const size_t bytes  = ggml_backend_buffer_get_size(buf.get());
+            const size_t res    = (size_t) std::min<size_t>(kv_resident_cells, get_size());
+            const size_t vram   = bytes / get_size() * res + (bytes % get_size()) * res / get_size();
+            ret[buft] += vram;
+            if (bytes > vram) {
+                ret[ggml_backend_cpu_buffer_type()] += bytes - vram;
+            }
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
             ret[buft] += ggml_backend_buffer_get_size(buf.get());
@@ -1800,8 +1939,8 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
 }
 
 uint32_t llama_kv_cache::get_kv_split_n_tail(uint32_t n_kv) const {
-    const uint32_t w = kv_split_resident_cells();
-    if (w == 0) {
+    const uint32_t w = llama_kv_region_resident_cells_requested();
+    if (w == 0 || w == UINT32_MAX) {
         return 0; // default: no split, byte-identical to the single-base read (including the OOM)
     }
     if (v_trans) {
