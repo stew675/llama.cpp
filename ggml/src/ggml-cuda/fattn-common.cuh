@@ -121,7 +121,14 @@ typedef void (* fattn_kernel_t)(
         // First KV row of the launched extent in the whole op's cell space (0 unless KV-chunked): used
         // only by the two exactly-sliceable absolute-KV optimizations (the masked-group bitmap and the
         // KV_max bound), so a chunk keeps both.
-        const int kv_start);
+        const int kv_start,
+        // wip/kv-residency (TODO #118) A1: the two-base K/V read (ggml_flash_attn_ext_set_kv_split).
+        // K/V above are the HEAD segment: their row 0 is cell n_tail.  K_tail/V_tail are the TAIL
+        // segment: their row 0 is cell 0, i.e. the same global index space, a different base.  The
+        // cell index space, the mask and the derived-mask state are unchanged -- only the base a
+        // whole KV tile reads from is chosen.  n_tail == 0 (nullptr/0 for the pointers) means the op
+        // carries no split and every read is the single-base read it always was.
+        const char * K_tail, const char * V_tail, const int n_tail);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -191,6 +198,56 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 }
 
 #include "fattn-rdna.cuh"
+
+// wip/kv-residency (TODO #118) A1: the TWO-BASE K/V READ (see ggml_flash_attn_ext_set_kv_split).
+//
+// FA already takes one K/V base plus a row stride and indexes rows as `base + i*stride`, with the
+// caller forming the per-tile base -- so a split is an ADDRESSING change, not a numerics change.
+// The op carries a second base pair (`k_tail`/`v_tail`, op src[8]/src[9]) plus `n_tail` (op_params
+// i32 5, the number of cells the tail segment holds), and the K/V CELL INDEX SPACE STAYS GLOBAL:
+// cell i < n_tail is read from the tail base, cell i >= n_tail from the head base, so the mask,
+// cell_pos/tok_lo/tok_hi and the derived-mask form are untouched.
+//
+// `n_tail` is a multiple of GGML_CUDA_FA_KV_SPLIT_GRAN, which is a multiple of every kernel's KV
+// tile height (nbatch_fa is 32/64/128 in the tile and MMA config tables, and a V tile divides the K
+// tile), so a KV tile never straddles the boundary and the split costs a per-tile base selection --
+// the in-tile row index, the accumulation order and the staged values are all unchanged.  That is
+// what makes A1's oracle an EQUALITY (same rows, same order, a different base address).
+//
+// n_tail == 0 is the no-split op and every read is the single-base read it always was.
+#define GGML_CUDA_FA_KV_SPLIT_GRAN GGML_FA_KV_SPLIT_GRAN
+
+// Per (sequence, KV head) segment bases: the tail segment's row-0 base, with the same head/sequence
+// offsets applied as the head segment's `K_h2`/`kv_native.K`, plus its cell count.  A kernel builds
+// this once per block; n_tail == 0 means "no split" and the pointers are unused.
+struct fattn_kv_split_t {
+    const char * K_tail = nullptr; // row 0 == cell 0
+    const char * V_tail = nullptr; // row 0 == cell 0
+    int n_tail = 0;
+};
+
+static __device__ __forceinline__ fattn_kv_split_t fattn_kv_split_make(
+        const char * K_tail, const char * V_tail, const int n_tail,
+        const int64_t nb13, const int64_t nb12, const int64_t nb23, const int64_t nb22,
+        const int64_t sequence, const int64_t z_KV, const bool v_is_k_view) {
+    fattn_kv_split_t s;
+    if (n_tail > 0) {
+        s.K_tail = K_tail + nb13*sequence + nb12*z_KV;
+        s.V_tail = v_is_k_view ? s.K_tail : (V_tail + nb23*sequence + nb22*z_KV);
+        s.n_tail = n_tail;
+    }
+    return s;
+}
+
+// The base a whole KV tile (the nbatch_fa rows starting at cell `k0`) reads from: rows below n_tail
+// come from the TAIL segment, the rest from the HEAD segment.  Both bases are addressed by the GLOBAL
+// cell number -- which is what makes this a base selection and nothing else: the in-tile row index,
+// the accumulation order, the mask and every staged value are unchanged.  `n_tail <= 0` returns the
+// head unchanged, so the no-split op compiles to the single-base read it always was.
+static __device__ __forceinline__ const char * fattn_kv_split_sel(
+        const char * head, const char * tail, const int n_tail, const int k0) {
+    return (n_tail > 0 && k0 < n_tail) ? tail : head;
+}
 
 // Byte-addressed K/V rows for a native (non-F16-staged) operand.  The tile staging is unchanged
 // (F16 half2 tiles); only the source of the staged values differs.  `type_K`/`type_V` is
@@ -1635,6 +1692,28 @@ void launch_fattn(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    // wip/kv-residency (TODO #118) A1: the two-base K/V read (see fattn_kv_split_t).  n_tail == 0
+    // for every op that does not opt in, and then both pointers are nullptr and everything below is
+    // the single-base launch it always was.
+    const int kv_split_n_tail = ggml_flash_attn_ext_get_kv_split_n_tail(dst);
+    const char * K_tail_data  = kv_split_n_tail > 0 ? (const char *) dst->src[8]->data : nullptr;
+    const char * V_tail_data  = kv_split_n_tail > 0 ? (const char *) dst->src[9]->data : nullptr;
+
+    // wip/kv-residency (TODO #118) A1: the two-base K/V read is served by the tile and the MMA-f16
+    // kernels (the two families this box selects for the shapes Goal A cares about).  A family that
+    // ignores src[8] reads src[1] alone, which still holds every cell in A1 -- so a decline is the
+    // single-base read, i.e. no spill and today's fit-or-fail path, never a wrong answer.  A split op
+    // additionally forbids the KV-chunked prefill (it slices K by chunk) and the sparse index path,
+    // and requires a natively readable K/V (one base cannot be staged and the other raw).
+    if (kv_split_n_tail > 0) {
+        GGML_ASSERT(kv_split_n_tail % GGML_CUDA_FA_KV_SPLIT_GRAN == 0);
+        GGML_ASSERT(kv_split_n_tail < K->ne[1]);
+        GGML_ASSERT(!use_sparse);
+        GGML_ASSERT(dst->src[8] != nullptr && dst->src[9] != nullptr);
+        GGML_ASSERT(ggml_cuda_fattn_kv_native_type(K) != FATTN_KV_NATIVE_NONE || K->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_cuda_fattn_kv_native_type(V) != FATTN_KV_NATIVE_NONE || V->type == GGML_TYPE_F16);
+    }
+
     // V3 derived kq mask: present instead of the mask tensor above.
     const ggml_tensor * cell_pos = dst->src[5];
     const ggml_tensor * tok_lo   = dst->src[6];
@@ -1693,7 +1772,10 @@ void launch_fattn(
     // gap growing with it (gfx1151 9B q8_0 pp16k 1405 vs 1410, pp20k 1359 vs 1369, pp32k 1253 vs
     // 1266, pp65k 1043 vs 1059), so it keeps the native read at prefill too.
     const bool prefill_stages = !GGML_CUDA_CC_IS_RDNA3_5(cc);
-    const bool native_width = Q->ne[1] <= 8 || !prefill_stages;
+    // wip/kv-residency (TODO #118) A1: a split op reads the raw cache (see the assertions below), so its
+    // native width is the whole launch -- a staged whole-cache F16 copy would leave the tail's rows in
+    // their original type behind the kernel's back.
+    const bool native_width = Q->ne[1] <= 8 || !prefill_stages || kv_split_n_tail > 0;
 
     // A native-capable operand that stages takes its scratch from the per-context, per-stream arena
     // rather than the generic CUDA pool.  The pool grows by exact fit and *retains* every distinct
@@ -2403,7 +2485,7 @@ void launch_fattn(
                 tok_lo   ? ((const int *) tok_lo  ->data) : nullptr,
                 tok_hi   ? ((const int *) tok_hi  ->data) : nullptr,
                 FATTN_KV_NATIVE_NONE, FATTN_KV_NATIVE_NONE,
-                part_meta, (int) k0);
+                part_meta, (int) k0, nullptr, nullptr, 0);
             CUDA_CHECK(cudaGetLastError());
 
             sk_fold(ntiles_kv_c, nblocks, part, chunk_fix.ptr, part_meta);
@@ -2445,7 +2527,8 @@ void launch_fattn(
         kv_native_kernel_K, kv_native_kernel_V,
         // wip/fa-stage-chunking: the whole-prefix launch keeps the shipping (final, normalized)
         // contract; only the chunk loop above uses the partial one.
-        nullptr, 0
+        nullptr, 0,
+        K_tail_data, V_tail_data, kv_split_n_tail
     );
     CUDA_CHECK(cudaGetLastError());
 

@@ -3146,8 +3146,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * k_tail,
+         ggml_tensor * v_tail,
+              int32_t  n_tail) const {
     const bool v_trans = v->nb[1] > v->nb[2];
+
+    GGML_ASSERT((k_tail == nullptr) == (n_tail == 0));
+    GGML_ASSERT(k_tail == nullptr || v_tail != nullptr);
 
     // split the batch into streams if needed
     const auto n_stream = k->ne[3];
@@ -3161,6 +3167,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
+    // wip/kv-residency (TODO #118) A1: the tail segment's views take exactly the same permutation
+    // and type conversions as the head's, so both bases describe the same row layout.
+    if (k_tail) {
+        k_tail = ggml_permute(ctx0, k_tail, 0, 2, 1, 3);
+        v_tail = ggml_permute(ctx0, v_tail, 0, 2, 1, 3);
+    }
+
     ggml_tensor * cur;
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
@@ -3169,15 +3182,24 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (v_trans) {
             v = ggml_transpose(ctx0, v);
+            if (v_tail) {
+                v_tail = ggml_transpose(ctx0, v_tail);
+            }
         }
 
         // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+            if (k_tail) {
+                k_tail = ggml_cast(ctx0, k_tail, GGML_TYPE_F16);
+            }
         }
 
         if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            if (v_tail) {
+                v_tail = ggml_cast(ctx0, v_tail, GGML_TYPE_F16);
+            }
         }
 
         // V3: the mask may have a derived form registered by build_attn_inp_kq_mask - in that case
@@ -3204,6 +3226,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+
+        // wip/kv-residency (TODO #118) A1: the two-base K/V read.  Set after the op exists so the
+        // setter can validate the two segments against it; n_tail == 0 leaves the op exactly as it
+        // was built above.
+        ggml_flash_attn_ext_set_kv_split(cur, k_tail, v_tail, n_tail);
         ggml_prec_set_acc(cur, GGML_PREC_F32);
 
         if (v_mla) {
@@ -3449,6 +3476,9 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k;
     ggml_tensor * v;
+    ggml_tensor * k_tail = nullptr;
+    ggml_tensor * v_tail = nullptr;
+    int32_t       n_tail = 0;
 
     if (cparams.training) {
         GGML_ASSERT(mctx_cur->get_n_kv() == n_tokens);
@@ -3466,11 +3496,20 @@ ggml_tensor * llm_graph_context::build_attn(
 
         k = mctx_cur->get_k(ctx0, il);
         v = mctx_cur->get_v(ctx0, il);
+
+        // wip/kv-residency (TODO #118) A1: the tail segment of the two-base K/V read, when the memory
+        // module offers one (it needs the narrow llama_kv_cache context, so a hybrid/dsa/msa memory
+        // declines here and the op stays the single-base read).  0 = no split.
+        n_tail = (int32_t) mctx_cur->get_kv_split_n_tail();
+        if (n_tail > 0) {
+            k_tail = mctx_cur->get_k_tail(ctx0, il, (uint32_t) n_tail);
+            v_tail = mctx_cur->get_v_tail(ctx0, il, (uint32_t) n_tail);
+        }
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, k_tail, v_tail, n_tail);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -3557,7 +3596,19 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    // wip/kv-residency (TODO #118) A1: the tail segment of the two-base K/V read (0 = no split).  This
+    // is a K-only cache, so its V tail is the same view shape taken from the K tail.
+    ggml_tensor * k_tail = nullptr;
+    ggml_tensor * v_tail = nullptr;
+    int32_t       n_tail = 0;
+    n_tail = (int32_t) mctx_cur->get_kv_split_n_tail();
+    if (n_tail > 0) {
+        k_tail = mctx_cur->get_k_tail(ctx0, il, (uint32_t) n_tail);
+        v_tail = ggml_view_4d(ctx0, k_tail, v_cur->ne[0], k_tail->ne[1], k_tail->ne[2], k_tail->ne[3],
+                              k_tail->nb[1], k_tail->nb[2], k_tail->nb[3], 0);
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il, k_tail, v_tail, n_tail);
     cb(cur, "kqv_out", il);
 
     if (wo) {

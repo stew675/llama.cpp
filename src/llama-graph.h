@@ -1355,7 +1355,14 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            // wip/kv-residency (TODO #118) A1: the two-base K/V read.  Non-null k_tail (with
+            // n_tail > 0) makes `k`/`v` the HEAD segment, whose row 0 is cell n_tail, and k_tail/v_tail
+            // the TAIL segment, whose row 0 is cell 0 -- the cell index space stays global, so the
+            // mask, cell_pos and the derived mask are untouched.  Default = the single-base read.
+            ggml_tensor * k_tail = nullptr, // [n_embd_head_k, n_head_k, n_tail]
+            ggml_tensor * v_tail = nullptr, // [n_embd_head_v, n_head_v, n_tail]
+                 int32_t  n_tail = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

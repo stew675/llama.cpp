@@ -5692,6 +5692,57 @@ void ggml_flash_attn_ext_add_kq_derived(
     a->src[7] = tok_hi;
 }
 
+// wip/kv-residency (TODO #118) A1: the two-base K/V read (see ggml.h).  src[8]/src[9] carry the
+// tail segment's K/V (row 0 == cell 0) and op_params i32 5 carries n_tail, the number of cells that
+// segment holds.  The head segment is src[1]/src[2] unchanged, EXCEPT that its row 0 is cell n_tail;
+// the kernels index both bases with the global cell number.  n_tail == 0 disables the split and
+// leaves every read exactly as it was.
+void ggml_flash_attn_ext_set_kv_split(
+        struct ggml_tensor * a,
+        struct ggml_tensor * k_tail,
+        struct ggml_tensor * v_tail,
+        int32_t              n_tail) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(n_tail >= 0);
+
+    if (k_tail == NULL || n_tail == 0) {
+        a->src[8] = NULL;
+        a->src[9] = NULL;
+        ggml_set_op_params_i32(a, 5, 0);
+        return;
+    }
+
+    {
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+
+    GGML_ASSERT(a->src[8] == NULL);
+    GGML_ASSERT(v_tail != NULL);
+    GGML_ASSERT(n_tail < k->ne[1]);
+
+    GGML_ASSERT(k_tail->type == k->type);
+    GGML_ASSERT(v_tail->type == v->type);
+    // same head/stream layout, one contiguous run of cells at the front of the same index space
+    GGML_ASSERT(k_tail->ne[0] == k->ne[0] && k_tail->ne[1] == n_tail);
+    GGML_ASSERT(k_tail->ne[2] == k->ne[2] && k_tail->ne[3] == k->ne[3]);
+    GGML_ASSERT(v_tail->ne[0] == v->ne[0] && v_tail->ne[1] == n_tail);
+    GGML_ASSERT(v_tail->ne[2] == v->ne[2] && v_tail->ne[3] == v->ne[3]);
+    // the rows the kernels index are a plain cell step in both segments
+    GGML_ASSERT(k_tail->nb[1] == k->nb[1] && v_tail->nb[1] == v->nb[1]);
+
+    a->src[8] = k_tail;
+    a->src[9] = v_tail;
+    ggml_set_op_params_i32(a, 5, n_tail);
+    }
+}
+
+int32_t ggml_flash_attn_ext_get_kv_split_n_tail(const struct ggml_tensor * a) {
+    if (a->op != GGML_OP_FLASH_ATTN_EXT || a->src[8] == NULL) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 5);
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

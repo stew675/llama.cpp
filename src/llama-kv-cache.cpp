@@ -1729,7 +1729,62 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
     return result;
 }
 
+// wip/kv-residency (TODO #118) A1: the windowed KV's resident window, in CELLS.  0/unset = off.
+//
+// A1 keeps both segments in VRAM (two views of the same KV tensor), so this only forces a split at a
+// chosen width -- it is the test lever for the two-base read, not a memory feature yet.  A2 moves the
+// tail's storage to the pinned host master and A3 sizes the window from free VRAM and turns this into
+// the opt-in flag (O2-PLAN.md §6.1).
+static uint32_t kv_resident_cells() {
+    static const uint32_t v = []() {
+        const char * e = getenv("LLAMA_KV_RESIDENT_CELLS");
+        return e != nullptr ? (uint32_t) strtoul(e, nullptr, 10) : 0u;
+    }();
+    return v;
+}
+
+uint32_t llama_kv_cache::get_kv_split_n_tail(uint32_t n_kv) const {
+    const uint32_t w = kv_resident_cells();
+    if (w == 0) {
+        return 0; // default: no split, byte-identical to the single-base read (including the OOM)
+    }
+    if (v_trans) {
+        return 0; // a transposed V cache has its cell axis on dim 0: not served, so no split
+    }
+    if (n_kv <= w) {
+        return 0; // everything is resident: no tail to read from a second base
+    }
+    // the tail is rounded DOWN to the granularity every FA kernel tile satisfies, so a tile never
+    // straddles the boundary and the split is a base selection rather than a numeric change
+    return ((n_kv - w)/GGML_FA_KV_SPLIT_GRAN)*GGML_FA_KV_SPLIT_GRAN;
+}
+
+// wip/kv-residency (TODO #118) A1 NEGATIVE CONTROL.  `LLAMA_KV_SPLIT_POISON_CELLS=N` (default 0) shifts
+// the TAIL view by N cells, so every kernel tile below n_tail reads the wrong rows.  A1's oracle is an
+// equality (both segments are views of one tensor, so a wrong base choice is invisible to it), and this
+// is what makes the equality meaningful: with the poison on the text MUST change, which is the only
+// evidence that the kernels actually read the second base.  Never a shipping knob.
+static uint32_t kv_split_poison_cells() {
+    static const uint32_t v = []() {
+        const char * e = getenv("LLAMA_KV_SPLIT_POISON_CELLS");
+        return e != nullptr ? (uint32_t) strtoul(e, nullptr, 10) : 0u;
+    }();
+    return v;
+}
+
+ggml_tensor * llama_kv_cache::get_k_tail(ggml_context * ctx, int32_t il, uint32_t n_tail, const slot_info & sinfo) const {
+    return get_k_cells(ctx, il, n_tail, kv_split_poison_cells(), sinfo);
+}
+
+ggml_tensor * llama_kv_cache::get_v_tail(ggml_context * ctx, int32_t il, uint32_t n_tail, const slot_info & sinfo) const {
+    return get_v_cells(ctx, il, n_tail, kv_split_poison_cells(), sinfo);
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    return get_k_cells(ctx, il, n_kv, 0, sinfo);
+}
+
+ggml_tensor * llama_kv_cache::get_k_cells(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t cell_off, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -1746,10 +1801,15 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0 +
+            ggml_row_size(k->type, n_embd_k_gqa)*(int64_t) cell_off);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    return get_v_cells(ctx, il, n_kv, 0, sinfo);
+}
+
+ggml_tensor * llama_kv_cache::get_v_cells(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t cell_off, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1769,7 +1829,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0 +
+                ggml_row_size(v->type, n_embd_v_gqa)*(int64_t) cell_off);
     }
 
     // note: v->nb[1] > v->nb[2]
@@ -1778,7 +1839,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0 +
+            ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il))*(int64_t) cell_off);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -3607,6 +3669,18 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+uint32_t llama_kv_cache_context::get_kv_split_n_tail() const {
+    return kv->get_kv_split_n_tail(n_kv);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_tail(ggml_context * ctx, int32_t il, uint32_t n_tail) const {
+    return kv->get_k_tail(ctx, il, n_tail, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_tail(ggml_context * ctx, int32_t il, uint32_t n_tail) const {
+    return kv->get_v_tail(ctx, il, n_tail, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

@@ -219,6 +219,29 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // wip/kv-residency (TODO #118) A1: the two-base K/V read (ggml_flash_attn_ext_set_kv_split).
+    //
+    // The split point of a `n_kv`-row view: the number of LEADING cells that form the tail segment
+    // (0 = no split).  The tail is cells [0, n_tail) and the head [n_tail, n_kv), so the most recent
+    // cells are the resident head -- a window `LLAMA_KV_RESIDENT_CELLS` wide.  A1 keeps both
+    // segments in VRAM (two views of the same tensor, get_*_tail below), so this is only the lever
+    // that forces a split at a chosen width; it exists on the memory module because that is where
+    // the residency decision belongs (A2 moves the tail's storage, A3 sizes it from free VRAM).
+    //
+    // Returns 0 (no split) when the knob is off, when it cannot be served (a transposed V cache has
+    // its cell axis on dim 0) or when the cache does not exceed the window.  The result is rounded
+    // DOWN to GGML_FA_KV_SPLIT_GRAN cells so no FA kernel tile straddles the boundary.
+    uint32_t get_kv_split_n_tail(uint32_t n_kv) const;
+
+    // the tail segment's views: the same layout as get_k/get_v, cells [0, n_tail) of the same stream.
+    // Both are views of the ONE KV tensor (A1): the segments differ only in where they start.
+    ggml_tensor * get_k_tail(ggml_context * ctx, int32_t il, uint32_t n_tail, const slot_info & sinfo) const;
+    ggml_tensor * get_v_tail(ggml_context * ctx, int32_t il, uint32_t n_tail, const slot_info & sinfo) const;
+
+    // the same views with the first cell shifted by cell_off (the A1 negative control, see the .cpp)
+    ggml_tensor * get_k_cells(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t cell_off, const slot_info & sinfo) const;
+    ggml_tensor * get_v_cells(ggml_context * ctx, int32_t il, uint32_t n_kv, uint32_t cell_off, const slot_info & sinfo) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -470,6 +493,12 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // wip/kv-residency (TODO #118) A1: the split point of this context's views (0 = no split) and
+    // the tail segment's views -- see llama_kv_cache::get_kv_split_n_tail
+    uint32_t get_kv_split_n_tail() const;
+    ggml_tensor * get_k_tail(ggml_context * ctx, int32_t il, uint32_t n_tail) const;
+    ggml_tensor * get_v_tail(ggml_context * ctx, int32_t il, uint32_t n_tail) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

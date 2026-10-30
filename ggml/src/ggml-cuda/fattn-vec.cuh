@@ -47,7 +47,9 @@ static __global__ void flash_attn_ext_vec(
                             const int *, const int *, const int *,
                             const int, const int,
                             // wip/fa-stage-chunking (TODO #114): MMA-prefill only.
-                            float2 *, const int) {
+                            float2 *, const int,
+                            // A1 two-base K/V read (see fattn_kernel_t)
+                            const char *, const char *, const int) {
     ggml_cuda_pdl_lc();
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;

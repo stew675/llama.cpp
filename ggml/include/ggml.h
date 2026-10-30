@@ -2565,6 +2565,25 @@ extern "C" {
             struct ggml_tensor * tok_lo,
             struct ggml_tensor * tok_hi);
 
+    // wip/kv-residency (TODO #118) A1: TWO-BASE K/V READ.  The KV cell index space stays GLOBAL;
+    // a tile whose rows are all below n_tail takes its base from k_tail/v_tail (whose row 0 is
+    // cell 0), a tile at or above it from k/v (whose row 0 is cell n_tail).  The accumulation
+    // order is unchanged, so n_tail cells of the same values read through two bases produce the
+    // same result; n_tail == 0 (the default) indexes exactly as before.  n_tail must be a
+    // multiple of 256 (GGML_CUDA_FA_KV_SPLIT_GRAN) so no kernel tile straddles the boundary.
+    // The alignment n_tail must satisfy: a multiple of every FA kernel's KV tile height, so no tile
+    // straddles the segment boundary (see ggml_flash_attn_ext_set_kv_split).
+#define GGML_FA_KV_SPLIT_GRAN 256
+
+    GGML_API void ggml_flash_attn_ext_set_kv_split(
+            struct ggml_tensor * a,
+            struct ggml_tensor * k_tail,
+            struct ggml_tensor * v_tail,
+            int32_t              n_tail);
+
+    GGML_API int32_t ggml_flash_attn_ext_get_kv_split_n_tail(
+            const struct ggml_tensor * a);
+
     // qwen4exp QSA sparse attention: attend only over the cells that the
     // indexer's top-k names, instead of the whole KV cache.  The mask is the
     // base kq_mask and is gathered in-kernel at the idx positions.

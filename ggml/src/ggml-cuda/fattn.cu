@@ -900,9 +900,36 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// wip/kv-residency (TODO #118) A1: report which kernel family serves a split op, once per family, so a
+// gate can state that coverage actually reached the shapes it claims.  Diagnostic only.
+static void ggml_cuda_fattn_kv_split_report(const best_fattn_kernel kernel, const ggml_tensor * dst) {
+    static const bool enabled = getenv("GGML_CUDA_FA_SPLIT_DEBUG") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    const int32_t n_tail = ggml_flash_attn_ext_get_kv_split_n_tail(dst);
+    if (n_tail <= 0) {
+        return;
+    }
+    static bool seen[4] = {false, false, false, false};
+    const int idx = kernel == BEST_FATTN_KERNEL_TILE ? 1 : kernel == BEST_FATTN_KERNEL_MMA_F16 ? 2 : kernel == BEST_FATTN_KERNEL_VEC ? 3 : 0;
+    if (seen[idx]) {
+        return;
+    }
+    seen[idx] = true;
+    GGML_LOG_WARN("FA_KV_SPLIT kernel=%s n_tail=%d n_kv=%lld n_q=%lld type_K=%s\n",
+        kernel == BEST_FATTN_KERNEL_TILE ? "tile" : kernel == BEST_FATTN_KERNEL_MMA_F16 ? "mma-f16" :
+        kernel == BEST_FATTN_KERNEL_VEC  ? "vec"  : "none",
+        (int) n_tail, (long long) dst->src[1]->ne[1], (long long) dst->src[0]->ne[1],
+        ggml_type_name(dst->src[1]->type));
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    // one chooser evaluation (it is on the per-op host path)
+    const best_fattn_kernel best = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    ggml_cuda_fattn_kv_split_report(best, dst);
+    switch (best) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

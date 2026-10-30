@@ -780,7 +780,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         const int k_VKQ_sup,
         const int k_KQ_0,
         float * KQ_acc,
-        const fattn_kv_native_t kv_q8) {
+        const fattn_kv_native_t kv_q8,
+        // wip/kv-residency (TODO #118) A1: the two-base K/V read (see fattn_kv_split_t)
+        const fattn_kv_split_t kv_split) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -788,17 +790,26 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
 
+    // A1 two-base K/V read: this iteration's KV tile is entirely inside one segment (n_tail is a
+    // multiple of nbatch_fa and the iteration starts on an nbatch_fa boundary), so one base covers
+    // the whole tile.  With no split this is the head base, unchanged.
+    const char * K_seg = fattn_kv_split_sel(reinterpret_cast<const char *>(K_h2),
+                                            kv_split.K_tail, kv_split.n_tail, k_VKQ_0);
+
     // Issue #30 item 2: this must test the same set the native dequant loaders support, i.e. the
     // kernels' compile-time K/V type, not a hand-written list -- when this tested only q8_0/q4_0,
     // the q4_1/q5_0/q5_1/iq4_nl instantiations took the F16 branch and read a staging buffer that
     // need_f16_K == false had left unwritten (NaN in the KQ dot product).
     if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_KV>() != FATTN_KV_NATIVE_NONE) {
         // V4: read and dequantize the raw quantized cache rows instead of an F16 staging copy.
+        // A1: the native row base is byte-addressed, so the segment base is used directly.
+        const char * const K_row0 = kv_split.n_tail > 0 && k_VKQ_0 < kv_split.n_tail ?
+            kv_split.K_tail : kv_q8.K;
         flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
-            (kv_q8.K + int64_t(k_VKQ_0)*kv_q8.stride_K, KV_tmp, kv_q8.stride_K, k_KQ_0, k_VKQ_sup);
+            (K_row0 + int64_t(k_VKQ_0)*kv_q8.stride_K, KV_tmp, kv_q8.stride_K, k_KQ_0, k_VKQ_sup);
     } else {
         flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
-            (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+            (reinterpret_cast<const T_KV *>(K_seg) + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
     }
     __syncthreads();
 
@@ -932,7 +943,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         const int k_VKQ_0,
         const int k_VKQ_max,
         const int col_Q_0,
-        const fattn_kv_native_t kv_q8) {
+        const fattn_kv_native_t kv_q8,
+        // wip/kv-residency (TODO #118) A1: the two-base K/V read (see fattn_kv_split_t)
+        const fattn_kv_split_t kv_split) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -956,6 +969,11 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     static_assert(cpw % KQ_cs == 0, "bad KQ_cs");
     const int k_VKQ_sup = k_VKQ_max - k_VKQ_0; // k supremum, only smaller k values have valid KV data
 
+    // A1: the V side of this iteration's tile (one base covers the whole tile -- see the K side in
+    // flash_attn_tile_iter_KQ).  With no split this is the head base, unchanged.
+    const char * V_seg = fattn_kv_split_sel(reinterpret_cast<const char *>(V_h2),
+                                            kv_split.V_tail, kv_split.n_tail, k_VKQ_0);
+
     float KQ_max_new[cpw];
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
@@ -969,12 +987,12 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>(
-            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8);
+            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8, kv_split);
     }
     if (nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
         flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, type_KV>(
-            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8);
+            Qg_base, q_row, Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, kv_q8, kv_split);
     }
 
     // Apply logit softcap + mask, update KQ_max:
@@ -1120,11 +1138,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
         if constexpr (ggml_cuda_fattn_native_type_from_kernel<type_KV>() != FATTN_KV_NATIVE_NONE) {
+            const char * const V_row0 = kv_split.n_tail > 0 && k_VKQ_0 < kv_split.n_tail ?
+                kv_split.V_tail : kv_q8.V;
             flash_attn_tile_load_tile_native<type_KV, warp_size, nwarps, nbatch_V, DV, 0, oob_check>
-                (kv_q8.V + int64_t(k_VKQ_0 + k0)*kv_q8.stride_V, KV_tmp, kv_q8.stride_V, 0, k_VKQ_sup - k0);
+                (V_row0 + int64_t(k_VKQ_0 + k0)*kv_q8.stride_V, KV_tmp, kv_q8.stride_V, 0, k_VKQ_sup - k0);
         } else {
             flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
-                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+                (reinterpret_cast<const T_KV *>(V_seg) + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
         }
         __syncthreads();
 
@@ -1311,7 +1331,9 @@ static __global__ void flash_attn_tile(
                             const int, const int,
                             // wip/fa-stage-chunking (TODO #114): the per-row partial contract is
                             // MMA-prefill only; the tile kernel keeps its single whole-prefix launch.
-                            float2 *, const int) {
+                            float2 *, const int,
+                            // A1 two-base K/V read (see fattn_kernel_t)
+                            const char * K_tail_ptr, const char * V_tail_ptr, const int n_tail) {
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
@@ -1373,6 +1395,12 @@ static __global__ void flash_attn_tile(
         kv_native_self,
         kv_native_self,
     };
+
+    // A1 two-base K/V read: the tail segment's bases for this (sequence, KV head), 0 when the op
+    // carries no split (see fattn_kv_split_t)
+    const fattn_kv_split_t kv_split = fattn_kv_split_make(
+        K_tail_ptr, V_tail_ptr, n_tail,
+        nb13, nb12, nb23, nb22, sequence, head0 / gqa_ratio, false);
 
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
 
@@ -1550,14 +1578,14 @@ static __global__ void flash_attn_tile(
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0_cur, k_VKQ_max, col_Q_0, kv_q8);
+                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0_cur, k_VKQ_max, col_Q_0, kv_q8, kv_split);
         }
         if (k_VKQ_0 < k_VKQ_max &&
                 !(kq_blocks != nullptr && fattn_kq_group_masked(kq_blocks_tile, k_VKQ_0/nbatch_fa, nbatch_fa))) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
+                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8, kv_split);
         }
     } else {
         // Branch without out-of-bounds checks.  The last tile may extend past k_VKQ_max, where the
@@ -1577,14 +1605,14 @@ static __global__ void flash_attn_tile(
                 constexpr bool oob_check_tail = true;
                 flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check_tail, type_KV>
                     (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                    stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
+                    stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8, kv_split);
                 continue;
             }
 #endif // defined(RDNA2)
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_KV>
                 (Qg_base, q_row, Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8);
+                stride_K2, stride_V2, stride_mask, derived, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, kv_q8, kv_split);
         }
     }
 
