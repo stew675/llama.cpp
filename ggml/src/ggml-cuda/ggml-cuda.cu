@@ -2670,10 +2670,36 @@ static enum ggml_status ggml_backend_cuda_kv_region_init_tensor(ggml_backend_buf
         return GGML_STATUS_SUCCESS;
     }
 
-    // A2 mixed backing: nothing is mapped here.  The mapping follows the CELL WATERMARK (grow_cells below),
-    // so a short run pins only the tail cells it actually reaches -- mapping the whole extent at placement
-    // would pin the entire spill (7 GiB on a 27B at -c 262144) for a 50k-token run.  The padding memset
-    // below is therefore skipped at this point; clear-on-map covers it (see `map_span`).
+    // A2 the windowed KV: commit the RESIDENT WINDOW's VRAM here, at buffer creation, and nothing else.
+    //
+    // This is not an optimisation, it is the ordering rule (`O2-PLAN.md` §6.2): the slab maps
+    // `free VRAM - reserve` at SLAB_INIT and the KV buffer is created just before it, so whatever the window
+    // will need must already be committed or the arena takes it -- and then the first slide forward has no
+    // physical to map, which aborts the batch (measured: Flash-Next `-c 65536 -W 32768`, `free=0.0 MiB`,
+    // `growth refused`).  The steady-state footprint of the window is exactly W cells, and the slide keeps it
+    // there (it flips the trailing unit to host *before* mapping a new one above), so committing W cells now
+    // is the whole of what the window will ever hold.
+    //
+    // The HOST side is still lazy: `grow_cells` maps the spill only as far as the cell watermark actually
+    // reaches, so a short run pins only the tail it uses (7 GiB on a 27B at -c 262144 would otherwise be
+    // pinned for a 50k-token run).
+    if (ctx->kv_resident_cells != 0 && tensor->nb[1] != 0) {
+        const size_t cells  = ctx->kv_resident_cells < (size_t) tensor->ne[1] ? ctx->kv_resident_cells
+                                                                             : (size_t) tensor->ne[1];
+        const size_t window = cells * tensor->nb[1];
+        const size_t off_t  = (size_t) ((char *) tensor->data - (char *) ctx->dev_ptr);
+        ggml_cuda_set_device(ctx->device);
+        for (int64_t st = 0; st < tensor->ne[2]; ++st) {
+            const size_t off = off_t + (size_t) st * tensor->nb[2];
+            if (!ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off, window, /*host=*/ false)) {
+                GGML_LOG_ERROR("%s: the KV window (%.2f MiB) could not be committed in VRAM on device %d; the "
+                               "windowed KV needs that room at SLAB_INIT\n", __func__, window / 1048576.0, ctx->device);
+            }
+        }
+    }
+
+    // The byte watermark (`grow_cells`) maps the rest; the padding memset below is skipped at this point and
+    // clear-on-map covers it (see `map_span`).
     // remember the layout: `nb[1]` is one cell, `nb[2]` one stream, `off` the tensor's place in the region
     ggml_backend_cuda_buffer_context::vmm_tens t;
     t.off = (size_t) ((char *) tensor->data - (char *) ctx->dev_ptr);
