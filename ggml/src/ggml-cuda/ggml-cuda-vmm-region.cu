@@ -14,19 +14,29 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <vector>
+
+// One mapping.  Mixed backing (A2) needs mappings of *different* sizes inside one reservation -- a 2 MiB
+// bulk and a 4 KiB-granular segment boundary -- so the extent is a table, not a per-unit bitmap.  `maps` is
+// kept sorted by `off` with no overlaps and no two entries touching (a request that would extend an existing
+// mapping is coalesced), which is what makes `is_mapped` a scan and `free` one unmap per entry.
+struct vmm_mapping {
+    size_t off   = 0;
+    size_t bytes = 0;
+    bool   host  = false;   // backed by pinned system RAM instead of VRAM
+};
 
 struct ggml_cuda_vmm_region {
     int      device  = -1;
     int      phys    = -1;
     size_t   size    = 0;   // the VA reservation
-    size_t   unit    = 0;   // map granularity (mapping is always a whole number of units)
-    size_t   n_units = 0;   // size / unit -- the bitmap's length
-    size_t   mapped  = 0;   // bytes mapped (a count, not a watermark: the set can have holes)
+    size_t   unit    = 0;   // bulk map granularity (`unit`-sized steps by default)
+    size_t   gran    = 0;   // the driver's MINIMUM granularity (4 KiB): what a boundary must align to
+    size_t   mapped  = 0;   // bytes mapped (device + host)
+    size_t   mapped_host = 0;
     void *   base    = nullptr;
-    // One byte per unit: is that unit mapped (and therefore cleared)?  `size / unit` is a few KiB even for a
-    // 16 GiB region at 2 MiB units, and it makes `is_mapped()` a pure range scan with no driver call.
-    std::vector<uint8_t> unit_map;
+    std::vector<vmm_mapping> maps;
 };
 
 namespace {
@@ -39,6 +49,30 @@ size_t vmm_up(size_t x, size_t a) {
 // RECOMMENDED granularity) and latched whether the driver offers VMM at all, so there is no second query
 // and no need for the `CUresult`/`CU_MEM_ALLOC_GRANULARITY_MINIMUM` macros -- which `vendors/hip.h` does
 // not map (only the RECOMMENDED one), and adding them would touch a header every backend compiles.
+// The driver's MINIMUM map granularity (4 KiB on gfx1201).  A mapping must be a whole multiple of it, and a
+// mixed-backing segment boundary is aligned to it.  Cached: two driver round trips per process at most.
+size_t vmm_granularity_min(int device) {
+    static size_t cache[GGML_CUDA_MAX_DEVICES] = {};
+    static bool   done [GGML_CUDA_MAX_DEVICES] = {};
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || !ggml_cuda_info().devices[device].vmm) {
+        return 0;
+    }
+    if (done[device]) {
+        return cache[device];
+    }
+    done[device] = true;
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = ggml_cuda_get_physical_device(device);
+    size_t g = 0;
+    if (cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != cudaSuccess || g == 0) {
+        (void) cudaGetLastError();
+        g = (size_t) 2 << 20;   // conservative fallback: the recommended granularity
+    }
+    return cache[device] = g;
+}
+
 size_t vmm_granularity(int device) {
     const ggml_cuda_device_info & info = ggml_cuda_info();
     if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || !info.devices[device].vmm) {
@@ -51,11 +85,14 @@ size_t vmm_granularity(int device) {
 // Map `bytes` of fresh physical at `addr` and grant READWRITE to the owner, then each peer on its own
 // (best effort -- a refused peer descriptor must not fail the mapping; the slab's helper documents the
 // `-sm tensor` fault that taught that).  The handle is released after a successful map.
-bool vmm_map(ggml_cuda_vmm_region * r, size_t addr_off, size_t bytes) {
+bool vmm_map(ggml_cuda_vmm_region * r, size_t addr_off, size_t bytes, bool host = false) {
     CUmemAllocationProp prop = {};
     prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id   = r->phys;
+    // A host-location handle is pinned system RAM granted device access: the device can read AND write it
+    // (measured: 28.4 GB/s, both directions, through the copy engine too), which is why mixed backing needs
+    // no kernel change.  Same code path otherwise -- a VMM mapping is a VMM mapping.
+    prop.location.type = host ? CU_MEM_LOCATION_TYPE_HOST : CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = host ? 0 : r->phys;
 
     CUmemGenericAllocationHandle handle = 0;
     if (cuMemCreate(&handle, bytes, &prop, 0) != cudaSuccess) {
@@ -135,9 +172,12 @@ ggml_cuda_vmm_region * ggml_cuda_vmm_region_create(int device, size_t bytes, siz
     r->device = device;
     r->phys   = phys;
     r->unit   = u;
+    r->gran   = vmm_granularity_min(device);
+    if (r->gran == 0) {
+        r->gran = gran;   // the recommended granularity: always legal, just coarser
+    }
     r->size   = vmm_up(bytes, u);
-    r->n_units = r->size / u;
-    r->unit_map.assign(r->n_units, 0);
+    r->maps.reserve(1024);
 
     CUdeviceptr base = 0;
     if (cuMemAddressReserve(&base, r->size, 0, 0, 0) != cudaSuccess) {
@@ -153,7 +193,49 @@ ggml_cuda_vmm_region * ggml_cuda_vmm_region_create(int device, size_t bytes, siz
     return r;   // nothing is mapped yet: mapped == 0
 }
 
-bool ggml_cuda_vmm_region_grow_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes) {
+namespace {
+
+// Is [off, off + bytes) covered by one mapping, and is that mapping host-backed?  (Mappings never overlap,
+// so "covered" means exactly one entry contains the whole range.)
+bool vmm_find(const ggml_cuda_vmm_region * r, size_t off, size_t bytes, size_t * end, bool * host) {
+    for (const vmm_mapping & m : r->maps) {
+        if (m.off > off) {
+            return false;   // sorted: nothing later can cover it
+        }
+        if (off - m.off < m.bytes) {
+            if (bytes > m.bytes - (off - m.off)) {
+                return false;   // starts inside a mapping but runs past its end
+            }
+            if (end  != nullptr) { *end  = m.off + m.bytes; }
+            if (host != nullptr) { *host = m.host; }
+            return true;
+        }
+    }
+    return false;
+}
+
+// Insert a mapping and keep the table sorted and coalesced.
+void vmm_insert(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host) {
+    size_t i = 0;
+    while (i < r->maps.size() && r->maps[i].off < off) { ++i; }
+    r->maps.insert(r->maps.begin() + (long) i, vmm_mapping{off, bytes, host});
+    // coalesce with the neighbours when they touch and share a kind
+    for (size_t k = 0; k + 1 < r->maps.size(); ) {
+        if (r->maps[k].host == r->maps[k+1].host && r->maps[k].off + r->maps[k].bytes >= r->maps[k+1].off) {
+            r->maps[k].bytes = std::max(r->maps[k].bytes, r->maps[k+1].off + r->maps[k+1].bytes - r->maps[k].off);
+            r->maps.erase(r->maps.begin() + (long) (k+1));
+            if (k > 0) { --k; }
+            continue;
+        }
+        ++k;
+    }
+    r->mapped += bytes;
+    if (host) { r->mapped_host += bytes; }
+}
+
+}  // namespace
+
+bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host) {
     if (r == nullptr) {
         return false;
     }
@@ -163,34 +245,56 @@ bool ggml_cuda_vmm_region_grow_span(ggml_cuda_vmm_region * r, size_t off, size_t
     if (off > r->size || bytes > r->size - off) {
         return false;   // outside the reservation -- the caller sized the region for its own extent
     }
-    // Whole units only: a sub-range of a mapping cannot be unmapped later (VMM-PROBE T5), so the mapping
-    // granularity is the unit and every span is rounded OUTWARDS to it.  Rounding outwards can only touch
-    // more VA than asked for, never a byte outside the reservation (`last` is clamped).
-    const size_t first = off / r->unit;
-    size_t       last  = (off + bytes + r->unit - 1) / r->unit;
-    if (last > r->n_units) {
-        last = r->n_units;
-    }
-    for (size_t u = first; u < last; ++u) {
-        if (r->unit_map[u] != 0) {
-            continue;   // already mapped (and cleared once): never re-clear, data must survive
+    // Round OUTWARD to the driver's minimum granularity (a host mapping must be a whole multiple of it, and a
+    // mixed-backing boundary is 4 KiB-granular), then map in <=`unit` pieces.  Rounding outward can only touch
+    // more VA than asked for, never a byte outside the reservation.
+    const size_t g  = r->gran != 0 ? r->gran : (size_t) 4096;
+    size_t a = (off / g) * g;
+    size_t b = vmm_up(off + bytes, g);
+    if (b > r->size) { b = r->size; }
+
+    while (a < b) {
+        size_t next = 0;
+        if (vmm_find(r, a, 1, &next, nullptr)) {
+            a = next;                 // already mapped: skip it (the driver refuses a re-map)
+            continue;
         }
-        const size_t addr_off = u * r->unit;
-        if (!vmm_map(r, addr_off, r->unit)) {
-            // Leave what did map: those bytes are valid and cleared, so the caller can still run on a shorter
-            // extent instead of falling over.
-            return false;
+        size_t n = r->unit;
+        // do not step over an existing mapping
+        for (const vmm_mapping & m : r->maps) {
+            if (m.off > a && m.off - a < n) { n = m.off - a; }
         }
-        r->unit_map[u] = 1;
-        r->mapped += r->unit;
-        // A fresh mapping can contain stale bytes (measured), so clear exactly what was just mapped.  The
-        // write runs at VRAM speed (~490 GB/s measured, no fault storm), so this is not a real cost.
-        if (cudaMemset((char *) r->base + addr_off, 0, r->unit) != cudaSuccess) {
+        if (b - a < n) { n = b - a; }
+        if (!vmm_map(r, a, n, host)) {
+            return false;             // leave what did map: those bytes are valid and cleared
+        }
+        vmm_insert(r, a, n, host);
+        // A fresh mapping can contain stale bytes (measured), so clear exactly what was just mapped.
+        if (cudaMemset((char *) r->base + a, 0, n) != cudaSuccess) {
             (void) cudaGetLastError();
             return false;
         }
+        a += n;
     }
     return true;
+}
+
+bool ggml_cuda_vmm_region_grow_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes) {
+    if (r == nullptr) {
+        return false;
+    }
+    if (bytes == 0) {
+        return true;
+    }
+    if (off > r->size || bytes > r->size - off) {
+        return false;
+    }
+    // O1's form: whole `unit` chunks, rounded outward, VRAM-backed.  Kept for the O1 buffer type and the
+    // selftest; mixed backing (A2) calls `map_span` directly with its own granularity.
+    const size_t a = (off / r->unit) * r->unit;
+    size_t b = vmm_up(off + bytes, r->unit);
+    if (b > r->size) { b = r->size; }
+    return ggml_cuda_vmm_region_map_span(r, a, b - a, false);
 }
 
 bool ggml_cuda_vmm_region_grow(ggml_cuda_vmm_region * r, size_t used_bytes) {
@@ -213,28 +317,19 @@ bool ggml_cuda_vmm_region_is_mapped(const ggml_cuda_vmm_region * r, size_t off, 
     if (off > r->size || bytes > r->size - off) {
         return false;
     }
-    const size_t first = off / r->unit;
-    size_t       last  = (off + bytes + r->unit - 1) / r->unit;
-    if (last > r->n_units) {
-        last = r->n_units;
-    }
-    for (size_t u = first; u < last; ++u) {
-        if (r->unit_map[u] == 0) {
-            return false;
-        }
-    }
-    return true;
+    return vmm_find(r, off, bytes, nullptr, nullptr);
 }
+
+size_t ggml_cuda_vmm_region_mapped_host(const ggml_cuda_vmm_region * r) { return r != nullptr ? r->mapped_host : 0; }
+
+size_t ggml_cuda_vmm_region_granularity(int device) { return vmm_granularity_min(device); }
 
 void ggml_cuda_vmm_region_clear(ggml_cuda_vmm_region * r, uint8_t value) {
     if (r == nullptr) {
         return;
     }
-    for (size_t u = 0; u < r->n_units; ++u) {
-        if (r->unit_map[u] == 0) {
-            continue;
-        }
-        if (cudaMemset((char *) r->base + u * r->unit, value, r->unit) != cudaSuccess) {
+    for (const vmm_mapping & m : r->maps) {
+        if (cudaMemset((char *) r->base + m.off, value, m.bytes) != cudaSuccess) {
             (void) cudaGetLastError();
             return;
         }
@@ -250,15 +345,14 @@ void ggml_cuda_vmm_region_free(ggml_cuda_vmm_region * r) {
     if (r == nullptr) {
         return;
     }
-    // A mapping is a whole unit and units are disjoint, so the mapped set is unmapped unit by unit -- there is
-    // never a sub-range unmap (which the driver refuses, VMM-PROBE T5).
-    for (size_t u = 0; u < r->n_units; ++u) {
-        if (r->unit_map[u] != 0) {
-            vmm_unmap(r, u * r->unit, r->unit);
-            r->unit_map[u] = 0;
-        }
+    // One unmap per mapping, each of a whole mapping -- never a sub-range (which the driver refuses,
+    // VMM-PROBE T5).  Mixed backing's small boundary mappings are unmapped exactly like the bulk ones.
+    for (const vmm_mapping & m : r->maps) {
+        vmm_unmap(r, m.off, m.bytes);
     }
+    r->maps.clear();
     r->mapped = 0;
+    r->mapped_host = 0;
     if (r->base != nullptr) {
         if (cuMemAddressFree((CUdeviceptr) (uintptr_t) r->base, r->size) != cudaSuccess) {
             (void) cudaGetLastError();
@@ -426,12 +520,36 @@ bool ggml_cuda_vmm_region_selftest(int device) {
     check(!ggml_cuda_vmm_region_grow_span(r, 5 * unit, 2 * unit), "a span past the reservation is refused");
     check(!ggml_cuda_vmm_region_is_mapped(r, 0, n_units * unit), "the reserved tail stays unmapped");
 
+    // MIXED BACKING (A2): the same reservation, a span backed by PINNED SYSTEM RAM instead of VRAM.  The
+    // device must be able to WRITE it (the KV's set_rows path) and read it back -- that is the whole
+    // capability the windowed KV rests on (wip/kv-residency/mixed-backing-probe.cc measured 28.4 GB/s).
+    {
+        const size_t off = 3 * unit;   // the gap the span checks left unmapped
+        const bool mapped_host = ggml_cuda_vmm_region_map_span(r, off, unit, /*host=*/ true);
+        check(mapped_host, "a HOST-backed span maps into the same reservation");
+        if (mapped_host) {
+            check(ggml_cuda_vmm_region_is_mapped(r, off, unit), "the host span reads as mapped");
+            check(ggml_cuda_vmm_region_mapped_host(r) == unit, "the host-backed byte count");
+            st_fill_kernel<<<256, 256>>>((uint32_t *) ((char *) ggml_cuda_vmm_region_base(r) + off), unit / 4, 0x3c3c3c3cu);
+            check(cudaDeviceSynchronize() == cudaSuccess, "the device writes the host-backed span");
+            (void) cudaMemset(d_bad, 0, sizeof(int));
+            st_check_kernel<<<256, 256>>>((const uint32_t *) ((char *) ggml_cuda_vmm_region_base(r) + off), unit / 4,
+                    0x3c3c3c3cu, d_bad);
+            int bad = -1;
+            (void) cudaDeviceSynchronize();
+            (void) cudaMemcpy(&bad, d_bad, sizeof(int), cudaMemcpyDeviceToHost);
+            check(bad == 0, "the device reads back what it wrote to the host-backed span");
+            // a host span must not disturb its VRAM neighbour
+            if (ok) { check(st_units_are(r, 1, 0x5a5a5a5au, d_bad, "VRAM unit 0 after the host span"), "VRAM unit 0 intact"); }
+        }
+    }
+
     // and it must survive its own teardown (with holes in the mapped set)
     ggml_cuda_vmm_region_free(r);
     (void) cudaFree(d_bad);
 
     GGML_LOG_INFO("%s: device %d: %s (reserved %zu MiB in %zu x %zu MiB units, prefix + span growth, "
-                  "the watermark contract and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
+                  "a HOST-backed span, the watermark contract and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
                   (n_units * unit) >> 20, n_units, unit >> 20);
     return ok;
 }

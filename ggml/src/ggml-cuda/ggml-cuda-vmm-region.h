@@ -51,6 +51,28 @@ ggml_cuda_vmm_region * ggml_cuda_vmm_region_create(int device, size_t bytes, siz
 // bytes are valid and cleared, so a caller can still run on a shorter extent).
 bool ggml_cuda_vmm_region_grow(ggml_cuda_vmm_region * r, size_t used_bytes);
 
+// wip/kv-residency (TODO #118) A2: map [off, off + bytes) from PINNED SYSTEM RAM instead of VRAM.
+//
+// This is what makes a *windowed* KV possible without touching a kernel: one VA reservation, the resident
+// cells backed by device memory and the tail by host pages, so every existing cell-walking path (the
+// set_rows writers, the in-place rope shift behind defrag/seq_add, state save/restore, clear) keeps
+// addressing one contiguous range.  Measured on gfx1201 / ROCm 10.1.0 (`wip/kv-residency/mixed-backing-probe.cc`):
+// the device reads a host-backed chunk at 28.4 GB/s (the link), WRITES it, the copy engine copies both
+// directions across the boundary, and 3264 x 2 MiB host chunks map without a failure.
+//
+// Granularity: a host mapping must be a multiple of the driver's MINIMUM granularity (4 KiB here, not the
+// 2 MiB recommended one), so this rounds [off, off + bytes) OUTWARD to `gran` and maps it in <=`unit` pieces.
+// Ranges never overlap: a byte already mapped is skipped (re-mapping it would be refused by the driver).
+// Same fail-soft contract as the rest of this file (false = the driver refused, nothing half-created).
+bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host);
+
+// Bytes of the mapped extent that are host-backed (the spill), for reporting.
+size_t ggml_cuda_vmm_region_mapped_host(const ggml_cuda_vmm_region * r);
+
+// The driver's MINIMUM map granularity in bytes (4 KiB here); 0 when VMM is unavailable.  A mixed-backing
+// caller aligns its segment boundary to this.
+size_t ggml_cuda_vmm_region_granularity(int device);
+
 // Map whole units covering [off, off + bytes) and clear what it maps; a unit already mapped is left alone
 // (and never re-cleared, so data survives).  Same monotone/false semantics as `grow()`.  This is the form a
 // consumer with a strided layout uses: the mapped extent is a SET of spans, not a single watermark.
