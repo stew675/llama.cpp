@@ -182,6 +182,13 @@ public:
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
 
+    // wip/kv-residency (TODO #118) B2: is this cache's KV STREAMING at the extent `n_kv` -- i.e. is a
+    // resident window active and has the used extent passed it, so that the tail of every tensor lives in
+    // pinned host RAM?  A read of a spilled cell comes over the PCIe link (~55 GB/s) instead of VRAM
+    // (~565 GB/s), which is what makes the attention ARM worth switching (a streamed cache prefers the
+    // sparse QSA decode, a resident one the dense arm; wip/kv-residency/B1-STRATA-PLAN.md §3.2).
+    bool is_streaming(uint32_t n_kv) const;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -468,6 +475,9 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // wip/kv-residency (TODO #118) B2: see llama_kv_cache::is_streaming
+    bool is_streaming(uint32_t n_kv) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
