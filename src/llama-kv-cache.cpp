@@ -402,6 +402,24 @@ llama_kv_cache::llama_kv_cache(
     //   (K and V included).  Anything else DECLINES the window -- no spill, today's fit-or-fail -- not a guess.
     if (llama_kv_region_enabled() && other == nullptr && !v_trans && !hparams.no_alloc) {
         uint32_t w = llama_kv_region_resident_cells_requested();
+        // wip/kv-residency (TODO #118) B1 DIAGNOSTIC -- campaign branch only, never shipped.
+        // A per-cache window override, so an arm can spill the ATTENTION KV while the INDEXER cache stays
+        // fully resident (or the reverse).  The indexer cache is scored over EVERY block, so it cannot be
+        // streamed cheaply; isolating its share of a spill's cost is what B1 needs
+        // (../llama-cpp-rdna-boosts/wip/kv-residency/B1-STRATA-PLAN.md §5).  The indexer cache is created
+        // with the "idx_" name tag (llama-memory-hybrid-idx.cpp).  `0` = no window for that cache (fully
+        // resident).  Unset = the global `LLAMA_KV_RESIDENT_CELLS` for both, i.e. the shipped behaviour.
+        {
+            const bool  is_idx = strncmp(name_tag, "idx_", 4) == 0;
+            const char * e     = getenv(is_idx ? "LLAMA_KV_RESIDENT_CELLS_IDX" : "LLAMA_KV_RESIDENT_CELLS_ATTN");
+            if (e != nullptr && e[0] != '\0') {
+                const long v = atol(e);
+                LLAMA_LOG_WARN("%s: DIAGNOSTIC: the %s cache's window is %ld cells (%s=%s), not the global %u\n",
+                        __func__, is_idx ? "indexer" : "attention", v > 0 ? v : 0,
+                        is_idx ? "LLAMA_KV_RESIDENT_CELLS_IDX" : "LLAMA_KV_RESIDENT_CELLS_ATTN", e, w);
+                w = v > 0 ? (uint32_t) v : 0;
+            }
+        }
         // A window needs a per-device VMM region buffer type, and the backend answers for it through the
         // device's own backend reg.  A Meta (tensor-split) device has none (`-sm tensor` combines the plain
         // per-device buffer types), so a tensor split cannot carry the window at all.
