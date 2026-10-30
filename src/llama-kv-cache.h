@@ -139,6 +139,12 @@ public:
 
     void clear(bool data) override;
 
+    // wip/kv-residency (TODO #117): map the growable KV region so the first `n_kv` cells of every KV tensor are
+    // backed by physical memory.  `n_kv` must be the value the graph views use -- the PADDED one from
+    // `get_n_kv()` -- because a kernel that reads a cell above the mapped extent faults the GPU rather than
+    // returning an error.  A no-op unless the KV is region-backed (LLAMA_KV_REGION).
+    void grow_regions(uint32_t n_kv) const;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -334,6 +340,16 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // wip/kv-residency (TODO #117): is a buffer of this cache backed by a growable VMM region (provider P1)?
+    // Set once at construction from the backend's answer, and `grow_regions()` is then called with the extent
+    // the graph is about to read/write.  Zero cost (and no proc lookup) when the feature is off.
+    bool kv_region = false;
+
+    // wip/kv-residency (TODO #118) A2/A3: the windowed KV's resident window, in CELLS (0 = no window).
+    // `memory_breakdown()` reports only the resident part against the device buffer type, because that is
+    // all the buffer ever COMMITS -- the rest is pinned host memory.
+    size_t kv_resident_cells = 0;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
