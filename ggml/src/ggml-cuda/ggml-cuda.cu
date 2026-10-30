@@ -2592,6 +2592,41 @@ static int ggml_backend_cuda_kv_region_is_kv_buft(ggml_backend_buffer_type_t buf
     return buft != nullptr && buft->iface.alloc_buffer == ggml_backend_cuda_kv_region_buffer_type_alloc_buffer;
 }
 
+// wip/kv-residency (TODO #118) DIAGNOSTIC: `LLAMA_KV_REGION_SPILL_SKIP=<i,j,...>` keeps the listed TENSORS
+// (indices into a buffer's tensor list, in creation order -- `LLAMA_KV_REGION_DEBUG=1` prints the growth per
+// tensor) fully resident, so one tensor's spill can be isolated.  It exists to bisect the open finding in
+// `wip/kv-residency/A2-MIXED-BACKING.md` §3.7.6 (a spilled KV changes the numbers on a 27B).  Never a shipping
+// knob: unset is the shipped behaviour, and a skip list that covers every tensor is the "no spill" control.
+static bool ggml_cuda_kv_spill_skip(int tensor_index) {
+    static const std::vector<int> skip = [] {
+        std::vector<int> v;
+        const char * e = getenv("LLAMA_KV_REGION_SPILL_SKIP");
+        if (e == nullptr || e[0] == '\0') {
+            return v;
+        }
+        const char * p = e;
+        while (*p != '\0') {
+            char * end = nullptr;
+            const long x = strtol(p, &end, 10);
+            if (end == p) {
+                break;
+            }
+            v.push_back((int) x);
+            p = end;
+            while (*p == ',' || *p == ' ') { ++p; }
+        }
+        GGML_LOG_WARN("%s: DIAGNOSTIC: %zu tensor(s) stay fully resident (LLAMA_KV_REGION_SPILL_SKIP)\n",
+                      __func__, v.size());
+        return v;
+    }();
+    for (int x : skip) {
+        if (x == tensor_index) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int ggml_cuda_kv_spill_ram_pct(void) {
     const char * e = getenv("LLAMA_KV_SPILL_RAM_PCT");
     if (e == nullptr || e[0] == '\0') {
@@ -2694,6 +2729,9 @@ static void ggml_backend_cuda_kv_region_log(const char * what, ggml_backend_cuda
                    (need_off >> 20), ((need_off + need_bytes) >> 20), (ggml_cuda_kv_region_map_cap() >> 20));
 }
 
+// wip/kv-residency: the diagnostic skip list (defined with the spill ceiling, below).
+static bool ggml_cuda_kv_spill_skip(int tensor_index);
+
 // Grow the region so the first `n_cells` cells of every tensor it holds are mapped.  This is the extent the
 // graph views read and write: `llama_kv_cache` sizes its views by the PADDED n_kv (`get_n_kv`), so growing
 // to the used cells instead would leave a kernel reading unmapped VA.
@@ -2737,7 +2775,8 @@ static int ggml_backend_cuda_kv_region_grow_cells(ggml_backend_buffer_t buffer, 
         if (lead_bytes > used_unit) { lead_bytes = used_unit; }
         if (lead_bytes < ctx->kv_lead_bytes) { lead_bytes = ctx->kv_lead_bytes; }
 
-        for (const auto & t : ctx->vmm_tensors) {
+        for (size_t it = 0; it < ctx->vmm_tensors.size(); ++it) {
+            const auto & t = ctx->vmm_tensors[it];
             const size_t used_bytes = (size_t) n_cells * t.nb1;
             if (used_bytes == 0) {
                 continue;
@@ -2745,6 +2784,9 @@ static int ggml_backend_cuda_kv_region_grow_cells(ggml_backend_buffer_t buffer, 
             // the VRAM extent is rounded UP to a whole unit (never past the tensor), so every mapping this
             // region makes ends on the unit grid the spill boundary is quantised to
             const size_t used_up = std::min(((used_bytes + unit - 1) / unit) * unit, (size_t) t.cells * t.nb1);
+            // diagnostic: a listed tensor never spills (so its cells are all VRAM, and its "boundary" is 0)
+            const size_t lead_t    = ggml_cuda_kv_spill_skip((int) it) ? 0 : lead_bytes;
+            const size_t lead_cur  = ggml_cuda_kv_spill_skip((int) it) ? 0 : ctx->kv_lead_bytes;
             for (int64_t st = 0; st < t.ne2; ++st) {
                 const size_t off = t.off + (size_t) st * t.nb2;
                 if (cap != 0 && off + used_up > cap) {
@@ -2752,22 +2794,22 @@ static int ggml_backend_cuda_kv_region_grow_cells(ggml_backend_buffer_t buffer, 
                     return -1;
                 }
                 // 1. hand the newly-spilled leading cells to system RAM (the slide's forward step)
-                if (lead_bytes > ctx->kv_lead_bytes) {
-                    const size_t spill_bytes = lead_bytes - ctx->kv_lead_bytes;
+                if (lead_t > lead_cur) {
+                    const size_t spill_bytes = lead_t - lead_cur;
                     // item 3 of the campaign's owed list: the spill is PINNED, non-swappable RAM.  Ask the
                     // ceiling first so a run that is about to exhaust RAM says so instead of being OOM-killed.
                     if (!ggml_cuda_kv_spill_allow(spill_bytes)) {
                         return -1;
                     }
-                    if (!ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + ctx->kv_lead_bytes,
+                    if (!ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + lead_cur,
                                 spill_bytes, /*host=*/ true)) {
-                        ggml_backend_cuda_kv_region_log("host growth", ctx, ctx->vmm_region, off + ctx->kv_lead_bytes,
+                        ggml_backend_cuda_kv_region_log("host growth", ctx, ctx->vmm_region, off + lead_cur,
                                 spill_bytes);
                         return -1;
                     }
                 }
                 // 2. map the newly-used resident cells in VRAM
-                const size_t from = std::max(ctx->kv_dev_bytes, lead_bytes);
+                const size_t from = std::max(ctx->kv_dev_bytes, lead_t);
                 if (used_up > from &&
                         !ggml_cuda_vmm_region_ensure_span(ctx->vmm_region, off + from, used_up - from, /*host=*/ false)) {
                     ggml_backend_cuda_kv_region_log("growth", ctx, ctx->vmm_region, off + from, used_up - from);

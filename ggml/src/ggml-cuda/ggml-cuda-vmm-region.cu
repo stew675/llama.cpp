@@ -860,7 +860,8 @@ bool ggml_cuda_vmm_region_selftest(int device) {
     (void) cudaFree(d_bad);
 
     GGML_LOG_INFO("%s: device %d: %s (reserved %zu MiB in %zu x %zu MiB units, prefix + span growth, "
-                  "a HOST-backed span, a partial (window-boundary) flip, the watermark contract and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
+                  "a HOST-backed span, aligned window flips (a partial one is REFUSED), the watermark contract "
+                  "and clear-on-map verified)\n", __func__, device, ok ? "PASS" : "FAIL",
                   (n_units * unit) >> 20, n_units, unit >> 20);
     return ok;
 }
