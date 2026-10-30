@@ -1961,6 +1961,17 @@ bool llama_kv_cache::get_can_shift() const {
     return true;
 }
 
+bool llama_kv_cache::is_streaming(uint32_t n_kv) const {
+    // The window is a CELL count and it is only ever set when the region provider is in use; a cell at or
+    // above it is backed by pinned host RAM (the slide is monotone).  `n_kv` is the extent the graph is
+    // about to read, so this answers the question the arm choice actually asks.
+    return kv_resident_cells != 0 && n_kv > kv_resident_cells;
+}
+
+bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
+    return kv->is_streaming(n_kv);
+}
+
 uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 
