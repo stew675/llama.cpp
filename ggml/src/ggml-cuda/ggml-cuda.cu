@@ -2839,6 +2839,12 @@ static int ggml_backend_cuda_kv_region_grow_cells(ggml_backend_buffer_t buffer, 
         }
     }
     if (ggml_cuda_kv_region_debug()) {
+        static int grow_check = 0;
+        char where[64];
+        snprintf(where, sizeof(where), "grow#%d cells=%u", grow_check++, n_cells);
+        ggml_cuda_vmm_region_verify_host(ctx->vmm_region, where);
+    }
+    if (ggml_cuda_kv_region_debug()) {
         const size_t mapped_after = ggml_cuda_vmm_region_mapped(ctx->vmm_region);
         if (mapped_after != mapped_before) {
             GGML_LOG_INFO("%s: device %d: %u cells -> mapped %.2f of %.2f MiB (+%.2f MiB), of which host %.2f MiB "
@@ -3051,6 +3057,7 @@ static void ggml_backend_cuda_kv_region_clear(ggml_backend_buffer_t buffer, uint
     ggml_cuda_set_device(ctx->device);
     ggml_cuda_async_input_drain(ctx->device);
     ggml_cuda_vmm_region_clear(ctx->vmm_region, value);
+    ggml_cuda_vmm_region_verify_host(ctx->vmm_region, "kv clear");
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_kv_region_buffer_interface = {

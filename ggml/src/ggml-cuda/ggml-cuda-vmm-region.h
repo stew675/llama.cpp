@@ -101,6 +101,16 @@ void * ggml_cuda_vmm_region_base  (const ggml_cuda_vmm_region * r);
 // Unmap what is mapped, free the VA, destroy the object.
 void   ggml_cuda_vmm_region_free  (ggml_cuda_vmm_region * r);
 
+// DIAGNOSTIC (block §3.7.6): write every MAPPED byte of the region to `path` at its own file offset, read
+// back through a device kernel (the access a host-location mapping is known to serve), so two arms' dumps are
+// byte-comparable and can separate "the bytes in the spill are wrong" from "the reader is wrong".  Triggered
+// at teardown by `LLAMA_KV_REGION_DUMP=<path>`.
+bool   ggml_cuda_vmm_region_dump  (ggml_cuda_vmm_region * r, const char * path);
+
+// DIAGNOSTIC (block §3.7.6): re-fingerprint every HOST mapping and report (stderr) any that no longer holds
+// what the flip left there.  `where` names the checkpoint.  No-op unless LLAMA_KV_REGION_DEBUG is set.
+void   ggml_cuda_vmm_region_verify_host(ggml_cuda_vmm_region * r, const char * where);
+
 // Is VMM usable on this device at all (reserve + one map + unmap succeeded once)?  Cached per device.
 bool   ggml_cuda_vmm_region_available(int device);
 
