@@ -1058,6 +1058,33 @@ bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
     if (!can_park()) {
         return false;
     }
+
+    // wip/kv-residency (TODO #118): a park MOVES cells, and park_bound() is the top of the CACHE -- above the cell
+    // watermark a growable/windowed region has mapped.  The move is `ggml_backend_tensor_copy` (the copy engine),
+    // so a write into unmapped VA is a GPU PAGE FAULT, not an error: measured on Flash-Next (both KV caches
+    // windowed, `-c 65536 -ncmoe 48`) and reproduced with the window OFF (`LLAMA_KV_REGION=1` alone) and at a
+    // depth where nothing spills, so it belongs to the region provider, not to the window
+    // (`../llama-cpp-rdna-boosts/wip/kv-residency/A2-MIXED-BACKING.md` §3.7.11.3).
+    //
+    // Growing the region to cover the park instead is not free either: on a windowed cache the parked (cold)
+    // cells would take the resident window while the ACTIVE cells fall below the spill boundary, so every decode
+    // step would read the running context over the link -- a per-token cost against save-and-clear's one state
+    // copy per idle transition.  So this DECLINES, which leaves every cell where it is and lets the caller use its
+    // fallback: the server saves the slot to the prompt cache and clears it (server-context.cpp,
+    // `park_idle_slots_for_launch`: "cannot park the idle slot: saving it to the prompt cache and clearing it"),
+    // i.e. exactly the behaviour the parking gate compares against.  A region-backed cache is opt-in
+    // (`LLAMA_KV_REGION=1`), so the default path is unchanged.
+    if (kv_region) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: the KV is a growable/windowed REGION (LLAMA_KV_REGION): a park moves cells above "
+                    "the region's mapped watermark and a copy-engine move there faults the GPU, so idle slots are "
+                    "saved to the prompt cache and cleared instead of parked (one state copy per idle transition)\n",
+                    __func__);
+        }
+        return false;
+    }
     if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
         return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
     }
