@@ -37,6 +37,9 @@ struct ggml_cuda_vmm_region {
     size_t   mapped_host = 0;
     void *   base    = nullptr;
     std::vector<vmm_mapping> maps;
+    // pinned staging for a remap (grow-only, one unit's worth is enough for the sliding window)
+    void *   stage       = nullptr;
+    size_t   stage_bytes = 0;
 };
 
 namespace {
@@ -197,21 +200,33 @@ namespace {
 
 // Is [off, off + bytes) covered by one mapping, and is that mapping host-backed?  (Mappings never overlap,
 // so "covered" means exactly one entry contains the whole range.)
-bool vmm_find(const ggml_cuda_vmm_region * r, size_t off, size_t bytes, size_t * end, bool * host) {
-    for (const vmm_mapping & m : r->maps) {
-        if (m.off > off) {
-            return false;   // sorted: nothing later can cover it
-        }
-        if (off - m.off < m.bytes) {
-            if (bytes > m.bytes - (off - m.off)) {
-                return false;   // starts inside a mapping but runs past its end
-            }
-            if (end  != nullptr) { *end  = m.off + m.bytes; }
-            if (host != nullptr) { *host = m.host; }
-            return true;
-        }
+// The mapping whose range contains (or starts at) `off`, or nullptr.  `maps` is sorted by `off` and
+// non-overlapping, so this is a binary search: the sliding window calls it once per cell per batch.
+const vmm_mapping * vmm_at(const ggml_cuda_vmm_region * r, size_t off) {
+    auto it = std::upper_bound(r->maps.begin(), r->maps.end(), off,
+            [](size_t v, const vmm_mapping & m) { return v < m.off; });
+    if (it == r->maps.begin()) {
+        return nullptr;
     }
-    return false;
+    --it;
+    return off - it->off < it->bytes ? &*it : nullptr;
+}
+
+// The first mapping that starts strictly after `off`, or nullptr.
+const vmm_mapping * vmm_next(const ggml_cuda_vmm_region * r, size_t off) {
+    auto it = std::upper_bound(r->maps.begin(), r->maps.end(), off,
+            [](size_t v, const vmm_mapping & m) { return v < m.off; });
+    return it == r->maps.end() ? nullptr : &*it;
+}
+
+bool vmm_find(const ggml_cuda_vmm_region * r, size_t off, size_t bytes, size_t * end, bool * host) {
+    const vmm_mapping * m = vmm_at(r, off);
+    if (m == nullptr || bytes > m->bytes - (off - m->off)) {
+        return false;
+    }
+    if (end  != nullptr) { *end  = m->off + m->bytes; }
+    if (host != nullptr) { *host = m->host; }
+    return true;
 }
 
 // Insert a mapping and keep the table sorted and coalesced.
@@ -254,15 +269,13 @@ bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t 
     if (b > r->size) { b = r->size; }
 
     while (a < b) {
-        size_t next = 0;
-        if (vmm_find(r, a, 1, &next, nullptr)) {
-            a = next;                 // already mapped: skip it (the driver refuses a re-map)
+        if (const vmm_mapping * cur = vmm_at(r, a)) {
+            a = cur->off + cur->bytes;   // already mapped: skip it (the driver refuses a re-map)
             continue;
         }
         size_t n = r->unit;
-        // do not step over an existing mapping
-        for (const vmm_mapping & m : r->maps) {
-            if (m.off > a && m.off - a < n) { n = m.off - a; }
+        if (const vmm_mapping * nxt = vmm_next(r, a)) {
+            if (nxt->off - a < n) { n = nxt->off - a; }   // do not step over an existing mapping
         }
         if (b - a < n) { n = b - a; }
         if (!vmm_map(r, a, n, host)) {
@@ -270,6 +283,97 @@ bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t 
         }
         vmm_insert(r, a, n, host);
         // A fresh mapping can contain stale bytes (measured), so clear exactly what was just mapped.
+        if (cudaMemset((char *) r->base + a, 0, n) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        a += n;
+    }
+    return true;
+}
+
+// Preserve a mapping's bytes across a kind change.  A remap is unmap + map, and the driver hands back fresh
+// physical with no relation to what was there (measured: stale on device chunks, zero on host ones), so the
+// bytes are staged through a pinned scratch.  Only the sliding window takes this path, once per unit per
+// few thousand tokens, so a blocking round trip is the right trade for simplicity here.
+bool vmm_remap(ggml_cuda_vmm_region * r, const vmm_mapping & m, bool host) {
+    if (m.bytes > r->stage_bytes) {
+        if (r->stage != nullptr) { (void) cudaFreeHost(r->stage); r->stage = nullptr; r->stage_bytes = 0; }
+        void * st = nullptr;
+        if (cudaMallocHost(&st, m.bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        r->stage = st;
+        r->stage_bytes = m.bytes;
+    }
+    // nothing may be in flight while the VA is unmapped (the VA stays valid for graphs, the *physical* does not)
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (cudaMemcpy(r->stage, (const char *) r->base + m.off, m.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    vmm_unmap(r, m.off, m.bytes);
+    // drop the table entry by hand (we are holding a reference into the vector)
+    const size_t off = m.off, bytes = m.bytes;
+    const bool was_host = m.host;
+    r->maps.erase(std::find_if(r->maps.begin(), r->maps.end(),
+            [off](const vmm_mapping & e) { return e.off == off; }));
+    r->mapped      -= bytes;
+    r->mapped_host -= was_host ? bytes : 0;
+
+    if (!vmm_map(r, off, bytes, host)) {
+        return false;   // left unmapped: the caller's next batch will refuse loudly rather than read garbage
+    }
+    if (cudaMemcpy((char *) r->base + off, r->stage, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    vmm_insert(r, off, bytes, host);   // re-insert (and coalesce with its new neighbours of the same kind)
+    return true;
+}
+
+bool ggml_cuda_vmm_region_ensure_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host) {
+    if (r == nullptr) {
+        return false;
+    }
+    if (bytes == 0) {
+        return true;
+    }
+    if (off > r->size || bytes > r->size - off) {
+        return false;
+    }
+    const size_t g = r->gran != 0 ? r->gran : (size_t) 4096;
+    size_t a = (off / g) * g;
+    size_t b = vmm_up(off + bytes, g);
+    if (b > r->size) { b = r->size; }
+
+    while (a < b) {
+        if (const vmm_mapping * cur = vmm_at(r, a)) {
+            if (cur->host == host) {
+                a = cur->off + cur->bytes;    // this piece is already the KIND we need
+                continue;
+            }
+            // The kind is wrong for the whole mapping: flip it, preserving its bytes.  Flipping the whole
+            // mapping (not just this range) keeps the table one-entry-per-mapping and avoids a sub-range
+            // unmap, which the driver refuses.
+            if (!vmm_remap(r, *cur, host)) {
+                return false;
+            }
+            continue;                          // `a` is unchanged; the entry is gone/rewritten
+        }
+        size_t n = r->unit;
+        if (const vmm_mapping * nxt = vmm_next(r, a)) {
+            if (nxt->off - a < n) { n = nxt->off - a; }
+        }
+        if (b - a < n) { n = b - a; }
+        if (!vmm_map(r, a, n, host)) {
+            return false;
+        }
+        vmm_insert(r, a, n, host);
         if (cudaMemset((char *) r->base + a, 0, n) != cudaSuccess) {
             (void) cudaGetLastError();
             return false;
@@ -353,6 +457,11 @@ void ggml_cuda_vmm_region_free(ggml_cuda_vmm_region * r) {
     r->maps.clear();
     r->mapped = 0;
     r->mapped_host = 0;
+    if (r->stage != nullptr) {
+        (void) cudaFreeHost(r->stage);
+        r->stage = nullptr;
+        r->stage_bytes = 0;
+    }
     if (r->base != nullptr) {
         if (cuMemAddressFree((CUdeviceptr) (uintptr_t) r->base, r->size) != cudaSuccess) {
             (void) cudaGetLastError();

@@ -66,6 +66,12 @@ bool ggml_cuda_vmm_region_grow(ggml_cuda_vmm_region * r, size_t used_bytes);
 // Same fail-soft contract as the rest of this file (false = the driver refused, nothing half-created).
 bool ggml_cuda_vmm_region_map_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host);
 
+// Like `map_span`, but also flips a piece whose backing KIND is wrong: it stages the bytes out, unmaps, maps
+// the other kind and stages them back (a remap loses the physical contents -- measured).  This is the sliding
+// window's primitive; the caller keeps the VA, so captured graphs and every existing data path stay valid.
+// One blocking round trip per flipped mapping, so a caller should call it with DELTAS, not the whole range.
+bool ggml_cuda_vmm_region_ensure_span(ggml_cuda_vmm_region * r, size_t off, size_t bytes, bool host);
+
 // Bytes of the mapped extent that are host-backed (the spill), for reporting.
 size_t ggml_cuda_vmm_region_mapped_host(const ggml_cuda_vmm_region * r);
 

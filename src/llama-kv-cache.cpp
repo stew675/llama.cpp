@@ -54,17 +54,17 @@ static ggml_backend_buffer_type_t llama_kv_region_buft(ggml_backend_dev_t dev) {
     return fn != nullptr ? fn(dev) : nullptr;
 }
 
-// wip/kv-residency (TODO #118) A2: the same buffer type with mixed backing -- `tail_bytes` of every tensor is
-// backed by pinned system RAM (the window's spill), the rest by VRAM.
-typedef ggml_backend_buffer_type_t (*llama_kv_region_buft_split_fn)(ggml_backend_dev_t dev, size_t tail_bytes);
+// wip/kv-residency (TODO #118) A2: the same buffer type with the windowed KV -- the newest `cells` cells of
+// the used extent are in VRAM, everything older in pinned system RAM.
+typedef ggml_backend_buffer_type_t (*llama_kv_region_buft_split_fn)(ggml_backend_dev_t dev, size_t cells);
 
-static ggml_backend_buffer_type_t llama_kv_region_buft_split(ggml_backend_dev_t dev, size_t tail_bytes) {
-    if (!llama_kv_region_enabled() || dev == nullptr || tail_bytes == 0) {
+static ggml_backend_buffer_type_t llama_kv_region_buft_split(ggml_backend_dev_t dev, size_t cells) {
+    if (!llama_kv_region_enabled() || dev == nullptr || cells == 0) {
         return nullptr;
     }
     auto fn = (llama_kv_region_buft_split_fn) ggml_backend_reg_get_proc_address(
             ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_region_buft_split");
-    return fn != nullptr ? fn(dev, tail_bytes) : nullptr;
+    return fn != nullptr ? fn(dev, cells) : nullptr;
 }
 
 // wip/kv-residency (TODO #118): the windowed KV's resident window, in CELLS.  0/unset = off.
@@ -268,14 +268,14 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
-    // wip/kv-residency (TODO #118) A2: the mixed-backing window.  The resident window is the LAST `W` cells
-    // of the context (`LLAMA_KV_RESIDENT_CELLS`, the same knob A1 used), so the spill is cells [0, W_tail) --
-    // a STATIC split, decided here, before the slab is armed, so the arena gets the VRAM the KV never commits.
-    // `tail_bytes` is that prefix in BYTES of one tensor's cell extent, which is what the buffer type maps
-    // from pinned system RAM; it is one number for every tensor, so the geometry has to be uniform across the
-    // layers this cache holds (K and V included).  Anything else DECLINES the split -- no spill, today's
-    // fit-or-fail -- rather than guess.
-    size_t kv_tail_bytes = 0;
+    // wip/kv-residency (TODO #118) A2: the windowed KV.  The RESIDENT WINDOW is the newest `W` cells of the
+    // USED extent (`LLAMA_KV_RESIDENT_CELLS`), so the host/VRAM boundary slides forward as the context fills
+    // and a token always attends the newest cells from VRAM.  The spill grows with the used extent up to
+    // (kv_size - W) cells, i.e. the VRAM the cache never commits is what the expert arena gets.
+    //   Default W = kv_size -> no spill, i.e. today's fully resident cache (the opt-in is what spills).
+    //   One W covers every tensor, so the cell geometry has to be uniform across the layers this cache holds
+    //   (K and V included).  Anything else DECLINES the window -- no spill, today's fit-or-fail -- not a guess.
+    size_t kv_resident_cells = 0;
     if (llama_kv_region_enabled() && other == nullptr && !v_trans && !hparams.no_alloc) {
         const uint32_t w = kv_split_resident_cells();
         const uint32_t n_tail = (w != 0 && kv_size > w) ? kv_size - w : 0;
@@ -293,25 +293,18 @@ llama_kv_cache::llama_kv_cache(
             uniform = ck == cell && cv == cell;
         }
         if (!uniform) {
-            LLAMA_LOG_WARN("%s: the mixed-backing KV window is unavailable for this cache (%s); the KV stays "
-                           "fully resident\n", __func__,
+            LLAMA_LOG_WARN("%s: the windowed KV is unavailable for this cache (%s); the KV stays fully "
+                           "resident\n", __func__,
                            n_tail == 0 ? "no spilled cells" : "non-uniform K/V cell geometry across layers");
         } else {
-            // a boundary must be a multiple of the driver's minimum map granularity (4 KiB)
-            const size_t gran = 4096;
-            kv_tail_bytes = ((size_t) n_tail * cell / gran) * gran;
-            if (kv_tail_bytes == 0) {
-                LLAMA_LOG_WARN("%s: the KV window of %u cells is below one map granule; the KV stays fully resident\n",
-                               __func__, n_tail);
-            } else {
-                LLAMA_LOG_WARN("%s: WINDOWED KV ENABLED: %u of %u cells spilling to pinned system RAM (%.2f MiB "
-                               "per tensor%s), %u cells resident in VRAM.  The spilled cells are read over the "
-                               "PCIe link every step (~28.8 GB/s), so a token at depth costs about "
-                               "(cells beyond the window) x %.1f KiB / 28.8 GB/s.  Unset LLAMA_KV_RESIDENT_CELLS "
-                               "or LLAMA_KV_REGION to keep the KV fully resident.\n",
-                               __func__, n_tail, kv_size, kv_tail_bytes / 1024.0 / 1024.0,
-                               n_stream > 1 ? " per stream" : "", w, cell / 1024.0);
-            }
+            kv_resident_cells = w;
+            LLAMA_LOG_WARN("%s: WINDOWED KV ENABLED: the newest %u of up to %u cells stay in VRAM, everything "
+                           "older spills to pinned system RAM (%.1f KiB per cell%s).  The spill grows with the "
+                           "used extent, up to %.2f MiB per tensor at full context, and every spilled cell is "
+                           "read over the PCIe link per step (~28.8 GB/s).  Unset LLAMA_KV_RESIDENT_CELLS or "
+                           "LLAMA_KV_REGION to keep the KV fully resident.\n",
+                           __func__, w, kv_size, cell / 1024.0, n_stream > 1 ? ", per stream" : "",
+                           (double) n_tail * cell / 1048576.0);
         }
     }
 
@@ -376,7 +369,7 @@ llama_kv_cache::llama_kv_cache(
             // device buffer type with the plain type's vtable contract (same device, same name predicate), so
             // everything downstream -- the scheduler's placement, `memory_breakdown()`, `--fit` -- sees a KV
             // buffer of the same size; only WHEN its physical is committed changes.
-            ggml_backend_buffer_type_t buft_region = kv_tail_bytes != 0 ? llama_kv_region_buft_split(dev, kv_tail_bytes) : nullptr;
+            ggml_backend_buffer_type_t buft_region = kv_resident_cells != 0 ? llama_kv_region_buft_split(dev, kv_resident_cells) : nullptr;
             if (buft_region == nullptr) {
                 buft_region = llama_kv_region_buft(dev);
             }
