@@ -4,6 +4,8 @@
 
 #include "gguf.h"
 
+#include "../src/llama-ext.h"
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -100,7 +102,8 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                                    uint32_t n_ctx,
                                                    uint32_t n_ubatch,
                                                    ggml_type type_k,
-                                                   ggml_type type_v) {
+                                                   ggml_type type_v,
+                                                   bool shares_model) {
     common_draft_reserve r;
 
     if (path.empty()) {
@@ -130,7 +133,9 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
     for (int64_t i = 0; i < n_tensors; ++i) {
         weights += gguf_get_tensor_size(g, i);
     }
-    r.weights = weights;
+    // a shared-weights draft (an embedded MTP head) owns no weights: it runs the target's nextn layer, and
+    // charging them again is what the flat constant did
+    r.weights = shares_model ? 0 : weights;
 
     // `n_ctx == 0` means "from the model": estimating the KV with 0 would UNDER-estimate the reserve (the
     // dangerous direction), so fall back to the context the draft itself declares as its trained maximum.
@@ -197,7 +202,13 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                               ? (double) kv_own * (double) idx_heads * (double) idx_len * (double) F32_BYTES
                               : 0.0;
     // +10 % for per-row block padding and the KQ-mask padding llama.cpp adds to the cell count.
-    r.kv = (size_t) ((double) n_ctx * (attn_per_tok + idx_per_tok) * 1.10);
+    //
+    // The MTP drafter's KV window (llama-ext.h) is honoured here for the same reason the cache takes it: the
+    // estimate is what the slab holds back in `aux_reserve`, so an un-windowed estimate leaves the freed VRAM
+    // unspent instead of handing it to the expert arena.
+    const uint32_t draft_window = llama_spec_draft_window_cells(n_ctx, n_ubatch);
+    const uint32_t kv_cells     = draft_window != 0 ? std::min(n_ctx, draft_window + n_ubatch) : n_ctx;
+    r.kv = (size_t) ((double) kv_cells * (attn_per_tok + idx_per_tok) * 1.10);
 
     // --- compute + slack: measured tiers -------------------------------------------------------
     // The draft context's compute buffer (pinned into the slab's narrow-2 region, and its mapping still comes
@@ -211,13 +222,14 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
     r.ok    = r.total > 0;
 
     LOG_INF("%s: draft reserve estimate for '%s': weights %.0f + kv %.0f (%u x %u layers, %u kv heads,"
-            " %u/%u head dims, indexer %s%s) + compute %.0f + slack %.0f = %.0f MiB (n_ctx %u)\n",
+            " %u/%u head dims, indexer %s%s) + compute %.0f + slack %.0f = %.0f MiB (n_ctx %u, kv cells %u%s%s)\n",
             __func__, path.c_str(),
             (double) r.weights / 1048576.0, (double) r.kv / 1048576.0, kv_own, kv_layers, n_head_kv,
             k_len, v_len, have_indexer ? "yes" : "no",
             shares_kv ? ", KV shared with the target (0 owned)" : "",
             (double) r.compute / 1048576.0, (double) r.slack / 1048576.0, (double) r.total / 1048576.0,
-            n_ctx);
+            n_ctx, kv_cells, draft_window != 0 ? ", MTP draft window" : "",
+            shares_model ? ", weights shared with the target (0 charged)" : "");
 
     return r;
 }

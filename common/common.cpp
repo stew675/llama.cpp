@@ -1268,11 +1268,21 @@ common_init_result::common_init_result(common_params & params, bool model_only, 
             } else {
                 // `n_ctx == 0` ("from the model") is resolved inside the estimator from the draft GGUF's own
                 // `context_length`: estimating with 0 would UNDER-estimate the reserve, the dangerous direction.
+                //
+                // An MTP draft has no GGUF of its own (it runs the target's nextn layer), and its KV window
+                // only reaches the expert arena if this reserve shrinks with it: the slab reserves `aux`
+                // BEFORE the draft context exists, and the surplus is not handed back.  So for an MTP draft
+                // whose window is active, estimate from the target's own metadata with the weights zeroed
+                // (they are shared) -- which is the draft's real post-slab footprint.  Without a window the
+                // flat constant stays, so no existing run changes.
+                const bool mtp_shared = params.speculative.has_mtp() &&
+                                        llama_spec_draft_window_cells(params.n_ctx, params.n_ubatch) != 0;
                 draft_reserve = common_draft_reserve_estimate(
-                        params.speculative.draft.mparams.path,
+                        mtp_shared ? params.model.path : params.speculative.draft.mparams.path,
                         params.n_ctx,
                         params.n_ubatch,
-                        params.cache_type_k, params.cache_type_v);
+                        params.cache_type_k, params.cache_type_v,
+                        mtp_shared);
             }
         }
     }

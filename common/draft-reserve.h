@@ -37,8 +37,12 @@ struct common_draft_reserve {
 };
 
 // Estimate the post-slab VRAM `path` (a draft GGUF) will need for `n_ctx` with the given KV types.
+// `shares_model`: the draft runs the TARGET's weights (an embedded MTP head), so the weights term is 0 and
+// `path` is the target's GGUF -- the caller only passes `true` when the draft's KV window is active, so an
+// un-windowed run keeps the flat `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT` it has always had.
 common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                                    uint32_t n_ctx,
                                                    uint32_t n_ubatch,
                                                    ggml_type type_k,
-                                                   ggml_type type_v);
+                                                   ggml_type type_v,
+                                                   bool shares_model = false);

@@ -246,6 +246,24 @@ LLAMA_API void llama_kv_region_set_probe(bool on);
 // this before the real contexts exist.  One W covers every cache in the process (the A2 rule).
 LLAMA_API void llama_kv_region_set_resident_cells(uint32_t cells);
 
+//
+// The speculative draft's KV window (the MTP drafter's ring).
+//
+// The MTP draft context carries a KV cache of its own, sized `-c` cells, although the drafter only ever reads
+// its recent prefix (measured: 256 MiB of a 27B at `-c 65536`, 1 GiB at `-c 262144` -- one draft layer).
+// `LLAMA_SPEC_DRAFT_WINDOW` makes it a sliding window instead, which is an APPROXIMATION the target verifies
+// (a wrong draft is a slower run, never a wrong answer).
+//
+//   unset / `auto`  the adaptive policy: a quarter of the context, clamped to [32768, 65536] cells -- a window
+//                   at or above the context the drafter actually works over costs nothing measurable, and one
+//                   far below it is a real 7-9 % decode loss, so the clamps are the safety rails
+//   `0`             no window: today's behaviour, byte-identical
+//   `N`             N cells (floored at one ubatch, and at the context where it would exceed it)
+//
+// Returns the window in cells, or 0 for "no window" (nothing to save at this context, or disabled).  MTP only:
+// a DFlash2/`-md` draft keeps its own `-c` cache.
+LLAMA_API uint32_t llama_spec_draft_window_cells(uint32_t n_ctx_seq, uint32_t n_ubatch);
+
 // Did `--fit` hand a decision down?  Writes it to `cells` (0 = it decided no window is needed) and returns
 // true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
 LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);

@@ -3109,6 +3109,52 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// The MTP drafter's KV window policy (see llama-ext.h).  `LLAMA_SPEC_DRAFT_WINDOW` = unset/`auto` (the
+// adaptive policy), `0` (off, today's shape) or a cell count.
+//
+// The adaptive policy is a quarter of the context clamped to [32768, 65536] cells: the drafter reads its last
+// few thousand tokens, so a window at or above the context it works over is free (measured: -2.3 % relative
+// acceptance, generation flat, at a 46k context with a 32768 window) while a window far below it costs 7-9 % of
+// decode.  The lower clamp keeps the window above that band at any context; the upper clamp stops a very large
+// `-c` from keeping a window bigger than anything the policy needs (one draft layer, ~1 GiB at `-c 262144`).
+uint32_t llama_spec_draft_window_cells(uint32_t n_ctx_seq, uint32_t n_ubatch) {
+    const char * env = getenv("LLAMA_SPEC_DRAFT_WINDOW");
+
+    if (n_ctx_seq == 0) {
+        return 0;
+    }
+
+    // one ubatch must always be placeable (`llama_kv_cache::find_slot` refuses a batch wider than the cache)
+    const uint32_t floor_cells = GGML_PAD(n_ubatch + 256, 256);
+
+    uint32_t w;
+    if (env == nullptr || env[0] == '\0' || strcmp(env, "auto") == 0) {
+        w = n_ctx_seq / 4;
+        if (w < 32768) {
+            w = 32768;
+        }
+        if (w > 65536) {
+            w = 65536;
+        }
+    } else {
+        const long v = atol(env);
+        if (v <= 0) {
+            return 0;
+        }
+        w = (uint32_t) v;
+    }
+
+    if (w < floor_cells) {
+        w = floor_cells;
+    }
+    // nothing to save: the window would hold the whole cache
+    if (w >= n_ctx_seq) {
+        return 0;
+    }
+
+    return w;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -3680,6 +3726,33 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // The MTP drafter's KV window (llama-ext.h).  The draft context is created AFTER the
+                        // target, so this is the only place its cell count exists.
+                        //
+                        // A sliding window, not a ring allocator: `find_slot` already reclaims a cell whose
+                        // position is more than `n_swa` behind the newest one for its sequence, which IS the
+                        // ring, and `set_input_kq_mask` reads THIS cache's `n_swa`, so the packed mask windows
+                        // consistently and `hparams` (shared with the target) is untouched.  The derived mask
+                        // stays valid as well -- its predicate is `tok_lo <= cell_pos <= tok_hi` over the
+                        // per-cell POSITION, so a recycled cell reports its new position (a position range, not
+                        // a cell-index range).  Only the drafter loses the tokens older than the window, and
+                        // the target verifies every token it proposes.
+                        uint32_t mtp_kv_size = cparams.n_ctx_seq;
+                        uint32_t mtp_n_swa   = hparams.n_swa;
+                        llama_swa_type mtp_swa_type = hparams.swa_type;
+                        if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            const uint32_t win = llama_spec_draft_window_cells(cparams.n_ctx_seq, cparams.n_ubatch);
+                            if (win != 0) {
+                                // the iswa sizing shape: a whole ubatch must always find room to be placed
+                                mtp_kv_size  = GGML_PAD(std::min(cparams.n_ctx_seq, win + cparams.n_ubatch), 256);
+                                mtp_n_swa    = win;
+                                mtp_swa_type = LLAMA_SWA_TYPE_STANDARD;
+                                LLAMA_LOG_INFO("%s: MTP draft KV window = %u cells (draft cache %u of %u cells; "
+                                               "LLAMA_SPEC_DRAFT_WINDOW -- the target still verifies every token)\n",
+                                               __func__, win, mtp_kv_size, cparams.n_ctx_seq);
+                            }
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -3688,11 +3761,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                mtp_kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                mtp_n_swa,
+                                mtp_swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,
