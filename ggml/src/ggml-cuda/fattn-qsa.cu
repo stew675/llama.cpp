@@ -49,6 +49,7 @@ static __global__ void flash_attn_qsa(
         const char * K_ptr,
         const char * V_ptr,
         const int  * idx_ptr,
+        const int  * kvidx_ptr,
         const char * mask_ptr,
         const int  * cell_vis_ptr,
         const int  * q_vis_ptr,
@@ -78,13 +79,18 @@ static __global__ void flash_attn_qsa(
     const char * GGML_CUDA_RESTRICT K    = K_ptr;
     const char * GGML_CUDA_RESTRICT V    = V_ptr;
     const int  * GGML_CUDA_RESTRICT idx  = idx_ptr;
+    // wip/kv-residency (TODO #118) B-A: the K/V POSITION list.  When the attention KV lives in a compact
+    // page pool the selected cells' K/V are at their pool slots, while the mask / visibility keys stay
+    // indexed by the original cell number -- so the reader gathers K/V through `kvidx` and everything
+    // cell-indexed through `idx`.  nullptr (the shipped path) means both are `idx`.
+    const int  * GGML_CUDA_RESTRICT kvidx = kvidx_ptr;
     const char * GGML_CUDA_RESTRICT mask = mask_ptr;
     float      * GGML_CUDA_RESTRICT dst   = dst_ptr;
     float      * GGML_CUDA_RESTRICT parts = parts_ptr;
     float2     * GGML_CUDA_RESTRICT meta  = meta_ptr;
 
     if constexpr (use_logit_softcap) {
-        GGML_UNUSED_VARS(Q, K, V, idx, mask, dst, parts, meta, n_slices, n_slice_cells, scale, logit_softcap,
+        GGML_UNUSED_VARS(Q, K, V, idx, kvidx, mask, dst, parts, meta, n_slices, n_slice_cells, scale, logit_softcap,
             head_base,
             ne00, ne01, ne02, ne03, nb01, nb02, nb03,
             ne10, ne11, ne12, ne13, nb11, nb12, nb13,
@@ -116,6 +122,9 @@ static __global__ void flash_attn_qsa(
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
     idx += col*ne40 + sequence*ne40*ne41; // [n_top_k, n_tps, 1, n_stream]
+    if (kvidx != nullptr) {
+        kvidx += col*ne40 + sequence*ne40*ne41;   // same layout as idx
+    }
     const half * maskh = mask_ptr != nullptr
             ? (const half *) (mask + nb33*(sequence % ne33) + nb31*col) : nullptr;
 
@@ -124,6 +133,11 @@ static __global__ void flash_attn_qsa(
     // gathered from the mask.  Same values, and the same fp16 constants the mask holds.
     const int * cell_vis = cell_vis_ptr != nullptr ? cell_vis_ptr + sequence*nb_cv1 : nullptr;
     const int   q_vis_r  = q_vis_ptr    != nullptr ? q_vis_ptr[col + sequence*nb_qv1] : 0;
+
+    // the K/V position of a selected cell: the pool slot when a page table is in play, else the cell
+    auto qsa_kv_pos = [&](int sel) -> int {
+        return identity ? sel : (kvidx != nullptr ? kvidx[sel] : idx[sel]);
+    };
 
     auto qsa_cell_mask = [&](int cell_g) -> half {
         if (cell_vis != nullptr) {
@@ -211,7 +225,7 @@ static __global__ void flash_attn_qsa(
                     for (int i = flat; i < nblk; i += blockDim.x*blockDim.y) {
                         const int cell = i / (D/32);
                         const int blk  = i % (D/32);
-                        const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
+                        const int cell_g = qsa_kv_pos(tile0 + cell);
                         const block_q8_0 * Kb = (const block_q8_0 *) (K + (int64_t) cell_g*nb11);
                         const block_q8_0 * Vb = (const block_q8_0 *) (V + (int64_t) cell_g*nb21);
                         const float dk = __half2float(Kb[blk].d);
@@ -235,7 +249,7 @@ static __global__ void flash_attn_qsa(
                     for (int i = flat; i < nblk; i += blockDim.x*blockDim.y) {
                         const int cell = i / (D/32);
                         const int blk  = i % (D/32);
-                        const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
+                        const int cell_g = qsa_kv_pos(tile0 + cell);
                         const void * Kb = K + (int64_t) cell_g*nb11;
                         const void * Vb = V + (int64_t) cell_g*nb21;
 #pragma unroll
@@ -252,7 +266,7 @@ static __global__ void flash_attn_qsa(
                     for (int i = flat; i < nv2; i += blockDim.x*blockDim.y) {
                         const int cell = i >> shift;
                         const int off  = i & mask;
-                        const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
+                        const int cell_g = qsa_kv_pos(tile0 + cell);
                         const uint2 k = ((const uint2 *) (K + (int64_t) cell_g*nb11))[off];
                         const uint2 v = ((const uint2 *) (V + (int64_t) cell_g*nb21))[off];
                         *((uint2 *) &K_smem[cell][off*2]) = k;
@@ -400,7 +414,7 @@ static __global__ void flash_attn_qsa(
                 for (int i = flat; i < nload; i += blockDim.x*blockDim.y) {
                     const int cell = i/(D/2);
                     const int off  = i%(D/2);
-                    const int cell_g = identity ? tile0 + cell : idx[tile0 + cell];
+                    const int cell_g = qsa_kv_pos(tile0 + cell);
                     K_smem[cell][off] = ((const nv_bfloat162 *) (K + (int64_t) cell_g*nb11))[off];
                     V_smem[cell][off] = ((const nv_bfloat162 *) (V + (int64_t) cell_g*nb21))[off];
                 }
@@ -489,7 +503,7 @@ static __global__ void flash_attn_qsa(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, idx_ptr, mask_ptr, dst_ptr, parts_ptr, meta_ptr, n_slices, n_slice_cells,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, idx_ptr, kvidx_ptr, mask_ptr, dst_ptr, parts_ptr, meta_ptr, n_slices, n_slice_cells,
         scale, logit_softcap, identity, head_base,
         ne00, ne01, ne02, ne03, nb01, nb02, nb03,
         ne10, ne11, ne12, ne13, nb11, nb12, nb13,
@@ -508,6 +522,8 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
     const ggml_tensor * mask = dst->src[4];
     const ggml_tensor * cell_vis = dst->src[5];
     const ggml_tensor * q_vis    = dst->src[6];
+    // wip/kv-residency (TODO #118) B-A: the K/V position list when the KV is a compact page pool
+    const ggml_tensor * kvidx    = dst->src[9];
 
     cudaStream_t main_stream = ctx.stream();
 
@@ -598,6 +614,7 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
                 (const char *) K->data,
                 (const char *) V->data,
                 (const int  *) idx->data,
+                kvidx != nullptr ? (const int *) kvidx->data : nullptr,
                 mask != nullptr ? (const char *) mask->data : nullptr,
                 cell_vis != nullptr ? (const int *) cell_vis->data : nullptr,
                 q_vis    != nullptr ? (const int *) q_vis->data    : nullptr,
@@ -620,6 +637,7 @@ static void ggml_cuda_flash_attn_qsa_case(ggml_backend_cuda_context & ctx, ggml_
                 (const char *) K->data,
                 (const char *) V->data,
                 (const int  *) idx->data,
+                kvidx != nullptr ? (const int *) kvidx->data : nullptr,
                 mask != nullptr ? (const char *) mask->data : nullptr,
                 cell_vis != nullptr ? (const int *) cell_vis->data : nullptr,
                 q_vis    != nullptr ? (const int *) q_vis->data    : nullptr,
@@ -688,6 +706,16 @@ void ggml_cuda_flash_attn_qsa(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     GGML_ASSERT(K->nb[0]  == ggml_element_size(K));
     GGML_ASSERT(V->nb[0]  == ggml_element_size(V));
     GGML_ASSERT(idx->type == GGML_TYPE_I32);
+    if (dst->src[9] != nullptr) {
+        // the pool's K/V position list has idx's shape; the mask / visibility keys stay CELL-indexed,
+        // so their length is the caller's contract (see ggml_flash_attn_qsa)
+        GGML_ASSERT(dst->src[9]->type == GGML_TYPE_I32);
+        GGML_ASSERT(dst->src[9]->ne[0] == idx->ne[0] && dst->src[9]->ne[1] == idx->ne[1] &&
+                    dst->src[9]->ne[3] == idx->ne[3]);
+    } else {
+        GGML_ASSERT(dst->src[4] == nullptr || dst->src[4]->ne[0] == K->ne[1]);
+        GGML_ASSERT(dst->src[5] == nullptr || dst->src[5]->ne[0] == K->ne[1]);
+    }
 
     const int D = (int) Q->ne[0];
 

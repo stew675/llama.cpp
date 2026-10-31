@@ -746,6 +746,7 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.kv_pool   =*/ cparams.ctx_other == nullptr,
         };
         // the graph builders that choose between quantized-aware attention arms need the same
         // types the memory module was given (see qwen4exp_qsa_sparse)
