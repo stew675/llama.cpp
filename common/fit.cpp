@@ -180,7 +180,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ggml_log_level log_level,
         std::vector<size_t> * host_expert_bytes_out = nullptr,
         std::vector<std::pair<ggml_backend_dev_t, size_t>> * host_experts_out = nullptr,
-        std::vector<size_t> * kv_bytes_out = nullptr) {
+        std::vector<size_t> * kv_bytes_out = nullptr,
+        size_t * kv_pool_vram_out = nullptr,
+        size_t * kv_pool_ram_out = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -219,6 +221,18 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     std::vector<llama_device_memory_data> ret(nd + 1);
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+
+    // wip/kv-residency (TODO #118) B-A: the attendance pool's split -- the compact device pool (VRAM) and the
+    // pinned host mirror (RAM).  `memory_breakdown()` already charges the mirror to the host bucket, so the
+    // device tier is right without it; `--fit` needs the two numbers to report them and to know that this
+    // KV's VRAM does NOT grow with `-c` (see the step-2 guard in common_params_fit_impl).
+    if (kv_pool_vram_out != nullptr || kv_pool_ram_out != nullptr) {
+        size_t pool_vram = 0;
+        size_t pool_ram  = 0;
+        llama_get_kv_pool_bytes(ctx, &pool_vram, &pool_ram);
+        if (kv_pool_vram_out != nullptr) { *kv_pool_vram_out = pool_vram; }
+        if (kv_pool_ram_out  != nullptr) { *kv_pool_ram_out  = pool_ram;  }
+    }
 
     // wip/kv-residency (TODO #118) A3: the KV's own bytes, per device (the window's cell size comes from
     // these: a KV cell is `kv_bytes / kv_size` bytes across the whole cache).
@@ -511,7 +525,10 @@ static void common_params_fit_impl(
     std::vector<std::pair<ggml_backend_dev_t, size_t>> host_experts;
     // wip/kv-residency (TODO #118) A3: the KV cache's own bytes, which is what the window is sized against
     std::vector<size_t> kv_bytes_full;
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &host_expert_bytes, &host_experts, &kv_bytes_full);
+    // wip/kv-residency (TODO #118) B-A: the attendance pool's device pool / pinned host mirror bytes (0/0 when off)
+    size_t kv_pool_vram = 0;
+    size_t kv_pool_ram  = 0;
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &host_expert_bytes, &host_experts, &kv_bytes_full, &kv_pool_vram, &kv_pool_ram);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -531,6 +548,17 @@ static void common_params_fit_impl(
     }
 
     add_extra_memory(dmds_full);
+
+    // wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL.  Report the split, because it is the one thing
+    // about this KV that the arithmetic below cannot show: the mirror is pinned HOST RAM (memory_breakdown()
+    // charges it to the host bucket, so it is absent from the device tier) and only the compact device pool
+    // is VRAM -- and, unlike every other KV, that VRAM does NOT grow with `-c`.
+    if (kv_pool_vram != 0 || kv_pool_ram != 0) {
+        LOG_WRN("%s: the ATTENDANCE POOL is active (LLAMA_KV_REGION_POOL): the KV's device tier is the compact "
+                "pool (%.1f MiB of VRAM) and its %.1f MiB authoritative mirror is pinned host RAM, which the "
+                "device budget does not carry.  The pool's VRAM is fixed; only the mirror grows with -c.\n",
+                __func__, (double) kv_pool_vram / MiB, (double) kv_pool_ram / MiB);
+    }
 
     const size_t nd = devs.size(); // number of devices
 
@@ -1066,7 +1094,15 @@ static void common_params_fit_impl(
                     "%s: cannot meet free memory targets on all devices, need to use %" PRId64 " MiB less in total\n",
                     __func__, -global_surplus/MiB);
             }
-            if (n_ctx_auto) {
+            if (n_ctx_auto && kv_pool_ram != 0) {
+                // wip/kv-residency (TODO #118) B-A: with the attendance pool the KV's VRAM is a fixed-size
+                // device pool, so reducing `-c` frees NO device memory -- the interpolation below divides by
+                // a near-zero bytes-per-context delta and would hand back a nonsense (huge) context, whose
+                // pinned mirror could then OOM the host.  Skip it and let the layer reduction below decide.
+                LOG_WRN("%s: cannot buy device memory back by reducing the context: the attendance pool's VRAM "
+                        "is fixed and only its pinned host mirror scales with -c.  Pin -c, lower -ngl, or unset "
+                        "LLAMA_KV_REGION_POOL to fit the context instead.\n", __func__);
+            } else if (n_ctx_auto) {
                 if (n_ctx_max > n_ctx_min_total) {
                     int64_t sum_used_target = sum_free;
                     if (nd == 0) {

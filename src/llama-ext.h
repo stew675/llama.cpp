@@ -102,6 +102,11 @@ LLAMA_API bool llama_model_moe_host_expert_dev(const struct llama_model * model,
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// wip/kv-residency (TODO #118) B-A: the attendance pool's footprint -- `vram` is the compact device pool and
+// `ram` the pinned host mirror that holds the authoritative copy of the whole context (both 0 when off).
+// `--fit` uses it to report the split and to know the KV's VRAM does NOT grow with `-c` in this mode.
+LLAMA_API void llama_get_kv_pool_bytes(const struct llama_context * ctx, size_t * vram, size_t * ram);
+
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 

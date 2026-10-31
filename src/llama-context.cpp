@@ -746,6 +746,7 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.kv_pool   =*/ cparams.ctx_other == nullptr,
         };
         // the graph builders that choose between quantized-aware attention arms need the same
         // types the memory module was given (see qwen4exp_qsa_sparse)
@@ -6910,6 +6911,22 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+void llama_context::kv_pool_bytes(size_t & vram, size_t & ram) const {
+    vram = 0;
+    ram  = 0;
+    if (memory) {
+        memory->kv_pool_bytes(vram, ram);
+    }
+}
+
+void llama_get_kv_pool_bytes(const struct llama_context * ctx, size_t * vram, size_t * ram) {
+    size_t v = 0;
+    size_t r = 0;
+    ctx->kv_pool_bytes(v, r);
+    if (vram != nullptr) { *vram = v; }
+    if (ram  != nullptr) { *ram  = r; }
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

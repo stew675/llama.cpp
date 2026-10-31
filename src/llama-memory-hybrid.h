@@ -40,7 +40,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+    // wip/kv-residency (TODO #118) B-A: the attention cache may take the attendance pool
+                     bool   kv_pool     = false);
 
     ~llama_memory_hybrid() = default;
 
@@ -71,6 +73,9 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    // wip/kv-residency (TODO #118) B-A: the attendance pool lives on the attention cache
+    void kv_pool_bytes(size_t & vram, size_t & ram) const override;
 
     // state write/load
 
