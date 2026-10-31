@@ -29,6 +29,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fattn-qsa.cuh"
 #include "ggml-cuda/indexer-topk.cuh"
+#include "ggml-cuda/kv-pool.cuh"
 #include "ggml-cuda/indexer-score.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/gdn-conv.cuh"
@@ -4255,6 +4256,82 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     return ggml_backend_cuda_host_buffer_type_dev(0);
 }
 
+// wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL's host mirror buffer type.
+//
+// The pool's authoritative copy of the KV lives in pinned host RAM (a spilled cell is read by a kernel at
+// the link rate, and `cudaMallocHost` is what makes that legal with XNACK off).  It cannot be
+// `ROCm_Host`: that buffer type reports `is_host`, and the scheduler places the consumers of a host
+// buffer on the CPU backend when the device is discrete -- the KV's write path (`SET_ROWS`) and the FA
+// read must run on the GPU.  This type is therefore a DEVICE buffer type (its `device` is the CUDA
+// device, `is_host` is NULL) whose backing allocation is pinned host memory, so every op that touches it
+// is scheduled exactly as it would be on the device buffer (`wip/kv-residency/BA-POOL-DESIGN.md` §5).
+static const char * ggml_backend_cuda_kv_pool_mirror_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_KV_Pool_Mirror";
+
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_buft_is_cuda_kv_pool_mirror(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.get_name == ggml_backend_cuda_kv_pool_mirror_buffer_type_name;
+}
+
+static void ggml_backend_cuda_kv_pool_mirror_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    CUDA_CHECK(cudaFreeHost(buffer->context));
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_kv_pool_mirror_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    void * ptr = nullptr;
+    const cudaError_t err = cudaMallocHost(&ptr, size);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: failed to pin %.2f MiB for the KV pool mirror: %s\n", __func__,
+                (double) size / 1048576.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_kv_pool_mirror_buffer_free_buffer;
+    return buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_kv_pool_mirror_buffer_type_dev(int device) {
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+
+    static struct ggml_backend_buffer_type bufts[GGML_CUDA_MAX_DEVICES];
+    static bool init[GGML_CUDA_MAX_DEVICES] = {};
+
+    if (!init[device]) {
+        bufts[device] = {
+            /* .iface    = */ {
+                /* .get_name            = */ ggml_backend_cuda_kv_pool_mirror_buffer_type_name,
+                /* .alloc_buffer        = */ ggml_backend_cuda_kv_pool_mirror_buffer_type_alloc_buffer,
+                /* .alloc_buffer_n      = */ NULL,
+                /* .get_alignment       = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                /* .get_max_size        = */ NULL,
+                /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                /* .get_alloc_size_n    = */ NULL,
+                /* .is_host             = */ NULL,
+            },
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+            /* .context  = */ nullptr,
+        };
+        init[device] = true;
+    }
+
+    return &bufts[device];
+}
+
+// reached from the KV cache by proc address (no new public symbol in the delivery library)
+static ggml_backend_buffer_type_t ggml_backend_cuda_kv_pool_mirror_buft_for_dev(ggml_backend_dev_t dev) {
+    for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+        if (ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i) == dev) {
+            return ggml_backend_cuda_kv_pool_mirror_buffer_type_dev(i);
+        }
+    }
+    return nullptr;
+}
+
 // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
 //
 // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
@@ -5686,6 +5763,9 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
             break;
         case GGML_OP_FLASH_ATTN_QSA:
             ggml_cuda_flash_attn_qsa(ctx, dst);
+            break;
+        case GGML_OP_KV_POOL:
+            ggml_cuda_kv_pool(ctx, dst);
             break;
         case GGML_OP_INDEXER_TOPK:
             ggml_cuda_indexer_top_k(ctx, dst);
@@ -8747,6 +8827,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_ATTN_QSA:
             return ggml_cuda_flash_attn_qsa_supported(dev_ctx->device, op);
+        case GGML_OP_KV_POOL:
+            // the page-table resolve: I32 ids -> I32 pool positions, plus the mirror->pool fills
+            return op->type == GGML_TYPE_I32 && op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_I32 &&
+                op->src[1] != nullptr && op->src[1]->type == GGML_TYPE_I32 &&
+                op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_I32 &&
+                op->src[3] != nullptr && op->src[3]->type == GGML_TYPE_I32 &&
+                op->src[4] != nullptr && op->src[4]->type == op->src[6]->type &&
+                op->src[5] != nullptr && op->src[5]->type == op->src[7]->type;
         case GGML_OP_INDEXER_TOPK:
             return ggml_cuda_indexer_top_k_supported(dev_ctx->device, op);
         case GGML_OP_INDEXER_SCORE:
@@ -8776,7 +8864,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
+        (ggml_backend_buft_is_cuda_kv_pool_mirror(buft) && buft->device == dev);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -9197,6 +9286,9 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_region_buft_split_for_dev
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_kv_pool_mirror_buft") == 0) {
+        return (void *) ggml_backend_cuda_kv_pool_mirror_buft_for_dev;
+    }
     if (strcmp(name, "ggml_backend_cuda_kv_region_buft") == 0) {
         return (void *) ggml_backend_cuda_kv_region_buft_for_dev;
     }
