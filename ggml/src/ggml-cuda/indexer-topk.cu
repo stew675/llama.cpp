@@ -1,6 +1,10 @@
 #include "indexer-topk.cuh"
 #include "common.cuh"
 
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
 // Fused indexer expand + mask + top-k.
 //
 // The qwen4exp indexer scores blocks, then every cell of a block carries the
@@ -927,6 +931,18 @@ static void indexer_topk_radix_cuda_blocks(
 }
 
 void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // wip/kv-residency (TODO #118) B1(c) DIAGNOSTIC -- campaign branch only, NEVER shipped.  See the dump at
+    // the end of this function.
+    static FILE * qsa_census_f = []() -> FILE * {
+        const char * p = getenv("LLAMA_QSA_STREAM_CENSUS");
+        if (p == nullptr || p[0] == '\0') {
+            return nullptr;
+        }
+        FILE * fp = fopen(p, "ab");
+        GGML_LOG_WARN("%s: DIAGNOSTIC: attended-set census -> %s (run with GGML_CUDA_DISABLE_GRAPHS=1 and the "
+                      "sparse decode arm; timings from this arm are meaningless)\n", __func__, p);
+        return fp;
+    }();
     const ggml_tensor * score    = dst->src[0];
     const ggml_tensor * cell_blk = dst->src[1];
     const ggml_tensor * additive = dst->src[2];
@@ -988,6 +1004,25 @@ void ggml_cuda_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     } else {
         indexer_topk_radix_cuda(pool, score_d, cell_blk_d, (const float *) additive->data, extra,
                 dst_d, n_kv, nrows, n_tps, n_blocks, n_kv, k, false, stream);
+    }
+
+    // wip/kv-residency (TODO #118) B1(c): record this call's selection, DECODE BAND ONLY (`nrows <= 8`; a
+    // prefill row set is thousands of queries wide and irrelevant to a residency policy).  One record is
+    // [nrows, k, n_kv, n_blocks, name_len, name, ids...]; `wip/kv-residency/qsa-census.py` turns them into
+    // the attended set's size and its step-to-step stability (the hit rate a pool of N cells would get),
+    // which is what decides whether an attendance-driven pool beats block 15's recency window
+    // (../llama-cpp-rdna-boosts/wip/kv-residency/B1-STRATA-PLAN.md §3.4).
+    if (qsa_census_f != nullptr && nrows > 0 && nrows <= 8 && k > 0) {
+        std::vector<int> host((size_t) k * nrows);
+        CUDA_CHECK(cudaMemcpyAsync(host.data(), dst_d, host.size() * sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const int hdr[4]   = { nrows, k, n_kv, n_blocks };
+        const int name_len = (int) strlen(dst->name);
+        fwrite(hdr, sizeof(int), 4, qsa_census_f);
+        fwrite(&name_len, sizeof(int), 1, qsa_census_f);
+        fwrite(dst->name, 1, (size_t) name_len, qsa_census_f);
+        fwrite(host.data(), sizeof(int), host.size(), qsa_census_f);
+        fflush(qsa_census_f);
     }
 }
 
