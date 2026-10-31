@@ -1094,6 +1094,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "TOP_K_MASK",
     "FLASH_ATTN_QSA",
+    "KV_POOL",
     "INDEXER_TOPK",
     "INDEXER_SCORE",
     "INDEXER_FILL",
@@ -1118,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ALL_GATHER",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1219,6 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "flash_attn_qsa(q, k, v, idx, mask)",
+    "kv_pool(ids, tbl, inv, ctr, mk, mv, pk, pv, wids)",
     "indexer_topk(q, k, weights, mask)",
     "indexer_fill(k, blk, pos, w, rng, pool)",
     "hc_mix(x, w_norm, w_down, w_up)",
@@ -1242,7 +1244,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "all_gather(x)",
 };
 
-static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
+static_assert(GGML_OP_COUNT == 110, "GGML_OP_COUNT != 110");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5739,7 +5741,11 @@ struct ggml_tensor * ggml_flash_attn_qsa(
     if (mask != NULL) {
         GGML_ASSERT(mask->type == GGML_TYPE_F16);
         GGML_ASSERT(ggml_is_contiguous(mask));
-        GGML_ASSERT(mask->ne[0] == k->ne[1]);  // n_kv
+        // wip/kv-residency (TODO #118) B-A: the mask is CELL-indexed, so it matches k->ne[1] only
+        // when the K/V is the cell-indexed cache.  With a page pool (ggml_flash_attn_qsa_set_kv_idx)
+        // k/v are the compact pool and the length is the caller's contract; the launcher checks the
+        // shipped form.
+        GGML_ASSERT(mask->ne[0] > 0);              // n_kv
         GGML_ASSERT(mask->ne[1] == q->ne[1]);
         GGML_ASSERT(mask->ne[3] == q->ne[3]);
     }
@@ -5747,7 +5753,7 @@ struct ggml_tensor * ggml_flash_attn_qsa(
     if (cell_vis != NULL) {
         GGML_ASSERT(q_vis != NULL);
         GGML_ASSERT(cell_vis->type == GGML_TYPE_I32 && q_vis->type == GGML_TYPE_I32);
-        GGML_ASSERT(cell_vis->ne[0] == k->ne[1] && cell_vis->ne[1] == q->ne[3]);
+        GGML_ASSERT(cell_vis->ne[0] > 0 && cell_vis->ne[1] == q->ne[3]);
         GGML_ASSERT(q_vis->ne[0]    == q->ne[1] && q_vis->ne[1]    == q->ne[3]);
     }
 
@@ -5802,6 +5808,21 @@ void ggml_flash_attn_qsa_set_packed(
     a->src[8] = packed_values;
 }
 
+void ggml_flash_attn_qsa_set_kv_idx(
+        struct ggml_tensor * a,
+        struct ggml_tensor * kv_idx) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_QSA);
+    if (kv_idx == NULL) {
+        a->src[9] = NULL;
+        return;
+    }
+    const struct ggml_tensor * idx = a->src[3];
+    GGML_ASSERT(kv_idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(kv_idx->ne[0] == idx->ne[0] && kv_idx->ne[1] == idx->ne[1] &&
+                kv_idx->ne[2] == idx->ne[2] && kv_idx->ne[3] == idx->ne[3]);
+    a->src[9] = kv_idx;
+}
+
 void ggml_flash_attn_qsa_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
@@ -5818,6 +5839,60 @@ enum ggml_prec ggml_flash_attn_qsa_get_prec(
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 2);
 
     return (enum ggml_prec) prec_i32;
+}
+
+// ggml_kv_pool (wip/kv-residency TODO #118 B-A step 2)
+
+struct ggml_tensor * ggml_kv_pool(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * tbl,
+        struct ggml_tensor  * inv,
+        struct ggml_tensor  * ctr,
+        struct ggml_tensor  * mirror_k,
+        struct ggml_tensor  * mirror_v,
+        struct ggml_tensor  * pool_k,
+        struct ggml_tensor  * pool_v,
+        struct ggml_tensor  * wids,
+        struct ggml_tensor  * use) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(tbl->type == GGML_TYPE_I32 && inv->type == GGML_TYPE_I32 && ctr->type == GGML_TYPE_I32);
+    GGML_ASSERT(use->type == GGML_TYPE_I32 && use->ne[0] >= inv->ne[0]);
+    GGML_ASSERT(wids == NULL || wids->type == GGML_TYPE_I64 || wids->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(mirror_k->type == mirror_v->type && pool_k->type == pool_v->type);
+    GGML_ASSERT(mirror_k->type == pool_k->type);
+    GGML_ASSERT(mirror_k->ne[0] == pool_k->ne[0]);
+    GGML_ASSERT(mirror_v->ne[0] == pool_v->ne[0]);
+    GGML_ASSERT(tbl->ne[0] > 0 && inv->ne[0] > 0);  // one table entry per block, one inverse entry per slot
+    GGML_ASSERT(ctr->ne[0] >= 4);
+
+    const int64_t ne[4] = { ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, 1);           // page cells (ggml_kv_pool_set_page)
+
+    result->op     = GGML_OP_KV_POOL;
+    result->src[0] = ids;
+    result->src[1] = tbl;
+    result->src[2] = inv;
+    result->src[3] = ctr;
+    result->src[4] = mirror_k;
+    result->src[5] = mirror_v;
+    result->src[6] = pool_k;
+    result->src[7] = pool_v;
+    result->src[8] = wids;
+    result->src[9] = use;
+
+    return result;
+}
+
+void ggml_kv_pool_set_page(
+        struct ggml_tensor * a,
+        int                   page_cells) {
+    GGML_ASSERT(a->op == GGML_OP_KV_POOL);
+    GGML_ASSERT(page_cells > 0);
+    ggml_set_op_params_i32(a, 0, page_cells);
 }
 
 // ggml_indexer_top_k

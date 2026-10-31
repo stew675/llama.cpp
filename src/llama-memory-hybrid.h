@@ -40,7 +40,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+    // wip/kv-residency (TODO #118) B-A: the attention cache may take the attendance pool
+                     bool   kv_pool     = false);
 
     ~llama_memory_hybrid() = default;
 

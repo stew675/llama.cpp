@@ -25,6 +25,11 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // wip/kv-residency (TODO #118) B-A: may this memory's ATTENTION cache take the attendance pool
+    // (`LLAMA_KV_REGION_POOL`)?  Only the trunk's: the MTP draft's cache is read densely, so pooling it
+    // would only make its reads leave VRAM.
+    bool kv_pool;
 };
 
 enum llama_memory_status {

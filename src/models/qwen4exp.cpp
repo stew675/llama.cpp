@@ -2389,9 +2389,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
     }
 
+    // wip/kv-residency (TODO #118) B-A step 2: the ATTENDANCE POOL -- the sparse decode reads its K/V out
+    // of a compact device pool through a page table instead of the whole cache (`BA-POOL-DESIGN.md`).  The
+    // pool carries copies only; the CELL-indexed cache tensor (the pinned host mirror) stays authoritative,
+    // so the mask / visibility keys keep addressing cells and only the K/V gather is redirected.
+    //
+    // Decode band only: a prefill's union of selections is not sparse (every block is somebody's top-k), so
+    // a prefill chunks through the pool would thrash it and would need the capacity of the whole context.
+    // A batch too wide for the pool takes the cell-indexed path instead (`kv_pool_serves`).
+    ggml_tensor * top_k_kv = nullptr;
+    if (qsa_sparse && mctx_cur->has_kv_pool()) {
+        const int64_t pool_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
+        if (n_tokens <= pool_band && mctx_cur->kv_pool_serves((uint32_t) n_tokens)) {
+            top_k_kv = mctx_cur->build_kv_pool_resolve(ctx0, top_k, inp->get_k_idxs(), il);
+            ggml_build_forward_expand(gf, top_k_kv);
+        }
+    }
+
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = top_k_kv != nullptr ? mctx_cur->get_k_pool(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = top_k_kv != nullptr ? mctx_cur->get_v_pool(ctx0, il) : mctx_cur->get_v(ctx0, il);
     // the natural cache views, kept for the qsa3 packs (which must cast before permuting)
     ggml_tensor * k_raw = k;
     ggml_tensor * v_raw = v;
@@ -2410,6 +2427,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
         cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                 qsa_cell_vis, qsa_q_vis);
+        if (top_k_kv != nullptr) {
+            // the K/V gather follows the page table; the mask / visibility keys stay at the cell ids
+            ggml_flash_attn_qsa_set_kv_idx(cur, top_k_kv);
+        }
         // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
         // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
         // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1) plus the
