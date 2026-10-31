@@ -424,9 +424,18 @@ void ggml_cuda_mul_mat_q_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     {
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = src1->nb[2] / src1->nb[1];
-        for (int i = 0; i < 2; ++i) {
-            ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec_i[i], expert_bounds.get(),
-                src0s[i]->ne[2], ne12, n_expert_used, ne11, /*tile_width=*/J_best_i[i], si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        // ONE compaction for both arms: the ids mapping is tile-width independent (only the seams are not),
+        // so the second arm's layout is re-emitted from the bounds this call writes instead of walking `ids`
+        // again -- the duplicate launch measured +94 launches and ~2.7 % of 30B-A3B prefill (TODO #301).
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec_0.get(), expert_bounds.get(),
+            src0s[0]->ne[2], ne12, n_expert_used, ne11, /*tile_width=*/J_best_i[0], si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        CUDA_CHECK(cudaGetLastError());
+        if (J_best_i[1] == J_best_i[0]) {
+            // identical tile width => identical seams, so arm 1 reuses arm 0's tile_spec
+            tile_spec_i[1] = tile_spec_i[0];
+        } else {
+            ggml_cuda_launch_mm_id_retile(tile_spec_1.get(), expert_bounds.get(), src0s[0]->ne[2], ne12, n_expert_used,
+                /*tile_width=*/J_best_i[1], stream);
             CUDA_CHECK(cudaGetLastError());
         }
     }

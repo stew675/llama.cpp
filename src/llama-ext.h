@@ -127,6 +127,11 @@ LLAMA_API bool llama_model_moe_host_expert_dev(const struct llama_model * model,
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// wip/kv-residency (TODO #118) B-A: the attendance pool's footprint -- `vram` is the compact device pool and
+// `ram` the pinned host mirror that holds the authoritative copy of the whole context (both 0 when off).
+// `--fit` uses it to report the split and to know the KV's VRAM does NOT grow with `-c` in this mode.
+LLAMA_API void llama_get_kv_pool_bytes(const struct llama_context * ctx, size_t * vram, size_t * ram);
+
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
@@ -244,3 +249,66 @@ LLAMA_API uint32_t llama_model_n_tokens_delay(const struct llama_model * model);
 
 // each sequence is paired with an unconditional one at n_seq_max / 2 + seq_id, in a unified KV cache
 LLAMA_API bool llama_model_classifier_free_guidance(const struct llama_model * model);
+
+//
+// The windowed KV cache.
+//
+// `LLAMA_KV_RESIDENT_CELLS=<cells>` keeps the newest <cells> cells of the KV in VRAM and puts everything
+// older in pinned system RAM; `=auto` leaves the number to `--fit`, which sizes it against the device memory
+// it has left after the expert arena's reserve and the pinned-RAM ceiling on the spill.  Unset (or 0) = no
+// window: the KV takes the plain device buffer and the run is byte-identical to a build without this
+// feature, including its OOM.
+//
+// Is the KV region provider available (a device that offers VMM, and `LLAMA_KV_REGION=0` not given)?
+LLAMA_API bool llama_kv_region_is_enabled(void);
+
+// The window the cache would use: 0 = none, UINT32_MAX = `auto` (fit decides), else the cell count.
+// Reads the fit decision first, then the environment.
+LLAMA_API uint32_t llama_kv_region_resident_cells_requested(void);
+
+// For `--fit`'s measurement context only: take a region buffer even with no window, so the fit can identify
+// the KV's bytes.  No batch ever runs on such a context.
+LLAMA_API void llama_kv_region_set_probe(bool on);
+
+// Hand a window (in cells) down to every context created afterwards; 0 clears it.  `common_params_fit` calls
+// this before the real contexts exist.  One W covers every cache in the process (the A2 rule).
+LLAMA_API void llama_kv_region_set_resident_cells(uint32_t cells);
+
+//
+// The speculative draft's KV window (the MTP drafter's ring).
+//
+// The MTP draft context carries a KV cache of its own, sized `-c` cells, although the drafter only ever reads
+// its recent prefix (measured: 256 MiB of a 27B at `-c 65536`, 1 GiB at `-c 262144` -- one draft layer).
+// `LLAMA_SPEC_DRAFT_WINDOW` makes it a sliding window instead, which is an APPROXIMATION the target verifies
+// (a wrong draft is a slower run, never a wrong answer).
+//
+//   unset / `auto`  the adaptive policy: a quarter of the context, clamped to [32768, 65536] cells -- a window
+//                   at or above the context the drafter actually works over costs nothing measurable, and one
+//                   far below it is a real 7-9 % decode loss, so the clamps are the safety rails
+//   `0`             no window: today's behaviour, byte-identical
+//   `N`             N cells (floored at one ubatch, and at the context where it would exceed it)
+//
+// Returns the PER-SEQUENCE window in cells, or 0 for "no window" (nothing to save at this context, or
+// disabled).  MTP only: a DFlash2/`-md` draft keeps its own `-c` cache.  This is the policy; the cache's cell
+// count comes from `llama_spec_draft_kv_cells()` below.
+LLAMA_API uint32_t llama_spec_draft_window_cells(uint32_t n_ctx_seq, uint32_t n_ubatch);
+
+// The draft cache's geometry for that window, as the cache has to actually allocate it: writes the window the
+// cache will use to `win_out` (0 = no window, i.e. the full `-c` cache with `n_swa` 0) and returns its cell
+// count, 0 meaning "no window".
+//
+// The window is PER SEQUENCE, so a UNIFIED cache -- which holds every sequence in ONE stream -- must be sized
+// per sequence: `(win + one batch) x n_seq_max`, capped at the context.  Sizing it as `win + n_ubatch` while
+// several sequences share it is the r193 defect (issue #264): once the first sequence filled the window no
+// cell was left for a second sequence's batch, `find_slot` had no contiguous run to place it in and the server
+// answered `decode() failed: failed to process speculative batch` on that slot for every request.  A
+// per-stream cache (no `--kv-unified`) already sizes each stream separately, so its shape is unchanged.
+//
+// The window is lowered when `win` per sequence does not fit the context, and declined when what is left
+// cannot hold one batch: `LLAMA_SPEC_DRAFT_WINDOW` is a VRAM saving, never a reason a batch cannot be placed.
+LLAMA_API uint32_t llama_spec_draft_kv_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, uint32_t n_seq_max,
+                                             bool kv_unified, uint32_t * win_out);
+
+// Did `--fit` hand a decision down?  Writes it to `cells` (0 = it decided no window is needed) and returns
+// true, so a cache can tell "the fit decided the KV stays fully resident" from "nobody sized `auto`".
+LLAMA_API bool llama_kv_region_resident_cells_decided(uint32_t * cells);

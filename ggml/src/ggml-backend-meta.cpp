@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <memory_resource>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -612,6 +613,101 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 }
 
 //
+// TODO #124: the backend's KV REGION on a tensor split.
+//
+// The KV cache and `--fit` reach the backend's KV-region proc addresses through the DEVICE's own reg, and a
+// Meta (tensor-split) device has none (`device->reg == NULL`).  These three functions are the Meta side of
+// that gap: each resolves the proc through a child device's reg (the same "ask the backend, do not assume"
+// discipline the comm procs use) and requires EVERY child to answer, because a window on 2 of 3 devices
+// would be a silent surprise.  Nothing here allocates: the region itself stays per device -- every child
+// commits the same `cells` cells of its own slice at its own cell stride, so one cell index still means the
+// same cell on every device.
+//
+typedef ggml_backend_buffer_type_t (*ggml_backend_meta_kv_region_buft_fn)(ggml_backend_dev_t dev);
+typedef ggml_backend_buffer_type_t (*ggml_backend_meta_kv_region_buft_split_fn)(ggml_backend_dev_t dev, size_t cells);
+typedef int (*ggml_backend_meta_kv_region_is_kv_buft_fn)(ggml_backend_buffer_type_t buft);
+typedef int (*ggml_backend_meta_kv_region_grow_fn)(ggml_backend_buffer_t buffer, uint32_t n_cells);
+
+// A proc address on a simple device's reg, or nullptr when the device has no reg or does not answer.
+static void * ggml_backend_meta_simple_dev_proc(ggml_backend_dev_t simple_dev, const char * name) {
+    ggml_backend_reg_t reg = simple_dev != nullptr ? ggml_backend_dev_backend_reg(simple_dev) : nullptr;
+    return reg != nullptr ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+
+// The Meta buffer type over a given vector of child buffer types (cached: one instance per child set).
+static ggml_backend_buffer_type_t ggml_backend_meta_buffer_type_from_simple(const std::vector<ggml_backend_buffer_type_t> & simple_bufts, ggml_backend_dev_t meta_dev) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    static std::map<ggml_backend_dev_t, std::map<std::vector<ggml_backend_buffer_type_t>, std::unique_ptr<ggml_backend_buffer_type>>> cache;
+    auto & per_dev = cache[meta_dev];
+    auto it = per_dev.find(simple_bufts);
+    if (it != per_dev.end()) {
+        return it->second.get();
+    }
+
+    auto bt = std::make_unique<ggml_backend_buffer_type>();
+    *bt = {
+        /*.iface  =*/ ggml_backend_meta_buffer_type_iface,
+        /*.device =*/ meta_dev,
+        /*.context=*/ new ggml_backend_meta_buffer_type_context(simple_bufts),
+    };
+    return per_dev.emplace(simple_bufts, std::move(bt)).first->second.get();
+}
+
+ggml_backend_buffer_type_t ggml_backend_meta_kv_region_buft(ggml_backend_dev_t meta_dev, size_t cells) {
+    if (meta_dev == nullptr || !ggml_backend_dev_is_meta(meta_dev)) {
+        return nullptr;
+    }
+    const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
+    if (n_devs == 0) {
+        return nullptr;
+    }
+
+    std::vector<ggml_backend_buffer_type_t> simple_bufts;
+    simple_bufts.reserve(n_devs);
+    for (size_t i = 0; i < n_devs; i++) {
+        ggml_backend_dev_t simple_dev = ggml_backend_meta_dev_simple_dev(meta_dev, i);
+        ggml_backend_buffer_type_t simple_buft = nullptr;
+        if (cells == 0) {
+            auto fn = (ggml_backend_meta_kv_region_buft_fn) ggml_backend_meta_simple_dev_proc(
+                    simple_dev, "ggml_backend_cuda_kv_region_buft");
+            simple_buft = fn != nullptr ? fn(simple_dev) : nullptr;
+        } else {
+            auto fn = (ggml_backend_meta_kv_region_buft_split_fn) ggml_backend_meta_simple_dev_proc(
+                    simple_dev, "ggml_backend_cuda_kv_region_buft_split");
+            simple_buft = fn != nullptr ? fn(simple_dev, cells) : nullptr;
+        }
+        if (simple_buft == nullptr) {
+            // all or nothing: one device without a region would make the window a per-device surprise
+            return nullptr;
+        }
+        simple_bufts.push_back(simple_buft);
+    }
+
+    return ggml_backend_meta_buffer_type_from_simple(simple_bufts, meta_dev);
+}
+
+int ggml_backend_meta_kv_region_is_kv_buft(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr || !ggml_backend_buft_is_meta(buft)) {
+        return 0;
+    }
+    const size_t n_bufts = ggml_backend_meta_buft_n_bufts(buft);
+    if (n_bufts == 0) {
+        return 0;
+    }
+    for (size_t i = 0; i < n_bufts; i++) {
+        ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
+        auto fn = (ggml_backend_meta_kv_region_is_kv_buft_fn) ggml_backend_meta_simple_dev_proc(
+                ggml_backend_buft_get_device(simple_buft), "ggml_backend_cuda_kv_region_is_kv_buft");
+        if (fn == nullptr || fn(simple_buft) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+//
 // meta backend buffer
 //
 
@@ -872,6 +968,48 @@ static int ggml_backend_meta_view_slab_dim(const struct ggml_tensor * view, cons
         }
     }
     return -1;
+}
+
+// TODO #124: grow every child region to `n_cells` cells (the windowed KV on a tensor split).  The children
+// are the buffers the Meta buffer was built from, so each is the plain per-device region buffer of its own
+// slice.  Returns
+//    1 = every child that carries a region grew it,  0 = no child carries a region (nothing to do),
+//   -1 = a child refused, or a child/handle is missing (a HARD error: an unmapped extent the next batch
+//        reads faults the GPU instead of returning a status, so this must never read as success).
+int ggml_backend_meta_kv_region_grow(ggml_backend_buffer_t buffer, uint32_t n_cells) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_meta(buffer)) {
+        return 0;
+    }
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
+    if (n_bufs == 0) {
+        GGML_LOG_ERROR("%s: the Meta buffer has no child buffers, so its KV regions cannot be grown\n", __func__);
+        return -1;
+    }
+    int ret = 0;
+    for (size_t i = 0; i < n_bufs; i++) {
+        ggml_backend_buffer_t simple_buf = ggml_backend_meta_buffer_simple_buffer(buffer, i);
+        if (simple_buf == nullptr) {
+            GGML_LOG_ERROR("%s: child buffer %zu of %zu is missing, so its KV region cannot be grown\n",
+                    __func__, i, n_bufs);
+            return -1;
+        }
+        auto fn = (ggml_backend_meta_kv_region_grow_fn) ggml_backend_meta_simple_dev_proc(
+                ggml_backend_buft_get_device(ggml_backend_buffer_get_type(simple_buf)),
+                "ggml_backend_cuda_kv_region_grow");
+        if (fn == nullptr) {
+            GGML_LOG_ERROR("%s: child buffer %zu of %zu has no backend that answers the KV-region grow hook\n",
+                    __func__, i, n_bufs);
+            return -1;
+        }
+        const int r = fn(simple_buf, n_cells);
+        if (r < 0) {
+            return -1;
+        }
+        if (r > 0) {
+            ret = 1;
+        }
+    }
+    return ret;
 }
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
@@ -3538,8 +3676,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // `////` x1 and MTP acc 1.00; this copy -> coherent, acc 3.88, and it keeps the
                 // staging win (IQ4_XS 16k: ppN 1000 vs 875 with staging off, decode 43.6 vs 48.0).
                 // `GGML_STAGE_META_REDIRECT=1` restores the redirect for A/B only -- it is not a
-                // correct configuration.
-                if (getenv("GGML_STAGE_META_REDIRECT") == nullptr && chunk.backend->iface.stage_d2d != NULL) {
+                // correct configuration.  Latched: this is the per-chunk upload path (issue #273 audit).
+                static const bool meta_redirect = getenv("GGML_STAGE_META_REDIRECT") != nullptr;
+                if (!meta_redirect && chunk.backend->iface.stage_d2d != NULL) {
                     chunk.backend->iface.stage_d2d(chunk.backend, chunk.orig, chunk.slot,
                                                    ggml_nbytes(simple_tensor));
                 } else {

@@ -593,6 +593,10 @@ bool ggml_cuda_flash_attn_qsa3_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * pk   = dst->src[7];
     const ggml_tensor * pv   = dst->src[8];
 
+    if (dst->src[9] != nullptr) {
+        return false;   // a page pool's K/V position list is the VEC kernel's (wip/kv-residency B-A)
+    }
+
     if (!pk || !pv) {                                     // the graph did not build the packs
         return false;
     }

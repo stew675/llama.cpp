@@ -70,10 +70,6 @@ bool    ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib
 bool    ggml_hip_runtime_module_info(char * path_out, size_t path_cap, bool * system_dir_out, int * version_out);
 #endif
 
-#if defined(GGML_USE_HIP) && defined(_WIN32)
-int64_t ggml_hip_win_available_ram_bytes();   // GlobalMemoryStatusEx (wddm-mem.cu)
-#endif
-
 namespace {
 
 // A pool file descriptor: an `int` on POSIX and a pointer-sized `HANDLE` on Windows, where `int` is 32-bit
@@ -2240,7 +2236,7 @@ static host_pool_t * table_pool_locked(table_t & t) {
         // cold reads (18 % of accesses, and that fraction DECAYS over a run as the arena warms, i.e. exactly
         // the observed "worse starting state that converges").  `plain` = cudaMallocHost (the master's
         // shape), `mapped` = cudaHostAllocMapped only, `portable` = the historical pair (default).
-        static const char * pool_alloc = getenv("MOE_HOST_POOL_ALLOC") != nullptr ? getenv("MOE_HOST_POOL_ALLOC") : "thp";
+        static const char * pool_alloc = [] { const char * e = getenv("MOE_HOST_POOL_ALLOC"); return e != nullptr ? e : "thp"; }();
         const size_t pool_bytes = (size_t) slots * t.host_bytes;
         cudaError_t  alloc_err  = (cudaError_t) -1;   // for HIP, whose enum has no `cudaErrorUnknown`
         /**/ if (strcmp(pool_alloc, "thp") == 0) {
@@ -2901,7 +2897,7 @@ static void pool_rank_experts_locked(const table_t & t, std::vector<int32_t> & o
 }
 
 static void pool_prepopulate_locked(host_pool_t & p, const table_t & t) {
-    static const bool bulk = getenv("MOE_HOST_POOL_BULK") == nullptr || atoi(getenv("MOE_HOST_POOL_BULK")) != 0;
+    static const bool bulk = [] { const char * e = getenv("MOE_HOST_POOL_BULK"); return e == nullptr || atoi(e) != 0; }();
     if (bulk && pool_mirror_bulk_fill_locked(p, t)) {
         return;
     }
@@ -3451,7 +3447,29 @@ static cudaError_t fill_slot_from_host(table_t & t, void * dst, size_t expert, c
         return k_no_host_source;
     }
     const cudaError_t err = copy_slot_from_src(t, dst, src, stream);
-    expert_src_done(t, pool, src, stream, /*retire*/ true);
+    // wip/host-expert-pool-region: retire the source slot ONLY when the pool is a BOUNDED complement of the
+    // arena (`slots < n_experts`), which is the case TODO #87's hand-over design was written for.  When the
+    // budget covers the whole tensor the pool is a MIRROR of it, and retiring the slot here UN-LOADS an expert
+    // that is already resident: the first arena eviction of that expert then has to re-read it from the page
+    // cache through the bounce ring (a synchronous 288 KiB `memcpy` + an H2D) instead of a D2D from the pool.
+    // Measured on a full-coverage run at 2 devices: 20 116 such bounce fills in the first 300 decode tokens
+    // (5.5 GiB of host memcpy at ~7 GB/s = ~0.5 s), which is what made the pool's STARTING state worse than a
+    // pinned master's and converged away as the arena settled.  A pinned master never has this: it holds every
+    // expert for the whole run, so every fill is a direct H2D from pinned memory.
+    // wip/host-expert-pool-surplus: keep the pool's copy whenever its capacity exceeds the COMPLEMENT (the
+    // experts the arena does NOT hold).  The surplus is spent mirroring the arena-resident weights, so a budget
+    // that is merely "big enough for the complement" already stops the un-load/re-read cycle, and a budget that
+    // covers the whole tensor mirrors it completely (measured: retiring those copies cost 20 116 synchronous
+    // page-cache memcpys in the first 300 decode tokens at full coverage).  A pool too small for the complement
+    // retires it, so the space can hold a complement expert -- the historical bounded layout.
+    const int  n_arena  = (int) t.expert_slot.size();
+    // TODO #269: a pool whose capacity COVERS the tensor mirrors it, so it must never un-load an expert just
+    // because the arena also holds it.  That is the same argument the surplus case below makes, taken to its
+    // conclusion -- and it is also what makes the decode remap's cold map stable: a retirement is the ONLY way
+    // an expert that is resident can lose its slot (the demand path never evicts a resident and a covering
+    // pool's re-rank is a no-op), so with this condition a covering pool's layout is write-once after sizing.
+    const bool keep_all = pool != nullptr && (pool->slots >= t.n_experts || pool->slots > t.n_experts - n_arena);
+    expert_src_done(t, pool, src, stream, /*retire*/ !keep_all);
     return err;
 }
 
@@ -5698,9 +5716,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
     }
     // The floor is a one-time early decision, but the aux estimate is only known from `common` (after the
     // model load).  Re-run it when a larger aux arrives so the load-time aux-0 answer cannot silently
-    // keep a cache that the with-draft projection would have declined.
-    if (g_preflight_done && aux_reserve_bytes <= g_preflight_aux) {
-        return g_enabled;   // latch: the call with the largest aux so far decides
+    // keep a cache that the with-draft projection would have declined -- and re-run it while the cache is
+    // DECLINED even for a smaller aux: a windowed MTP draft (LLAMA_SPEC_DRAFT_WINDOW) derives a much
+    // smaller reserve than the flat constant the load-time call can only use, so that call is the
+    // pessimistic one, and a decline it reached must not survive the real number.
+    if (g_preflight_done && aux_reserve_bytes <= g_preflight_aux && g_enabled) {
+        return g_enabled;   // latch while the cache is on: the call with the largest aux so far decides
     }
     g_preflight_done = true;
     g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
@@ -7888,7 +7909,7 @@ bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weigh
     // `head_pad`-byte writes (~256 KiB for 512 experts), i.e. free next to the expert upload it
     // guards.  `GGML_MOE_GATHER_ONCE=1` restores the once-only arm for A/B.
     if (head_pad > 0 && weight_cpy->data != nullptr) {
-        static const bool once = getenv("GGML_MOE_GATHER_ONCE") != nullptr && atoi(getenv("GGML_MOE_GATHER_ONCE")) != 0;
+        static const bool once = [] { const char * e = getenv("GGML_MOE_GATHER_ONCE"); return e != nullptr && atoi(e) != 0; }();
         bool run = true;
         if (once) {
             std::lock_guard<std::mutex> lock(g_mutex);

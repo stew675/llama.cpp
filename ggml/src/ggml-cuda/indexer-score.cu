@@ -362,7 +362,12 @@ static void ggml_cuda_indexer_score_impl(ggml_backend_cuda_context & ctx, ggml_t
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
     float corr_v[2];
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(dst), corr_v);
+    // This node is GGML_OP_INDEXER_SCORE, not a ROPE node, so ggml_rope_get_truncate(dst) does not
+    // apply (it asserts on the op).  The rope this kernel fuses is the graph's `ggml_rope_multi`
+    // indexer-key node, whose truncate default is TRUE (`ggml_rope_impl` initialises `no_trunc` 0 and
+    // nothing calls ggml_rope_set_truncate on it) -- and the pre-#30206 5-argument helper this code
+    // used floor/ceil'd unconditionally, i.e. the same.  Hard-code it.
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, /*truncate*/ true, corr_v);
 
     // optional derived-cache path: src6 = pool view, src7 = per-stream limit leaf
     const ggml_tensor * P = dst->src[6];
@@ -594,7 +599,12 @@ static void ggml_cuda_indexer_fill_impl(ggml_backend_cuda_context & ctx, ggml_te
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
     float corr_v[2];
-    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(dst), corr_v);
+    // This node is GGML_OP_INDEXER_SCORE, not a ROPE node, so ggml_rope_get_truncate(dst) does not
+    // apply (it asserts on the op).  The rope this kernel fuses is the graph's `ggml_rope_multi`
+    // indexer-key node, whose truncate default is TRUE (`ggml_rope_impl` initialises `no_trunc` 0 and
+    // nothing calls ggml_rope_set_truncate on it) -- and the pre-#30206 5-argument helper this code
+    // used floor/ceil'd unconditionally, i.e. the same.  Hard-code it.
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, /*truncate*/ true, corr_v);
 
     cudaStream_t stream = ctx.stream();
     qsa_score_log(1, "derived-fill", dst, ktype, "incremental");

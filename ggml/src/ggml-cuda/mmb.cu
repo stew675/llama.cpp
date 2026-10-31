@@ -2555,6 +2555,15 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     const int n_rows_x = ne11 * T, n_rows = n_used * T;
     constexpr int BN = 128;
     const uint16_t * xhp = mmb_bf16_activation(ctx, src1, (size_t) n_rows_x * K, stream);
+    // The slot buffer is a LONG-LIVED pool block: `ggml_cuda_mmb_slot_reserve` pushes it on the pool stack and
+    // it is released by `ggml_cuda_mmb_yield_caches` after the graph, not at the end of this scope.  It must
+    // therefore be taken BEFORE any plain pool allocation in this function: the pool asserts LIFO (the VMM
+    // pool; the non-VMM one silently corrupts its accounting), and a plain temporary allocated *before* the
+    // push is freed *below* it.  That is what aborted a Flash-Next run on gfx1151 -- the block being freed was
+    // `desc_small` (2176 B) while the slot was still live (GGML_CUDA_POOL_TRACE stack, 2026-11-08).  Same rule
+    // as the `hc_combine_norm` fix (R13); see `pool_stack` in common.cuh.
+    uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
+    const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(glu);
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_rows);
     ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), E + 1);
@@ -2571,8 +2580,6 @@ void ggml_cuda_mul_mat_id_mmb_glu(ggml_backend_cuda_context & ctx, const ggml_te
     ggml_cuda_pool_alloc<uint32_t> desc_big(ctx.pool(), nbig_max);
     ggml_cuda_pool_alloc<uint32_t> desc_small(ctx.pool(), nsmall_max);
     mmb_build_desc2<<<1, 1024, 0, stream>>>(bounds.get(), desc_big.get(), desc_small.get(), E, nbig_max, nsmall_max, BN, BN_SMALL, THRESH);
-    uint16_t * Dh = ggml_cuda_mmb_slot_reserve(ctx, 2, glu, (size_t) n_rows * M);
-    const bool store_f32 = !ggml_cuda_mmb_is_bf16_only(glu);
     static unsigned hits = 0; if (mmb_dbg() && hits++ < 2) fprintf(stderr, "MMB_GLU fused gate/up+swiglu: M=%d K=%d rows=%d store_f32=%d\n", M, K, n_rows, (int) store_f32);
     const uint8_t * Wg = (const uint8_t *) gw->data, * Wu = (const uint8_t *) uw->data; float * D = (float *) glu->data; const size_t eb = (size_t) gw->nb[2];
     dim3 gbig((M + 63) / 64, nbig_max), gsmall((M + 63) / 64, nsmall_max);
