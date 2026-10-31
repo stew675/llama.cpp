@@ -18,6 +18,287 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+//
+// wip/kv-residency (TODO #117): provider P1 for the KV cache -- a growable VMM region instead of one
+// `cudaMalloc` of the whole context.
+//
+// The KV buffer is allocated BEFORE the movable-boundary slab exists, so `SLAB_INIT` maps `free VRAM -
+// reserve` and every token of context comes out of the MoE expert arena 1:1.  A region reserves the KV's VA
+// up front and maps physical only for the cells a run reaches, which keeps that arithmetic exact at any
+// context length without touching a kernel: the region's base never moves, so a captured graph's baked
+// pointers stay valid, and the graph's existing "view is [0, n_kv) cells" contract is exactly the mapped
+// extent.
+//
+// Gated OFF (`LLAMA_KV_REGION=1` enables).  When the backend cannot provide a region -- no VMM, a driver
+// refusal, or no such hook at all -- the plain device buffer type is used and the numbers are the old ones.
+//
+
+typedef int (*llama_kv_region_grow_fn)(ggml_backend_buffer_t buffer, uint32_t n_cells);
+
+// Is the region PROVIDER usable at all?  Default yes: the buffer type is only ever taken when a window is
+// actually asked for (`LLAMA_KV_RESIDENT_CELLS`), so the default path is the plain device buffer and this
+// switch exists for A/B testing and bisection.  `LLAMA_KV_REGION=0` disables the provider outright.
+static bool llama_kv_region_enabled() {
+    static const bool on = [] {
+        const char * s = getenv("LLAMA_KV_REGION");
+        return s == nullptr || s[0] == '\0' || strcmp(s, "0") != 0;
+    }();
+    return on;
+}
+
+// The backend reg a device's KV-region proc addresses hang off, or nullptr when the device has none.  A Meta
+// (tensor-split) device carries no reg of its own (`device->reg == NULL`), so `ggml_backend_dev_backend_reg`
+// must not be fed to `ggml_backend_reg_get_proc_address` for it: every caller below reads nullptr as "the
+// backend does not provide this", which is how the window is DECLINED on a tensor split instead of aborting
+// inside an assert.  (A Meta device could not host a per-device VMM region anyway: the window is one VA range
+// per device, and a tensor split combines the plain buffer types.)
+static ggml_backend_reg_t llama_kv_region_dev_reg(ggml_backend_dev_t dev) {
+    return dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+}
+
+// TODO #124: a Meta (tensor-split) device has no reg of its own (`device->reg == NULL`), so a backend question
+// that is not about a per-device buffer type -- the spill ceiling (process-global), the H2D link constant, the
+// pinned-RAM reserve -- is asked on the Meta device's FIRST child.  Every child is the same backend, and none
+// of these three numbers is per device.  (A per-device buffer type is a different matter: it is built by
+// `ggml_backend_meta_kv_region_buft`, one region per child, and never by handing the Meta device to the CUDA
+// proc.)
+static ggml_backend_reg_t llama_kv_region_answer_reg(ggml_backend_dev_t dev) {
+    if (dev != nullptr && ggml_backend_dev_is_meta(dev)) {
+        dev = ggml_backend_meta_dev_n_devs(dev) > 0 ? ggml_backend_meta_dev_simple_dev(dev, 0) : nullptr;
+    }
+    return llama_kv_region_dev_reg(dev);
+}
+
+// The backend's region buffer type WITHOUT a window (`cells = 0`, the O1 shape).  Only the `--fit` probe uses
+// it: the fit identifies the KV's share of the device tier by this buffer TYPE, and the probe context is a
+// `no_alloc` one (so it declines a window), which would otherwise leave the fit unable to see the KV at all --
+// and then it reports an over-budget config and aborts instead of sizing the window.  No batch ever runs on a
+// probe context, so O1's KNOWN LIMIT (the slab takes the uncommitted VRAM) cannot bite.
+typedef ggml_backend_buffer_type_t (*llama_kv_region_buft_fn)(ggml_backend_dev_t dev);
+
+static bool g_kv_region_probe = false;
+
+static ggml_backend_buffer_type_t llama_kv_region_buft(ggml_backend_dev_t dev) {
+    if (!llama_kv_region_enabled() || dev == nullptr) {
+        return nullptr;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        // TODO #124: a tensor split needs the Meta build of the same buffer type (one region per child); it
+        // declines unless every child answers.
+        return ggml_backend_meta_kv_region_buft(dev, 0);
+    }
+    ggml_backend_reg_t reg = llama_kv_region_dev_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    auto fn = (llama_kv_region_buft_fn) ggml_backend_reg_get_proc_address(reg,
+            "ggml_backend_cuda_kv_region_buft");
+    return fn != nullptr ? fn(dev) : nullptr;
+}
+
+
+// wip/kv-residency (TODO #118) A2: the same buffer type with the windowed KV -- the newest `cells` cells of
+// the used extent are in VRAM, everything older in pinned system RAM.
+typedef ggml_backend_buffer_type_t (*llama_kv_region_buft_split_fn)(ggml_backend_dev_t dev, size_t cells);
+
+static ggml_backend_buffer_type_t llama_kv_region_buft_split(ggml_backend_dev_t dev, size_t cells) {
+    if (!llama_kv_region_enabled() || dev == nullptr || cells == 0) {
+        return nullptr;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        // TODO #124: the Meta build of the windowed buffer type (one region per child, every child at the SAME
+        // `cells`).  A cell index means the same cell on every device, so a per-device W is not a thing.
+        return ggml_backend_meta_kv_region_buft(dev, cells);
+    }
+    ggml_backend_reg_t reg = llama_kv_region_dev_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    auto fn = (llama_kv_region_buft_split_fn) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_cuda_kv_region_buft_split");
+    return fn != nullptr ? fn(dev, cells) : nullptr;
+}
+
+// wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL's pinned host MIRROR buffer type.  It is a
+// device-carrying buffer type whose allocation is pinned host memory (a discrete device reports `is_host`
+// false, so the scheduler still places the KV's writer and the FA read on the GPU).  Same proc-address
+// discipline as the region: a backend that does not answer declines the pool.
+typedef ggml_backend_buffer_type_t (*llama_kv_pool_mirror_buft_fn)(ggml_backend_dev_t dev);
+
+static ggml_backend_buffer_type_t llama_kv_pool_mirror_buft(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = llama_kv_region_dev_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    auto fn = (llama_kv_pool_mirror_buft_fn) ggml_backend_reg_get_proc_address(reg,
+            "ggml_backend_cuda_kv_pool_mirror_buft");
+    return fn != nullptr ? fn(dev) : nullptr;
+}
+
+// `LLAMA_KV_REGION_POOL=<cells>`: the attendance pool's size, in CELLS per layer (0/unset = off).  Page = one
+// indexer block (`compress_ratio` cells), so the pool is `ceil(cells / page)` slots.
+static uint32_t kv_pool_cells_env() {
+    const char * e = getenv("LLAMA_KV_REGION_POOL");
+    if (e == nullptr || e[0] == '\0') {
+        return 0u;
+    }
+    const long v = atol(e);
+    return v > 0 ? (uint32_t) v : 0u;
+}
+
+// wip/kv-residency (TODO #118): the windowed KV's resident window, in CELLS.  0/unset = off.
+//
+// The resident window is the LAST `W` cells of the context, so the spill is the low cells [0, kv_size - W).
+// A3 (this session) makes `W` a decision `--fit` can take instead of the user's arithmetic:
+//   - a number         -> that window, exactly as before;
+//   - `auto`           -> `--fit` sizes it (`llama_kv_region_set_resident_cells` below).  Without `--fit`
+//                         there is nobody to decide, so the cache declines the window and says so;
+//   - unset / 0        -> no window (today's fully resident cache, today's OOM).
+static uint32_t kv_split_resident_cells_env() {
+    const char * e = getenv("LLAMA_KV_RESIDENT_CELLS");
+    if (e == nullptr || e[0] == '\0') {
+        return 0u;
+    }
+    if (strcmp(e, "auto") == 0) {
+        return UINT32_MAX;
+    }
+    return (uint32_t) strtoul(e, nullptr, 10);
+}
+
+// The fit-produced window (`--fit` with `LLAMA_KV_RESIDENT_CELLS=auto`), 0 = none decided.  A process
+// global on purpose: `common_params_fit` runs before the contexts exist and hands the decision down here,
+// and one W covers every KV cache the process creates (the A2 rule: one window for every tensor and
+// cache).
+static uint32_t g_kv_resident_cells_override = 0;
+// ...and whether that 0 is a DECISION (`auto` sized by the fit: the KV fits fully resident, keep it) or just
+// "nothing set".  Without the second flag the cache cannot tell them apart, and it reported "--fit did not
+// run" after the fit had decided exactly that.
+static bool     g_kv_resident_cells_decided  = false;
+
+void llama_kv_region_set_resident_cells(uint32_t cells) {
+    g_kv_resident_cells_override = cells;
+    g_kv_resident_cells_decided  = true;
+}
+
+bool llama_kv_region_resident_cells_decided(uint32_t * cells) {
+    if (!g_kv_resident_cells_decided) {
+        return false;
+    }
+    if (cells != nullptr) {
+        *cells = g_kv_resident_cells_override;
+    }
+    return true;
+}
+
+bool llama_kv_region_is_enabled(void) {
+    return llama_kv_region_enabled();
+}
+
+// UINT32_MAX = `auto`: fit sizes it (see above).
+// `--fit`'s measurement context: take a region buffer even with no window, purely so the fit can identify
+// the KV.  Never set by the runtime; a probe context allocates no window and runs no batch.
+void llama_kv_region_set_probe(bool on) {
+    g_kv_region_probe = on;
+}
+
+uint32_t llama_kv_region_resident_cells_requested(void) {
+    if (g_kv_resident_cells_override != 0) {
+        return g_kv_resident_cells_override;
+    }
+    return kv_split_resident_cells_env();
+}
+
+// How much pinned host RAM the spill may take (bytes), 0 = no ceiling / unknown.  The backend owns the
+// number (`LLAMA_KV_SPILL_RAM_PCT` % of MemAvailable, shared by every cache in the process).
+typedef size_t (*llama_kv_spill_budget_fn)(void);
+
+typedef float (*llama_kv_link_gbps_fn)(ggml_backend_dev_t dev);
+
+// The PCIe link constant every spill cost model divides by: the backend's own calibrated H2D number
+// (~28.8 GB/s when the campaign was written, ~55 GB/s after the 2026-10 PCIe rework).  0 = unknown.
+static float llama_kv_region_link_gbps(ggml_backend_dev_t dev) {
+    ggml_backend_dev_t adev = dev;
+    if (adev != nullptr && ggml_backend_dev_is_meta(adev)) {
+        // the calibration initialises a backend, so it must be asked on a real device, never on the Meta wrapper
+        adev = ggml_backend_meta_dev_n_devs(adev) > 0 ? ggml_backend_meta_dev_simple_dev(adev, 0) : nullptr;
+    }
+    ggml_backend_reg_t reg = llama_kv_region_answer_reg(adev);
+    if (reg == nullptr) {
+        return 0.0f;
+    }
+    auto fn = (llama_kv_link_gbps_fn) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_cuda_kv_region_link_gbps");
+    return fn != nullptr ? fn(adev) : 0.0f;
+}
+
+typedef void (*llama_kv_spill_reserve_fn)(size_t bytes);
+
+// What is left of the pinned-spill ceiling for a NEW cache to plan, in bytes (SIZE_MAX = no ceiling).
+static size_t llama_kv_region_spill_budget(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = llama_kv_region_answer_reg(dev);
+    if (reg == nullptr) {
+        return SIZE_MAX;
+    }
+    auto fn = (llama_kv_spill_budget_fn) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_cuda_kv_region_spill_ram_budget");
+    return fn != nullptr ? fn() : SIZE_MAX;
+}
+
+// Account this cache's planned worst-case spill against that ceiling.
+static void llama_kv_region_spill_reserve(ggml_backend_dev_t dev, size_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+    ggml_backend_reg_t reg = llama_kv_region_answer_reg(dev);
+    if (reg == nullptr) {
+        return;
+    }
+    auto fn = (llama_kv_spill_reserve_fn) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_cuda_kv_region_spill_ram_reserve");
+    if (fn != nullptr) {
+        fn(bytes);
+    }
+}
+
+// The grow hook is the same for every device, so resolve it once.
+static llama_kv_region_grow_fn llama_kv_region_grow_hook() {
+    static llama_kv_region_grow_fn fn = nullptr;
+    static bool done = false;
+    if (!done) {
+        done = true;
+        if (llama_kv_region_enabled()) {
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+                fn = (llama_kv_region_grow_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_region_grow");
+                if (fn != nullptr) {
+                    break;
+                }
+            }
+        }
+    }
+    return fn;
+}
+
+// TODO #123: the attendance pool's pinned host mirror grows with the cell watermark too (same hook signature).
+static llama_kv_region_grow_fn llama_kv_pool_mirror_grow_hook() {
+    static llama_kv_region_grow_fn fn = nullptr;
+    static bool done = false;
+    if (!done) {
+        done = true;
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            fn = (llama_kv_region_grow_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_pool_mirror_grow");
+            if (fn != nullptr) {
+                break;
+            }
+        }
+    }
+    return fn;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -103,7 +384,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
-                     bool   v_enabled) :
+                     bool   v_enabled,
+                     bool   kv_pool_capable) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad),
     n_pad_prefill(kv_n_pad_prefill_default(model)), n_swa(n_swa), swa_type(swa_type),
@@ -187,6 +469,297 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    // wip/kv-residency (TODO #118) A2: the windowed KV.  The RESIDENT WINDOW is the newest `W` cells of the
+    // USED extent (`LLAMA_KV_RESIDENT_CELLS`), so the host/VRAM boundary slides forward as the context fills
+    // and a token always attends the newest cells from VRAM.  The spill grows with the used extent up to
+    // (kv_size - W) cells, i.e. the VRAM the cache never commits is what the expert arena gets.
+    //   Default W = kv_size -> no spill, i.e. today's fully resident cache (the opt-in is what spills).
+    //   One W covers every tensor, so the cell geometry has to be uniform across the layers this cache holds
+    //   (K and V included).  Anything else DECLINES the window -- no spill, today's fit-or-fail -- not a guess.
+    if (llama_kv_region_enabled() && other == nullptr && !v_trans && !hparams.no_alloc) {
+        uint32_t w = llama_kv_region_resident_cells_requested();
+        // A window needs a per-device VMM region buffer type, and the backend answers for it through the
+        // device's own backend reg.  Under `-sm tensor` the KV lives on the Meta wrapper, whose children are
+        // the real devices: the window is the SAME window there (one region per child, every child at the same
+        // `cells`, committed at its own cell stride -- see `ggml_backend_meta_kv_region_buft`).  Capability is
+        // therefore "this device, or every child of this Meta device, answers" (TODO #124).
+        const ggml_backend_dev_t kv_dev  = model.dev_layer(0);
+        const bool               kv_meta = kv_dev != nullptr && ggml_backend_dev_is_meta(kv_dev);
+        const bool region_capable = !kv_meta ? llama_kv_region_dev_reg(kv_dev) != nullptr
+                                             : ggml_backend_meta_kv_region_buft(kv_dev, 1) != nullptr;
+        // A MIRRORED cache (every device holds the whole thing) is declined: `n_devices x W x cell` of VRAM for
+        // one window, and the pinned-spill plan below is per logical cache -- it would under-book the spill by
+        // the device count and the run-time pinned-RAM ceiling would then refuse a mapping mid-run.
+        const bool kv_mirrored = kv_meta && model.get_split_state_ud.n_devices > 1 &&
+                model.kv_cache_split_mirrored();
+        if (w == UINT32_MAX) {
+            // `LLAMA_KV_RESIDENT_CELLS=auto`: `--fit` owns the sizing (it is the only thing that knows the
+            // free-VRAM budget the ARENA also draws on, and the RAM budget the spill draws on).  Three states,
+            // and they are not the same thing: the fit decided a window, the fit decided the KV fits fully
+            // resident (0 -- keep it, say nothing), or nobody decided (decline, and say why).
+            uint32_t decided = 0;
+            if (llama_kv_region_resident_cells_decided(&decided)) {
+                w = decided;
+            } else if (region_capable && !kv_mirrored) {
+                LLAMA_LOG_WARN("%s: LLAMA_KV_RESIDENT_CELLS=auto is sized by --fit, which did not run (or could not "
+                               "decide); the KV stays fully resident.  Pass the window explicitly "
+                               "(LLAMA_KV_RESIDENT_CELLS=<cells>) or run with --fit.\n", __func__);
+            }
+            // ... and when the device cannot host a region, the message below is the whole story.
+        }
+        if (w != 0 && kv_mirrored) {
+            static bool warned_mirrored = false;
+            if (!warned_mirrored) {
+                warned_mirrored = true;
+                LLAMA_LOG_WARN("%s: the windowed KV was declined: under this tensor split the KV cache is MIRRORED "
+                               "on every device (dsv4 / HRM), so one resident window would cost one copy per "
+                               "device and the pinned spill would be booked once; the KV stays fully resident.  "
+                               "Use one device (or -sm layer) for the window (LLAMA_KV_RESIDENT_CELLS).\n", __func__);
+            }
+            w = 0;
+        }
+        // Decline a requested window on a region-less device once, naming the reason, instead of letting the
+        // per-layer buft lookup decline it silently.
+        if (w != 0 && !region_capable) {
+            static bool warned_no_region = false;
+            if (!warned_no_region) {
+                warned_no_region = true;
+                if (kv_meta) {
+                    LLAMA_LOG_WARN("%s: the windowed KV was declined: it is one VMM region per device, and on this "
+                                   "tensor split at least one device does not provide a region buffer type (all "
+                                   "devices must answer, or the window would cover only some of them); the KV "
+                                   "stays fully resident (LLAMA_KV_RESIDENT_CELLS).\n", __func__);
+                } else {
+                    LLAMA_LOG_WARN("%s: the windowed KV is one VMM region per device, and this cache's KV lives on a "
+                                   "device that does not provide the region buffer type; the KV stays fully "
+                                   "resident (LLAMA_KV_RESIDENT_CELLS).\n", __func__);
+                }
+            }
+            w = 0;
+        }
+        // A window is a DEVICE region plus a pinned host tail.  A cache that is not device-offloaded
+        // (`-nkvo`) is pageable host RAM from end to end -- the per-layer buffer is chosen inside
+        // `if (offload)` below -- so there is nothing to window, and leaving the plan set would make
+        // `is_streaming()` (and with it qwen4exp's sparse decode arm) and the pinned-RAM spill reserve
+        // describe a placement this cache does not have.  Decline it, once, with the reason.
+        if (w != 0 && !offload) {
+            static bool warned_not_offloaded = false;
+            if (!warned_not_offloaded) {
+                warned_not_offloaded = true;
+                LLAMA_LOG_WARN("%s: the windowed KV was declined: it is one VMM region per device plus a pinned "
+                               "host tail, and this cache is not device-offloaded (`-nkvo`: the whole KV is already "
+                               "pageable host RAM), so there is nothing to window.  The KV cache is unchanged.\n",
+                               __func__);
+            }
+            w = 0;
+        }
+        const uint32_t n_tail = (w != 0 && kv_size > w) ? kv_size - w : 0;
+        size_t cell = 0;
+        size_t n_tens = 0;
+        bool   uniform = n_tail != 0;
+        for (uint32_t il = 0; uniform && il < n_layer; ++il) {
+            if (!hparams.has_kv(il) || (filter && !filter(il))) {
+                continue;
+            }
+            const size_t ck = ggml_row_size(type_k, hparams.n_embd_k_gqa(il));
+            const size_t cv = (!is_mla && v_enabled) ? ggml_row_size(type_v, hparams.n_embd_v_gqa(il)) : ck;
+            if (cell == 0) {
+                cell = ck;
+            }
+            uniform = ck == cell && cv == cell;
+            if (uniform) {
+                n_tens += (!is_mla && v_enabled) ? 2 : 1;
+            }
+        }
+        size_t spill_cap_bytes = 0;   // > 0 when the RAM budget clamped the window
+        size_t w_eff = w;
+        if (uniform) {
+            // A3/item 3: the spill is PINNED, non-swappable RAM, so the window is clamped UP (fewer spilled
+            // cells) until the worst case -- every tail cell of the context -- fits the RAM budget the
+            // backend's `LLAMA_KV_SPILL_RAM_PCT` ceiling allows.  This is the creation-time decision; the
+            // backend keeps a run-time check for RAM that disappears under a running process.
+            const size_t cell_all = cell * n_tens * n_stream;              // one cell, every tensor
+            const size_t budget   = llama_kv_region_spill_budget(model.dev_layer(0));
+            const size_t spill_worst = (size_t) n_tail * cell_all;
+            if (budget != SIZE_MAX && spill_worst > budget) {
+                spill_cap_bytes = budget;
+                const size_t tail_cells = budget / (cell_all != 0 ? cell_all : 1);
+                w_eff = kv_size > tail_cells ? (size_t) kv_size - tail_cells : (size_t) kv_size;
+                LLAMA_LOG_WARN("%s: the windowed KV's spill would need %.2f MiB of pinned, NON-SWAPPABLE RAM at "
+                               "full context (%.0f KiB per cell x %u tail cells in the cache), but only %.2f MiB "
+                               "is available (the LLAMA_KV_SPILL_RAM_PCT ceiling on pinned RAM).  The resident "
+                               "window is raised from %u to %zu of %u cells, so the spill is %.2f MiB.\n",
+                               __func__, (double) spill_worst / 1048576.0, (double) cell_all / 1024.0, n_tail,
+                               (double) budget / 1048576.0,
+                               w, w_eff, kv_size, (double) ((size_t) kv_size - w_eff) * cell_all / 1048576.0);
+                if (w_eff >= kv_size) {
+                    LLAMA_LOG_ERROR("%s: even with the whole KV resident the RAM budget leaves no room for this "
+                                   "window; the KV stays fully resident (today's fit-or-fail).  Lower -c, raise "
+                                   "LLAMA_KV_SPILL_RAM_PCT, or free RAM.\n", __func__);
+                }
+            }
+            // account the plan, so a second cache (Flash-Next has two) sizes against what is left
+            llama_kv_region_spill_reserve(model.dev_layer(0), (size_t) ((size_t) kv_size - w_eff) * cell_all);
+        }
+        if (n_tail == 0) {
+            // No window asked for, or it was declined above with its own message: fully resident, nothing to add.
+        } else if (!uniform) {
+            LLAMA_LOG_WARN("%s: the windowed KV is unavailable for this cache (non-uniform K/V cell geometry "
+                           "across layers); the KV stays fully resident\n", __func__);
+        } else if (w_eff < kv_size) {
+            const size_t tail = (size_t) kv_size - w_eff;
+            const float  gbps = llama_kv_region_link_gbps(model.dev_layer(0));
+            const size_t cell_all = cell * n_tens * n_stream;
+            this->kv_resident_cells = w_eff;
+            LLAMA_LOG_WARN("%s: WINDOWED KV ENABLED: the newest %zu of up to %u cells stay in VRAM, everything "
+                           "older spills to pinned system RAM (%.1f KiB per cell%s).  The spill grows with the "
+                           "used extent, up to %.2f MiB at full context, and every spilled cell is read over "
+                           "the PCIe link per step (%s).%s  Unset LLAMA_KV_RESIDENT_CELLS or LLAMA_KV_REGION to "
+                           "keep the KV fully resident.%s\n",
+                           __func__, w_eff, kv_size, cell / 1024.0, n_stream > 1 ? ", per stream" : "",
+                           (double) tail * cell_all / 1048576.0,
+                           gbps > 0.0f ? (std::to_string((int) (gbps + 0.5f)) + " GB/s, calibrated").c_str()
+                                       : "the link's measured rate",
+                           kv_meta ? "  On this tensor split every device keeps its own slice of the window (one "
+                                      "VMM region per device, the same cells on each)." : "",
+                           spill_cap_bytes != 0 ? "  (The window was widened by the RAM budget -- see above.)" : "");
+        }
+    }
+
+    // wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL -- a compact device pool of pages plus a pinned
+    // host MIRROR that holds the whole context and is AUTHORITATIVE (see `has_kv_pool()` in the header).
+    // Eligibility is narrow on purpose: the pool serves the sparse QSA DECODE read, so it needs a cache whose
+    // layers have one indexer block per page (a uniform `compress_ratio`), one stream, K and V both present,
+    // and a device that answers for the mirror buffer type.  Anything else keeps today's cache.
+    {
+        const uint32_t req = kv_pool_capable ? kv_pool_cells_env() : 0u;
+        if (req != 0) {
+            // one page == one indexer block
+            uint32_t page = 0;
+            bool     uniform_page = true;
+            bool     uniform_cell = true;
+            size_t   cell = 0;
+            size_t   n_tens = 0;
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                if (!hparams.has_kv(il) || (filter && !filter(il))) {
+                    continue;
+                }
+                const uint32_t r = hparams.dsv4_compress_ratios[il];
+                if (r == 0) {
+                    uniform_page = false;
+                    break;
+                }
+                if (page == 0) {
+                    page = r;
+                }
+                uniform_page = uniform_page && r == page;
+
+                const size_t ck = ggml_row_size(type_k, hparams.n_embd_k_gqa(il));
+                const size_t cv = (!is_mla && v_enabled) ? ggml_row_size(type_v, hparams.n_embd_v_gqa(il)) : ck;
+                if (cell == 0) {
+                    cell = ck;
+                }
+                uniform_cell = uniform_cell && ck == cell && cv == cell;
+                if (uniform_cell) {
+                    n_tens += (!is_mla && v_enabled) ? 2 : 1;
+                }
+            }
+
+            const char * why = nullptr;
+            if (!offload || other != nullptr || v_trans || is_mla || !v_enabled || n_stream != 1) {
+                why = "this cache's shape (it needs a device-offloaded, single-stream, non-MLA K/V cache)";
+            } else if (kv_resident_cells != 0) {
+                why = "the windowed KV is already active (LLAMA_KV_RESIDENT_CELLS)";
+            } else if (!uniform_page) {
+                why = "the compress ratio (page size) is not uniform across its layers";
+            } else if (!uniform_cell) {
+                why = "the K/V cell geometry is not uniform across its layers";
+            }
+            // The mirror must be answerable on EVERY device that will hold a pool layer: with `-sm layer` a
+            // multi-device cache gets one mirror buffer (and one device pool, page table and counter block)
+            // per device, and a device that does not answer would have to fall back to the plain device KV
+            // for its layers only -- which the resolve node (one per layer, all sources local) cannot express.
+            // A tensor split still declines: its Meta device has no reg, so no per-device mirror exists.
+            std::vector<ggml_backend_buffer_type_t> mirror_bufts;
+            if (why == nullptr) {
+                for (uint32_t il = 0; il < n_layer; ++il) {
+                    if (!hparams.has_kv(il) || (filter && !filter(il))) {
+                        continue;
+                    }
+                    ggml_backend_buffer_type_t b = llama_kv_pool_mirror_buft(model.dev_layer(il));
+                    if (b == nullptr) {
+                        why = "the backend does not provide the pool's pinned host mirror buffer type for every "
+                              "device the cache's layers are on (the CUDA backend, one device per layer: a "
+                              "tensor split has no per-device mirror)";
+                        break;
+                    }
+                    if (std::find(mirror_bufts.begin(), mirror_bufts.end(), b) == mirror_bufts.end()) {
+                        mirror_bufts.push_back(b);
+                    }
+                }
+            }
+            // the pinned mirror is bounded by the same ceiling as the windowed KV's spill: it is NON-SWAPPABLE RAM
+            size_t mirror_worst = (size_t) kv_size * cell * n_tens;
+            if (why == nullptr) {
+                const size_t budget = llama_kv_region_spill_budget(model.dev_layer(0));
+                if (budget != SIZE_MAX && mirror_worst > budget) {
+                    LLAMA_LOG_ERROR("%s: LLAMA_KV_REGION_POOL needs a %.2f MiB pinned host mirror at full context, "
+                                    "but only %.2f MiB is available (the LLAMA_KV_SPILL_RAM_PCT ceiling on pinned, "
+                                    "non-swappable RAM).  The pool is disabled and the KV stays as it is.\n",
+                                    __func__, (double) mirror_worst / 1048576.0, (double) budget / 1048576.0);
+                    why = "no room for the mirror";
+                } else {
+                    llama_kv_region_spill_reserve(model.dev_layer(0), mirror_worst);
+                }
+            }
+
+            if (why != nullptr) {
+                LLAMA_LOG_WARN("%s: LLAMA_KV_REGION_POOL=%u was declined: %s.  The KV cache is unchanged.\n",
+                        __func__, req, why);
+            } else {
+                // A resolve must never evict a page it claimed in the same launch (a verify batch resolves
+                // several selections at once), so the pool is floored at one full decode band's worth of
+                // blocks.  The graph re-checks this per width (`kv_pool_serves`); the floor is what makes the
+                // band usable at all.
+                const int64_t width = std::min<int64_t>(kv_size, (int64_t) hparams.indexer_top_k + page - 1);
+                const uint32_t blocks_row = (uint32_t) ((width + page - 1)/page);
+                const uint32_t band = 8;   // the QSA decode band (`QSA_DECODE_BAND` in qwen4exp.cpp)
+                uint32_t cells = std::max<uint32_t>(req, band*blocks_row*page);
+                cells = GGML_PAD(cells, n_pad > 1 ? n_pad : page);
+                // a pool bigger than the cache can never be more than 100 % resident, and pages past the
+                // cache's last block are never claimed: clamp, or `LLAMA_KV_REGION_POOL=1000000` on a
+                // 262144-cell context took a 12.4 GiB device pool (250000 pages) for 65536 usable ones.
+                cells = std::min<uint32_t>(cells, (uint32_t) kv_size);
+                const uint32_t n_pages  = (cells + page - 1)/page;
+                const uint32_t n_blocks = (uint32_t) ((kv_size + page - 1)/page);
+
+                kv_pool_page = page;
+                kv_pool_n_pages    = n_pages;
+                kv_pool_n_blocks   = n_blocks;
+                kv_pool_blocks_row = blocks_row;
+                pool_mirror_bufts  = mirror_bufts;
+
+                const std::string dev_note = mirror_bufts.size() > 1
+                        ? "  The cache's layers span " + std::to_string(mirror_bufts.size()) +
+                          " devices: each keeps its own mirror, pool and counter block, and a layer's resolve "
+                          "node runs entirely on its own device."
+                        : "";
+                LLAMA_LOG_WARN("%s: ATTENDANCE POOL ENABLED for the attention KV: a %.1f MiB device pool of %u pages "
+                               "x %u cells per layer (LLAMA_KV_REGION_POOL=%u%s), with the authoritative copy in a "
+                               "pinned host mirror (up to %.2f MiB at full context).  A decode step resolves its "
+                               "top-k selection through the page table and fills the pages it missed from the "
+                               "mirror (~%.2f MiB/token at a 90%% hit rate); prefill reads the mirror over the "
+                               "PCIe link.%s  Unset LLAMA_KV_REGION_POOL to keep the KV fully in VRAM.\n",
+                               __func__,
+                               (double) n_pages*page*cell*n_tens / 1048576.0, n_pages, page, req,
+                               n_pages*page != req ? ", floored to one decode band" : "",
+                               (double) mirror_worst / 1048576.0,
+                               (double) (width*cell*n_tens*0.10) / 1048576.0,
+                               dev_note.c_str());
+            }
+        }
+    }
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -243,6 +816,40 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            // Windowed KV: take the region buffer type ONLY when a window is actually asked for.  It is a
+            // device buffer type with the plain type's vtable contract (same device, same name predicate), so
+            // everything downstream -- the scheduler's placement, `memory_breakdown()`, `--fit` -- sees a KV
+            // buffer of the same size; only WHEN and WHERE its physical is committed changes.
+            //
+            // With no window (`LLAMA_KV_RESIDENT_CELLS` unset or 0) the plain device buffer is used, so the
+            // run is byte-identical to a build without this feature -- including its OOM.  The growable but
+            // fully-resident variant (O1) is deliberately NOT selected here: it changes when the KV's physical
+            // is committed, the slab takes the difference, and a run that later needs the whole context can
+            // then refuse where the plain arm completes (O1's KNOWN LIMIT).
+            if (kv_resident_cells != 0) {
+                ggml_backend_buffer_type_t buft_region = llama_kv_region_buft_split(dev, kv_resident_cells);
+                if (buft_region == nullptr) {
+                    // A silent fallback here means a warning above that promises a window the buffer does not have.
+                    static bool warned_split = false;
+                    if (!warned_split) {
+                        warned_split = true;
+                        LLAMA_LOG_WARN("%s: the backend declined the windowed KV buffer type for %zu cells; the KV "
+                                       "is fully resident (no spill), so the VRAM saving does not happen\n",
+                                       __func__, kv_resident_cells);
+                    }
+                } else {
+                    buft = buft_region;
+                    kv_region = true;
+                }
+            } else if (g_kv_region_probe) {
+                // the fit's measurement context (see llama_kv_region_set_probe)
+                ggml_backend_buffer_type_t buft_probe = llama_kv_region_buft(dev);
+                if (buft_probe != nullptr) {
+                    buft = buft_probe;
+                    kv_region = true;
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -252,11 +859,31 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
+        // wip/kv-residency (TODO #118) B-A: in pool mode the CELL-INDEXED cache tensors are the pinned host
+        // MIRROR -- every existing path (the writers, the state I/O, the shift, `get_k`/`get_v`) then works on
+        // it unchanged, which is exactly the point of making the mirror authoritative.  The pool is a separate
+        // device allocation in the ordinary device buffer.
+        ggml_backend_dev_t dev_layer = model.dev_layer(il);
+
+        ggml_context * ctx_kv = ctx;
+        if (kv_pool_page != 0) {
+            ggml_backend_buffer_type_t buft_mirror = llama_kv_pool_mirror_buft(dev_layer);
+            ctx_kv = buft_mirror != nullptr ? ctx_for_buft(buft_mirror) : nullptr;
+            if (!ctx_kv) {
+                throw std::runtime_error("failed to create ggml context for the KV pool mirror");
+            }
+            // the eligibility check above walked the same layer set, so this only re-states it (and keeps
+            // `memory_breakdown()`'s host bucket honest if the two ever disagree)
+            if (std::find(pool_mirror_bufts.begin(), pool_mirror_bufts.end(), buft_mirror) == pool_mirror_bufts.end()) {
+                pool_mirror_bufts.push_back(buft_mirror);
+            }
+        }
+
         const bool has_k = true;
         const bool has_v = !is_mla && v_enabled;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx_kv, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx_kv, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
@@ -265,13 +892,50 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            // the views must live in the SAME context as their source (the mirror, in pool mode): a context's
+            // buffers are allocated one buft at a time, and a view of a tensor whose buffer is not allocated
+            // yet is refused by ggml_backend_view_init
+            k_stream.push_back(has_k ? ggml_view_2d(ctx_kv, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx_kv, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+
+        // the compact pool + page table for this layer (B-A)
+        kv_pool_layer pl;
+        if (kv_pool_page != 0 && has_v) {
+            const int64_t pool_cells = (int64_t) kv_pool_page*kv_pool_n_pages;
+            pl.pool_k = ggml_new_tensor_2d(ctx, type_k, n_embd_k_gqa, pool_cells);
+            pl.pool_v = ggml_new_tensor_2d(ctx, type_v, n_embd_v_gqa, pool_cells);
+            pl.tbl    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv_pool_n_blocks);
+            pl.inv    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv_pool_n_pages);
+            pl.use    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv_pool_n_pages);
+            ggml_format_name(pl.pool_k, "kvpool_%sk_l%d", name_tag, il);
+            ggml_format_name(pl.pool_v, "kvpool_%sv_l%d", name_tag, il);
+            ggml_format_name(pl.tbl,    "kvpool_%stbl_l%d", name_tag, il);
+            ggml_format_name(pl.inv,    "kvpool_%sinv_l%d", name_tag, il);
+            ggml_format_name(pl.use,    "kvpool_%suse_l%d", name_tag, il);
+            // one counter block per DEVICE, in that device's own context: 12 counters, then the miss list
+            // (one entry per claimed block + one per written page)
+            {
+                ggml_tensor * ctr_d = nullptr;
+                for (const auto & pc : pool_ctrs) {
+                    if (pc.first == dev_layer) {
+                        ctr_d = pc.second;
+                        break;
+                    }
+                }
+                if (ctr_d == nullptr) {
+                    ctr_d = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 12 + (int64_t) kv_pool_n_pages + 256);
+                    ggml_format_name(ctr_d, "kvpool_%sctr_%s", name_tag, ggml_backend_dev_name(dev_layer));
+                    pool_ctrs.emplace_back(dev_layer, ctr_d);
+                }
+                pl.ctr = ctr_d;
+            }
+        }
+        pool_layers.push_back(pl);
     }
 
     if (reuse) {
@@ -317,6 +981,29 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // wip/kv-residency (TODO #118) B-A: -1 in the page table and its inverse means "not resident", and the
+    // buffers arrive zeroed.  The counters start at zero too (claim cursor, miss list, fills, ids, hits, ...).
+    if (kv_pool_page != 0 && !hparams.no_alloc) {
+        size_t pool_bytes = 0;
+        size_t mirror_bytes = 0;
+        for (auto & pl : pool_layers) {
+            if (pl.tbl == nullptr) {
+                continue;
+            }
+            ggml_backend_tensor_memset(pl.tbl, 0xFF, 0, ggml_nbytes(pl.tbl));
+            ggml_backend_tensor_memset(pl.inv, 0xFF, 0, ggml_nbytes(pl.inv));
+            ggml_backend_tensor_memset(pl.use, 0xFF, 0, ggml_nbytes(pl.use));
+            pool_bytes += ggml_nbytes(pl.pool_k) + ggml_nbytes(pl.pool_v);
+        }
+        for (const auto & pc : pool_ctrs) {
+            ggml_backend_tensor_memset(pc.second, 0, 0, ggml_nbytes(pc.second));
+        }
+        mirror_bytes = size_k_bytes() + size_v_bytes();
+        LLAMA_LOG_INFO("%s: attendance pool: %.2f MiB of device pool, %.2f MiB of pinned host mirror, "
+                       "%u pages of %u cells\n", __func__, (double) pool_bytes / 1048576.0,
+                       (double) mirror_bytes / 1048576.0, kv_pool_n_pages, kv_pool_page);
     }
 
     {
@@ -425,6 +1112,9 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+        // wip/kv-residency (TODO #118) B-A: the buffer clear zeroes the page table, and 0 is a VALID slot --
+        // so a pooled cache has to put its "not resident" marker back (-1).
+        kv_pool_invalidate();
     }
 }
 
@@ -748,6 +1438,10 @@ void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
     }
 
     ggml_backend_meta_set_scratch_views(false);
+
+    // wip/kv-residency (TODO #118) B-A: a park moves cells in place (a copy, not a writer), so the pool's
+    // residency claims no longer describe the mirror.
+    kv_pool_invalidate();
 }
 
 // the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
@@ -801,6 +1495,38 @@ static std::pair<uint32_t, uint32_t> llama_kv_cache_seq_run(const llama_kv_cells
 
 bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
     if (!can_park()) {
+        return false;
+    }
+
+    // wip/kv-residency (TODO #118): a park MOVES cells, and park_bound() is the top of the CACHE -- above the cell
+    // watermark a growable/windowed region has mapped.  The move is `ggml_backend_tensor_copy` (the copy engine),
+    // so a write into unmapped VA is a GPU PAGE FAULT, not an error: measured on Flash-Next (both KV caches
+    // windowed, `-c 65536 -ncmoe 48`) and reproduced with the window OFF (`LLAMA_KV_REGION=1` alone) and at a
+    // depth where nothing spills, so it belongs to the region provider, not to the window
+    // (`../llama-cpp-rdna-boosts/wip/kv-residency/A2-MIXED-BACKING.md` §3.7.11.3).
+    //
+    // Growing the region to cover the park instead is not free either: on a windowed cache the parked (cold)
+    // cells would take the resident window while the ACTIVE cells fall below the spill boundary, so every decode
+    // step would read the running context over the link -- a per-token cost against save-and-clear's one state
+    // copy per idle transition.  So this DECLINES, which leaves every cell where it is and lets the caller use its
+    // fallback: the server saves the slot to the prompt cache and clears it (server-context.cpp,
+    // `park_idle_slots_for_launch`: "cannot park the idle slot: saving it to the prompt cache and clearing it"),
+    // i.e. exactly the behaviour the parking gate compares against.  A region-backed cache is opt-in
+    // (`LLAMA_KV_REGION=1`), so the default path is unchanged.
+    //
+    // TODO #123: the attendance pool's mirror is grown on demand, so growing it to a park's destination would pin
+    // the WHOLE context again (a park packs to `cells.size()`), which is the host-RAM cost #123 exists to remove.
+    // It therefore declines for the same reason the window does, and the gate reports the save-and-clear fallback.
+    if (kv_region || kv_pool_page != 0) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: the KV is a growable/windowed REGION (LLAMA_KV_REGION) or an attendance POOL whose "
+                    "mirror is grown on demand (LLAMA_KV_REGION_POOL): a park moves cells to the TOP of the cache, "
+                    "which would map (and pin) the whole context, so idle slots are saved to the prompt cache and "
+                    "cleared instead of parked (one state copy per idle transition)\n",
+                    __func__);
+        }
         return false;
     }
     if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
@@ -1028,9 +1754,33 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     for (const auto & [ctx, buf] : ctxs_bufs) {
         ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
 
+        // wip/kv-residency (TODO #118) B-A: in pool mode the CELL-INDEXED tensors are the pool's pinned host
+        // MIRROR -- the authoritative copy of the whole context -- and only the compact device pool is VRAM.
+        // Charge the mirror to the host bucket, the same treatment the windowed KV's spill gets above, so
+        // `--fit` sizes a context around the pool instead of reserving the mirror (1.6-2.4 GiB at 103k-180k)
+        // as if it were device memory; that reservation was giving back the very arena the pool frees.
+        const bool is_pool_mirror = kv_pool_page != 0 &&
+                std::find(pool_mirror_bufts.begin(), pool_mirror_bufts.end(), buft) != pool_mirror_bufts.end();
+
         if (hparams.no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            ret[is_pool_mirror ? ggml_backend_cpu_buffer_type() : buft] +=
+                    ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+        } else if (is_pool_mirror) {
+            ret[ggml_backend_cpu_buffer_type()] += ggml_backend_buffer_get_size(buf.get());
+        } else if (kv_resident_cells != 0 && get_size() != 0) {
+            // wip/kv-residency (TODO #118) A3: a WINDOWED buffer only *commits* its resident window, so report
+            // the split instead of the whole reservation (the buffer's size is the VA range).  The geometry is
+            // uniform by construction (the ctor declines the window otherwise), so the split is proportional to
+            // the cells.  The spill is charged to the host/CPU bucket, which is what makes `--fit` size a
+            // context around the window and what makes the memory table show where the KV really lives.
+            const size_t bytes  = ggml_backend_buffer_get_size(buf.get());
+            const size_t res    = (size_t) std::min<size_t>(kv_resident_cells, get_size());
+            const size_t vram   = bytes / get_size() * res + (bytes % get_size()) * res / get_size();
+            ret[buft] += vram;
+            if (bytes > vram) {
+                ret[ggml_backend_cpu_buffer_type()] += bytes - vram;
+            }
         } else {
             // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
             ret[buft] += ggml_backend_buffer_get_size(buf.get());
@@ -1038,6 +1788,36 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     }
 
     return ret;
+}
+
+void llama_kv_cache::kv_pool_bytes(size_t & vram, size_t & ram) const {
+    vram = 0;
+    ram  = 0;
+    if (kv_pool_page == 0) {
+        return;
+    }
+    // the compact device pool, its page tables and the shared counter block (all in the plain device buffer)
+    for (const auto & pl : pool_layers) {
+        for (ggml_tensor * t : { pl.pool_k, pl.pool_v, pl.tbl, pl.inv, pl.use }) {
+            if (t != nullptr) {
+                vram += ggml_nbytes(t);
+            }
+        }
+    }
+    for (const auto & pc : pool_ctrs) {
+        if (pc.second != nullptr) {
+            vram += ggml_nbytes(pc.second);
+        }
+    }
+    // the cell-indexed tensors ARE the mirror in this mode: the authoritative copy of the whole context
+    for (const auto & l : layers) {
+        if (l.k) {
+            ram += ggml_nbytes(l.k);
+        }
+        if (l.v) {
+            ram += ggml_nbytes(l.v);
+        }
+    }
 }
 
 llama_memory_context_ptr llama_kv_cache::init_batch(
@@ -1556,6 +2336,164 @@ bool llama_kv_cache::get_can_shift() const {
     return true;
 }
 
+bool llama_kv_cache::is_streaming(uint32_t n_kv) const {
+    // The dense decode arm would read `O(depth)` KV bytes per step over the link whenever the cells the
+    // graph is about to read are NOT device-resident, so this is the placement question, not the plan one:
+    // `kv_region` is set only where the per-layer buffer type was actually taken (see `offload` above), and
+    // `kv_resident_cells` alone also names a plan whose buft the backend declined.  Keying on the plan made
+    // a `-nkvo` cache (or a refused region buft) pick the streamed arm for a fully host/fully resident KV.
+    //
+    // wip/kv-residency (TODO #118) B-A: an ACTIVE ATTENDANCE POOL streams too -- the cell-indexed cache is the
+    // pinned host mirror there, so the DENSE decode arm would read `O(depth)` bytes per step over the link.
+    // The pool exists to serve the sparse arm, so the pool turning the dense arm off is part of its contract.
+    return has_kv_pool() || (kv_region && kv_resident_cells != 0 && n_kv > kv_resident_cells);
+}
+
+bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
+    return kv->is_streaming(n_kv);
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
+    // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
+    // counters back synchronises the device).
+    if (kv_pool_page == 0 || pool_ctrs.empty() || pool_ctrs.front().second == nullptr ||
+            pool_ctrs.front().second->data == nullptr) {
+        return;
+    }
+    // the path, not a flag: a line on stderr sits between the generated text and llama-cli's perf line, and
+    // `scripts/extract-generated.py` slices exactly that range -- a text hash must never be taken beside it
+    const char * e = getenv("LLAMA_KV_POOL_STATS");
+    if (e == nullptr || e[0] == '\0') {
+        return;
+    }
+    FILE * f = fopen(e, "a");
+    if (f == nullptr) {
+        return;
+    }
+    // one counter block per device: every field is additive across them (the epoch/cursor/miss list are
+    // per-device state, so summing reports the same physical events the single block used to count)
+    int64_t c[12] = {};
+    for (const auto & pc : pool_ctrs) {
+        if (pc.second == nullptr || pc.second->data == nullptr) {
+            continue;
+        }
+        int32_t cd[12] = {};
+        ggml_backend_tensor_get(pc.second, cd, 0, sizeof(cd));
+        for (int i = 0; i < 12; ++i) {
+            c[i] += cd[i];
+        }
+    }
+    const double ids = (double) c[3];
+    fprintf(f, "%s: KV pool: %u pages x %u cells/layer, %u layers, %u counter blocks, claims %d, misses %d, ids %d, "
+            "hits %d (%.2f %%), dirty re-fills %d, resolves %d, bad %d\n",
+            __func__, kv_pool_n_pages, kv_pool_page, (uint32_t) layers.size(), (uint32_t) pool_ctrs.size(),
+            (int) c[0], (int) c[2], (int) c[3], (int) c[4], ids > 0 ? 100.0*(double) c[4]/ids : 0.0,
+            (int) c[5], (int) c[6], (int) c[7]);
+    fclose(f);
+}
+
+bool llama_kv_cache::has_kv_pool() const {
+    return kv_pool_page != 0;
+}
+
+uint32_t llama_kv_cache::kv_pool_page_cells() const {
+    return kv_pool_page;
+}
+
+uint32_t llama_kv_cache::kv_pool_blocks_per_row() const {
+    return kv_pool_blocks_row;
+}
+
+bool llama_kv_cache::kv_pool_serves(uint32_t n_rows) const {
+    // A resolve must not evict a page it claimed in the same launch, so one launch's worth of DISTINCT
+    // blocks has to fit the pool.  `n_rows` selections of `blocks_row` blocks each is the conservative
+    // bound (they overlap in practice); a wider batch simply takes the cell-indexed path instead.
+    if (kv_pool_page == 0) {
+        return false;
+    }
+    return (uint64_t) n_rows*kv_pool_blocks_row <= (uint64_t) kv_pool_n_pages;
+}
+
+void llama_kv_cache::kv_pool_invalidate() {
+    if (kv_pool_page == 0) {
+        return;
+    }
+    for (auto & pl : pool_layers) {
+        if (pl.tbl == nullptr) {
+            continue;
+        }
+        ggml_backend_tensor_memset(pl.tbl, 0xFF, 0, ggml_nbytes(pl.tbl));
+        ggml_backend_tensor_memset(pl.inv, 0xFF, 0, ggml_nbytes(pl.inv));
+        ggml_backend_tensor_memset(pl.use, 0xFF, 0, ggml_nbytes(pl.use));
+    }
+}
+
+// the pool's K/V views: the same 4-D layout get_k/get_v return, over `page_cells*n_pages` cells
+static ggml_tensor * kv_pool_view(ggml_context * ctx, const ggml_tensor * t, int32_t n_embd_head, int32_t n_head_kv,
+        int64_t n_cells) {
+    const int64_t n_embd_gqa = t->ne[0];
+
+    return ggml_view_4d(ctx, const_cast<ggml_tensor *>(t),
+            n_embd_head, n_head_kv, n_cells, 1,
+            ggml_row_size(t->type, n_embd_head),
+            ggml_row_size(t->type, n_embd_gqa),
+            ggml_row_size(t->type, n_embd_gqa*n_cells),
+            0);
+}
+
+ggml_tensor * llama_kv_cache::get_k_pool(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    GGML_ASSERT(ikv >= 0 && (size_t) ikv < pool_layers.size() && pool_layers[ikv].pool_k != nullptr);
+
+    return kv_pool_view(ctx, pool_layers[ikv].pool_k, hparams.n_embd_head_k(il), hparams.n_head_kv(il),
+            (int64_t) kv_pool_page*kv_pool_n_pages);
+}
+
+ggml_tensor * llama_kv_cache::get_v_pool(ggml_context * ctx, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    GGML_ASSERT(ikv >= 0 && (size_t) ikv < pool_layers.size() && pool_layers[ikv].pool_v != nullptr);
+    GGML_ASSERT(!v_trans);
+
+    return kv_pool_view(ctx, pool_layers[ikv].pool_v, hparams.n_embd_head_v(il), hparams.n_head_kv(il),
+            (int64_t) kv_pool_page*kv_pool_n_pages);
+}
+
+ggml_tensor * llama_kv_cache::build_kv_pool_resolve(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * wids, int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    GGML_ASSERT(ikv >= 0 && (size_t) ikv < pool_layers.size() && pool_layers[ikv].pool_k != nullptr);
+
+    const kv_pool_layer & pl = pool_layers[ikv];
+
+    ggml_tensor * res = ggml_kv_pool(ctx, ids, pl.tbl, pl.inv, pl.ctr,
+            /* mirror_k */ layers[ikv].k, /* mirror_v */ layers[ikv].v,
+            pl.pool_k, pl.pool_v, wids, pl.use);
+
+    ggml_kv_pool_set_page(res, (int) kv_pool_page);
+
+    return res;
+}
+
+bool llama_kv_cache_context::has_kv_pool() const {
+    return kv->has_kv_pool();
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_pool(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_pool(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_pool(ggml_context * ctx, int32_t il) const {
+    return kv->get_v_pool(ctx, il);
+}
+
+ggml_tensor * llama_kv_cache_context::build_kv_pool_resolve(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * wids, int32_t il) const {
+    return kv->build_kv_pool_resolve(ctx, ids, wids, il);
+}
+
+bool llama_kv_cache_context::kv_pool_serves(uint32_t n_rows) const {
+    return kv->kv_pool_serves(n_rows);
+}
+
 uint32_t llama_kv_cache::get_size() const {
     const auto & cells = v_cells[seq_to_stream[0]];
 
@@ -1615,6 +2553,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return seq_to_stream[seq_id];
+}
+
+void llama_kv_cache::grow_regions(uint32_t n_kv) const {
+    // `kv_region` is the windowed KV; a pooled cache grows its pinned host MIRROR through the same cell
+    // watermark (TODO #123), so the two providers share this hook site.
+    if ((!kv_region && kv_pool_page == 0) || ctxs_bufs.empty()) {
+        return;
+    }
+    llama_kv_region_grow_fn fn = kv_region ? llama_kv_region_grow_hook() : llama_kv_pool_mirror_grow_hook();
+    for (const auto & [_, buf] : ctxs_bufs) {
+        // TODO #124: under a tensor split the KV is ONE Meta buffer over per-device region buffers, and the
+        // CUDA grow hook returns 0 (= "not a region buffer") for it -- a silent success on unmapped VA, which
+        // the next batch would fault on.  Fan the same grow out to every child instead, and treat a child that
+        // cannot be reached as a refusal (never as a 0).
+        const ggml_backend_dev_t buf_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf.get()));
+        const int r = buf_dev != nullptr && ggml_backend_dev_is_meta(buf_dev)
+                ? ggml_backend_meta_kv_region_grow(buf.get(), n_kv)
+                : (fn != nullptr ? fn(buf.get(), n_kv) : 0);
+        if (r < 0) {
+            // A refused grow is not something to continue past: the graph this batch would build reads cells
+            // above the mapped extent, and that faults the GPU (it does not return an error).  The backend has
+            // already logged the numbers; refuse loudly instead of hanging the card.
+            GGML_ABORT("%s: the KV region/mirror cannot be grown to %u cells and a batch that needs more than the "
+                       "mapped extent would fault the GPU.  Lower -c, raise LLAMA_KV_REGION_MAP_MAX_MIB or "
+                       "LLAMA_KV_SPILL_RAM_PCT, or unset LLAMA_KV_REGION/LLAMA_KV_REGION_POOL.\n", __func__, n_kv);
+        }
+    }
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) const {
@@ -1895,6 +2860,9 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
 }
 
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
+    // wip/kv-residency (TODO #118) B-A: a shift rewrites cells in place WITHOUT going through the writers
+    // (`set_rows`), so every residency claim is dropped: the pool pages would otherwise hold unshifted bytes.
+    const_cast<llama_kv_cache *>(this)->kv_pool_invalidate();
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     int32_t * data = (int32_t *) dst->data;
@@ -3319,6 +4287,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
     }
 
+    // wip/kv-residency (TODO #118) B-A: a restore writes cells directly, so no residency claim survives it
+    kv_pool_invalidate();
+
     return true;
 }
 
@@ -3491,6 +4462,11 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur], ubatches[i_cur].n_tokens);
+
+    // wip/kv-residency (TODO #117): this is the last point before the graph is built, and `n_kv` is the PADDED
+    // extent its views use -- so it is also exactly the extent the region must have mapped.  Growing to the
+    // used cells instead would leave a kernel reading unmapped VA (a GPU fault, not an error).
+    kv->grow_regions(n_kv);
 
     return true;
 }

@@ -4,6 +4,8 @@
 
 #include "gguf.h"
 
+#include "../src/llama-ext.h"
+
 #include <algorithm>
 #include <cstring>
 #include <vector>
@@ -104,7 +106,10 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                                    uint32_t n_ctx,
                                                    uint32_t n_ubatch,
                                                    ggml_type type_k,
-                                                   ggml_type type_v) {
+                                                   ggml_type type_v,
+                                                   bool shares_model,
+                                                   uint32_t n_seq_max,
+                                                   bool kv_unified) {
     common_draft_reserve r;
 
     if (path.empty()) {
@@ -134,7 +139,9 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
     for (int64_t i = 0; i < n_tensors; ++i) {
         weights += gguf_get_tensor_size(g, i);
     }
-    r.weights = weights;
+    // a shared-weights draft (an embedded MTP head) owns no weights: it runs the target's nextn layer, and
+    // charging them again is what the flat constant did
+    r.weights = shares_model ? 0 : weights;
 
     // `n_ctx == 0` means "from the model": estimating the KV with 0 would UNDER-estimate the reserve (the
     // dangerous direction), so fall back to the context the draft itself declares as its trained maximum.
@@ -149,6 +156,18 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
     uint32_t block_count = 0;
     uint32_t n_nextn      = 0;
     (void) read_u32_max(g, arch + ".nextn_predict_layers", n_nextn);   // absent for a standalone draft
+
+    // `shares_model` (an MTP draft with no GGUF of its own) is only right for a model that DECLARES its MTP
+    // head: qwen3.5/3.6/3.8 carry `nextn_predict_layers`, while qwen4exp/Flash-Next keeps its head in a
+    // separate `mtp-*.gguf` -- and that file's path is not known yet when this estimate runs, so reading the
+    // TARGET would charge 48 layers of KV to a draft the window does not even apply to.  Decline instead,
+    // and the caller keeps the flat constant.
+    if (shares_model && n_nextn == 0) {
+        r.note = "the model declares no embedded MTP head (nextn_predict_layers); keeping the flat constant";
+        gguf_free(g);
+        return r;
+    }
+
     if (!read_u32_max(g, arch + ".block_count", block_count) || block_count == 0) {
         r.note = "draft GGUF has no usable block_count";
         gguf_free(g);
@@ -201,7 +220,32 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                               ? (double) kv_own * (double) idx_heads * (double) idx_len * (double) F32_BYTES
                               : 0.0;
     // +10 % for per-row block padding and the KQ-mask padding llama.cpp adds to the cell count.
-    r.kv = (size_t) ((double) n_ctx * (attn_per_tok + idx_per_tok) * 1.10);
+    //
+    // The MTP drafter's KV window (llama-ext.h) is honoured here for the same reason the cache takes it: the
+    // estimate is what the slab holds back in `aux_reserve`, so an un-windowed estimate leaves the freed VRAM
+    // unspent instead of handing it to the expert arena.
+    // The draft KV window applies ONLY to an embedded MTP head (`shares_model`), which is the cache
+    // `create_memory`'s plain kv_cache branch builds.  A separate draft GGUF (qwen4exp's `-md` MTP head) keeps
+    // its full `-c` cache, so sizing ITS reserve by the window under-charges it by (n_ctx - W) cells -- the
+    // direction the file's header calls dangerous.
+    //
+    // The cell count comes from `llama_spec_draft_kv_cells()`, the same function the cache itself uses, so the
+    // reserve cannot disagree with the allocation: under `--kv-unified` the window is granted per SEQUENCE and
+    // the cache is `(win + one batch) x n_seq_max` cells (issue #264).
+    //
+    // A per-STREAM cache (no `--kv-unified`) gets one `kv_size`-cell stream per sequence, so the TOTAL is
+    // `n_seq_max x` the returned per-stream count -- charging one stream for a multi-slot server would
+    // under-charge the reserve by `(n_seq_max - 1) x (win + n_ubatch)` cells (the direction the header calls
+    // dangerous).  An un-windowed estimate already returns `n_ctx` cells, which IS the total.
+    uint32_t draft_win = 0;
+    const uint32_t draft_cells = shares_model
+                               ? llama_spec_draft_kv_cells(n_ctx, n_ubatch, n_seq_max, kv_unified, &draft_win)
+                               : 0;
+    const size_t   kv_cells     = draft_cells != 0
+                                ? (size_t) draft_cells
+                                  * (size_t) (kv_unified ? 1u : std::max<uint32_t>(1, n_seq_max))
+                                : (size_t) n_ctx;
+    r.kv = (size_t) ((double) kv_cells * (attn_per_tok + idx_per_tok) * 1.10);
 
     // --- compute + slack: measured, not assumed ------------------------------------------------
     // A measured tier here was wrong in both directions: the draft context's compute buffer is read back
@@ -224,13 +268,14 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
     r.ok    = r.total > 0;
 
     LOG_INF("%s: draft reserve estimate for '%s': weights %.0f + kv %.0f (%u x %u layers, %u kv heads,"
-            " %u/%u head dims, indexer %s%s) + compute %.0f + slack %.0f = %.0f MiB (n_ctx %u)\n",
+            " %u/%u head dims, indexer %s%s) + compute %.0f + slack %.0f = %.0f MiB (n_ctx %u, kv cells %zu%s%s)\n",
             __func__, path.c_str(),
             (double) r.weights / 1048576.0, (double) r.kv / 1048576.0, kv_own, kv_layers, n_head_kv,
             k_len, v_len, have_indexer ? "yes" : "no",
             shares_kv ? ", KV shared with the target (0 owned)" : "",
             (double) r.compute / 1048576.0, (double) r.slack / 1048576.0, (double) r.total / 1048576.0,
-            n_ctx);
+            n_ctx, kv_cells, draft_cells != 0 ? ", MTP draft window" : "",
+            shares_model ? ", weights shared with the target (0 charged)" : "");
 
     return r;
 }

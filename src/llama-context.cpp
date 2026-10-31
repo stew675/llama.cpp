@@ -746,6 +746,7 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.kv_pool   =*/ cparams.ctx_other == nullptr,
         };
         // the graph builders that choose between quantized-aware attention arms need the same
         // types the memory module was given (see qwen4exp_qsa_sparse)
@@ -3312,7 +3313,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // outputs (a prompt chunk that does not end its prompt), so they need the same wait there: the next ubatch's input
         // upload waits only for this graph's compute, not for the copies queued after it, and was observed (Windows, ROCm)
         // to overwrite a layer input before its copy had read it.
-        static const bool readback_sync = getenv("GGML_READBACK_SYNC") == nullptr || atoi(getenv("GGML_READBACK_SYNC")) != 0;
+        static const bool readback_sync = [] { const char * e = getenv("GGML_READBACK_SYNC"); return e == nullptr || atoi(e) != 0; }();
         // F1 (issue #240): with the in-graph stores there is no layer-input readback to order (the copy that needed
         // it no longer exists, and syncing the device once per ubatch would serialize a multi-ubatch prefill) -
         // except for an embedding ubatch, which fills the host rows the draft reads.
@@ -6910,6 +6911,22 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+void llama_context::kv_pool_bytes(size_t & vram, size_t & ram) const {
+    vram = 0;
+    ram  = 0;
+    if (memory) {
+        memory->kv_pool_bytes(vram, ram);
+    }
+}
+
+void llama_get_kv_pool_bytes(const struct llama_context * ctx, size_t * vram, size_t * ram) {
+    size_t v = 0;
+    size_t r = 0;
+    ctx->kv_pool_bytes(v, r);
+    if (vram != nullptr) { *vram = v; }
+    if (ram  != nullptr) { *ram  = r; }
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

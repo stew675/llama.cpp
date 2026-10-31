@@ -118,9 +118,13 @@ public:
                  const char *   name_tag = "",
         // set to false for keys-only caches (e.g. the qwen4exp QSA indexer store):
         // no V tensor is allocated, and no V-side op may be issued against the cache
-                         bool   v_enabled = true);
+                         bool   v_enabled = true,
+        // wip/kv-residency (TODO #118) B-A: may this cache take the ATTENDANCE POOL
+        // (`LLAMA_KV_REGION_POOL`)?  Only a cache whose decode read is the sparse QSA arm can use it;
+        // the MTP draft's attention is dense, so the draft cache must not take it.
+                         bool   kv_pool_capable = false);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -138,6 +142,12 @@ public:
     bool get_can_shift() const override;
 
     void clear(bool data) override;
+
+    // wip/kv-residency (TODO #117): map the growable KV region so the first `n_kv` cells of every KV tensor are
+    // backed by physical memory.  `n_kv` must be the value the graph views use -- the PADDED one from
+    // `get_n_kv()` -- because a kernel that reads a cell above the mapped extent faults the GPU rather than
+    // returning an error.  A no-op unless the KV is region-backed (LLAMA_KV_REGION).
+    void grow_regions(uint32_t n_kv) const;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
@@ -163,6 +173,9 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // wip/kv-residency (TODO #118) B-A: the attendance pool's device VRAM and pinned host mirror bytes
+    void kv_pool_bytes(size_t & vram, size_t & ram) const override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -175,6 +188,35 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream() const;
+
+    // wip/kv-residency (TODO #118) B2: is this cache's KV STREAMING at the extent `n_kv` -- i.e. is a
+    // resident window active and has the used extent passed it, so that the tail of every tensor lives in
+    // pinned host RAM?  A read of a spilled cell comes over the PCIe link (~55 GB/s) instead of VRAM
+    // (~565 GB/s), which is what makes the attention ARM worth switching (a streamed cache prefers the
+    // sparse QSA decode, a resident one the dense arm; wip/kv-residency/B1-STRATA-PLAN.md §3.2).
+    bool is_streaming(uint32_t n_kv) const;
+
+    // wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL.
+    //
+    // The attention KV is kept twice: the MIRROR (`layers[].k`/`v`, pinned host memory, authoritative and
+    // cell-indexed -- every existing path, the writers included, works on it unchanged) and a compact
+    // DEVICE POOL of `n_pages` pages of `page_cells` cells each (`page_cells` == one indexer block, so the
+    // selection's own granularity), with a page table `tbl[block] -> slot`.  A decode step resolves its
+    // selection through the table (`build_kv_pool_resolve`): the missed pages are copied from the mirror,
+    // and the reader gathers K/V at the pool slots (`ggml_flash_attn_qsa_set_kv_idx`).  See
+    // `wip/kv-residency/BA-POOL-DESIGN.md`; the writer rule (mirror always, no invalidation ever) is in
+    // `ggml/src/ggml-cuda/kv-pool.cu`.
+    bool has_kv_pool() const;
+    uint32_t kv_pool_page_cells() const;
+    // the block count one selection can span, i.e. the widest pool a single attention row needs
+    uint32_t kv_pool_blocks_per_row() const;
+    // may a resolve of `n_rows` selections be served without evicting a page it just claimed?
+    bool kv_pool_serves(uint32_t n_rows) const;
+    // the compact pool's K/V views (same 4-D layout as get_k/get_v, over the pool's cells)
+    ggml_tensor * get_k_pool(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_pool(ggml_context * ctx, int32_t il) const;
+    // the page-table resolve for one layer's selection: dst = the selected cells' POOL positions
+    ggml_tensor * build_kv_pool_resolve(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * wids, int32_t il) const;
 
     bool get_has_shift() const;
 
@@ -335,6 +377,45 @@ private:
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
+    // wip/kv-residency (TODO #117): is a buffer of this cache backed by a growable VMM region (provider P1)?
+    // Set once at construction from the backend's answer, and `grow_regions()` is then called with the extent
+    // the graph is about to read/write.  Zero cost (and no proc lookup) when the feature is off.
+    bool kv_region = false;
+
+    // wip/kv-residency (TODO #118) A2/A3: the windowed KV's resident window, in CELLS (0 = no window).
+    // `memory_breakdown()` reports only the resident part against the device buffer type, because that is
+    // all the buffer ever COMMITS -- the rest is pinned host memory.
+    size_t kv_resident_cells = 0;
+
+    // wip/kv-residency (TODO #118) B-A: the attendance pool (see has_kv_pool()).  `pool_layers` is
+    // parallel to `layers`; `layers[].k`/`v` are the MIRROR in this mode.
+    struct kv_pool_layer {
+        ggml_tensor * pool_k = nullptr;   // [n_embd_k_gqa, page_cells*n_pages]  device
+        ggml_tensor * pool_v = nullptr;
+        ggml_tensor * tbl    = nullptr;   // I32 [n_blocks]  block -> slot | -1
+        ggml_tensor * inv    = nullptr;   // I32 [n_pages]   slot -> block | -1
+        ggml_tensor * use    = nullptr;   // I32 [n_pages]   the epoch that last marked the slot in use
+        ggml_tensor * ctr    = nullptr;   // I32 [12 + n_pages + 256] this layer's DEVICE counter block
+    };
+    std::vector<kv_pool_layer> pool_layers;
+    // ONE counter block per DEVICE (claim cursor, epoch, miss list, ...): a resolve node runs on the device
+    // its layer is on, so its sources must all be there -- a single block for the whole cache would put every
+    // other device's node in a cross-device graph that no backend claims (r213).
+    std::vector<std::pair<ggml_backend_dev_t, ggml_tensor *>> pool_ctrs;
+    uint32_t kv_pool_page       = 0;       // page size in cells (0 = pool off)
+    uint32_t kv_pool_n_pages    = 0;
+    uint32_t kv_pool_n_blocks   = 0;
+    uint32_t kv_pool_blocks_row = 0;       // blocks one selection can span
+    // the pinned host MIRROR's buffer types, ONE PER DEVICE the cache's layers are on: `memory_breakdown()`
+    // charges their bytes to the host bucket (only the compact device pool above is VRAM), which is what
+    // `--fit` needs to size a context around the pool
+    std::vector<ggml_backend_buffer_type_t> pool_mirror_bufts;
+
+    // drop every residency claim (the pages stay valid copies, they just stop being authoritative for
+    // their block).  Needed by any path that rewrites cells in place WITHOUT going through the writers:
+    // the K-shift (rope/per-token moves) and a state restore.
+    void kv_pool_invalidate();
+
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
@@ -452,6 +533,20 @@ public:
     //
 
     uint32_t get_n_kv() const;
+
+    // wip/kv-residency (TODO #118) B2: see llama_kv_cache::is_streaming
+    bool is_streaming(uint32_t n_kv) const;
+
+    // wip/kv-residency (TODO #118) B-A: see llama_kv_cache::has_kv_pool
+    bool has_kv_pool() const;
+    // the K/V views of the compact pool (same 4-D layout as get_k/get_v, n_kv = the pool's cells)
+    ggml_tensor * get_k_pool(ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_v_pool(ggml_context * ctx, int32_t il) const;
+    // emit the page-table resolve for this layer's selection: dst = the selected cells' POOL positions.
+    // `ids` is the selection (cell ids, the shape indexer_top_k returns), `wids` the cells this batch just
+    // WROTE (the pages holding them are re-filled from the mirror), or nullptr.
+    ggml_tensor * build_kv_pool_resolve(ggml_context * ctx, ggml_tensor * ids, ggml_tensor * wids, int32_t il) const;
+    bool kv_pool_serves(uint32_t n_rows) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

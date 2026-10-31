@@ -213,6 +213,9 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    // wip/kv-residency (TODO #118) B-A: the attendance pool's device VRAM and pinned host mirror bytes
+    void kv_pool_bytes(size_t & vram, size_t & ram) const;
+
     //
     // training
     //

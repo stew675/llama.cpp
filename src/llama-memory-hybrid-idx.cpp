@@ -70,13 +70,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
+    const layer_filter_cb & filter_idx,
+                     bool   kv_pool) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, n_rs_batch, offload, unified,
-        filter_attn, filter_recr),
+        filter_attn, filter_recr, kv_pool),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -1789,7 +1790,9 @@ std::vector<int64_t> llama_memory_hybrid_idx_context::qsa_score_key_limits(
         limits.push_back(std::min(n_blocks, std::max(budget, (maximum + 1)/ratio) + 1));
     }
 
-    if (getenv("LLAMA_QSA_SCORE_STRIP_DEBUG") != nullptr) {
+    // a per-decide read: latch it (issue #273's getenv audit)
+    static const bool strip_debug = getenv("LLAMA_QSA_SCORE_STRIP_DEBUG") != nullptr;
+    if (strip_debug) {
         fprintf(stderr, "QSA score bounds: n_tokens=%lld n_blocks=%lld strip=%lld ratio=%u budget=%lld limits=[%lld, %lld]\n",
                 (long long) n_tokens, (long long) n_blocks, (long long) strip, ratio, (long long) budget,
                 (long long) limits.front(), (long long) limits.back());
