@@ -2641,6 +2641,17 @@ size_t llama_model::max_host_expert_slice_bytes() const {
     return max_slice;
 }
 
+// TODO #124: keep this in step with the split-state callback's own MIRRORED rule for `cache_k_*`/`cache_v_*`
+// (`llama_meta_device_get_split_state`, above): HRM_TEXT replicates every cache tensor, and dsv4
+// (DEEPSEEK4/41, or DFLASH with the hyper-connection state) mirrors the KV cache and its state tensors.
+bool llama_model::kv_cache_split_mirrored() const {
+    if (arch == LLM_ARCH_HRM_TEXT) {
+        return true;
+    }
+    return arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 ||
+        (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+}
+
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
@@ -3109,6 +3120,94 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// The MTP drafter's KV window policy (see llama-ext.h).  `LLAMA_SPEC_DRAFT_WINDOW` = unset/`auto` (the
+// adaptive policy), `0` (off, today's shape) or a cell count.
+//
+// The adaptive policy is a quarter of the context clamped to [32768, 65536] cells: the drafter reads its last
+// few thousand tokens, so a window at or above the context it works over is free (measured: -2.3 % relative
+// acceptance, generation flat, at a 46k context with a 32768 window) while a window far below it costs 7-9 % of
+// decode.  The lower clamp keeps the window above that band at any context; the upper clamp stops a very large
+// `-c` from keeping a window bigger than anything the policy needs (one draft layer, ~1 GiB at `-c 262144`).
+uint32_t llama_spec_draft_window_cells(uint32_t n_ctx_seq, uint32_t n_ubatch) {
+    const char * env = getenv("LLAMA_SPEC_DRAFT_WINDOW");
+
+    if (n_ctx_seq == 0) {
+        return 0;
+    }
+
+    // one ubatch must always be placeable (`llama_kv_cache::find_slot` refuses a batch wider than the cache)
+    const uint32_t floor_cells = GGML_PAD(n_ubatch + 256, 256);
+
+    uint32_t w;
+    if (env == nullptr || env[0] == '\0' || strcmp(env, "auto") == 0) {
+        w = n_ctx_seq / 4;
+        if (w < 32768) {
+            w = 32768;
+        }
+        if (w > 65536) {
+            w = 65536;
+        }
+    } else {
+        const long v = atol(env);
+        if (v <= 0) {
+            return 0;
+        }
+        w = (uint32_t) v;
+    }
+
+    if (w < floor_cells) {
+        w = floor_cells;
+    }
+    // nothing to save: the window would hold the whole cache
+    if (w >= n_ctx_seq) {
+        return 0;
+    }
+
+    return w;
+}
+
+// The cache's cell count for that window (see llama-ext.h).  One function so the cache, the slab's reserve
+// estimate (common/draft-reserve.cpp) and the "is a window active" test cannot disagree about the geometry.
+uint32_t llama_spec_draft_kv_cells(uint32_t n_ctx_seq, uint32_t n_ubatch, uint32_t n_seq_max, bool kv_unified,
+                                   uint32_t * win_out) {
+    GGML_ASSERT(win_out != nullptr);
+    *win_out = 0;
+
+    if (n_ctx_seq == 0) {
+        return 0;
+    }
+
+    const uint32_t win = llama_spec_draft_window_cells(n_ctx_seq, n_ubatch);
+    if (win == 0) {
+        return 0;
+    }
+
+    // one whole batch must always be placeable on top of the window (the `iswa` sizing shape)
+    const uint32_t batch = std::max<uint32_t>(1, n_ubatch);
+
+    if (!kv_unified) {
+        // one stream per sequence: each stream already owns `n_ctx_seq` cells and its own `n_swa`
+        *win_out = win;
+        return GGML_PAD(std::min(n_ctx_seq, win + batch), 256);
+    }
+
+    // A unified cache holds every sequence in ONE stream, so the window has to be granted per sequence or the
+    // first sequence to fill it starves the rest (issue #264).  `per_seq` is the most any one sequence can ever
+    // own, and the window may only claim what leaves a batch of room beside it: a window that does not is
+    // declined rather than lowered, because lowering it to `per_seq - batch` saves `batch` cells per sequence
+    // and masks the drafter's newest cells to do it.
+    const uint32_t n_seq   = std::max<uint32_t>(1, n_seq_max);
+    const uint32_t per_seq = n_ctx_seq / n_seq;
+
+    if (win + batch > per_seq) {
+        return 0;
+    }
+
+    *win_out = win;
+
+    return std::min(n_ctx_seq, GGML_PAD((win + batch)*n_seq, 256));
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -3573,7 +3672,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* kv_pool           */ params_l.kv_pool);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -3679,6 +3779,42 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // The MTP drafter's KV window (llama-ext.h).  The draft context is created AFTER the
+                        // target, so this is the only place its cell count exists.
+                        //
+                        // A sliding window, not a ring allocator: `find_slot` already reclaims a cell whose
+                        // position is more than `n_swa` behind the newest one for its sequence, which IS the
+                        // ring, and `set_input_kq_mask` reads THIS cache's `n_swa`, so the packed mask windows
+                        // consistently and `hparams` (shared with the target) is untouched.  The derived mask
+                        // stays valid as well -- its predicate is `tok_lo <= cell_pos <= tok_hi` over the
+                        // per-cell POSITION, so a recycled cell reports its new position (a position range, not
+                        // a cell-index range).  Only the drafter loses the tokens older than the window, and
+                        // the target verifies every token it proposes.
+                        //
+                        // The window is per SEQUENCE: under `--kv-unified` this cache holds every sequence in
+                        // one stream, so `llama_spec_draft_kv_cells()` multiplies the cell count by
+                        // `n_seq_max` (issue #264 -- a `win + n_ubatch` cache left a second sequence no cell to
+                        // place its batch in, and every request on that slot failed).
+                        uint32_t mtp_kv_size = cparams.n_ctx_seq;
+                        uint32_t mtp_n_swa   = hparams.n_swa;
+                        llama_swa_type mtp_swa_type = hparams.swa_type;
+                        if (params_l.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            uint32_t win = 0;
+                            const uint32_t cells = llama_spec_draft_kv_cells(cparams.n_ctx_seq, cparams.n_ubatch,
+                                                                             cparams.n_seq_max, cparams.kv_unified,
+                                                                             &win);
+                            if (cells != 0) {
+                                mtp_kv_size  = cells;
+                                mtp_n_swa    = win;
+                                mtp_swa_type = LLAMA_SWA_TYPE_STANDARD;
+                                LLAMA_LOG_INFO("%s: MTP draft KV window = %u cells per sequence (draft cache %u "
+                                               "of %u cells per stream, n_seq_max %u, %s; "
+                                               "LLAMA_SPEC_DRAFT_WINDOW -- the target still verifies every token)\n",
+                                               __func__, win, mtp_kv_size, cparams.n_ctx_seq, cparams.n_seq_max,
+                                               cparams.kv_unified ? "unified" : "per-sequence streams");
+                            }
+                        }
+
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -3687,11 +3823,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params_l
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                mtp_kv_size,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                mtp_n_swa,
+                                mtp_swa_type,
                                 nullptr,
                                 filter,
                                 nullptr,

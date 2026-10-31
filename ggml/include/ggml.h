@@ -587,6 +587,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
         GGML_OP_FLASH_ATTN_QSA,
+        GGML_OP_KV_POOL,
         GGML_OP_INDEXER_TOPK,
         GGML_OP_INDEXER_SCORE,
         GGML_OP_INDEXER_FILL,
@@ -2599,6 +2600,47 @@ extern "C" {
 
     GGML_API enum ggml_prec ggml_flash_attn_qsa_get_prec(
             const struct ggml_tensor * a);
+
+    // wip/kv-residency (TODO #118) B-A: give the sparse reader a SEPARATE K/V position list, so the
+    // cells' K/V can live in a compact page pool while the mask / visibility keys stay indexed by
+    // the original cell number.  `kv_idx` has idx's shape and type; NULL = K/V at idx (the shipped
+    // behaviour, byte-identical).
+    GGML_API void ggml_flash_attn_qsa_set_kv_idx(
+            struct ggml_tensor * a,
+            struct ggml_tensor * kv_idx);
+
+    // wip/kv-residency (TODO #118) B-A step 2: resolve a QSA selection through a page table.
+    //
+    // The attention KV lives in two places: `mirror_k`/`mirror_v` are the AUTHORITATIVE,
+    // cell-indexed copies (pinned host memory, one full cache each), and `pool_k`/`pool_v` are a
+    // compact device pool of `n_pages` pages of `page_cells` cells each.  `tbl[block]` is the page
+    // table (the slot holding that block, or -1) and `inv[slot]` its inverse (-1 when the slot is
+    // free).  For every selected cell id in `ids` this op
+    //   * writes its POOL position into dst (the K/V position list the reader uses),
+    //   * claims a slot for a block that is not resident (evicting the slot's previous block),
+    //   * and copies the claimed page (and every page a cell in `wids` was just written to) from
+    //     the mirror into the pool.
+    // The writers write the mirror only, so no invalidation is ever needed: a page that receives a
+    // write is re-filled from the mirror here, and a miss is filled from the mirror before the
+    // attention reads it.  `ctr` is a 4-int device counter (claim cursor, miss count, fills, ids).
+    // `wids` is the I64 cell list the batch just wrote (NULL = no dirty pages).
+    GGML_API struct ggml_tensor * ggml_kv_pool(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * tbl,
+            struct ggml_tensor  * inv,
+            struct ggml_tensor  * ctr,
+            struct ggml_tensor  * mirror_k,
+            struct ggml_tensor  * mirror_v,
+            struct ggml_tensor  * pool_k,
+            struct ggml_tensor  * pool_v,
+            struct ggml_tensor  * wids,
+            struct ggml_tensor  * use);
+
+    // the page size in cells (one QSA indexer block); stored in the op params
+    GGML_API void ggml_kv_pool_set_page(
+            struct ggml_tensor * a,
+            int                   page_cells);
 
     // fused expand + mask + top-k for the indexer: value[c] = score[cell_blk[c]] + additive[c]
     // src0: block scores [n_blocks, n_tps, n_stream] F32

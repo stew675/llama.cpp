@@ -4393,9 +4393,12 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
     }
     // The floor is a one-time early decision, but the aux estimate is only known from `common` (after the
     // model load).  Re-run it when a larger aux arrives so the load-time aux-0 answer cannot silently
-    // keep a cache that the with-draft projection would have declined.
-    if (g_preflight_done && aux_reserve_bytes <= g_preflight_aux) {
-        return g_enabled;   // latch: the call with the largest aux so far decides
+    // keep a cache that the with-draft projection would have declined -- and re-run it while the cache is
+    // DECLINED even for a smaller aux: a windowed MTP draft (LLAMA_SPEC_DRAFT_WINDOW) derives a much
+    // smaller reserve than the flat constant the load-time call can only use, so that call is the
+    // pessimistic one, and a decline it reached must not survive the real number.
+    if (g_preflight_done && aux_reserve_bytes <= g_preflight_aux && g_enabled) {
+        return g_enabled;   // latch while the cache is on: the call with the largest aux so far decides
     }
     g_preflight_done = true;
     g_preflight_aux = std::max(g_preflight_aux, aux_reserve_bytes);
