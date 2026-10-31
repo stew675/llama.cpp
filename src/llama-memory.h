@@ -25,6 +25,11 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // wip/kv-residency (TODO #118) B-A: may this memory's ATTENTION cache take the attendance pool
+    // (`LLAMA_KV_REGION_POOL`)?  Only the trunk's: the MTP draft's cache is read densely, so pooling it
+    // would only make its reads leave VRAM.
+    bool kv_pool;
 };
 
 enum llama_memory_status {
@@ -118,6 +123,16 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL's footprint -- the compact device pool that is
+    // VRAM and the pinned host mirror that holds the whole context.  Both 0 when the pool is off.  It is not
+    // derivable from `memory_breakdown()`: the mirror and the pool live behind different buffer types AND
+    // the mirror's bytes are reported against the host bucket (memory_breakdown() charges them there so
+    // `--fit` sizes a context around the pool), so `--fit` could not tell a pooled cache from a plain one.
+    virtual void kv_pool_bytes(size_t & vram, size_t & ram) const {
+        vram = 0;
+        ram  = 0;
+    }
 
     //
     // state write/read

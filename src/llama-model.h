@@ -922,6 +922,13 @@ struct llama_model {
     // slot has to hold, and the split is not necessarily even (it is granularity-rounded).
     size_t max_host_expert_slice_bytes() const;
 
+    // TODO #124: true when a tensor split MIRRORS this model's KV cache on every device instead of sharding
+    // it along the KV-head axis -- the same rule the split-state callback applies to `cache_k_*`/`cache_v_*`
+    // (dsv4-in-DFLASH / DEEPSEEK4 / DEEPSEEK41, and HRM_TEXT which mirrors every cache tensor).  A mirrored
+    // cache costs `n_devices x` per resident cell, so the windowed KV declines it rather than booking a
+    // pinned spill it cannot honour.
+    bool kv_cache_split_mirrored() const;
+
     // total number of parameters in the model
     uint64_t n_elements() const;
 
