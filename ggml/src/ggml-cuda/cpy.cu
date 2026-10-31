@@ -41,6 +41,27 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+// Vectorised strided row copy -- the fallback for the 2-D memcpy path when `ggml_cuda_cpy_as_memcpy_2d`'s
+// conservative guard refuses it (a padded block copy the driver would reject).  One thread copies one 16-byte
+// unit, and the row index comes from the grid, so there is no integer division at all; `cpy_scalar` above does
+// three divisions and three modulos per ELEMENT.  Bit-identical (same type, whole F32 elements per unit).
+// Measured on gfx1201: a 47 MiB qwen4exp indexer-cache copy 0.10 -> 0.02 ms.
+static __global__ void cpy_2d_vec16(const char * GGML_CUDA_RESTRICT cx, char * GGML_CUDA_RESTRICT cdst,
+        const int64_t n_units, const int64_t height, const int64_t spitch, const int64_t dpitch) {
+    ggml_cuda_pdl_lc();
+
+    const int64_t u   = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t row = (int64_t) blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u >= n_units || row >= height) {
+        return;
+    }
+
+    const int64_t off = u * 16;
+    ggml_cuda_pdl_sync();
+    *reinterpret_cast<uint4 *>(cdst + row*dpitch + off) = *reinterpret_cast<const uint4 *>(cx + row*spitch + off);
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -481,6 +502,11 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
 
+    // mc_width is written only once the geometry is valid (the guard below returns false after computing it), so
+    // a non-zero mc_width on a false return means "a 2-D copy that the driver refusal guard rejected".
+    const bool mc_memcpy_ok = ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch);
+    const bool mc_refused   = !mc_memcpy_ok && mc_width != 0;
+
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -491,9 +517,19 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         {
             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
         }
-    } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+    } else if (mc_memcpy_ok) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (mc_refused && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+               mc_width % 16 == 0 && mc_spitch % 16 == 0 && mc_dpitch % 16 == 0 &&
+               (uintptr_t) src0_ddc % 16 == 0 && (uintptr_t) src1_ddc % 16 == 0 &&
+               (mc_height + 7)/8 <= 65535 && (mc_width/16 + 31)/32 <= 65535) {
+        // the guard refused the 2-D memcpy: copy the same block with vectorised loads instead of the
+        // element-per-thread kernel (bit-identical, ~4x faster; see cpy_2d_vec16)
+        const dim3 cpy_block(32, 8, 1);
+        const dim3 cpy_grid((unsigned) ((mc_width/16 + 31)/32), (unsigned) ((mc_height + 7)/8), 1);
+        cpy_2d_vec16<<<cpy_grid, cpy_block, 0, main_stream>>>(src0_ddc, src1_ddc,
+                (int64_t) (mc_width/16), (int64_t) mc_height, (int64_t) mc_spitch, (int64_t) mc_dpitch);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
