@@ -1932,14 +1932,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // the fused score ops read the raw cache rows natively - the kernels' load dispatch is
-    // F32/BF16/F16 only, and the ggml_indexer_score/fill constructors assert the same, so a
-    // quantized indexer key cache (e.g. --cache-type-k q8_0, which is applied to the indexer
-    // store too) must NOT reach them.  Fall back to the per-op chain below, whose get_rows
-    // dequantizes any cache type on gather (the BF16/f32 fused decode path is unchanged).
-    const bool idx_key_float = k_all->type == GGML_TYPE_F32 ||
-                               k_all->type == GGML_TYPE_BF16 ||
-                               k_all->type == GGML_TYPE_F16;
+    // the fused score ops read the raw cache rows themselves and dequantize a quantized indexer key cache
+    // in-kernel with ggml's own helpers, so they serve --cache-type-k q8_0 (and the q4/q5 family) with the same
+    // values the per-op chain's get_rows would produce.  A type the fused op does not support (e.g. q6_k) still
+    // falls back to the per-op chain below, whose get_rows dequantizes ANY cache type on gather.
+    const bool idx_key_fused = ggml_indexer_key_type_supported(k_all->type);
 
     // every token of a block gets the block score; the budget is whole blocks, so top-k cuts on a block boundary
     // the reference returns indexer_top_k + compress_ratio - 1: whole blocks plus the tail
@@ -1989,9 +1986,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * top_k = nullptr;
 
     ggml_tensor * score = nullptr;
-    if (idx_score_fused && idx_key_float && n_tokens == 1 && blk_bias && n_idx_h <= 8 &&
+    if (idx_score_fused && idx_key_fused && n_tokens == 1 && blk_bias && n_idx_h <= 8 &&
             rope_type == GGML_ROPE_TYPE_IMROPE) {
-        // FUSED PROBE (env-gated, GGML_CUDA_QSA_INDEXER_SCORE=1): ONE kernel replaces the
+        // FUSED SCORE (default on, GGML_CUDA_QSA_INDEXER_SCORE=0 is the per-op-chain A/B): ONE kernel replaces the
         // per-token decode chain gather + r-slice pool + scale + rms_norm + rope_multi +
         // score mul_mat + relu + head-sum + bias (~12 kernels/layer) with the fused
         // INDEXER_SCORE op.  The kernel replicates the per-op F32 arithmetic byte-
@@ -1999,7 +1996,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         // IMROPE half-pair rope, mmvf F32 vec-dot order) - see ggml-cuda/indexer-score.cu.
         ggml_tensor * score_pool = nullptr;   // derived-cache pool view (fill dst), if used
         if (idx_cache && inp->rng != nullptr) {
-            // DERIVED-CACHE PROBE (env-gated, GGML_CUDA_QSA_INDEXER_CACHE=1, on top of the fused
+            // DERIVED CACHE (default on, GGML_CUDA_QSA_INDEXER_CACHE=0 is the A/B, on top of the fused
             // score): a fill op first writes the completed blocks' pooled+normed+ROTATED vectors
             // into the memory-layer pool (rows [from, lim) of this step's range leaf), then the
             // score op reads the pool rows for blocks below the limit instead of re-pooling the
