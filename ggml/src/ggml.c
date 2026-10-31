@@ -5968,6 +5968,23 @@ struct ggml_tensor * ggml_indexer_top_k(
 
 // ggml_indexer_score
 
+bool ggml_indexer_key_type_supported(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct ggml_tensor * ggml_indexer_score(
         struct ggml_context * ctx,
         struct ggml_tensor  * k,
@@ -5990,7 +6007,7 @@ struct ggml_tensor * ggml_indexer_score(
         float                 beta_slow,
         struct ggml_tensor  * pool,
         struct ggml_tensor  * rng) {
-    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_indexer_key_type_supported(k->type));
     GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(blk_pos->type  == GGML_TYPE_I32);
     GGML_ASSERT(q->type        == GGML_TYPE_F32);
@@ -6071,7 +6088,7 @@ struct ggml_tensor * ggml_indexer_fill(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow) {
-    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_BF16 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_indexer_key_type_supported(k->type));
     GGML_ASSERT(blk_cells->type == GGML_TYPE_I32);
     GGML_ASSERT(blk_pos->type  == GGML_TYPE_I32);
     GGML_ASSERT(w->type        == GGML_TYPE_F32);

@@ -24,6 +24,7 @@
 
 #include "indexer-score.cuh"
 #include "common.cuh"
+#include "dequantize.cuh"
 #include <algorithm>
 
 // --- rope math copied verbatim from ggml-cuda/rope.cu (rope_yarn) so the cos/sin
@@ -48,25 +49,55 @@ static __device__ void indexer_score_rope_yarn(
 }
 
 // --- pool + norm device helpers -----------------------------------------------
-// cache element ktype: 0 = F32, 1 = BF16 (ggml bits<<16 upcast), 2 = F16 (exact half->f32)
-static __device__ __forceinline__ float indexer_score_ld_val(const void * p, const int ktype) {
+// cache element ktype: 0 = F32, 1 = BF16 (ggml bits<<16 upcast), 2 = F16 (exact half->f32),
+// 3 = Q8_0, 4 = Q4_0, 5 = Q4_1, 6 = Q5_0, 7 = Q5_1, 8 = IQ4_NL (dequantized by ggml's own helper, i.e. the
+// same value the per-op chain's get_rows produces -- that is what keeps the paths byte-identical).
+//
+// A quantized row is addressed in 32-element blocks whose byte size is what ggml stores in nb[0], and the two
+// nibble families pack a byte's low nibble at channel `b` and its high nibble at channel `b + 16` (the q8_0
+// layout instead holds one element per byte), so the loader takes the ROW base plus the channel.
+static __device__ __forceinline__ float indexer_score_ld_chan(
+        const char * row, const int c, const int64_t nb0K, const int ktype) {
+    if (ktype == 0) {
+        return *(const float *) (row + (int64_t) c * 4);
+    }
     if (ktype == 1) {
-        return __uint_as_float(((uint32_t) *(const uint16_t *) p) << 16);
+        return __uint_as_float(((uint32_t) *(const uint16_t *) (row + (int64_t) c * 2)) << 16);
     }
     if (ktype == 2) {
         // f16 -> f32 is exact (bijection); matches get_rows' native half upcast
-        return __half2float(*(const __half *) p);
+        return __half2float(*(const __half *) (row + (int64_t) c * 2));
     }
-    return *(const float *) p;
+
+    // quantized: QK8_0-element blocks, `nb0K` bytes each (all supported types share QK == 32)
+    static_assert(QK8_0 == 32, "the packed layouts below assume a 32-element block");
+    const int     iq  = c & (QK8_0 - 1);
+    const char  * blk = row + (int64_t) (c / QK8_0) * nb0K;
+    float2 v;
+    if (ktype == 3) {
+        // q8_0: one element per byte
+        dequantize_q8_0(blk, 0, iq & ~1, v);
+        return (iq & 1) ? v.y : v.x;
+    }
+    // 4/5-bit: byte iq&15 carries channel (iq&15) in its low nibble and channel (iq&15) + 16 in its high one
+    const int b = iq & 15;
+    switch (ktype) {
+        case 4:  dequantize_q4_0(blk, 0, b, v); break;
+        case 5:  dequantize_q4_1(blk, 0, b, v); break;
+        case 6:  dequantize_q5_0(blk, 0, b, v); break;
+        case 7:  dequantize_q5_1(blk, 0, b, v); break;
+        default: dequantize_q4_nl(blk, 0, b, v); break;
+    }
+    return (iq < 16) ? v.x : v.y;
 }
 
 static __device__ __forceinline__ float indexer_score_norm_col(
-        const char * K, const int * blk_row, const int c, const int idx_dim,
+        const char * Ks, const int * blk_row, const int c,
         const int r, const float rinv, const int64_t nb0K, const int64_t nb1K, const int ktype) {
     float acc = 0.0f;
-    const char * Kcol = K + (int64_t) c * nb0K;
     for (int i = 0; i < r; ++i) {
-        acc += indexer_score_ld_val(Kcol + (int64_t) blk_row[i] * nb1K, ktype);
+        // identical address and value to the pre-quantized form for F32/BF16/F16 (nb0K == 4/2/2)
+        acc += indexer_score_ld_chan(Ks + (int64_t) blk_row[i] * nb1K, c, nb0K, ktype);
     }
     return acc * rinv;
 }
@@ -130,7 +161,7 @@ static __global__ void indexer_score_kernel(
         // --- pass 1: pool columns (increment-1 arithmetic, strided like rms_norm_f32) ---
         float tmp = 0.0f;
         for (int c = tid; c < idx_dim; c += IDX_SCORE_BLOCK) {
-            const float pv = indexer_score_norm_col(Ks, blk_row, c, idx_dim, r, rinv, nb0K, nb1K, ktype);
+            const float pv = indexer_score_norm_col(Ks, blk_row, c, r, rinv, nb0K, nb1K, ktype);
             vec[c] = pv;
             tmp += pv * pv;
         }
@@ -242,6 +273,22 @@ static __global__ void indexer_score_kernel(
     }
 }
 
+// host: cache key type -> the kernel's ktype code (-1 = not supported by the fused path)
+static int indexer_score_ktype(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:   return 0;
+        case GGML_TYPE_BF16:  return 1;
+        case GGML_TYPE_F16:   return 2;
+        case GGML_TYPE_Q8_0:  return 3;
+        case GGML_TYPE_Q4_0:  return 4;
+        case GGML_TYPE_Q4_1:  return 5;
+        case GGML_TYPE_Q5_0:  return 6;
+        case GGML_TYPE_Q5_1:  return 7;
+        case GGML_TYPE_IQ4_NL: return 8;
+        default:              return -1;
+    }
+}
+
 static void ggml_cuda_indexer_score_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K   = dst->src[0];
     const ggml_tensor * BLK = dst->src[1];
@@ -287,9 +334,10 @@ static void ggml_cuda_indexer_score_impl(ggml_backend_cuda_context & ctx, ggml_t
     GGML_ASSERT(n_blocks == dst->ne[0]);
     const int nrows = n_blocks * n_stream;
 
-    const int ktype = K->type == GGML_TYPE_F32 ? 0 : (K->type == GGML_TYPE_BF16 ? 1 : 2);
-    GGML_ASSERT((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
+    const int ktype = indexer_score_ktype(K->type);
+    GGML_ASSERT(ktype >= 0 && BLK->type == GGML_TYPE_I32 &&
                 POS->type == GGML_TYPE_I32 && Q->type == GGML_TYPE_F32 && W->type == GGML_TYPE_F32);
+    GGML_ASSERT(ktype < 3 || idx_dim % QK8_0 == 0);      // quantized rows: whole 32-element blocks
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
     float corr_v[2];
@@ -337,9 +385,9 @@ bool ggml_cuda_indexer_score_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[3];
     const ggml_tensor * W = dst->src[4];
     const ggml_tensor * B = dst->src[5];
-    if (!((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
-           POS->type == GGML_TYPE_I32 && Q->type == GGML_TYPE_F32 && W->type == GGML_TYPE_F32 &&
-           B->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32)) {
+    if (indexer_score_ktype(K->type) < 0 || BLK->type != GGML_TYPE_I32 ||
+           POS->type != GGML_TYPE_I32 || Q->type != GGML_TYPE_F32 || W->type != GGML_TYPE_F32 ||
+           B->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     if (dst->src[6] != nullptr) {
@@ -410,7 +458,7 @@ static __global__ void indexer_fill_kernel(
     // pass 1: pool columns (score kernel's raw pass, same strided walk + reduction)
     float tmp = 0.0f;
     for (int c = tid; c < idx_dim; c += IDX_SCORE_BLOCK) {
-        const float pv = indexer_score_norm_col(Ks, blk_row, c, idx_dim, r, rinv, nb0K, nb1K, ktype);
+        const float pv = indexer_score_norm_col(Ks, blk_row, c, r, rinv, nb0K, nb1K, ktype);
         vec[c] = pv;
         tmp += pv * pv;
     }
@@ -517,9 +565,10 @@ static void ggml_cuda_indexer_fill_impl(ggml_backend_cuda_context & ctx, ggml_te
     GGML_ASSERT(n_blocks == dst->ne[1]);
     const int nrows = n_blocks * n_stream;
 
-    const int ktype = K->type == GGML_TYPE_F32 ? 0 : (K->type == GGML_TYPE_BF16 ? 1 : 2);
-    GGML_ASSERT((K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) &&
-                BLK->type == GGML_TYPE_I32 && POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32);
+    const int ktype = indexer_score_ktype(K->type);
+    GGML_ASSERT(ktype >= 0 && BLK->type == GGML_TYPE_I32 &&
+                POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32);
+    GGML_ASSERT(ktype < 3 || idx_dim % QK8_0 == 0);      // quantized rows: whole 32-element blocks
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
     float corr_v[2];
@@ -555,7 +604,7 @@ bool ggml_cuda_indexer_fill_supported(int device, const ggml_tensor * dst) {
     const ggml_tensor * POS = dst->src[2];
     const ggml_tensor * W   = dst->src[3];
     const ggml_tensor * RNG = dst->src[4];
-    return (K->type == GGML_TYPE_F32 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_F16) && BLK->type == GGML_TYPE_I32 &&
+    return indexer_score_ktype(K->type) >= 0 && BLK->type == GGML_TYPE_I32 &&
            POS->type == GGML_TYPE_I32 && W->type == GGML_TYPE_F32 && RNG->type == GGML_TYPE_I32 &&
            dst->type == GGML_TYPE_F32;
 }

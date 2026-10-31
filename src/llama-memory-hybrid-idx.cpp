@@ -131,18 +131,17 @@ void llama_memory_hybrid_idx::pool_create(
 
     // the pool backs the fused INDEXER_FILL -> INDEXER_SCORE derived decode path only, and
     // only when that path can actually run:
-    //  - the fused ops read the raw indexer keys natively (F32/BF16/F16 only - quantized
-    //    indexer-key caches, e.g. --cache-type-k q8_0, always take the per-op chain), and
+    //  - the fused ops support this key type (F32/BF16/F16 natively, Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL through
+    //    ggml's dequantizers - ggml_indexer_key_type_supported; any other type takes the per-op chain), and
     //  - the memory-layer derived cache is engaged (GGML_CUDA_QSA_INDEXER_CACHE, default ON;
     //    =0 restores the raw-cache re-pool).  With it off, qsa_derived_limits emits an empty fill
     //    range every step and the pool is never written or read (each decode step would launch an
     //    empty fill for nothing).
     // Skip the allocation otherwise - get_pool() then returns nullptr and build_qsa_top_k
     // runs the fused score with no pool (pools the raw cache: the same F32 arithmetic and
-    // byte-identical output, minus the dead buffer) or the per-op chain for quantized keys.
-    if (!derived_enabled || (mem_idx->type_k() != GGML_TYPE_F32 &&
-                             mem_idx->type_k() != GGML_TYPE_BF16 &&
-                             mem_idx->type_k() != GGML_TYPE_F16)) {
+    // byte-identical output, minus the dead buffer) or, for a key type the fused op does not
+    // support, the per-op chain.
+    if (!derived_enabled || !ggml_indexer_key_type_supported(mem_idx->type_k())) {
         LLAMA_LOG_INFO("%s: derived indexer cache pool skipped (%s keys, derived cache %s)\n", __func__,
                 ggml_type_name(mem_idx->type_k()), derived_enabled ? "enabled" : "disabled");
         return;

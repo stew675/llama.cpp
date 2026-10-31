@@ -2685,6 +2685,11 @@ extern "C" {
     // src5 = per-block bias [n_blocks, n_tps, n_stream]; the remaining args replicate
     // the ggml rope call's parameters.  dst = [n_blocks, n_tps, n_stream],
     // byte-identical to the per-op chain's post-bias score.
+    // The cache key types the fused indexer ops accept: F32/BF16/F16 natively and Q8_0/Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL
+    // through ggml's own dequantizers (the same values the per-op chain's get_rows produces).  One predicate for the
+    // constructors, the CUDA kernels' _supported checks and the memory layer's derived-cache pool.
+    GGML_API bool ggml_indexer_key_type_supported(enum ggml_type type);
+
     GGML_API struct ggml_tensor * ggml_indexer_score(
             struct ggml_context * ctx,
             struct ggml_tensor  * k,
