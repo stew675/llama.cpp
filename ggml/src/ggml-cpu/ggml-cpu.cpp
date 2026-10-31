@@ -666,6 +666,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return ggml_is_contiguous(op->src[0]);
         case GGML_OP_SSM_SCAN:
             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
+        case GGML_OP_KV_POOL:
+            // wip/kv-residency (TODO #118) B-A: the page-table resolve is a CUDA-only op (it writes the
+            // pool in place); a graph that contains one has to run on a CUDA device.
+            return false;
         case GGML_OP_FLASH_ATTN_QSA:
             // the CPU reference implements the mask form only; the derived-visibility form
             // (cell_vis/q_vis, src[5]/src[6]) is CUDA-only and aborts here.  Refuse it so the
