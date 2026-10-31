@@ -5861,9 +5861,26 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+
+// wip/kv-residency (TODO #118) B-A: the ATTENDANCE POOL's mirror is pinned host memory in a device-carrying
+// buffer type, so the four async tensor copies below must not treat its pointer as device VRAM: a
+// `cudaMemcpyAsync` "H2D" into host memory is not a legal description of the copy, and the "D2H" reads are
+// really host-to-host.  Do them as a host copy, ordered behind the compute stream so a state save cannot read
+// the mirror while a graph is still writing it.  (The pool's own read path never goes through here.)
+static void ggml_cuda_kv_pool_mirror_sync(ggml_backend_cuda_context * cuda_ctx) {
+    ggml_cuda_async_input_drain(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    if (ggml_backend_buft_is_cuda_kv_pool_mirror(buf->buft)) {
+        ggml_cuda_kv_pool_mirror_sync(cuda_ctx);
+        memcpy((char *) tensor->data + offset, data, size);
+        return;
+    }
 
     // wip/kv-residency (TODO #118): a KV region buffer is a CUDA buffer too (`ggml_backend_buft_is_cuda`, the
     // same function-pointer identity the scheduler gates on), and its VA is a plain device pointer -- the
@@ -5916,6 +5933,12 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
+    if (ggml_backend_buft_is_cuda_kv_pool_mirror(buf->buft)) {
+        ggml_cuda_kv_pool_mirror_sync(cuda_ctx);
+        memcpy(data, (const char *) tensor->data + offset, size);
+        return;
+    }
+
     // wip/kv-residency (TODO #118): a KV region buffer is a CUDA buffer too (`ggml_backend_buft_is_cuda`, the
     // same function-pointer identity the scheduler gates on), and its VA is a plain device pointer -- the
     // batched state save/restore copies work unchanged.  The windowed KV has to be accepted here or the
@@ -5931,6 +5954,14 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    if (ggml_backend_buft_is_cuda_kv_pool_mirror(buf->buft)) {
+        ggml_cuda_kv_pool_mirror_sync(cuda_ctx);
+        for (size_t i = 0; i < n_copies; ++i) {
+            memcpy((char *) tensor->data + offset + i*stride_tensor, (const char *) data + i*stride_data, size);
+        }
+        return;
+    }
 
     // wip/kv-residency (TODO #118): a KV region buffer is a CUDA buffer too (`ggml_backend_buft_is_cuda`, the
     // same function-pointer identity the scheduler gates on), and its VA is a plain device pointer -- the
@@ -6030,6 +6061,14 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+
+    if (ggml_backend_buft_is_cuda_kv_pool_mirror(buf->buft)) {
+        ggml_cuda_kv_pool_mirror_sync(cuda_ctx);
+        for (size_t i = 0; i < n_copies; ++i) {
+            memcpy((char *) data + i*stride_data, (const char *) tensor->data + offset + i*stride_tensor, size);
+        }
+        return;
+    }
 
     // wip/kv-residency (TODO #118): a KV region buffer is a CUDA buffer too (`ggml_backend_buft_is_cuda`, the
     // same function-pointer identity the scheduler gates on), and its VA is a plain device pointer -- the
