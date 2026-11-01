@@ -150,6 +150,18 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
     uint32_t block_count = 0;
     uint32_t n_nextn      = 0;
     (void) read_u32_max(g, arch + ".nextn_predict_layers", n_nextn);   // absent for a standalone draft
+
+    // `shares_model` (an MTP draft with no GGUF of its own) is only right for a model that DECLARES its MTP
+    // head: qwen3.5/3.6/3.8 carry `nextn_predict_layers`, while qwen4exp/Flash-Next keeps its head in a
+    // separate `mtp-*.gguf` -- and that file's path is not known yet when this estimate runs, so reading the
+    // TARGET would charge 48 layers of KV to a draft the window does not even apply to.  Decline instead,
+    // and the caller keeps the flat constant.
+    if (shares_model && n_nextn == 0) {
+        r.note = "the model declares no embedded MTP head (nextn_predict_layers); keeping the flat constant";
+        gguf_free(g);
+        return r;
+    }
+
     if (!read_u32_max(g, arch + ".block_count", block_count) || block_count == 0) {
         r.note = "draft GGUF has no usable block_count";
         gguf_free(g);

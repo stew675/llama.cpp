@@ -1275,7 +1275,13 @@ common_init_result::common_init_result(common_params & params, bool model_only, 
                 // whose window is active, estimate from the target's own metadata with the weights zeroed
                 // (they are shared) -- which is the draft's real post-slab footprint.  Without a window the
                 // flat constant stays, so no existing run changes.
+                // ONLY an embedded-head MTP draft (no `-md`: qwen3.5/3.6/3.8) -- that is the draft whose KV this
+                // window can actually shrink (`create_memory`'s plain kv_cache branch).  A separate MTP draft
+                // GGUF (qwen4exp/Flash-Next) keeps the flat constant: its context has its own geometry (and an
+                // indexer cache) and the window does not apply to it, so deriving 48 layers of KV from the
+                // target's metadata would cut the arena for a draft that is not windowed at all.
                 const bool mtp_shared = params.speculative.has_mtp() &&
+                                        params.speculative.draft.mparams.path.empty() &&
                                         llama_spec_draft_window_cells(params.n_ctx, params.n_ubatch) != 0;
                 draft_reserve = common_draft_reserve_estimate(
                         mtp_shared ? params.model.path : params.speculative.draft.mparams.path,
