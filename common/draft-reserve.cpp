@@ -218,7 +218,11 @@ common_draft_reserve common_draft_reserve_estimate(const std::string & path,
     // The MTP drafter's KV window (llama-ext.h) is honoured here for the same reason the cache takes it: the
     // estimate is what the slab holds back in `aux_reserve`, so an un-windowed estimate leaves the freed VRAM
     // unspent instead of handing it to the expert arena.
-    const uint32_t draft_window = llama_spec_draft_window_cells(n_ctx, n_ubatch);
+    // The draft KV window applies ONLY to an embedded MTP head (`shares_model`), which is the cache
+    // `create_memory`'s plain kv_cache branch builds.  A separate draft GGUF (qwen4exp's `-md` MTP head) keeps
+    // its full `-c` cache, so sizing ITS reserve by the window under-charges it by (n_ctx - W) cells -- the
+    // direction the file's header calls dangerous.
+    const uint32_t draft_window = shares_model ? llama_spec_draft_window_cells(n_ctx, n_ubatch) : 0;
     const uint32_t kv_cells     = draft_window != 0 ? std::min(n_ctx, draft_window + n_ubatch) : n_ctx;
     r.kv = (size_t) ((double) kv_cells * (attn_per_tok + idx_per_tok) * 1.10);
 
