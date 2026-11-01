@@ -620,6 +620,10 @@ llama_kv_cache::llama_kv_cache(
                 const uint32_t band = 8;   // the QSA decode band (`QSA_DECODE_BAND` in qwen4exp.cpp)
                 uint32_t cells = std::max<uint32_t>(req, band*blocks_row*page);
                 cells = GGML_PAD(cells, n_pad > 1 ? n_pad : page);
+                // a pool bigger than the cache can never be more than 100 % resident, and pages past the
+                // cache's last block are never claimed: clamp, or `LLAMA_KV_REGION_POOL=1000000` on a
+                // 262144-cell context took a 12.4 GiB device pool (250000 pages) for 65536 usable ones.
+                cells = std::min<uint32_t>(cells, (uint32_t) kv_size);
                 const uint32_t n_pages  = (cells + page - 1)/page;
                 const uint32_t n_blocks = (uint32_t) ((kv_size + page - 1)/page);
 
