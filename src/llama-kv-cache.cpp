@@ -419,6 +419,8 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    parked.clear();
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -449,8 +451,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        // only the used range can match: an empty cell's pos is -1 (bounds taken before the loop changes them)
-        const uint32_t i_end = cells.used_max_p1();
+        // only the used range can match: an empty cell's pos is -1 (bounds taken before the loop changes them).
+        // Parked sequences (seq_park) hold the cells from park_bound() up and no other sequence has a cell there, so a
+        // sequence that is not parked stops below the bound -- the range get_n_kv() decodes over.  Without that a parked
+        // idle slot at the top of the cache made every removal scan the whole cache (issue #273: 245760 cells scanned
+        // per speculative step while the live sequence held 10.5K).
+        const bool below_park = !parked.empty() && parked.count(seq_id) == 0;
+        const uint32_t i_end = below_park ? cells.used_max_p1_below(park_bound()) : cells.used_max_p1();
         for (uint32_t i = cells.used_min(); i < i_end; ++i) {
             if (!cells.pos_in(i, p0, p1)) {
                 continue;
@@ -466,6 +473,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         // If we freed up a slot, set head to it so searching can start there.
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
+        }
+
+        if (parked.count(seq_id) > 0) {
+            park_refresh();
         }
     } else {
         // match any sequence
@@ -493,6 +504,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
                 head = new_head;
             }
         }
+
+        if (!parked.empty()) {
+            park_refresh();
+        }
     }
 
     return true;
@@ -506,6 +521,10 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
+
+    if (parked.count(seq_id_src) > 0 || parked.count(seq_id_dst) > 0) {
+        parked.clear(); // a copy out of (or into) the parked cells: give up parking rather than hide cells from the range
+    }
 
     const auto s0 = seq_to_stream[seq_id_src];
     const auto s1 = seq_to_stream[seq_id_dst];
@@ -611,10 +630,282 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         }
     }
 
+    if (!parked.empty()) {
+        park_refresh();
+    }
+
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
     }
+}
+
+// LLAMA_KV_PARK_DEBUG=1: log every park, unpark and compaction move, and why a park or an unpark is refused
+static bool llama_kv_park_debug() {
+    static const bool v = [] { const char * e = getenv("LLAMA_KV_PARK_DEBUG"); return e != nullptr && atoi(e) != 0; }();
+    return v;
+}
+
+uint32_t llama_kv_cache::park_bound() const {
+    uint32_t res = v_cells[0].size();
+    for (const auto & [seq_id, range] : parked) {
+        res = std::min(res, range.first);
+    }
+    return res;
+}
+
+void llama_kv_cache::park_refresh() {
+    const auto & cells = v_cells[0];
+    for (auto it = parked.begin(); it != parked.end(); ) {
+        uint32_t lo = it->second.second;
+        uint32_t hi = it->second.first;
+        for (uint32_t i = it->second.first; i < it->second.second; ++i) {
+            if (!cells.is_empty(i) && cells.seq_has(i, it->first)) {
+                lo = std::min(lo, i);
+                hi = i + 1;
+            }
+        }
+        if (lo >= hi) {
+            it = parked.erase(it);
+        } else {
+            it->second = { lo, hi };
+            ++it;
+        }
+    }
+}
+
+void llama_kv_cache::park_move(uint32_t src, uint32_t dst, uint32_t n) {
+    if (src == dst || n == 0) {
+        return;
+    }
+
+    auto & cells = v_cells[0];
+
+    // copy in chunks no longer than the distance, from the end when moving up and from the start when moving down, so
+    // that no chunk overwrites cells that have not been moved yet
+    const uint32_t dist  = src > dst ? src - dst : dst - src;
+    const uint32_t chunk = std::min(n, dist);
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 4*layers.size()*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    // The views below are created outside any graph, once per chunk, so their per-device simple tensors must not go to
+    // the buffer's per-generation compute-view containers: those are reclaimed only when a graph is rebuilt, and this
+    // move runs between graphs.  A long run parked into a small gap needs `n/chunk` chunks (chunk == the gap), each
+    // registering 2 views per (layer, K/V), so a nearly full unified cache registered thousands of them in one move and
+    // exhausted the container's fixed budget -- `ggml_new_object: not enough space in the context's memory pool`
+    // (issue #232).  They go to the meta backend's scratch container instead, reset once this chunk's copies (which are
+    // synchronous: a meta buffer has no `.cpy_tensor`) have completed.
+    std::vector<ggml_backend_buffer_t> view_bufs;
+    for (const auto & layer : layers) {
+        for (ggml_tensor * t : { layer.k, layer.v }) {
+            if (t != nullptr && t->buffer != nullptr) {
+                view_bufs.push_back(t->buffer);
+            }
+        }
+    }
+    std::sort(view_bufs.begin(), view_bufs.end());
+    view_bufs.erase(std::unique(view_bufs.begin(), view_bufs.end()), view_bufs.end());
+
+    ggml_backend_meta_set_scratch_views(true);
+
+    for (uint32_t done = 0; done < n; done += chunk) {
+        const uint32_t len = std::min(chunk, n - done);
+        const uint32_t off = dst > src ? n - done - len : done;
+
+        ggml_context_ptr ctx { ggml_init(params) };
+
+        for (const auto & layer : layers) {
+            for (ggml_tensor * t : { layer.k, layer.v }) {
+                if (t == nullptr) {
+                    continue;
+                }
+                ggml_tensor * a = ggml_view_2d(ctx.get(), t, t->ne[0], len, t->nb[1], (size_t) (src + off)*t->nb[1]);
+                ggml_tensor * b = ggml_view_2d(ctx.get(), t, t->ne[0], len, t->nb[1], (size_t) (dst + off)*t->nb[1]);
+                GGML_ASSERT(ggml_backend_view_init(a) == GGML_STATUS_SUCCESS);
+                GGML_ASSERT(ggml_backend_view_init(b) == GGML_STATUS_SUCCESS);
+                ggml_backend_tensor_copy(a, b);
+            }
+        }
+
+        if (dst > src) {
+            for (uint32_t i = len; i-- > 0; ) {
+                cells.mv(src + off + i, dst + off + i);
+            }
+        } else {
+            for (uint32_t i = 0; i < len; ++i) {
+                cells.mv(src + off + i, dst + off + i);
+            }
+        }
+
+        // the copies are synchronous, so this chunk's views and their simple tensors are dead
+        for (ggml_backend_buffer_t b : view_bufs) {
+            ggml_backend_meta_reset_scratch_views(b);
+        }
+    }
+
+    ggml_backend_meta_set_scratch_views(false);
+}
+
+// the cells of seq_id in stream 0, when they form one run that holds no other sequence: [lo, hi); else lo == hi
+static std::pair<uint32_t, uint32_t> llama_kv_cache_seq_run(const llama_kv_cells & cells, llama_seq_id seq_id);
+
+void llama_kv_cache::park_compact() {
+    std::vector<std::pair<uint32_t, llama_seq_id>> order;
+    for (const auto & [seq_id, range] : parked) {
+        order.emplace_back(range.first, seq_id);
+    }
+    std::sort(order.rbegin(), order.rend());
+
+    const auto & cells = v_cells[0];
+
+    uint32_t top = cells.size();
+    for (const auto & [lo_old, seq_id] : order) {
+        GGML_UNUSED(lo_old);
+        const auto [lo, hi] = llama_kv_cache_seq_run(cells, seq_id);
+        if (lo == hi) {
+            break; // not one run any more: leave the rest where it is
+        }
+        const uint32_t n = hi - lo;
+        if (hi != top) {
+            // between this sequence and the ones above it there are only free cells: the region above lo up to top
+            // holds no active cell (those are all below the lowest parked one) and no other parked sequence
+            park_move(lo, top - n, n);
+            if (llama_kv_park_debug()) {
+                LLAMA_LOG_WARN("%s: seq %d [%u, %u) -> [%u, %u)\n", __func__, seq_id, lo, hi, top - n, top);
+            }
+        }
+        parked[seq_id] = { top - n, top };
+        top -= n;
+    }
+}
+
+static std::pair<uint32_t, uint32_t> llama_kv_cache_seq_run(const llama_kv_cells & cells, llama_seq_id seq_id) {
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    uint32_t n  = 0;
+    for (const auto & [pos, i] : cells.seq_pos_get(seq_id)) {
+        GGML_UNUSED(pos);
+        if (cells.seq_count(i) != 1) {
+            return { 0, 0 };
+        }
+        lo = n == 0 ? i : std::min(lo, i);
+        hi = n == 0 ? i + 1 : std::max(hi, i + 1);
+        n++;
+    }
+    return n == hi - lo ? std::make_pair(lo, hi) : std::make_pair(0u, 0u);
+}
+
+bool llama_kv_cache::seq_park(llama_seq_id seq_id) {
+    if (!can_park()) {
+        return false;
+    }
+    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || parked.count(seq_id) > 0) {
+        return seq_id >= 0 && seq_id < LLAMA_MAX_SEQ;
+    }
+
+    auto & cells = v_cells[0];
+
+    const auto [lo, hi] = llama_kv_cache_seq_run(cells, seq_id);
+    if (lo == hi) {
+        if (llama_kv_park_debug() && !cells.seq_pos_get(seq_id).empty()) {
+            LLAMA_LOG_WARN("%s: seq %d: its %zu cells are not one run of its own\n", __func__, seq_id, cells.seq_pos_get(seq_id).size());
+        }
+        return cells.seq_pos_get(seq_id).empty(); // nothing to park, or a run that cannot move
+    }
+
+    park_compact();
+
+    const uint32_t n     = hi - lo;
+    const uint32_t bound = park_bound();
+    if (n > bound) {
+        return false;
+    }
+    const uint32_t dst = bound - n;
+
+    // the target run must hold nothing but free cells and cells of the run itself
+    for (uint32_t i = dst; i < bound; ++i) {
+        if (!cells.is_empty(i) && (i < lo || i >= hi)) {
+            if (llama_kv_park_debug()) {
+                LLAMA_LOG_WARN("%s: seq %d [%u, %u): cell %u of the target [%u, %u) is taken (seq %d)\n", __func__, seq_id, lo, hi,
+                        i, dst, bound, cells.seq_count(i) == 1 ? cells.seq_get(i) : -1);
+            }
+            return false;
+        }
+    }
+
+    park_move(lo, dst, n);
+    parked[seq_id] = { dst, bound };
+    if (llama_kv_park_debug()) {
+        LLAMA_LOG_WARN("%s: seq %d [%u, %u) -> [%u, %u)\n", __func__, seq_id, lo, hi, dst, bound);
+    }
+
+    auto & head = v_heads[0];
+    head = std::min(head, lo);
+
+    return true;
+}
+
+bool llama_kv_cache::seq_unpark(llama_seq_id seq_id) {
+    const auto it = parked.find(seq_id);
+    if (it == parked.end()) {
+        return true;
+    }
+
+    auto & cells = v_cells[0];
+
+    const auto [lo, hi] = llama_kv_cache_seq_run(cells, seq_id);
+    if (lo == hi) {
+        return false;
+    }
+    const uint32_t n = hi - lo;
+
+    const auto range = it->second;
+    parked.erase(it);
+    const uint32_t bound = park_bound();
+
+    // the lowest run of n cells below the remaining parked ones that holds nothing but free cells and cells of the run
+    uint32_t dst = 0;
+    uint32_t len = 0;
+    for (uint32_t i = 0; i < bound && len < n; ++i) {
+        if (cells.is_empty(i) || (i >= lo && i < hi)) {
+            if (len == 0) {
+                dst = i;
+            }
+            len++;
+        } else {
+            len = 0;
+        }
+    }
+    if (len < n) {
+        if (llama_kv_park_debug()) {
+            LLAMA_LOG_WARN("%s: seq %d [%u, %u): no run of %u free cells below %u\n", __func__, seq_id, lo, hi, n, bound);
+        }
+        parked[seq_id] = range;
+        return false;
+    }
+
+    park_move(lo, dst, n);
+    if (llama_kv_park_debug()) {
+        LLAMA_LOG_WARN("%s: seq %d [%u, %u) -> [%u, %u)\n", __func__, seq_id, lo, hi, dst, dst + n);
+    }
+
+    park_compact();
+
+    return true;
+}
+
+bool llama_kv_cache::seq_parked(llama_seq_id seq_id) const {
+    return parked.count(seq_id) > 0;
+}
+
+bool llama_kv_cache::can_park() const {
+    // shared cells (another cache reads them), a transposed V, or a sliding-window cache, which reuses the cells that fall
+    // out of a sequence's window -- another sequence's included -- so it cannot keep cells off limits
+    return n_stream == 1 && other == nullptr && v_cells_impl.use_count() == 1 && !v_trans && n_swa == 0;
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -798,6 +1089,19 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
 
 llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
     llama_kv_cache::slot_info_vec_t res;
+
+    // a batch for a parked sequence (the caller did not seq_unpark() it): parking is given up, so that the attention
+    // range (get_n_kv) never stops below cells of a sequence in the batch.  No data move here: a decode may be in flight
+    if (!parked.empty()) {
+        for (const auto & ubatch : ubatches) {
+            for (uint32_t s = 0; s < ubatch.n_seqs_unq && !parked.empty(); ++s) {
+                if (parked.count(ubatch.seq_id_unq[s]) > 0) {
+                    LLAMA_LOG_WARN("%s: a batch for parked seq %d: parking is given up\n", __func__, ubatch.seq_id_unq[s]);
+                    parked.clear();
+                }
+            }
+        }
+    }
 
     struct state_t {
         slot_info sinfo; // slot info for the ubatch
@@ -1051,14 +1355,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
+        // with parked sequences (seq_park), the search covers only the cells below them
+        const uint32_t n_cells = parked.empty() ? cells.size() : park_bound();
+
         // if we have enough unused cells before the current head ->
         //   better to start searching from the beginning of the cache, hoping to fill it
-        if (head_cur > cells.get_used() + 2*n_tokens) {
+        if (head_cur > cells.get_used() + 2*n_tokens || head_cur >= n_cells) {
             head_cur = 0;
         }
 
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+        if (n_tokens > n_cells) {
+            if (n_cells == cells.size()) {
+                LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+            }
             return { };
         }
 
@@ -1069,8 +1378,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const uint32_t n_test = cont ? n_tokens : 1;
 
         while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
+            if (head_cur + n_test > n_cells) {
+                n_tested += n_cells - head_cur;
                 head_cur = 0;
                 continue;
             }
@@ -1128,7 +1437,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 res.idxs[s].clear();
             }
 
-            if (n_tested >= cells.size()) {
+            if (n_tested >= n_cells) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -1315,7 +1624,7 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
     // LLAMA_KV_N_PAD_MIN raises the 256-cell floor: n_kv - and with it the graph layout - then stays constant for longer,
     // so fewer captured graphs are invalidated as the context grows (-sm tensor splits each token into ~100 graphs)
-    static const uint32_t n_pad_min = getenv("LLAMA_KV_N_PAD_MIN") ? (uint32_t) atoi(getenv("LLAMA_KV_N_PAD_MIN")) : 256u;
+    static const uint32_t n_pad_min = [] { const char * e = getenv("LLAMA_KV_N_PAD_MIN"); return e ? (uint32_t) atoi(e) : 256u; }();
     // LLAMA_KV_N_PAD_PREFILL: a coarser pad for prompt-sized ubatches (> 64 tokens) once the cache is past
     // LLAMA_KV_N_PAD_PREFILL_FROM cells (default 4096; compared with the decode-padded occupancy).  Every prompt ubatch grows the cache by its own size, so with the
     // decode pad n_kv - and the graph - changes at every ubatch and the whole graph is rebuilt (split state, allocation);
@@ -1324,14 +1633,15 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_tokens) co
     // Decode and verify batches keep the decode pad (a coarse pad there slows every step and changes its numerics).
     // Default: 8192 on a multi-device split, 0 (off) on a single device; the value is rounded up to a power of two.
     // Not for training (its graphs assert n_kv == n_tokens).
-    static const uint32_t n_pad_prefill_from = getenv("LLAMA_KV_N_PAD_PREFILL_FROM") ? (uint32_t) atoi(getenv("LLAMA_KV_N_PAD_PREFILL_FROM")) : 4096u;
+    static const uint32_t n_pad_prefill_from = [] { const char * e = getenv("LLAMA_KV_N_PAD_PREFILL_FROM"); return e ? (uint32_t) atoi(e) : 4096u; }();
     const uint32_t n_pad_cur = std::max(n_pad, n_pad_min);
     const bool     prefill   = n_tokens > 64 && n_pad_prefill > n_pad_cur;
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        const uint32_t used = cells.used_max_p1();
+        // parked sequences (seq_park) sit above every sequence that is decoded, so the range stops below them
+        const uint32_t used = parked.empty() ? cells.used_max_p1() : cells.used_max_p1_below(park_bound());
         const uint32_t pad  = prefill && GGML_PAD(used, n_pad_cur) > n_pad_prefill_from ? n_pad_prefill : n_pad_cur;
 
         result = std::max(std::min(cells.size(), std::max(pad, GGML_PAD(used, pad))), result);

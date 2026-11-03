@@ -153,4 +153,58 @@ int64_t ggml_hip_win_available_ram_bytes() {
     return (int64_t) st.ullAvailPhys;
 }
 
+// The adapter's SHARED (aperture) segments, all processes: where a pinned host allocation (`hipHostMalloc`,
+// `cudaHostAlloc`, `cudaHostRegister`) lands on Windows.  They are NOT VRAM, and `ggml_hip_mem_get_info`
+// deliberately ignores them, but they are the ceiling the host-expert pool actually hits: on issue #274's box
+// the shared usage stops at ~9.3 GiB whether the machine has 47 or 64 GiB of RAM, far below the commit limit and
+// far below `(RAM/2)/visible GPUs`.  Same statistics call as `wddm_free`, the other segment class.  Returns
+// false (and leaves the outputs at -1) when the query is unavailable, so a caller can report "unknown" rather
+// than a made-up number.
+bool ggml_hip_win_shared_mem_info(int64_t * limit_mib, int64_t * resident_mib) {
+    if (limit_mib    != nullptr) { *limit_mib    = -1; }
+    if (resident_mib != nullptr) { *resident_mib = -1; }
+    const wddm_query_fn query = wddm_query();
+    int device = 0;
+    if (query == nullptr || hipGetDevice(&device) != hipSuccess) {
+        (void) hipGetLastError();
+        return false;
+    }
+    if (device < 0 || device >= WDDM_MAX_DEVICES) {
+        return false;
+    }
+    LUID luid;
+    if (!wddm_luid(device, luid)) {
+        return false;
+    }
+    D3DKMT_QUERYSTATISTICS q = {};
+    q.Type        = D3DKMT_QUERYSTATISTICS_ADAPTER;
+    q.AdapterLuid = luid;
+    if (query(&q) != 0) {
+        return false;
+    }
+    unsigned long long limit = 0;
+    unsigned long long resident = 0;
+    for (ULONG i = 0; i < q.QueryResult.AdapterInformation.NbSegments; ++i) {
+        D3DKMT_QUERYSTATISTICS s = {};
+        s.Type                   = D3DKMT_QUERYSTATISTICS_SEGMENT;
+        s.AdapterLuid            = luid;
+        s.QuerySegment.SegmentId = i;
+        if (query(&s) != 0) {
+            return false;
+        }
+        const D3DKMT_QUERYSTATISTICS_SEGMENT_INFORMATION & seg = s.QueryResult.SegmentInformation;
+        if (!seg.Aperture) {
+            continue;   // the local VRAM segments are `wddm_free`'s half
+        }
+        limit    += seg.CommitLimit;
+        resident += seg.BytesResident;
+    }
+    if (limit == 0) {
+        return false;
+    }
+    if (limit_mib    != nullptr) { *limit_mib    = (int64_t) (limit >> 20); }
+    if (resident_mib != nullptr) { *resident_mib = (int64_t) (resident >> 20); }
+    return true;
+}
+
 #endif // defined(GGML_USE_HIP) && defined(_WIN32)

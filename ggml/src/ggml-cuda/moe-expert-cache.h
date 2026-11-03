@@ -112,6 +112,14 @@ void moe_cache_set_extra_reserve(int device, size_t bytes);
 // whole-process activity during the turn.
 bool moe_cache_get_stats(int64_t * hits, int64_t * misses, int64_t * arena_bytes);
 
+// r143: the model that registered this device's host-resident expert tables is going away
+// (`llama_model_free`), so drop them BEFORE its host masters are freed.  The cache is process-global and
+// its deferred arena sizing fills every registered table, so a table whose master was freed is a
+// host-memory use-after-free (a SIGSEGV inside the fill's host memcpy).  Frees each dropped table's arena
+// slice, remap staging, bounce ring and host pool, then un-sizes the cache so the next model re-sizes on
+// its own first band pass instead of silently running uncached.  `device < 0` drops every device.
+void moe_cache_forget_all(int device);
+
 // WIP r42: fail-soft guard -- free the whole arena (once) so a compute allocation that needs the VRAM
 // can succeed; the cache is disabled for the rest of the run.  Returns true when it released anything.
 bool moe_cache_release_arena();
@@ -166,6 +174,12 @@ bool moe_cache_ready();
 // host-resident expert weights and can participate in this run).  When false, the cache can never take
 // an input over, so its fusions must behave exactly as if it were disabled.
 bool moe_cache_has_tables();
+
+// wip/host-pool-speed (#131): true when the routed expert table backing `weight` on `device` is served by
+// the bounded pinned host POOL (`--host-experts pool`) instead of a pinned master.  The scheduler uses this
+// to send a pool-backed table to the device gather unconditionally: its whole-table staging is the slow
+// path at every width, while the gather reads the two pinned tiers on the device.
+bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device);
 
 // True only when EVERY table has a usable arena.  The cache-band fusion guard is global (one answer
 // for the whole graph) and the gate+up fused kernel indexes the gate lane with the up table's remap, so
@@ -233,6 +247,11 @@ void    moe_cache_heat_open(const char * model_path);
 // slots are also the region's presence bitmap, and with `MOE_HOST_POOL_COLD_MULTIDEV` a resident expert is read
 // in place by any device's kernel, so residency there buys the native transport at any device count.
 void    moe_cache_set_host_pool_budget(size_t bytes);
+// r212: the loader's RESOLVED `--load-mode` (1 = O_DIRECT), so the host pool's fill mode can mirror it.
+// The pool fills the same way the model was loaded, because `--load-mode` is the operator's caching
+// decision; `MOE_HOST_POOL_DIO=0|1` still forces either arm.  -1 (never told) keeps the historical
+// MemAvailable heuristic for a consumer that is not the CLI loader.
+void    moe_cache_set_host_fill_mode(int direct);
 int64_t moe_cache_heat_table_score(int layer, const char * name, int n_experts, size_t host_bytes);
 
 // LFRU residency decision + alias for expert `expert` of `table`.  The single compute-path seam.
@@ -289,6 +308,18 @@ bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_
 bool moe_cache_gather_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
                            const struct ggml_tensor * ids, void * stream, int device,
                            size_t slice_off, int split_axis);
+
+// wip/host-expert-master-drop (TODO #55): true when `p` lies inside a host expert master that is NOT
+// pinned (the pool-backed, file-mapping-backed master).  A device copy must not treat such a pointer as a
+// pinned source, and a kernel must not read it in place.
+bool moe_cache_source_pageable(const void * p);
+
+// wip/host-expert-master-drop (TODO #55): copy `size` bytes of a POOL-BACKED host expert master (the
+// pageable model mapping) at `src_host` into the device pointer `dst`, staging through the pinned pool or
+// the per-table pinned bounce -- never a pageable H2D.  Returns false when `src_host` is not inside a
+// registered pool-backed master of `device` (the caller keeps its normal copy path), so this is safe to
+// call for every host-to-device upload.
+bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, void * stream, int device);
 
 // Fill a whole-table staging copy from the expert-cache arena (the
 // immutable prefill residency snapshot) + the pinned host master, instead of re-uploading every expert
