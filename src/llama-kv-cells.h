@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <iterator>
 #include <set>
 #include <vector>
 
@@ -102,6 +103,38 @@ public:
 
     bool get_has_shift() const {
         return has_shift;
+    }
+
+    // the index of the last used cell below lim + 1, 0 if none (the attention range when cells from lim up are parked)
+    uint32_t used_max_p1_below(uint32_t lim) const {
+        const auto it = used.lower_bound(lim);
+        return it == used.begin() ? 0 : *std::prev(it) + 1;
+    }
+
+    // move the non-empty cell isrc to the empty cell idst: its sequences, position, extension and shift go with it
+    void mv(uint32_t isrc, uint32_t idst) {
+        assert(isrc < pos.size());
+        assert(idst < pos.size());
+
+        assert(pos[idst] == -1);
+        assert(pos[isrc] != -1);
+
+        seq_pos_rm(isrc);
+
+        pos  [idst] = pos  [isrc];
+        ext  [idst] = ext  [isrc];
+        shift[idst] = shift[isrc];
+        seq  [idst] = seq  [isrc];
+
+        pos  [isrc] = -1;
+        ext  [isrc].reset();
+        shift[isrc] = 0;
+        seq  [isrc].reset();
+
+        used.erase (isrc);
+        used.insert(idst);
+
+        seq_pos_add(idst);
     }
 
     // move cell isrc to idst (used during defrag)

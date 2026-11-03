@@ -231,7 +231,7 @@ llama_model_k2_horizon::graph::graph(const llama_model & model, const llm_graph_
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
-        res->t_layer_inp[il] = inpL;
+        res->set_layer_inp(il, inpL);
 
         ggml_tensor * inpSA = inpL;
 
