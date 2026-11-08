@@ -26,6 +26,13 @@ bool   ggml_cuda_slab_configured();
 // Is the slab live on THIS device?  (The gate can be on while a device failed to create one.)  Used to
 // keep the generic OOM path from churning the arena, which cannot help under the slab.
 bool   ggml_cuda_slab_active    (int device);
+// May `[dst, dst+nbytes)` be the destination of a raw cross-device peer copy?  A peer copy into a slab range
+// the driver's grants do not cover FAULTS the GPU instead of returning an error (the grant is best effort:
+// three ~29 GiB slabs leave the peers no free VRAM to build it), and the slab check is process-wide because
+// a copy fails while ANY live slab's grants are incomplete -- even between two fully granted devices.  A
+// destination outside every slab is always fine (plain memory peer copies stage inside the driver).
+// false => stage the copy through pinned host memory.
+bool   ggml_cuda_slab_peer_copy_ok(const void * dst, size_t nbytes);
 // The slab declined because `work estimate + cache floor` does not fit.  The expert cache must then stream
 // the experts from the host instead of building an arena a wide prefill would have to evict wholesale.
 bool   ggml_cuda_slab_cache_unusable(int device);
@@ -77,6 +84,47 @@ void * ggml_cuda_slab_arena_alloc_transient(int device, size_t size);
 // Per-slot capacity of the slab's ring hole (0 when there is none).  The op-offload H2D ring allocates one
 // full-capacity slot so every slot gets a stable VA and the ring never reallocs a slot.
 size_t ggml_cuda_slab_ring_slot_capacity(int device);
+// The ring hole's reserved size (0 when the slab carved none): `llama_context` uses it to skip the
+// narrow -> wide compute-buffer drop when there is no ring to arm.  wip/slab-ring-region (issue #164).
+size_t ggml_cuda_slab_ring_region(int device);
+// wip/slab-transient-absorption (F5, step 0): was the ring hole REQUESTED for this model?  The ring
+// fallback is refused only when it was (an operator can still leave the ring outside the slab with
+// GGML_CUDA_SLAB_RING_MIB=0, which is the pre-slab behaviour).
+bool   ggml_cuda_slab_ring_requested();
+// wip/slab-transient-absorption: the WIDE-PHASE auxiliary region (the FA prefill staging arena's home).
+// Bump-allocates above the live work boundary while the wide view is armed; released with the ring on the
+// prefill -> decode transition.  Returns nullptr when there is no wide view or no room (the caller falls
+// back).  `gen_out` receives the region generation, which the caller must compare against
+// `ggml_cuda_slab_wide_aux_gen` before reusing a cached pointer.
+void * ggml_cuda_slab_wide_aux_alloc(int device, size_t size, size_t * gen_out);
+void   ggml_cuda_slab_wide_aux_free(int device, void * ptr, size_t size);
+
+bool   ggml_cuda_slab_wide_available(int device);
+size_t ggml_cuda_slab_wide_aux_gen(int device);
+// One-line steady-state layout + transient accounting, gated on GGML_CUDA_SLAB_STATS (diagnostic only).
+void   ggml_cuda_slab_log_stats(int device, const char * tag);
+// wip/slab-transient-absorption: physical retained by the VMM workspace pool on this device (diagnostic).
+size_t ggml_cuda_pool_mapped_bytes(int device);
+// Largest single allocation made through `ggml_cuda_device_malloc` AFTER the slab became active, per
+// device: everything it reports is OUTSIDE the slab by construction (scheduler buffers, the Meta
+// all-reduce temp, the q8_1 arena, the pool).  Diagnostic only (GGML_CUDA_SLAB_STATS).
+size_t ggml_cuda_outside_alloc_max_bytes(int device);
+// Largest allocation the same choke point REFUSED after the slab became active (the outside-reserve
+// shortfall signal).  Diagnostic only (GGML_CUDA_SLAB_STATS).
+size_t ggml_cuda_outside_fail_max_bytes(int device);
+// Low-water mark of the free VRAM outside the slab, per device (diagnostic only).
+size_t ggml_cuda_free_min_bytes(int device);
+void   ggml_cuda_free_min_sample(int device, size_t free_b);
+// wip/slab-transient-absorption (step 2b): bytes and block count the workspace pools have currently handed
+// out from the slab's wide band on this device.  The block count is the LEAK TRIPWIRE: it must be 0 at the
+// prefill -> decode drop (a non-zero value means a pool allocation outlived the band, i.e. a retained site
+// that was not pinned; `ggml_cuda_slab_ring_set` warns `POOL_WIDE_LEAK`).
+size_t ggml_cuda_pool_wide_bytes (int device);
+size_t ggml_cuda_pool_wide_blocks(int device);
+// Diagnostic: bytes a large pool allocation asked for while the band was armed and the band REFUSED (it
+// then stays outside the slab as pool high-water).  Reset at the wide arm, reported at the wide drop.
+size_t ggml_cuda_pool_wide_refused(int device);
+void   ggml_cuda_pool_wide_refused_reset(int device);
 // Arm/disarm the ring hole: armed during prefill (excluded from the arena), disarmed at the
 // prefill -> decode transition (returned to the arena, so a decode-only stretch gets the VRAM back).
 // Arming evicts the arena tables the hole had picked up; called with NO lock held.
@@ -85,3 +133,15 @@ void   ggml_cuda_slab_ring_set(int device, bool arm);
 // model preflight, before the slab is created, from the largest host-resident weight table.
 void   ggml_cuda_slab_set_ring_region(size_t bytes);
 void   ggml_cuda_slab_arena_free (int device, void * ptr, size_t size);
+
+// Phase-2 (item 6b): slab state accessors used by the device wrappers in ggml-cuda.cu.
+void   ggml_cuda_slab_arm();
+void   ggml_cuda_slab_disarm();
+bool   ggml_cuda_slab_compute_enabled();
+void   ggml_cuda_slab_set_compute_narrow2(bool enable);
+void   ggml_cuda_slab_set_compute_plain(bool enable);
+bool   ggml_cuda_slab_compute_plain();
+size_t ggml_cuda_slab_headroom_bytes();
+void   ggml_cuda_slab_set_narrow_floor(int device, size_t bytes);
+void   ggml_cuda_slab_reserve_wide(int device, size_t bytes);
+size_t ggml_cuda_slab_seed_floor(int device);

@@ -67,6 +67,19 @@ GGML_API bool ggml_gallocr_reserve_n(
     const int * node_buffer_ids,
     const int * leaf_buffer_ids);
 
+// Compute and store the layout of graph without allocating or modifying the existing buffers.
+// Returns true if the buffers would need to be grown (reallocated) to hold the graph; in that case
+// the caller must ensure that no in-flight work is using the buffers (synchronize) and call
+// ggml_gallocr_reserve_n before ggml_gallocr_alloc_graph. If it returns false, the layout is ready
+// and ggml_gallocr_alloc_graph can be called directly: only tensor addresses change, which is safe
+// as long as the compute of the graph is ordered after the compute of any previous graph on the
+// backend streams (no buffer is freed or reallocated).
+GGML_API bool ggml_gallocr_reserve_n_probe(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids);
+
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);

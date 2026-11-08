@@ -291,9 +291,15 @@ static void top_k_radix_cuda(
 
 // The sorted indices live in a `ncols`-pitch temporary and only the first k columns of each row are wanted,
 // so getting them out is a strided row copy.  `cudaMemcpy2DAsync` is NOT usable for it: a padded 2-D copy
-// into a VMM-backed destination is refused with "invalid argument" by the driver on this stack -- measured
-// with a build of the PRISTINE UPSTREAM BASE that carries nothing but the delivery's VMM-pool prerequisite,
-// i.e. no delivery source change is involved, and the equal-pitch call (ncols == k) just before it succeeds.
+// into a VMM-backed destination is refused with "invalid argument" by the driver on this stack.  Two
+// independent attributions of the same refusal are on the record:
+//   * the VMM pool (R00.6): a build of the PRISTINE UPSTREAM BASE carrying nothing but the delivery's
+//     VMM-pool prerequisite aborts identically, i.e. no delivery source change is involved, and the
+//     equal-pitch call (ncols == k) just before it succeeds;
+//   * the movable-boundary slab (block 10): a copy into a graph tensor view succeeds on device 0, is
+//     refused on another device of the split (`-ot exps=CPU -sm layer`, 3 devices, the dsv4 indexer's top-k
+//     plus a DeepSeek-V4-Flash shape and the synthetic `deepseek32` fixture), and `GGML_CUDA_SLAB=0` or
+//     `MOE_EXPERT_CACHE_MIB=0` make it go away.
 // The same refusal is what `ggml_cuda_cpy_as_memcpy_2d` guards against and what the windowed KV's 2-D state
 // copy hit (issue #313).  One int per thread, the row taken from the grid with a stride loop, so there is no
 // per-element division and no grid-height limit.

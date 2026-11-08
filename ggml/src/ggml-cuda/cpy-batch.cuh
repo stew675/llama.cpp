@@ -7,3 +7,4 @@
 // Returns the number of graph nodes it consumed (the copies plus the no-op view nodes between them, >= 2), or 0 when the node
 // at i does not start such a run.  GGML_CUDA_FUSE_CPY_BATCH_DEBUG=1 prints every run.
 int ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, struct ggml_cgraph * cgraph, int i);
+int ggml_cuda_cpy_batch_try_fuse(ggml_backend_cuda_context & ctx, struct ggml_cgraph * cgraph, int i);
