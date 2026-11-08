@@ -156,6 +156,46 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 // Label of option i of a decision model ("<arch>.decision.labels"), nullptr past the last one
 LLAMA_API const char * llama_model_decision_label(const struct llama_model * model, uint32_t i);
 
+// mirrors:
+// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+
+// LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+// Set whether the context outputs the input embeddings of a specific layer
+LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+
+// mirrors:
+// LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
+
+// Write the enabled layer inputs to a device buffer [n_layer_inp*n_embd, n_batch] instead of host memory.
+// Row r holds the token at batch index r, layers in ascending layer id order.
+LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bool value);
+
+// Whether decode accepts entries added with llama_batch_ext_add_embd_row()
+// (needs a DFlash/DSpark decoder context whose ctx_other has a layer input device buffer).
+LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
+
+// Add an entry whose embedding is row `row` of the layer input device buffer of ctx_other.
+// All entries of the batch must be of this kind. Positions are set with llama_batch_ext_set_pos(), n_pos_per_embd of them.
+// Returns the batch index (>= 0), or the llama_batch_ext_add() error codes.
+LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
+// Llama-Frankenstein F1: device-resident layer inputs for draft feature injection
+LLAMA_API void                 llama_lf_set_layer_inp_dev(struct llama_context * ctx, bool enable);
+LLAMA_API struct ggml_tensor * llama_lf_get_layer_inp_dev(struct llama_context * ctx, uint32_t lid);
+// target context: the device buffer row of each row of its last batch, or nullptr when they are the same (the ubatches
+// kept the batch order: always for one sequence); *n_rows = the batch size when not nullptr
+LLAMA_API const int32_t *      llama_lf_get_dev_rows     (struct llama_context * ctx, int32_t * n_rows);
+// draft context: while enabled, a token batch is a KV injection whose token ids are the rows of the target's
+// last batch (its ctx_other) to read from the device layer inputs
+LLAMA_API void                 llama_lf_set_dev_inject   (struct llama_context * ctx, bool enable);
+// draft context: after the injections of a batch were enqueued; the target's next extraction waits for them on the GPU
+LLAMA_API void                 llama_lf_signal_features_consumed(struct llama_context * ctx_dft);
+
+LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //

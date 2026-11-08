@@ -52,19 +52,35 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    // A capture was deferred because the slab's wide band was armed: the direct runs in that stretch
+    // served the graph's pool temporaries from the band, so they are NOT cached for a capture.  The
+    // first disarmed compute runs directly to populate the pool (outside the slab), and the capture
+    // follows on the next one.  See the graph-capture guard in ggml-cuda.cu.
+    bool capture_deferred = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     // ggml_cuda_graph_mem_gen() of the graph's device when it was captured: a captured graph bakes in
     // the addresses of pool temporaries and per-context scratch buffers, so it is recaptured once any
     // of that memory has been freed (see ggml_cuda_graph_mem_freed)
     uint64_t mem_gen = 0;
-    struct node_properties {
-        ggml_tensor node;
-        void *   node_src_data_ptrs[GGML_MAX_SRC];
-        int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
-        size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+    // What a replay bakes in, per node, packed to the sources the node actually has.  The compare that
+    // guards a replay is O(nodes) and runs on EVERY graph_compute (the scheduler mints a fresh
+    // `cgraph->uid` per split, so the `uid` early-out in ggml_cuda_graph_update_required cannot fire),
+    // so its per-node bytes are a decode-time cost: a fixed GGML_MAX_SRC layout spends 720 of its 1048
+    // bytes on slots a node leaves empty (measured: 1.4 non-null sources per node on a decode split).
+    //   `prop_nodes`   the node header verbatim, `src[]`/`view_src`/`buffer` object identity included --
+    //                  that is what the guard compares, and it is why a null/non-null source layout can
+    //                  be taken for granted when the src run is walked.
+    //   `prop_srcs`    the data pointer and geometry of every non-null source, in source index order.
+    //   `prop_src_off` prop_nodes.size() + 1 entries delimiting each node's run in `prop_srcs`.
+    struct src_properties {
+        const void * data;
+        int64_t      ne[GGML_MAX_DIMS];
+        size_t       nb[GGML_MAX_DIMS];
     };
-    std::vector<node_properties> node_props;
+    std::vector<ggml_tensor>    prop_nodes;
+    std::vector<uint32_t>       prop_src_off;
+    std::vector<src_properties> prop_srcs;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);

@@ -982,9 +982,14 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    // Size of the largest host-resident weight tensor (the host MoE expert tables of a `-ncmoe`
+    // model).  Used to bound the raw device staging arenas that live outside the compute reserve
+    // (issue #33 class): the H2D staging ring holds one table per slot, so its worst case is
+    // `slots x this`.
+    size_t max_host_weight_tensor_bytes() const;
+
     // total number of parameters in the model
     uint64_t n_elements() const;
-    size_t max_host_weight_tensor_bytes() const;
 
     // TODO #135: a load-time guard against a degenerate `-sm tensor` device count.  It refuses (throws) a
     // split whose granularity-rounded per-device share of a HOST-RESIDENT expert table leaves a device with

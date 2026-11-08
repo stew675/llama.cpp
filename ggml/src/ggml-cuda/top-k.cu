@@ -299,6 +299,38 @@ static void top_k_radix_cuda(
     }
 }
 
+// The sorted indices live in a `ncols`-pitch temporary and only the first k columns of each row are wanted,
+// so getting them out is a strided row copy.  `cudaMemcpy2DAsync` is NOT usable for it: a padded 2-D copy
+// into a graph tensor view fails with "invalid argument" when the destination sits in the movable-boundary
+// slab -- the same driver refusal the CPY path guards against (see `ggml_cuda_cpy_as_memcpy_2d`: there the
+// identical copy succeeds on device 0, is refused on another device of the split, and the run is clean with
+// `GGML_CUDA_SLAB=0`).  Measured here on the dsv4 indexer's top-k, a DeepSeek-V4-Flash shape and the small
+// synthetic `deepseek32` fixture with `-ot exps=CPU -sm layer` on 3 devices: the 1-D copies into the very
+// same buffer succeed, the 2-D one is refused, and both `GGML_CUDA_SLAB=0` and `MOE_EXPERT_CACHE_MIB=0`
+// make it go away.  One int per thread, the row taken from the grid with a stride loop, so there is no
+// per-element division and no grid-height limit.
+static __global__ void top_k_gather_rows(const int * GGML_CUDA_RESTRICT src, int * GGML_CUDA_RESTRICT dst,
+        const int64_t ncols, const int64_t k, const int64_t nrows) {
+    const int64_t col = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+
+    if (col >= k) {
+        return;
+    }
+
+    for (int64_t row = blockIdx.y; row < nrows; row += gridDim.y) {
+        dst[row*k     + col] = src[row*ncols + col];
+    }
+}
+
+static void top_k_gather_cuda(const int * src, int * dst, int ncols, int64_t nrows, int k, cudaStream_t stream) {
+    constexpr int BLOCK_SIZE = 256;
+
+    // gridDim.y is bounded (65535); the kernel strides over the rows above that
+    const dim3 grid((k + BLOCK_SIZE - 1) / BLOCK_SIZE, (unsigned) std::min<int64_t>(nrows, 65535));
+
+    top_k_gather_rows<<<grid, BLOCK_SIZE, 0, stream>>>(src, dst, ncols, k, nrows);
+}
+
 static void top_k_argsort_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int64_t nrows, int k, bool use_cub, cudaStream_t stream) {
@@ -319,8 +351,7 @@ static void top_k_argsort_cuda(
         } else {
             argsort_f32_i32_cuda_bitonic(src, tmp, ncols, iter_nrows, GGML_SORT_ORDER_DESC, stream);
         }
-        CUDA_CHECK(cudaMemcpy2DAsync(dst, k * sizeof(int), tmp, ncols * sizeof(int), k * sizeof(int), iter_nrows,
-                                     cudaMemcpyDeviceToDevice, stream));
+        top_k_gather_cuda(tmp, dst, ncols, iter_nrows, k, stream);
 
         src += (size_t) ncols * iter_nrows;
         dst += (size_t) k     * iter_nrows;

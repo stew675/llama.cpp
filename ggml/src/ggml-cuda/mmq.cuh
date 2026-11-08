@@ -1,7 +1,9 @@
 #pragma once
 
 #include "common.cuh"
+#include "common.cuh"
 #include "mmid.cuh"
+#include "moe-expert-cache.h"
 #include "unary.cuh"
 
 #include <climits>
@@ -1763,14 +1765,18 @@ static __global__ void mul_mat_q_routed_compact(
         }
         const int offset_y = (col_low + jt * J) * (sizeof(block_q8_1_mmq) / sizeof(int));
         const int tile_x_max_i = nrows_x - it * I - 1;
-        const int tile_y_max_j = col_diff - jt * J - 1;
+        // Upstream #31047 renamed this parameter from `tile_y_max_j` (inclusive max index) to `tile_y_j_sup`
+        // (exclusive count) and changed the plain path to pass `col_high - col_low`; passing the old
+        // max-index value here dropped the last column of every tile.  It went unnoticed only because the
+        // compact dispatch was unreachable (see the nchannels_x gate in launch_mul_mat_q).
+        const int tile_y_j_sup = col_diff - jt * J;
         const float * y_scale_tile = y_scale ? y_scale + col_low + jt * J : nullptr;
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, false, false>
             (x_use, nullptr, offset_x, y + offset_y, ids_dst_shared, dst + it * I, nullptr, y_scale_tile,
              GGML_GLU_OP_COUNT, 0.0f, nullptr, nullptr, stride_row_use, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+             tile_x_max_i, tile_y_j_sup, 0, blocks_per_ne00.z);
     }
 }
 
@@ -1818,15 +1824,22 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // GGML_CUDA_DISABLE_MMQ_ROUTED=1 disables ONLY this compact dispatch (the per-expert J selection
     // in mul_mat_q_switch_J stays; both are part of the same port).
     static const bool routed_disabled = getenv("GGML_CUDA_DISABLE_MMQ_ROUTED") != nullptr;
-    const bool use_compact_routed = args.ids_dst != nullptr && mmq_rdna3_5_id_n_experts_ok(args.nchannels_y) && mmq_routed_compact_arch_ok(cc) &&
+    // The routed (ids) convention upstream's mmq_args now carries: tile_spec names the expert per tile, so
+    // the grid's channel dimension (nchannels_y) is 1 and the expert count lives in nchannels_x.  Keying the
+    // compact dispatch on nchannels_y (the pre-#31047 layout, where z enumerated the experts) silently made
+    // it unreachable; expert_bounds is the other thing the compact kernel needs and only the delivery's
+    // helper emits it.
+    const int64_t n_experts_ids = args.nchannels_x;
+    const bool use_compact_routed = args.ids_dst != nullptr && args.expert_bounds != nullptr &&
+        mmq_rdna3_5_id_n_experts_ok(n_experts_ids) && mmq_routed_compact_arch_ok(cc) &&
         !has_gate && !ggml_cuda_mmq_get_stream_k(type, J, fallback, cc, prec_src1) && mmq_rdna3_5_id_use_compact(type, J, GGML_CUDA_CC_IS_RDNA4(cc)) &&
         !routed_disabled;
     mmq_routed_src routed_src = {};
     if (use_compact_routed) {
-        const int max_descriptors = (args.ncols_dst + J - 1) / J + args.nchannels_y;
+        const int max_descriptors = (args.ncols_dst + J - 1) / J + n_experts_ids;
         ggml_cuda_pool_alloc<uint32_t> descriptors(ctx.pool(id), max_descriptors);
         build_mmq_routed_descriptors<J><<<1, MMQ_ROUTED_MAX_EXPERTS, 0, stream>>>
-            (args.expert_bounds, descriptors.get(), args.nchannels_y, max_descriptors);
+            (args.expert_bounds, descriptors.get(), n_experts_ids, max_descriptors);
 
         const int descriptor_blocks = (args.ncols_dst + J - 1) / J;
         const dim3 block_nums_compact(nti, descriptor_blocks, args.nsamples_y);
@@ -2047,3 +2060,8 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
 // prec_requested: the src1 precision requested by the fused MUL_MATs.
 bool ggml_cuda_mmq_fusion_is_efficient(ggml_type type, ggml_prec prec_requested, int64_t nrows_x, int64_t ncols, int64_t nchannels, int device);
+
+int ggml_cuda_mul_mat_q_pair_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+int ggml_cuda_mul_mat_q_swiglu_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+int ggml_cuda_mul_mat_q_swiglu_dense_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

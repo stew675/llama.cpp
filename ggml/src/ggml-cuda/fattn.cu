@@ -256,7 +256,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             // instead of two (q8_0, gfx1201: -10..-15 % from 4k KV rows, but +2..8 % below 2k, where the
             // 16-warp block is mostly idle), so the KV-length gate cannot change any output either.
             // GGML_HIP_FA_BAND_WIDE=0 restores the two-tile launch.
-            static const bool band_wide_on = getenv("GGML_HIP_FA_BAND_WIDE") == nullptr || atoi(getenv("GGML_HIP_FA_BAND_WIDE")) != 0;
+            static const bool band_wide_on = [] { const char * e = getenv("GGML_HIP_FA_BAND_WIDE"); return e == nullptr || atoi(e) != 0; }();
             if (band_wide_on && ggml_cuda_fattn_band_wmma_ncols1(dst) == 4 && Q->ne[1] > 4 && K->ne[1] >= 4096) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8, true>(ctx, dst);
             } else if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
@@ -956,6 +956,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     return f16_extra.end - (uintptr_t) dst->data;
 }
+
+thread_local ggml_cuda_fa_had_req ggml_cuda_fa_had;
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
