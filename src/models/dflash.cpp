@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-context.h"
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
@@ -683,8 +684,25 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
+    // Under `-sm tensor` the draft logits are vocabulary-split: the lm_head is the target's, whose
+    // placement is the target's policy (`output.weight` is split on its vocabulary axis), so a device
+    // holds only its share of the vocabulary.  The selector reduces along exactly that axis -- the
+    // `ggml_top_k` below picks the candidates and the `ggml_get_rows` reads their values back -- which a
+    // per-device op cannot do (the Meta backend aborts on a per-row op over a row that straddles a
+    // split).  All-gather the logits first: every device then holds the whole row, the selector runs
+    // locally and identically on all of them, and the candidate ids keep their global vocabulary
+    // positions.  Single-device/`-sm layer` graphs keep the plain path (the op is not built at all).
+    ggml_tensor * logits = res->t_logits;
+    // `devices` is the meta wrapper itself (one entry, `is_meta`) for a >= 2-device tensor split, so this
+    // is exactly "the logits are vocab-split": a single device has no split, and a tensor split over one
+    // device skips the wrapper (`llama_prepare_model_devices`).
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.devices.size() == 1 && model.devices[0].is_meta) {
+        logits = ggml_all_gather(ctx0, logits);
+        g.cb(logits, "dflash2_logits_gathered", -1);
+    }
+
+    ggml_tensor * candidates  = ggml_top_k(ctx0, logits, top_k);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_tokens);
     ggml_tensor * unary       = ggml_reshape_2d(ctx0,
             ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);

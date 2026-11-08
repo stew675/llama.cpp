@@ -1112,6 +1112,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
+    bool    strict_pos     = true;  // the draft's batch check requires consecutive positions (no M-RoPE jump)
     int32_t selector_top_k = 0;
 
     // DFlash2 probabilistic drafting: one generator per sequence and the seed it was last seeded with (-1: reseed)
@@ -1126,6 +1127,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // block-internal attention
     bool causal_attn = false;
+
+    // every layer of the draft attends over a sliding window of n_swa positions: a prompt row older than the last n_swa
+    // positions of the prompt never reaches a draft, so it is not ingested (LLAMA_DFLASH_INGEST_TAIL=0: every row).
+    // Exact because DFlash sets LLAMA_SWA_TYPE_STANDARD unconditionally (src/models/dflash.cpp): the mask is
+    // p1 - p0 >= n_swa, so a prompt's last n_swa positions are exactly the rows a first generation row can attend to.
+    // (A LLAMA_SWA_TYPE_CHUNKED window reaches back to the chunk start -- up to 2*n_swa-1 -- and would need a wider tail.)
+    int32_t                ingest_window = 0;
+    std::vector<llama_pos> ingest_from;
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
@@ -1185,6 +1194,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
+        {
+            const char *  e     = getenv("LLAMA_DFLASH_INGEST_TAIL");
+            const int32_t n_swa = llama_model_n_swa(model_dft);
+            if ((e == nullptr || atoi(e) != 0) && n_swa > 0 && llama_model_n_layer_swa(model_dft) == llama_model_n_layer(model_dft)) {
+                ingest_window = n_swa;
+            }
+            ingest_from.assign(n_seq, 0);
+        }
+
         if (is_dspark && this->params.p_min > 0.0f) {
             char buf[16] = {};
             const bool has_conf =
@@ -1199,6 +1217,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
+        if (ingest_window > 0) {
+            LOG_INF("%s: - every layer has a %d-position window: a prompt is ingested from its last %d positions\n", __func__,
+                    ingest_window, ingest_window);
+        }
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
@@ -1216,6 +1238,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
+        // an M-RoPE draft is the one context the batch check lets jump forward (see spec_draft_align_cache())
+        {
+            const llama_rope_type rope_type = llama_model_rope_type(model_dft);
+            strict_pos = rope_type != LLAMA_ROPE_TYPE_MROPE && rope_type != LLAMA_ROPE_TYPE_IMROPE;
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1254,6 +1281,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     [](int32_t a, int32_t b) { return a >= b; }) == target_layer_ids + target_layer_ids_n;
 
             use_dev_features = !is_lilicorr && ascending && (env == nullptr || atoi(env) != 0);
+            // The delivery's F1 forced the host path here when the target had host-resident MoE experts (-ncmoe)
+            // and more than one sequence: r163 measured the armed slab breaking the draft's device reads (draft
+            // acceptance near 0, one sequence or GGML_CUDA_SLAB=0 fine).  Re-measured on the re-based slab at R13
+            // (Flash-Next GSQ and 35B-A3B, -ncmoe 10 and 24, 2 slots, -sm layer): the device buffer and the host
+            // copies give identical acceptance (same accepted/generated counts, same mean block length) and the
+            // same wall time, so the guard is gone.  LLAMA_DFLASH_DEV=0 still forces the host path anywhere.
             if (use_dev_features) {
                 llama_set_embeddings_layer_inp_dev(ctx_tgt, true);
                 use_dev_features = llama_supports_embd_row(ctx_dft);
@@ -1281,6 +1314,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1301,6 +1335,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             LOG_WRN("%s: ctx_dft pos_max=%d < N-1=%d - process() did not run on every prefill ubatch. "
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
+        }
+    }
+
+    void set_prompt_end(llama_seq_id seq_id, llama_pos n_prompt) override {
+        if (ingest_window > 0 && seq_id >= 0 && seq_id < (llama_seq_id) n_seq) {
+            ingest_from[seq_id] = std::max<llama_pos>(0, n_prompt - ingest_window);
         }
     }
 
@@ -1332,6 +1372,42 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             i_batch_end[seq_id] = k;
             if (i_batch_beg[seq_id] < 0) {
                 i_batch_beg[seq_id] = k;
+            }
+        }
+
+        // prompt rows before the draft's window of the prompt's end are never attended to; a batch left with none (a
+        // long prompt's leading ubatches) returns before the wait on the target, so the target's ubatches stay queued
+        if (ingest_window > 0) {
+            bool any = false;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                while (i_batch_beg[seq_id] >= 0 && i_batch_beg[seq_id] <= i_batch_end[seq_id] &&
+                       batch_in.tokens[i_batch_beg[seq_id]].pos[0] < ingest_from[seq_id]) {
+                    i_batch_beg[seq_id]++;
+                }
+                if (i_batch_beg[seq_id] > i_batch_end[seq_id]) {
+                    i_batch_beg[seq_id] = -1;
+                }
+                // generation reached (a row at the prompt end or later): later position shifts never skip rows
+                if (i_batch_end[seq_id] >= 0 && batch_in.tokens[i_batch_end[seq_id]].pos[0] >= ingest_from[seq_id] + ingest_window) {
+                    ingest_from[seq_id] = 0;
+                }
+                any = any || i_batch_beg[seq_id] >= 0;
+            }
+            if (!any) {
+                return true;
+            }
+        }
+
+        // The draft's cache must stay contiguous with the rows this call ingests: the batch check requires the first
+        // injected position to be the cache's seq_pos_max + 1.  It does NOT stay contiguous on its own, because a
+        // prompt is routinely only partially reused (see spec_draft_align_cache()).  Only the token path: an embedding
+        // batch may legitimately pin all of its rows to one position (an M-RoPE image).
+        if (has_tokens) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] >= 0) {
+                    spec_draft_align_cache(this->params.ctx_dft, seq_id,
+                            batch_in.tokens[i_batch_beg[seq_id]].pos[0], strict_pos);
+                }
             }
         }
 
@@ -3207,7 +3283,10 @@ common_speculative_init_result::common_speculative_init_result(
     llama_context * ctx_tgt,
     llama_model * model_dft_pre) :
     pimpl(new impl{}) {
-    const bool has_draft = params.speculative.has_dft();
+    // `has_dft()` only means `-md` was given: a type that never drafts with a model
+    // (`--spec-type none`, the n-gram types) must not create a context for it -- its warm-up needs the
+    // target's hidden state (gemma4-assistant) and aborts.
+    const bool has_draft = params.speculative.has_dft() && params.speculative.uses_dft();
     const bool spec_mtp = params.speculative.has_mtp();
 
     auto mparams = common_model_params_to_llama(params);
@@ -3232,6 +3311,20 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+
+    // MTP draft compute-buffer cap (TODO #42 / OPEN 1): the draft's encoder injection is fed in
+    // `n_ubatch` chunks, so its compute buffer during the target's first prefill is sized for that
+    // chunk (~1.6-1.7 GiB/device at the target's full `-ub`).  The draft only drafts `n_max+1` tokens
+    // and the injection is fast in small chunks, so cap it at 512 by default; the freed VRAM goes to
+    // the MoE expert arena (the `-ub 8192` decode DoD).  `MTP_DRAFT_N_UBATCH=0` restores the target's
+    // `-ub`; a positive value overrides the 512 default.
+    if (spec_mtp) {
+        const char * e = getenv("MTP_DRAFT_N_UBATCH");
+        const int64_t draft_ub = e != nullptr ? atoll(e) : 512;   // 0 = no cap (use the target's -ub)
+        if (draft_ub > 0) {
+            cparams.n_ubatch = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(draft_ub, (int64_t) cparams.n_ubatch));
+        }
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?

@@ -76,11 +76,6 @@ struct llama_cparams {
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
 
-    // Llama-Frankenstein F1: keep the extracted layer inputs on the device (target context) and let a draft
-    // context read them there (lf_dev_inject is set only while such a draft KV injection is being decoded)
-    bool lf_layer_inp_dev = false;
-    bool lf_dev_inject    = false;
-
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

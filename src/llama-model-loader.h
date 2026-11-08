@@ -98,6 +98,13 @@ struct llama_model_loader {
     bool   host_experts_pool_holes   = false;        // the holes are served by the bounded pinned pool
     std::string host_experts_policy;                // the resolved policy, for the census line
     bool   host_experts_heat_seen    = false;        // the heat prior answered for at least one tensor
+    // issue #274: how many host-expert tensors actually got an on-disk source registered for the pool
+    // (`moe_cache_set_host_source`), against how many were ELIGIBLE (a pageable, non-pinned expert bank).
+    // Without a source the pool is never built for that tensor and every miss falls back to the per-table
+    // bounce ring, so this pair is the first thing a "the pool never appears" report needs -- and it must be
+    // visible at the default log level, not only under `-v`.
+    size_t host_experts_sources      = 0;
+    size_t host_experts_sourceable   = 0;
 
     // The buffer type a host-resident expert weight (`-ncmoe`/`-cmoe`, a `MUL_MAT_ID` table) should use on
     // `dev`: the pinned host buffer by default, or the backend's pool-backed master buffer in POOL mode
@@ -157,9 +164,12 @@ struct llama_model_loader {
     }
 
     // The one-line census of the resolved tier, after the load: `pinned X MiB of Y MiB (cap C MiB),
-    // pageable Z MiB`, plus which tensors were pinned and why.  Always at INFO (a user must be able to see
-    // which tier they got: the pageable fallback costs half the throughput, and 0008's warning only fires
-    // when a PINNED allocation fails).
+    // pageable Z MiB`, plus which tensors were pinned and why, plus the pool-source count.
+    // issue #274: this is WARN, not INFO.  `common_log_get_verbosity()` maps GGML_LOG_LEVEL_INFO to
+    // LOG_LEVEL_TRACE, so an INFO line is INVISIBLE at the default verbosity (`-lv 3`) -- the reporter of
+    // issue #274 could not see the tier census, the pool's "enabled"/fill-mode lines or the pool's per-table
+    // build line at all, which is what made a pool that had FAILED look like a pool that was never requested.
+    // It is a one-off decision line, the same class as `MoE expert cache (auto): arena ...` (also WARN).
     void report_host_expert_placement();
     bool check_tensors;
     bool no_alloc;

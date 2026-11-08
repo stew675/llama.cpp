@@ -2679,7 +2679,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--host-experts"}, "MODE",
         "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
         "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
-        "- pool: the pinned master plus a bounded pinned host pool (MOE_HOST_POOL_MIB, default 25% of the MoE host expert bytes)\n"
+        "- pool: NO full pinned master - the weights stay in the read-only model mapping and every GPU read goes\n"
+        "        through a bounded pinned host pool (MOE_HOST_POOL_MIB/FRAC, default MOE_HOST_POOL_FRAC=80% of\n"
+        "        the host expert bytes, capped by MOE_HOST_POOL_RAM_PCT of MemAvailable).\n"
+        "        Bounds the non-swappable footprint to the pool (the rest is reclaimable page cache) so a host\n"
+        "        expert set larger than RAM can stream from disk; costs some prefill bandwidth.\n"
         "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
         [](common_params & params, const std::string & value) {
             fprintf(stderr, "warning: --host-experts is deprecated; use --limit-host-experts [auto|N] "

@@ -40,11 +40,19 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
         }
-        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: bounded pinned host pool enabled "
-                       "(MOE_HOST_POOL_MIB, default 25%% of the MoE host expert bytes)\n", func);
+        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: NO pinned master; the host experts stay in the model "
+                       "mapping and every GPU read is served through a bounded pinned pool "
+                       "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80%% of the host expert bytes capped "
+                       "by MOE_HOST_POOL_RAM_PCT of MemAvailable, O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n",
+                       func);
     }
 }
 
+// wip/host-expert-master-drop (TODO #55): POOL mode drops the FULL PINNED host expert master.  The
+// tensors are placed in the read-only model mapping (page cache / GGUF on disk) instead, and every GPU
+// read of them goes through the bounded pinned pool, so the non-swappable part of the host expert set
+// becomes the pool budget rather than the whole set -- which is what lets a model whose expert set does
+// not fit in RAM run at all (the page cache is reclaimable; the pool is the only pinned tier).
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -902,17 +910,31 @@ void llama_model_loader::report_host_expert_placement() {
     if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
         return;
     }
-    // Always at INFO: a user must be able to see which tier they got.  The pageable fallback costs about
-    // half the decode throughput and the only other warning (0008's PINNED HOST ALLOCATION FAILED) fires
-    // when a pinned allocation is refused, not when the policy chose not to pin.
+    // Always at WARN: a user must be able to see which tier they got.  The pageable fallback costs about half
+    // the decode throughput and the only other warning (0008's PINNED HOST ALLOCATION FAILED) fires when a
+    // pinned allocation is refused, not when the policy chose not to pin.
+    //
+    // issue #274: it used to be INFO, which is INVISIBLE at the default verbosity (common/log.cpp maps
+    // GGML_LOG_LEVEL_INFO to LOG_LEVEL_TRACE against a default threshold of LOG_LEVEL_INFO).  The reporter
+    // could see only the WARN lines -- the failures -- and not one of the decisions that produced them.
     const double mib = 1024.0 * 1024.0;
-    LLAMA_LOG_INFO("%s: host experts: pinned %.1f MiB of %.1f MiB (cap %s), pageable %.1f MiB; %s\n", __func__,
+    std::string src = "";
+    if (host_experts_sourceable > 0) {
+        // The pool is built per host tensor from this registration; a mismatch against the pageable tensor
+        // count is the first thing a "the pool never appears" report needs to know.
+        src = format(", %zu/%zu pool sources registered", host_experts_sources, host_experts_sourceable);
+        if (host_experts_sources < host_experts_sourceable) {
+            src += " -- the unregistered tensors cannot use the pool (their buffer names no device); the "
+                   "per-table bounce ring serves them";
+        }
+    }
+    LLAMA_LOG_WARN("%s: host experts: pinned %.1f MiB of %.1f MiB (cap %s), pageable %.1f MiB%s; %s\n", __func__,
                    (double) host_experts_pinned_bytes / mib,
                    (double) host_experts_total_bytes / mib,
                    host_experts_cap_bytes == SIZE_MAX ? "none (the whole set)"
                        : (host_experts_cap_bytes == 0 ? "0 (mapping + pool)"
                                                       : format("%.1f MiB", (double) host_experts_cap_bytes / mib).c_str()),
-                   (double) host_experts_holes_bytes / mib,
+                   (double) host_experts_holes_bytes / mib, src.c_str(),
                    host_experts_policy.empty() ? "legacy mode-keyed placement" : host_experts_policy.c_str());
 }
 
@@ -952,8 +974,19 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    // r212: tell the host pool how the model was loaded, so its fills mirror the operator's caching
+    // decision instead of guessing from MemAvailable.  `--load-mode` IS that decision: a mapped load reads
+    // through the page cache (so the pool must too -- the population is the only read that cannot be
+    // avoided), and `--load-mode direct-io` means O_DIRECT all the way down.  `MOE_HOST_POOL_DIO=0|1`
+    // still forces either arm; a consumer that never runs this call keeps the historical heuristic.
+    {
+        const int fill_direct = this->use_direct_io ? 1 : 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_get(i), fill_direct);
+        }
+    }
 
-    // Host-resident expert weights are always pinned (`ROCm_Host`): the GPU reads the host master in
+    // Host-resident expert weights are pinned by default (`ROCm_Host`): the GPU reads the host master in
     // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
     // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
     this->host_experts_mode = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP ? LLAMA_HOST_EXPERTS_MODE_PINNED : host_experts_mode;
@@ -2642,9 +2675,18 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_buffer_is_host(cur->buffer) &&
                 !host_expert_is_pinned(ggml_get_name(cur)) &&
                 std::string(ggml_get_name(cur)).find("exps") != std::string::npos) {
+            // issue #274: the census needs to know whether the registration REACHED the backend.  A host-expert
+            // bank in a pageable buffer whose tensor buffer carries no device (a CPU bdev, or a buffer type the
+            // backend does not own) silently registers nothing, and then the pool is never built for it -- so
+            // count the eligible tensors and the ones whose buffer names a device.
+            host_experts_sourceable++;
+            ggml_backend_dev_t src_dev =
+                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
+            if (src_dev != nullptr) {
+                host_experts_sources++;
+            }
             ggml_backend_dev_moe_cache_set_host_source(
-                    ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer)),
-                    cur->data, files.at(weight->idx)->path().c_str(), weight->offs,
+                    src_dev, cur->data, files.at(weight->idx)->path().c_str(), weight->offs,
                     (int) cur->ne[2], (size_t) cur->nb[2], ggml_nbytes(cur));
         }
 

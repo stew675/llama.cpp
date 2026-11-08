@@ -51,11 +51,30 @@ void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const vo
     // Deferred unless the scheduler's redirect mode (GGML_SCHED_STAGE_MODE=1) points the input at the slot: every
     // other caller (the scheduler's ring in its default mode, the meta backend's mirrored upload) copies the slot
     // into the input with stage_d2d, where the deferral is resolved.
-    static const bool redirect = getenv("GGML_SCHED_STAGE_MODE") != nullptr && atoi(getenv("GGML_SCHED_STAGE_MODE")) != 0;
+    static const bool redirect = [] { const char * e = getenv("GGML_SCHED_STAGE_MODE"); return e != nullptr && atoi(e) != 0; }();
+    // wip/host-expert-master-drop (TODO #55): `stage_from_cache` also serves a POOL-BACKED (pageable) master,
+    // filling the slot from the arena + the pinned host pool -- so a pooled table is staged without a
+    // pageable transfer.  The plain fallback below (a 1-D pageable H2D) stays for a table the cache does
+    // not manage; it is legal, only slower.
     if (ggml_backend_cuda_stage_from_cache(cuda_ctx, data, 0, size, size, 1, dst, ev, /*defer =*/ !redirect)) {
         return;
     }
     cudaStream_t s = cuda_ctx->copy_stream();
+    // wip/host-expert-master-drop (TODO #55): a POOL-BACKED host expert master is PAGEABLE, and a pageable
+    // `cudaMemcpyAsync` is staged through a shared internal bounce (back-to-back copies tear -- measured as
+    // nondeterministic greedy text).  Stage it through the pool / the per-table pinned bounce instead.
+    if (moe_cache_upload_pageable(dst, data, size, s, cuda_ctx->device)) {
+        CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
+        return;
+    }
+    if (moe_cache_source_pageable(data)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: a pool-backed host expert master is being uploaded with a PAGEABLE copy "
+                          "(%zu bytes); this is slow and may tear -- please report\n", __func__, size);
+        }
+    }
     CUDA_CHECK(cudaMemcpyAsync(dst, data, size, cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
 }
@@ -72,6 +91,13 @@ void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const vo
 bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void * src, size_t offset, size_t width, size_t stride_src, size_t n_copies, ggml_backend_event_t ev, bool src_pinned) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(cuda_ctx->device);
+    // wip/host-expert-master-drop (TODO #55): the caller derives `src_pinned` from the buffer type of the
+    // tensor, and a pool-backed host expert master carries its device -- yet its bytes are in the PAGEABLE
+    // model mapping.  The 2-D pageable H2D is the pathological ROCm case, so refuse the pinned shape for
+    // any pointer that belongs to a pool-backed master (the host-gather shape below is used instead).
+    if (src_pinned && moe_cache_source_pageable(src)) {
+        src_pinned = false;
+    }
     const size_t total = width * n_copies;                 // the device's compacted slice
     void * dst = cuda_ctx->h2d_stage_buffer(slot, total);
     if (dst == nullptr) {
@@ -85,7 +111,7 @@ bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void
     // 2-D H2D, moving only `total` bytes instead of the whole contiguous range.  The pageable 2-D H2D
     // was the pathological ROCm case (the campaign's `hipMemcpy2DAsync` fault); this is the pinned
     // form the source-pinning fix made possible.  `GGML_STAGE_GATHER_SCRATCH=1` forces the old path.
-    static const bool force_scratch = getenv("GGML_STAGE_GATHER_SCRATCH") != nullptr && atoi(getenv("GGML_STAGE_GATHER_SCRATCH")) != 0;
+    static const bool force_scratch = [] { const char * e = getenv("GGML_STAGE_GATHER_SCRATCH"); return e != nullptr && atoi(e) != 0; }();
     if (src_pinned && !force_scratch) {
         CUDA_CHECK(cudaMemcpy2DAsync(dst, width, (const char *) src + offset, stride_src, width, n_copies, cudaMemcpyHostToDevice, s));
         CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
@@ -94,7 +120,10 @@ bool ggml_backend_cuda_stage_gather(ggml_backend_t backend, int slot, const void
     // A host gather when the per-block compaction is cheap (few copies), else stage the whole
     // contiguous range and pick this device's `width`-byte block out of every `stride_src` on the copy
     // stream (the F2D compaction hides with the H2D).
-    const bool host_gather = n_copies <= 4096;
+    // wip/host-expert-master-drop (TODO #55): a POOL-BACKED (pageable) source must use the host gather
+    // even when the block count is large: the alternative below is a pageable H2D of the whole range, which
+    // ROCm stages through a shared internal bounce (it tears).
+    const bool host_gather = n_copies <= 4096 || moe_cache_source_pageable(src);
     if (host_gather) {
         void * pin = cuda_ctx->h2d_pin_buffer(slot, total);
         if (pin == nullptr) {
@@ -213,6 +242,24 @@ bool ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_te
 }
 
 // B2: device-side host-weight expert gather for an offloaded `MUL_MAT_ID` prefill (see the iface comment).
+bool ggml_backend_cuda_moe_cache_register(ggml_backend_t backend, const struct ggml_tensor * weight,
+        const struct ggml_tensor * weight_cpy, size_t slice_off, int split_axis,
+        const struct ggml_backend_moe_slice * slices, int n_slices) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return moe_cache_register_host(weight, weight_cpy, cuda_ctx->device, slice_off, split_axis,
+                                   slices, n_slices) >= 0;
+}
+
+bool ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const struct ggml_tensor * weight) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return moe_cache_stage_ready(weight, cuda_ctx->device);
+}
+
+bool ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return moe_cache_pending(cuda_ctx->device);
+}
+
 int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend) {
     const ggml_backend_cuda_context * cuda_ctx = (const ggml_backend_cuda_context *) backend->context;
     return moe_cache_max_tok_dev(cuda_ctx->device);

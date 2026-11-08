@@ -686,8 +686,9 @@ struct server_task_result_apply_lora : server_task_result {
 struct server_prompt {
     server_tokens tokens;
 
-    // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
-    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
+    // the prompt cache shares a checkpoint with the slot instead of copying it.  Not `const`: a dropped checkpoint
+    // hands its state buffers back to the reuse pool (ckpt_recycle), which mutates it.
+    std::list<std::shared_ptr<common_prompt_checkpoint>> checkpoints;
 
     void clear() {
         tokens.clear();
@@ -744,11 +745,22 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // buffers of states that were restored or evicted, kept for the next save: a large state buffer costs about as much to
+    // zero-fill and fault in as to copy from the device, and as much again to free (LLAMA_SERVER_CACHE_REUSE=0: off)
+    std::vector<common_state_data> spare;
+
     size_t size() const;
 
     size_t n_tokens() const;
 
+    // a buffer of n bytes (a spare one if one is large enough), and the way back for a buffer that is no longer needed
+    common_state_data take(size_t n);
+    void recycle(common_state_data && buf);
+
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+
+    // the cached prompt that load() would restore for tokens_new into a slot holding prompt (states.end(): none)
+    std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
