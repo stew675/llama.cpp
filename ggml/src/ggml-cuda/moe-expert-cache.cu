@@ -138,6 +138,15 @@ struct table_t {
     // scheduler skips filling it when a hook returns true), or nullptr.  Cleared when the redirect serves the
     // table; a table still holding a promise when the redirect declines has had its copy skipped, which is the
     // state the consumer must repair rather than read.
+    //
+    // issue #327: the promise lives for ONE staging pass and `moe_cache_pass_end` clears it when that pass ends.
+    // The buffer it names is a pointer the scheduler recycles across graphs (and across the decode and prefill
+    // layouts), so an address ALONE cannot say "this pass skipped the copy": a promise left over from an earlier
+    // pass (a captured decode graph replays its launches without asking the consumer, so it never clears its
+    // promise, and a pass that stages through the gather path does not re-promise) matched a later pass' buffer
+    // and re-filled every routed table from the host master -- 138 x 206 MiB, ~10.4 s, on every 30-34 token
+    // prompt.  Scoping it by construction is what makes the repair's premise ("the copy this pass skipped")
+    // exact.
     const void * taken_cpy  = nullptr;
 
     // slot-remapped ids for the most recent routing (device), and its shape.
@@ -336,6 +345,13 @@ static const bool g_alias_role_check = [] {
     const char * e = getenv("MOE_EXPERT_ALIAS_ROLE_CHECK");
     return e == nullptr || atoi(e) != 0;
 }();
+// Diagnostic fault injection for the take-over repair (`TODO` #335): make the identity take-over break its own
+// promise, so `moe_cache_repair_copy` is exercised (see `moe_cache_take_over`).  Never on by default.
+static const bool g_takeover_fault = [] {
+    const char * e = getenv("MOE_EXPERT_TAKEOVER_FAULT");
+    return e != nullptr && atoi(e) != 0;
+}();
+
 static bool sem_role_matches(const char * name, const std::string & sem) {
     if (name == nullptr || sem.empty() || sem == "?") {
         return true;   // nothing to compare against: behave as before
@@ -501,8 +517,30 @@ int64_t                             g_cold_admits     = 0;  // misses served col
 int64_t                             g_touch           = 2;  // `admit=touch`: uses since last resident before a fill is allowed
 int64_t                             g_takeover        = 0;
 int64_t                             g_decline_all     = 0;
+// r362 (issue #368): the per-LAYER stand-down / re-arm tally.  `MOE_EXPERT_CACHE_TABLES=1` prints it with
+// the per-layer residency map at exit, so "which tables stood down in THIS run" is a reading rather than a
+// question: the eviction and re-arm messages carry only counts, and a state that differs run to run differs
+// in exactly this set.
+std::vector<int64_t>                g_diag_standdown(512, 0);
+std::vector<int64_t>                g_diag_rearm(512, 0);
+static bool moe_diag_tables() {
+    static const bool on = [] { const char * e = getenv("MOE_EXPERT_CACHE_TABLES"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
 int64_t                             g_get_ok          = 0;
 int64_t                             g_total_one_expert_bytes = 0;  // sum of one expert per table (the zero-slot reserve)
+// TODO #335/#336: how many times a take-over's promise was BROKEN (the table could no longer be served when
+// the op that took it over reached its launch, because the slab evicted it in between) and how many of those
+// the repair re-filled the skipped `input_cpy` for.  A nonzero `broken` on a run means the scheduler's copy
+// would otherwise have been read stale; `repaired` must then equal it (a repair only skips for a table with
+// no usable host master or a mismatched copy geometry, which logs).
+int64_t                             g_takeover_broken = 0;
+int64_t                             g_takeover_repaired = 0;
+// issue #327: promises that died at the end of the staging pass that made them, i.e. promises whose consumer
+// never came.  Nonzero is NORMAL -- a captured decode graph replays its launches without dispatching, so it
+// never reaches the consumer -- and it must NOT be folded into `broken`, which means a repair was owed.  Before
+// the pass scoping these were the promises a later pass could mistake for its own.
+int64_t                             g_takeover_stale = 0;
 // TODO #327: the prefill MoE fusion census.  `[kind][0]` counts a fusion launched on the scheduler's STAGED
 // copy, `[kind][1]` one launched on an IN-PLACE arena (the redirect `moe_cache_redirect_fused` does).  This is
 // the instrument the residency-neutrality gate asserts on: the same fusion kinds must fire with a nonzero
@@ -1943,6 +1981,40 @@ static void pool_rank_from_prefill_locked() {
 // an eviction victim.  Without this, an expert admitted earlier in the same token can be evicted by a later
 // one (its freshly-seeded count is the smallest), which is what made the hook's `all` flag flip from token
 // to token - and that variability is what broke CUDA graph replay.
+// wip/fix-gemma-4 (TODO #77/C): copy ONE expert's device slot from the host master.  One place for the
+// three geometries a table can have, so the eager fill, the identity fill and any future fill cannot
+// disagree: a FUSED table (multi-slice, concatenated in order), a strided axis-0 slice (2-D copy) and a
+// contiguous slice (1-D copy).
+static cudaError_t fill_slot_from_host(const table_t & t, void * dst, size_t expert, cudaStream_t stream) {
+    if (t.host == nullptr || t.host_bytes == 0 || t.expert_bytes == 0) {
+        return cudaErrorInvalidDeviceFunction;
+    }
+    if (t.n_slices > 0) {
+        const char * base = (const char *) t.host + expert * t.host_bytes;
+        size_t dst_o = 0;
+        for (int k = 0; k < t.n_slices; k++) {
+            const cudaError_t err = cudaMemcpyAsync((char *) dst + dst_o, base + t.slice[k].src_off,
+                                                    t.slice[k].len, cudaMemcpyHostToDevice, stream);
+            if (err != cudaSuccess) {
+                return err;
+            }
+            dst_o += t.slice[k].len;
+        }
+        return cudaSuccess;
+    }
+    const char * src = (const char *) t.host + expert * t.host_bytes + t.src_off;
+    if (t.split_axis == 0 && t.host_pitch > 0) {
+        const int64_t rows = (int64_t) (t.host_bytes / t.host_pitch);
+        const size_t  row  = rows > 0 ? (t.expert_bytes / (size_t) rows) : 0;
+        if (row == 0) {
+            return cudaErrorInvalidDeviceFunction;
+        }
+        return cudaMemcpy2DAsync(dst, row, src, t.host_pitch, row, (size_t) rows,
+                                 cudaMemcpyHostToDevice, stream);
+    }
+    return cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyHostToDevice, stream);
+}
+
 moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
                               const int32_t * protect = nullptr, int n_protect = 0,
                               bool * out_cold = nullptr) {
@@ -2099,6 +2171,22 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
             const bool pool_sync = (n_protect > pool->slots);
             pool_expert = pool_slot_locked(*pool, expert, &pool_slot, pool_sync);
         }
+        // wip/fix-gemma-4 (TODO #77/C): a fused table's slot is assembled from several host ranges
+        // (`[gate_slice | up_slice]`), concatenated in order.  It is filled from the master only: the
+        // host pool holds whole host experts and would need the same slicing, and the pool is the
+        // `--host-experts pool` path, which does not run fused tables today.
+        if (t.n_slices > 0) {
+            g_acc_fills++;
+            g_fill_bytes += (int64_t) t.expert_bytes;
+            void * dst_f = (char *) t.arena + (size_t) slot * t.expert_bytes;
+            const cudaError_t err_f = fill_slot_from_host(t, dst_f, (size_t) expert, (cudaStream_t) stream);
+            if (err_f != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_WARN("%s: fused async fill failed table layer=%d role=%s expert=%d\n",
+                              __func__, t.layer, t.role.c_str(), expert);
+            }
+            return { (char *) t.arena + (size_t) slot * t.expert_bytes, true };
+        }
         const bool from_pool = pool_expert != nullptr;
         const cudaMemcpyKind kind = from_pool ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice;
         const char * src = from_pool
@@ -2148,6 +2236,25 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
 
 // wip/moe-expert-cache prefill seed (MOE_EXPERT_CACHE_PREFILL_SEED=1): one-shot bulk admission of the
 // experts the prefill routing touched most, applied at arena sizing (after the arena/policy state exist).
+// wip/first-prefill-latency: the arena is sized against the full slab region, but a wide prefill reclaims
+// the band `[narrow_floor, narrow_floor + stage + wide)`.  A table whose arena starts inside that band is
+// the coldest (heat-ordered last) and must NOT be pre-seeded -- the seed would be thrown away on the very
+// next prefill.  Leave it empty; it fills lazily during decode.  Returns true when seeding is allowed.
+static bool heat_seed_above_floor(const table_t & t) {
+    if (t.device < 0 || t.arena == nullptr) {
+        return true;
+    }
+    const size_t floor = ggml_cuda_slab_seed_floor(t.device);
+    if (floor == 0) {
+        return true;   // layout not established (non-slab path): seed as before
+    }
+    const char * base = (const char *) ggml_cuda_slab_work_base(t.device);
+    if (base == nullptr) {
+        return true;
+    }
+    return (size_t) ((const char *) t.arena - base) >= floor;
+}
+
 // `t.prefill_count` was accumulated in `moe_cache_update_host`'s prefill branch; here it is ranked
 // (count desc, expert id asc), the top `min(slots, cap)` are placed in slots 0.. and copied from the
 // pinned host master - the same bytes a decode fill would fetch, just front-loaded.  The host mirrors are
@@ -2156,7 +2263,7 @@ moe_cache_alias access_locked(table_t & t, int32_t expert, void * stream,
 void apply_prefill_seed_locked(table_t & t) {
     const bool from_tally = g_prefill_seed;
     if (!g_prefill_seed || t.identity || t.slots <= 0 || t.host == nullptr ||
-        !t.expert_slot.empty()) {
+        !t.expert_slot.empty() || !heat_seed_above_floor(t)) {
         return;
     }
     if (from_tally && (int) t.prefill_count.size() != t.n_experts) {
@@ -2245,7 +2352,8 @@ void apply_prefill_seed_locked(table_t & t) {
 // MOE_EXPERT_CACHE_PREFILL_SEED.  Call it BEFORE `apply_prefill_seed_locked` so the persisted prior
 // wins the (empty-arena) race for slots 0...
 void apply_heat_seed_locked(table_t & t) {
-    if (!g_heat_on || t.identity || t.slots <= 0 || t.host == nullptr || !t.expert_slot.empty()) {
+    if (!g_heat_on || t.identity || t.slots <= 0 || t.host == nullptr || !t.expert_slot.empty() ||
+        !heat_seed_above_floor(t)) {
         return;
     }
     if ((int) t.heat.size() != t.n_experts || t.n_experts <= 0) {
@@ -3110,23 +3218,11 @@ void alloc_table_locked(table_t & t, int slots) {
     // because the arena is not read until a later token.  A partial copy rolls the table back to the
     // normal remap path.
     t.identity = false;
-    if (slots == t.n_experts && t.host != nullptr && t.expert_bytes > 0) {
+    if (slots == t.n_experts && t.host != nullptr && t.expert_bytes > 0 && heat_seed_above_floor(t)) {
         bool ok = true;
-        const int64_t rows = (t.split_axis == 0 && t.host_pitch > 0 && t.host_bytes > 0)
-                                 ? (int64_t) (t.host_bytes / t.host_pitch) : 0;
-        const size_t  row  = (rows > 0) ? (t.expert_bytes / (size_t) rows) : 0;
         for (int e = 0; e < t.n_experts && ok; ++e) {
-            void *       dst = (char *) t.arena + (size_t) e * t.expert_bytes;
-            const char * src = (const char *) t.host + (size_t) e * t.host_bytes + t.src_off;
-            cudaError_t err = cudaSuccess;
-            if (t.split_axis != 0 || t.host_pitch == 0) {
-                err = cudaMemcpyAsync(dst, src, t.expert_bytes, cudaMemcpyHostToDevice, (cudaStream_t) 0);
-            } else if (row > 0) {
-                err = cudaMemcpy2DAsync(dst, row, src, t.host_pitch, row, (size_t) rows,
-                                        cudaMemcpyHostToDevice, (cudaStream_t) 0);
-            } else {
-                ok = false;
-            }
+            void * dst = (char *) t.arena + (size_t) e * t.expert_bytes;
+            const cudaError_t err = fill_slot_from_host(t, dst, (size_t) e, (cudaStream_t) 0);
             if (err != cudaSuccess) {
                 (void) cudaGetLastError();
                 ok = false;
@@ -3202,7 +3298,24 @@ static bool moe_cache_tables_complete_locked() {
             expected += g_preflight_device_bytes[d];
         }
     }
-    return registered >= expected;
+    if (expected <= 0) {
+        return true;
+    }
+    // Small slack for rounding between the loader's account and the sum of the registered tables: the
+    // account is per host tensor (`ggml_nbytes`) while the cache adds `n_experts x expert_bytes` per
+    // device, and under `-sm tensor` the loader can only guess the per-device proportion
+    // (`bytes / n_dev`) that the Meta backend later decides exactly.  The TOTALS agree exactly for a
+    // fully registered set, which is what this compares (see the invariant above).
+    //
+    // It must stay well below one table: an earlier `expected/128` version silently accepted a 35B-A3B
+    // sizing pass with one 36.4 MiB table still unregistered (240 -> 239 tables, -3.6 % tg128), which is
+    // exactly the partial-set latch this guard exists to prevent.  The `moe_host_expert_account` filter
+    // is what keeps the gemma4 class (`ffn_down_exps.scale`, 512 B/layer, the reason an EXACT comparison
+    // once failed) out of the expectation in the first place.
+    const int64_t slack = moe_cache_min_i64(
+        moe_cache_max_i64((int64_t) 1 << 20, expected / 4096),
+        (int64_t) 16 << 20);
+    return registered + slack >= expected;
 }
 
 // Deferred, budget-adaptive, UNIFORM sizing.  Every table gets the same slot count
@@ -3842,6 +3955,37 @@ static void residency_host_refresh_locked(int device) {
 }
 
 } // namespace
+
+// issue #327: END of a staging pass.  Every promise a hook made during this pass has either been honoured by
+// the consumer it was made for (a few launches later, inside this same pass) or is now DEAD: the `input_cpy` it
+// names is recycled by the next pass, and repairing on that recycled address re-reads every routed table from
+// the host master for nothing (measured: 138 tables x 206 MiB, ~10.4 s, on every 30-34 token prompt).
+//
+// Enforcing the lifetime HERE -- at the one place a pass ends -- is what makes it structural rather than a rule
+// each promise site has to remember: a new promise site cannot forget it, a pass that stages the copy through the
+// gather/stage paths without promising cannot inherit an old one, and a pass that never dispatches at all (a
+// captured graph replays its launches) is cleaned up exactly like one that does.  The `broken`/`repaired` pair
+// therefore keeps its exact meaning -- a promise broken INSIDE its own pass by a mid-graph eviction -- and the
+// promises dropped here are counted separately as `stale`.
+//
+// DEFINED OUTSIDE the anonymous namespace above (`g_tables`/`g_mutex` live in it, the entry point does not): a
+// definition inside would have internal linkage, shadow the header's declaration and be dropped as unused,
+// leaving the backend's call unresolved.
+int64_t moe_cache_pass_end(int device) {
+    if (!g_enabled) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    int64_t cleared = 0;
+    for (table_t & t : g_tables) {
+        if (t.device == device && t.taken_cpy != nullptr) {
+            t.taken_cpy = nullptr;
+            cleared++;
+        }
+    }
+    g_takeover_stale += cleared;
+    return cleared;
+}
 
 static void devremap_batch_clear_locked();   // device remap: drop the pending sibling batches (defined with g_dr_batch)
 
@@ -4834,6 +4978,9 @@ bool moe_cache_rearm() {
         }
         if (got > 0) {
             n_rearmed += (int) ids.size();
+            if (moe_diag_tables() && layer >= 0 && layer < 512) {
+                g_diag_rearm[(size_t) layer] += (int64_t) ids.size();
+            }
         } else if (got == 0) {
             n_stooddown += (int) ids.size();
         }
@@ -4924,6 +5071,9 @@ size_t moe_cache_evict_slab_range(int device, void * lo, void * hi) {
         t.slot_expert.clear();
         t.expert_slot.clear();
         t.allocated      = true;   // it was decided; a re-arm can rebuild it
+        if (t.layer >= 0 && t.layer < 512) {
+            g_diag_standdown[(size_t) t.layer]++;
+        }
     }
     if (freed > 0) {
         // TODO #70: a captured graph bakes a table's arena address into the MoE kernels' launch parameters
@@ -5228,6 +5378,15 @@ void moe_cache_set_host_pool(bool on) {
                                            : "MOE_HOST_POOL_FRAC of the host bytes");
 }
 
+// r362 (issue #368): see the header.  `g_pool_requested` is set by `moe_cache_set_host_pool` from the
+// loader, i.e. it records `--host-experts pool` (or the loader's own pool decision) as an explicit request.
+// Read-only, and safe before any table is registered: `ensure_env()` only resolves the environment.
+bool moe_cache_host_pool_requested() {
+    ensure_env();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_pool_requested;
+}
+
 // wip/host-expert-tier: the persisted heat prior, opened by the model loader before it decides any
 // host-expert placement.  `moe_cache_set_host_source` opens it too, but only when the first tensor's DATA
 // is copied -- long after every buffer-type decision has been made, which would leave the pinned tier
@@ -5296,7 +5455,8 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
 
 int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                     size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
-                    const void * host, int device) {
+                    const void * host, int device,
+                    const struct ggml_backend_moe_slice * slices, int n_slices) {
     if (!g_enabled) {
         return -1;
     }
@@ -5313,6 +5473,13 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
     if (host_pitch != 0) {
         cold_safe = host_bytes > 0 && host_bytes % host_pitch == 0 &&
                     expert_bytes > 0 && expert_bytes % (host_bytes / host_pitch) == 0;
+    }
+    // A fused table's slot is several host ranges, so a single cold (UVA) read cannot express it: every
+    // miss is filled from the master instead.  That is the same cost as a resident-set miss on any other
+    // table, and it keeps the device-side cold encoding (`id - n_res_slots` -> one host stride) honest.
+    const bool fused = slices != nullptr && n_slices > 0;
+    if (fused) {
+        cold_safe = false;
     }
 
     const std::pair<const void*, int> key = { src0, device };
@@ -5344,6 +5511,11 @@ int moe_cache_table(const void * src0, int layer, const char * role, int n_exper
     t.host_pitch   = host_pitch;
     t.split_axis   = split_axis;
     t.cold_safe    = cold_safe;
+    t.n_slices     = fused ? std::min(n_slices, (int) GGML_BACKEND_MOE_MAX_SLICES) : 0;
+    for (int k = 0; k < t.n_slices; k++) {
+        t.slice[k].src_off = slices[k].src_off;
+        t.slice[k].len     = slices[k].len;
+    }
     // TEMP diagnostic (wip/moe-verify-fusions): print the per-table split geometry, to compare the
     // residency-sensitive qwen4exp tables against the residency-insensitive qwen35moe ones.
     if (ggml_cuda_cache_geom_debug()) {
@@ -5415,7 +5587,7 @@ moe_cache_alias moe_cache_alias_get(int table, int expert) {
     if (it != t.expert_slot.end()) {
         return { (char *) t.arena + (size_t) it->second * t.expert_bytes, true };
     }
-    if (t.host != nullptr && expert >= 0 && expert < t.n_experts && t.host_pitch == 0) {
+    if (t.host != nullptr && expert >= 0 && expert < t.n_experts && t.host_pitch == 0 && t.n_slices == 0) {
         return { (void *) ((const char *) t.host + (size_t) expert * t.host_bytes + t.src_off), false };
     }
     return { nullptr, false };
@@ -5733,6 +5905,27 @@ static uint32_t * gather_mask_get(int device, int n_experts) {
     g_mask_dev[device]   = p;
     g_mask_words[device] = words;
     return p;
+}
+
+// wip/fix-gemma-4 (TODO #77/C): every range of a fused table's slot must lie inside one host expert blob,
+// and the ranges must tile the device slot exactly (they are concatenated into it).
+static bool moe_cache_slices_addr_ok(size_t host_bytes, size_t expert_bytes,
+                                    const struct ggml_backend_moe_slice * slices, int n_slices) {
+    if (slices == nullptr || n_slices <= 0 || n_slices > GGML_BACKEND_MOE_MAX_SLICES) {
+        return false;
+    }
+    if (host_bytes == 0 || expert_bytes == 0) {
+        return false;
+    }
+    size_t total = 0;
+    for (int k = 0; k < n_slices; k++) {
+        const size_t len = slices[k].len;
+        if (len == 0 || slices[k].src_off > host_bytes || len > host_bytes - slices[k].src_off) {
+            return false;
+        }
+        total += len;
+    }
+    return total == expert_bytes;
 }
 
 bool moe_cache_gather_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
@@ -6082,7 +6275,8 @@ bool moe_cache_stage_table(int device, const void * host_src, size_t offset, siz
 bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weight_cpy,
                            const int32_t * ids, int64_t n_used, int64_t n_tok,
                            size_t ids_nb0, size_t ids_nb1, void * stream,
-                           int device, size_t slice_off, int split_axis) {
+                           int device, size_t slice_off, int split_axis,
+                           const struct ggml_backend_moe_slice * slices, int n_slices) {
     g_write_seq++;
     if (!g_enabled || weight == nullptr || ids == nullptr || weight->ne[2] < 1) {
         return false;
@@ -6125,7 +6319,24 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
             host_pitch = weight->nb[1];   // a strided axis-0 slice needs a 2-D fill
         }
     }
-    if (!moe_cache_slice_addr_ok(host_bytes, expert_bytes, slice_off, host_pitch)) {
+    const bool fused = slices != nullptr && n_slices > 0;
+    if (fused) {
+        // A fused table (`ffn_gate_up_exps` under `-sm tensor`) carries the whole geometry in `slices`;
+        // reject a list that does not tile the device slot, so a caller bug declines instead of filling
+        // an under-filled arena slot.
+        if (!moe_cache_slices_addr_ok(host_bytes, expert_bytes, slices, n_slices)) {
+            static bool warned_fused = false;
+            if (!warned_fused) {
+                warned_fused = true;
+                GGML_LOG_WARN("%s: declining a fused MoE expert table with an inconsistent slice list "
+                              "(layer=%d role=%s host_bytes=%zu expert_bytes=%zu n_slices=%d); the "
+                              "scheduler's per-op copy will serve it.  Please report this geometry.\n",
+                              __func__, layer, name_role(weight).c_str(), host_bytes, expert_bytes, n_slices);
+            }
+            moe_cache_note_unregisterable(weight, device, (int) n_experts, expert_bytes);
+            return false;
+        }
+    } else if (!moe_cache_slice_addr_ok(host_bytes, expert_bytes, slice_off, host_pitch)) {
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -6142,7 +6353,8 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
         return false;
     }
     const int table = moe_cache_table(weight, layer, name_role(weight).c_str(), n_experts, expert_bytes,
-                                      host_bytes, slice_off, host_pitch, split_axis, weight->data, device);
+                                      host_bytes, slice_off, host_pitch, split_axis, weight->data, device,
+                                      fused ? slices : nullptr, fused ? n_slices : 0);
     if (table < 0) {
         return false;
     }
@@ -6219,7 +6431,7 @@ bool moe_cache_update_host(const ggml_tensor * weight, const ggml_tensor * weigh
     // (issue #116's copy-side twin).  Decline the partial-residency case so the scheduler's
     // pageable-safe host path serves the op.  An identity (whole-resident) table needs no fill and is
     // left alone.
-    if (t.host_dev == nullptr && t.split_axis == 0 && t.host_pitch > 0 && !t.identity) {
+    if (t.n_slices == 0 && t.host_dev == nullptr && t.split_axis == 0 && t.host_pitch > 0 && !t.identity) {
         g_decline_all++;
         return false;
     }
@@ -6572,7 +6784,7 @@ static bool devremap_cold_ok_locked(const table_t & t) {
 
 // Constant for a table and shape once the cache is sized (a graph replay needs a constant take-over decision).
 static bool devremap_ok_locked(const table_t & t, int64_t n_used, int64_t n_tok, int device) {
-    return g_sized && !t.dr_failed && devremap_cold_ok_locked(t) && !t.identity &&
+    return g_sized && !t.dr_failed && devremap_cold_ok_locked(t) && t.n_slices == 0 && !t.identity &&
            t.arena != nullptr && t.slots > 0 && t.device == device && t.n_experts > 0 &&
            n_used < t.n_experts && t.remap_dev != nullptr && n_used * n_tok <= t.remap_cap &&
            (t.dr_device < 0 || (t.dr_device == device && t.dr_cap == t.remap_cap));
@@ -6824,7 +7036,7 @@ bool moe_cache_get_cold(const void * arena, void ** cold_base, int64_t * n_res,
                 return true;
             }
         }
-        if (t.arena != arena || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe) {
+        if (t.arena != arena || t.slots <= 0 || t.host_dev == nullptr || !t.cold_safe || t.n_slices > 0) {
             continue;
         }
         // Fold in this device's slice offset so the kernel never needs to know the tensor-split
@@ -6901,6 +7113,72 @@ bool moe_cache_get_table(const ggml_tensor * op, const ggml_tensor * weight_cpy,
     return true;
 }
 
+// TODO #335/#336: a take-over hook tells the scheduler "do not fill `input_cpy`, I serve this table from the
+// arena", and the scheduler skips the copy for the whole split.  The slab can still take that arena BETWEEN
+// the hook and the consumer's launch -- `moe_cache_evict_slab_range` runs from inside a graph's execution,
+// because an op's workspace allocation can move the work boundary -- and then `moe_cache_get_table` declines
+// a table whose copy was never written.  The consumer would read whatever the buffer held: a stale copy of a
+// previous ubatch's routed experts (a wrong answer, `TODO` #336) or, on the arena-release path, uninitialised
+// memory (a degenerate one, `TODO` #335).
+//
+// So the PROMISE is tracked per table (`taken_cpy`) and repaired here: the consumer calls this when the
+// redirect declined, and a table that promised THIS buffer gets it filled from the host master exactly as the
+// scheduler's own copy would have.  That is the same bytes, only later, and only on the rare pass where the
+// slab won the race -- a run where it never happens does no work and is bit-identical.
+//
+// Cost (measured: 13 of 144 tables on a Flash-Next 24 K-token prompt at 2 MiB free VRAM): one buffered H2D per
+// evicted table, ~1.8 ms for a 50 MiB table at 28 GB/s.  Correctness first: a stale read is not an option.
+size_t moe_cache_repair_copy(const ggml_tensor * weight_cpy, int device, void * stream) {
+    if (!g_enabled || weight_cpy == nullptr || weight_cpy->data == nullptr) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const int id = alias_find_checked(weight_cpy, device, -1);
+    if (id < 0) {
+        return 0;
+    }
+    table_t & t = g_tables[id];
+    // `moe_cache_pass_end` clears every promise at the end of the pass that made it, so a promise still standing
+    // here was made by THIS pass: the copy this op reads really was skipped (issue #327's stale-promise repair is
+    // no longer reachable by construction).
+    if (t.taken_cpy != (const void *) weight_cpy) {
+        return 0;   // no promise outstanding for this buffer: the scheduler filled it itself
+    }
+    g_takeover_broken++;
+    t.taken_cpy = nullptr;   // one repair per promise, whatever the outcome
+    if (t.host == nullptr || t.expert_bytes == 0 || t.n_experts <= 0) {
+        return 0;
+    }
+    const size_t stride = (size_t) weight_cpy->nb[2];
+    if (stride != t.expert_bytes ||
+        ggml_nbytes(weight_cpy) < (size_t) t.n_experts * stride) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: cannot repair layer=%d role=%s (copy stride %zu vs expert_bytes %zu, %zu bytes);\n"
+                          "the scheduler's copy was skipped and the table is no longer servable -- this pass reads "
+                          "stale expert bytes\n",
+                          __func__, t.layer, t.role.c_str(), stride, t.expert_bytes, ggml_nbytes(weight_cpy));
+        }
+        return 0;
+    }
+    size_t done = 0;
+    for (int e = 0; e < t.n_experts; e++) {
+        void * dst = (char *) weight_cpy->data + (size_t) e * stride;
+        if (fill_slot_from_host(t, dst, (size_t) e, (cudaStream_t) stream) == cudaSuccess) {
+            done += stride;
+        }
+    }
+    if (done != 0) {
+        g_takeover_repaired++;
+        GGML_LOG_WARN("%s: layer=%d role=%s was taken over, then its arena went to the slab before the op ran;\n"
+                      "re-filled the skipped copy from the host master (%.1f MiB). This pass would otherwise have "
+                      "read a stale expert table (TODO #335/#336)\n",
+                      __func__, t.layer, t.role.c_str(), (double) done / (1024 * 1024));
+    }
+    return done;
+}
+
 moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml_tensor * src0,
                                              const ggml_tensor * gate, const ggml_tensor * ids,
                                              int device, void * stream,
@@ -6922,9 +7200,23 @@ moe_cache_serve_status moe_cache_fusion_serve(const ggml_tensor * op, const ggml
         // The same routing-shape check the per-op consumer applies before it reads a remap.
         return rm == nullptr || (nu == ids->ne[0] && nt == ids->ne[1]);
     };
+    // A gate-less caller has ONE lane -- the decode down fold, the single-lane routed bias/scale folds and the
+    // RDNA3_5 swiglu->down fold all pass `gate == nullptr` -- so `gate_ok` must follow `up_ok` there.  Read as
+    // `gate == nullptr || lane_serves(gate)` it was vacuously true, which made a STAGED single-lane caller look
+    // one-lane-served and answer MIXED: every gate-less fusion stood itself down for as long as its table was
+    // staged, i.e. its kernel set was a function of residency (issue #332, the same impurity TODO #327 removes).
     const bool up_ok   = lane_serves(src0);
-    const bool gate_ok = gate == nullptr || lane_serves(gate);
+    const bool gate_ok = gate == nullptr ? up_ok : lane_serves(gate);
     if (!up_ok && !gate_ok) {
+        // STAGED: the fused launch reads the scheduler's copies.  A take-over promise can still be outstanding
+        // for a lane whose arena the slab took between the hook and this query (TODO #335/#336), and a fused
+        // launch never passes the per-op dispatch that repairs it -- so re-fill each staged lane HERE, once, and
+        // no call site has to remember (the gate+up pair, the MMB/MMQ triples and the down/swiglu folds all get
+        // it from this one place).  No promise outstanding for the lane -> no work, no log.
+        moe_cache_repair_copy(src0, device, stream);
+        if (gate != nullptr) {
+            moe_cache_repair_copy(gate, device, stream);
+        }
         return MOE_CACHE_SERVE_NONE;   // staged: the scheduler's copies are what every fused lane reads
     }
     if (!up_ok || !gate_ok) {
@@ -6996,6 +7288,8 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
     // OPEN 2 slab: gate per TABLE.  The `identity` check below already requires THIS table's arena
     // and slots, so this hook, the update hook and `moe_cache_get_table` agree per table; only the fusion
     // guard is global (`moe_cache_has_arena()`), so a partial cache loses the fusions but keeps serving.
+    void * fault_arena = nullptr;
+    size_t fault_bytes = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         const auto it = g_key_to_id.find({ (const void *) weight, device });
@@ -7015,6 +7309,18 @@ bool moe_cache_take_over(const ggml_tensor * weight, const ggml_tensor * weight_
         // `moe_cache_update_host`), so the alias must track the current tensor.
         g_alias_to_id[weight_cpy] = id;
         t.taken_cpy = weight_cpy;   // TODO #335/#336: the promise this hook makes to the scheduler
+        if (g_takeover_fault && t.arena != nullptr && t.slots > 0) {
+            fault_arena = t.arena;
+            fault_bytes = (size_t) t.slots * t.expert_bytes;
+        }
+    }
+    if (fault_arena != nullptr) {
+        // Diagnostic (`MOE_EXPERT_TAKEOVER_FAULT=1`, `TODO` #335): break the promise this hook just made, by
+        // handing the table's whole arena back to the slab before the consumer runs -- the state a mid-graph
+        // eviction leaves.  The consumer must then decline, and `moe_cache_repair_copy` must re-fill the copy
+        // the scheduler skipped: the arm's text is then identical to the staged (`MOE_EXPERT_PREFILL_IN_PLACE=0`)
+        // arm and the exit census reads `broken>0 repaired==broken`.  Never on by default.
+        moe_cache_evict_slab_range(device, fault_arena, (char *) fault_arena + fault_bytes);
     }
     return true;
 }
@@ -7131,6 +7437,159 @@ void moe_cache_report() {
     GGML_LOG_INFO("%s: MoE expert cache: h=%.4f (%lld/%lld reaches), fills=%lld evictions=%lld, tables=%d, slots=%d, arena=%.1f MiB total (budget %s MiB/device)\n",
                   __func__, h, (long long) hits, (long long) total, (long long) fills, (long long) evictions,
                   n_tables, n_slots, (double) g_arena_bytes / (1024 * 1024), budget_desc());
+                  n_tables, n_slots, (double) arena_b / (1024 * 1024), budget_desc());
+    // r362 (issue #368): WHICH tables, not just how many.  The eviction and re-arm messages carry counts and
+    // bytes, so two runs whose numbers agree on `h`/`evictions` can still hold different LAYERS -- which is
+    // exactly the state a residency-dependent report cannot otherwise name.  `MOE_EXPERT_CACHE_TABLES=1`
+    // prints the per-layer residency map (slots/n_experts, `I` when a table of the layer is on the identity
+    // fast path) and the per-layer stand-down / re-arm tally for this run.  Read it first when comparing two
+    // runs of a host-expert shape.
+    if (moe_diag_tables() && !g_tables.empty()) {
+        std::map<int, std::array<int64_t, 4>> by_layer;   // slots(min), n_experts, tables, identity
+        for (const table_t & t : g_tables) {
+            if (t.layer < 0 || t.layer >= 512) {
+                continue;
+            }
+            auto & v = by_layer[t.layer];
+            v[0] = (v[2] == 0 || t.slots < v[0]) ? t.slots : v[0];
+            v[1] = t.n_experts;
+            v[2] += 1;
+            v[3] += t.identity ? 1 : 0;
+        }
+        std::string map;
+        for (const auto & kv : by_layer) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "%sL%d %lld/%lld%s", map.empty() ? "" : " ", kv.first,
+                     (long long) kv.second[0], (long long) kv.second[1], kv.second[3] > 0 ? "I" : "");
+            map += buf;
+        }
+        GGML_LOG_INFO("%s: residency by layer (MOE_EXPERT_CACHE_TABLES=1): %s\n", __func__, map.c_str());
+        std::string sd, ra;
+        for (int l = 0; l < 512; l++) {
+            if (l < (int) g_diag_standdown.size() && g_diag_standdown[(size_t) l] > 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%sL%dx%lld", sd.empty() ? "" : " ", l,
+                         (long long) g_diag_standdown[(size_t) l]);
+                sd += buf;
+            }
+            if (l < (int) g_diag_rearm.size() && g_diag_rearm[(size_t) l] > 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%sL%dx%lld", ra.empty() ? "" : " ", l,
+                         (long long) g_diag_rearm[(size_t) l]);
+                ra += buf;
+            }
+        }
+        GGML_LOG_INFO("%s: slab-reclaim stand-downs this run: %s | re-arms: %s\n", __func__,
+                      sd.empty() ? "none" : sd.c_str(), ra.empty() ? "none" : ra.c_str());
+    }
+    // TODO #318: the front-loading policy that produced this run, and what it actually deferred. A deferred
+    // tier is invisible in the numbers above (the same experts are served, only later), so it needs its own
+    // line: `deferred` tables/pools start EMPTY and fill on first miss, `placed` ones were filled at sizing
+    // because they cover their tensor.
+    if (g_seed_policy != MOE_SEED_EAGER && (g_seed_deferred_tables + g_seed_deferred_pools +
+                                            g_seed_placed_tables) > 0) {
+        GGML_LOG_INFO("%s: expert seed (MOE_EXPERT_SEED=%s): %lld arena table(s) deferred (subset: seed on "
+                      "first miss), %lld placed (covers its tensor: filled at sizing); %lld host pool(s) "
+                      "deferred\n", __func__, g_seed_policy == MOE_SEED_LAZY ? "lazy" : "auto",
+                      (long long) g_seed_deferred_tables, (long long) g_seed_placed_tables,
+                      (long long) g_seed_deferred_pools);
+    }
+    // wip/apu-expert-gtt P3: the tier's own two acceptance numbers, on their own line so nothing that parses
+    // the census above has to change.  `arena releases` MUST be 0 on a steady-state arm (see the counter).
+    if (g_gtt_arena) {
+        GGML_LOG_INFO("%s: GTT arena tier: %lld table(s) resident, %lld arena release(s) (0 = steady state), "
+                      "extent budget %.1f MiB (%d MTP/nextn head layer(s) pinned at full residency, %.1f MiB "
+                      "outside that budget); read transport %s (%s, %d switch(es))\n", __func__,
+                      (long long) n_tables, (long long) g_arena_releases, (double) g_budget / (1024 * 1024),
+                      g_gtt_n_head_layers, (double) g_gtt_head_bytes / (1024 * 1024),
+                      pool_transport_name(g_pool_transport),
+                      g_pool_tr_mode == 3 ? "auto" : (g_pool_tr_mode < 0 ? "unset" : "pinned"),
+                      g_pool_tr_switches);
+        // wip/apu-expert-gtt P3c: the DRAFT-side invariant, printed as its own line so a reader (and a gate) can
+        // assert on it: the MTP/nextn head is never evicted.  `slots == experts` is the other half -- every expert
+        // of every head table resident -- and `evictions=0` is the one the maintainer asked for: the draft
+        // weights, embedded or a separate file, are not subject to being evicted.
+        GGML_LOG_INFO("%s: MTP/nextn head residency: %d table(s), %lld/%lld (tensor, expert) slots resident, "
+                      "%lld eviction(s) (MUST be 0: the draft weights are pinned and never evicted)\n", __func__,
+                      g_report_snap.head_tables, (long long) g_report_snap.head_slots,
+                      (long long) g_report_snap.head_experts, (long long) g_report_snap.head_evictions);
+        if (g_report_snap.head_evictions != 0) {
+            GGML_LOG_ERROR("%s: the MTP/nextn head LOST residency: %lld eviction(s) on its pinned tables.  That is "
+                           "a defect -- a head table holds one slot per expert, so a miss can never need to evict, "
+                           "and no pressure path may stand it down.  Please report the config.\n", __func__,
+                           (long long) g_report_snap.head_evictions);
+        }
+        if (g_report_snap.head_tables > 0 && g_report_snap.head_slots != g_report_snap.head_experts) {
+            GGML_LOG_ERROR("%s: the MTP/nextn head is not fully resident: %lld of %lld (tensor, expert) slots.  A "
+                           "draft step would then miss -- report this config.\n", __func__,
+                           (long long) g_report_snap.head_slots, (long long) g_report_snap.head_experts);
+        }
+        // TODO #317 (wip/prefill-in-place-arena P1): the IN-PLACE prefill arm's census.  It replaces the P5 span
+        // staging on the arena tier, so a mechanism that removes 95 % of a prefill pass's traffic would otherwise
+        // be invisible -- the text is identical and no existing counter moves.  The acceptance numbers to read
+        // here: `admitted` > 0 on a table with a real miss set, `declined` naming why, `arena D2D 0.0 MiB` (this
+        // arm copies nothing out of the arena), and `resident evicted 0` (a prefill pass never evicts a decode
+        // resident -- that is the policy, so a non-zero value is a defect rather than a tuning result).
+        if (g_pfip_calls > 0 || g_pfip_declined > 0) {
+            const double mib = 1.0 / (1024.0 * 1024.0);
+            GGML_LOG_INFO("%s: GTT prefill in place: %lld call(s) x %lld table(s), %lld slot admission(s) "
+                          "(%lld into a landing slot, %lld reclaiming the coldest NON-routed resident), arena "
+                          "D2D 0.0 MiB, read %.1f MiB of %.1f MiB used, remap "
+                          "%.1f MiB, finite-head zeroes %lld, declined %lld (%lld for want of room, %lld short "
+                          "read, %lld failed), %.0f ms in the hook\n", __func__,
+                          (long long) g_pfip_calls, (long long) g_pfip_tables, (long long) g_pfip_admits,
+                          (long long) g_pfip_land_reuse, (long long) g_pfip_evicted,
+                          (double) g_pfip_read_bytes * mib,
+                          (double) g_pfip_used_bytes * mib, (double) g_pfip_remap_bytes * mib,
+                          (long long) g_pfip_head_zeroes, (long long) g_pfip_declined,
+                          (long long) g_pfip_no_room, (long long) g_pfip_short, (long long) g_pfip_fail,
+                          (double) g_pfip_us / 1000.0);
+        }
+        // wip/apu-expert-gtt P5: the prefill stream's census.  `used` is what the delivery's per-expert copy
+        // would have read ("fetch every used expert"); `read` is what this path actually read from storage,
+        // `arena` came from the GTT store by D2D, and `fallback` is the part the span reader could not serve.
+        // `per pass` is the property the plan asks for: it must FALL after the first pass.
+        if (g_pf_calls > 0 || g_pf_declined > 0 || g_pf_fail > 0) {
+            const double mib = 1.0 / (1024.0 * 1024.0);
+            GGML_LOG_INFO("%s: GTT prefill stream: %lld ubatch(es) x table(s), used %.1f MiB | read %.1f MiB "
+                          "(%.1f %% of used) in %lld coalesced span(s) of %.2f MiB | arena D2D %.1f MiB, "
+                          "fallback %.1f MiB | declined %lld, failed %lld, ring shortfalls %lld, finite-head "
+                          "zeroes %lld, %.0f ms in the hook (%.0f ms reads, %.0f ms ring wait; %s, %d reader(s); ubatch %lld-%lld "
+                          "tok, up to %lld used "
+                          "expert(s))\n", __func__,
+                          (long long) g_pf_calls, (double) g_pf_used_bytes * mib,
+                          (double) g_pf_read_bytes * mib,
+                          g_pf_used_bytes > 0 ? 100.0 * (double) g_pf_read_bytes / (double) g_pf_used_bytes : 0.0,
+                          (long long) g_pf_span_reads,
+                          g_pf_span_reads > 0 ? (double) g_pf_span_bytes * mib / (double) g_pf_span_reads : 0.0,
+                          (double) g_pf_arena_bytes * mib, (double) g_pf_fallback_bytes * mib,
+                          (long long) g_pf_declined, (long long) g_pf_fail, (long long) g_pf_span_fallback,
+                          (long long) g_pf_head_zeroes, (double) g_pf_us / 1000.0,
+                          (double) g_pf_read_us / 1000.0, (double) g_pf_ring_us / 1000.0,
+                          g_pool_dio ? "O_DIRECT" : "buffered pread", g_pf_readers,
+                          (long long) g_pf_n_tok_min, (long long) g_pf_n_tok_max, (long long) g_pf_nexp_max);
+            if (g_pf_calls > 0) {
+                std::string pass;
+                char buf[160];
+                for (int i = 0; i < PF_PASS_REPORT; i++) {
+                    if (g_pf_pass_used[i] == 0) {
+                        break;
+                    }
+                    snprintf(buf, sizeof(buf), "%s%.0f/%.0f", i == 0 ? "" : " ",
+                             (double) g_pf_pass_read[i] * mib, (double) g_pf_pass_used[i] * mib);
+                    pass += buf;
+                }
+                std::vector<int64_t> pr = g_report_snap.pf_reads;
+                std::sort(pr.begin(), pr.end());
+                const int64_t mn = pr.empty() ? 0 : pr.front();
+                const int64_t md = pr.empty() ? 0 : pr[pr.size() / 2];
+                const int64_t mx = pr.empty() ? 0 : pr.back();
+                GGML_LOG_INFO("%s: GTT prefill stream per pass (read/used, MiB): %s | per layer read "
+                              "min/median/max = %.0f/%.0f/%.0f MiB over %zu layer(s)\n", __func__, pass.c_str(),
+                              (double) mn * mib, (double) md * mib, (double) mx * mib, pr.size());
+            }
+        }
+    }
     if (g_devremap_offers > 0 || g_devremap_calls > 0) {
         GGML_LOG_INFO("%s: device remap: %lld tables served, %lld of %lld offers declined\n", __func__,
                       (long long) g_devremap_calls, (long long) g_devremap_declined, (long long) g_devremap_offers);
@@ -7155,6 +7614,12 @@ void moe_cache_report() {
     GGML_LOG_INFO("%s: takeover=%lld decline_all=%lld get_ok=%lld cold=%s cold_reaches=%lld\n",
                   __func__, (long long) g_takeover, (long long) g_decline_all, (long long) g_get_ok,
                   g_cold_uva ? "uva" : "off", (long long) g_cold_reaches);
+    // TODO #335/#336: a nonzero `broken` means a take-over's promise was broken by an arena eviction landing
+    // between the hook and the consumer; `repaired` is how many of those had their skipped copy re-filled
+    // (they must match, or a repair was skipped -- which logs).
+    GGML_LOG_INFO("%s: take-over promises broken=%lld repaired=%lld stale=%lld\n",
+                  __func__, (long long) g_takeover_broken, (long long) g_takeover_repaired,
+                  (long long) g_takeover_stale);
     // TODO #327: the prefill MoE fusion census.  `staged` = the fusion ran on the scheduler's copy, `in_place` =
     // it ran on an arena table (the redirect).  A residency state that reroutes a kind from one column to the
     // other is exactly what this item removes, so a gate reads both columns and requires the same set of

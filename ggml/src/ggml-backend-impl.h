@@ -279,7 +279,11 @@ extern "C" {
         // inside one host expert blob.  When the split backend is the Meta backend it does not
         // implement the policy itself; it computes these per device from the meta split state and
         // forwards to each simple backend's hook with that device's simple tensor as `weight_cpy`.
-        bool (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis);
+        //
+        // `slices`/`n_slices` supersede that geometry for a FUSED table whose device slot is several
+        // ranges of the host expert (see `ggml_backend_moe_slice`); `n_slices == 0` means "use
+        // `slice_off`/`split_axis`".  The Meta backend builds the list per device.
+        bool (*moe_cache_update)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices);
 
         // wip/moe-expert-cache (session 7) identity fast path.  Return true iff this expert input is
         // cache-managed and the consumer can read the arena WITHOUT the host routing (an identity table:
@@ -408,14 +412,14 @@ extern "C" {
         // set it is zero-initialized.
         size_t (*slab_headroom_bytes)(ggml_backend_dev_t dev);
 
-        // (optional) wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.
-        // Armed during prefill (the hole is not the arena's), disarmed at the prefill -> decode transition
-        // (returned to the arena, so a decode-only stretch gets the VRAM back).  Appended like the fields
-        // above, so every backend that does not set it is zero-initialized.
-        void (*slab_ring_set)(ggml_backend_dev_t dev, bool arm);
+        // (optional) wip/slab-ring-region: arm/disarm the allocator's reserved transport region (the staging
+        // pipeline's buffers).  Armed during prefill (the region is not the arena's), disarmed at the prefill ->
+        // decode transition (returned to the arena, so a decode-only stretch gets the VRAM back).  Appended like
+        // the fields above, so every backend that does not set it is zero-initialized.
+        void (*slab_stage_set)(ggml_backend_dev_t dev, bool arm);
 
         // (optional) wip/slab-ring-region: pin the always-resident narrow (decode/verify) work size, so
-        // the allocator can place the staging ring above it.  Appended like the fields above.
+        // the allocator can place the transport region above it.  Appended like the fields above.
         void (*slab_narrow_floor)(ggml_backend_dev_t dev, size_t bytes);
 
         // (optional) wip/first-prefill-latency: reserve the wide (prefill) work region before the MoE
@@ -444,26 +448,27 @@ extern "C" {
         // the fields above, so backends that do not set it are zero-initialized.
         void (*slab_compute_plain)(ggml_backend_dev_t dev, bool enable);
 
-        // (optional) wip/slab-ring-region (issue #164): the size of the reserved H2D staging-ring hole, or
-        // 0 when the slab carved none.  `llama_context` uses it to skip the narrow -> wide compute-buffer
-        // drop when there is no ring to arm (the drop would only churn the layout).  Appended like the
-        // fields above, so every backend that does not set it is zero-initialized.
-        size_t (*slab_ring_region)(ggml_backend_dev_t dev);
+        // (optional) wip/slab-ring-region (issue #164): the size of the reserved transport region (the staging
+        // pipeline's buffers), or 0 when the slab has none carved.  `llama_context` uses it to skip the narrow ->
+        // wide compute-buffer drop when there is no region to arm (the drop would only churn the layout).  Appended
+        // like the fields above, so every backend that does not set it is zero-initialized.
+        size_t (*slab_stage_region)(ggml_backend_dev_t dev);
 
-        // (optional) wip/slab-ring-region (issue #164): set the H2D staging-ring auto-size cap (bytes),
-        // computed by `llama_context` from the ubatch and the host-expert device count.  The caller must set
-        // it BEFORE the slab is created.  Appended like the fields above.
-        void (*slab_set_ring_cap)(ggml_backend_dev_t dev, size_t bytes);
+        // (optional) wip/slab-ring-region (issue #164): set the transport region's CAP (bytes), computed by
+        // `llama_context` (1/4 of the smallest staging device's VRAM).  The caller must set it BEFORE the slab is
+        // created.  Appended like the fields above.
+        void (*slab_set_stage_cap)(ggml_backend_dev_t dev, size_t bytes);
+        void (*slab_set_stage_unit)(ggml_backend_dev_t dev, size_t bytes);
 
         // (optional) issue #164: whether this device's movable-boundary slab is enabled.  `llama_context`
-        // consults it before warning about a too-small `GGML_CUDA_SLAB_RING_MIB`.  Appended like the fields
+        // consults it before warning about a region that cannot serve a buffer.  Appended like the fields
         // above.
         bool (*slab_enabled)(ggml_backend_dev_t dev);
 
-        // (optional) issue #164: the H2D staging-ring depth (slots the ring region is divided into), or 0
-        // when the backend has no ring.  `llama_context` needs it to size the ring region so one staged
-        // table fits per slot.  Appended like the fields above.
-        size_t (*slab_ring_slots)(ggml_backend_dev_t dev);
+        // (optional) issue #164: the transport DEPTH (how many pipeline buffers the region is sized for), or 0
+        // when the backend has no staging transport.  `llama_context` needs it to size the region so one staged
+        // host-weight set fits per buffer.  Appended like the fields above.
+        size_t (*slab_stage_slots)(ggml_backend_dev_t dev);
 
         // (optional) TODO #59: the MoE expert cache's decode/verify band in tokens (the widest routed
         // `MUL_MAT_ID` batch the arena serves from VRAM), or 0 when the cache is disabled.  `common` clamps

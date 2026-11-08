@@ -316,7 +316,10 @@ static void check_fp8_attention(llama_model * model, bool offload_kqv = true) {
             LOG("FP8 attention: tensor split requires flash attention, skipping disabled cases\n");
             continue;
         }
-        for (int scaled : { 1, 2, 3 }) {
+        // rdna-boosts: K and V cache types must match (llama_init_from_model refuses a mixed pair
+        // outright), so only the both-FP8 arm is reachable through the context here; the per-side
+        // scaling of a mixed pair stays covered at the cache level by test-kv-cache.
+        for (int scaled : { 3 }) {
             const float sk = scaled & 1 ? 0.03125f : 1.0f;
             const float sv = scaled & 2 ? 0.125f : 1.0f;
             ggml_backend_tensor_set(k_scale, &sk, 0, sizeof(sk));

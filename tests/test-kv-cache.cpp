@@ -54,10 +54,13 @@ int main() {
                     errors.clear();
                     llama_context * ctx = llama_init_from_model(model.get(), params);
                     GGML_ASSERT(ctx == nullptr);
-                    if (type_k == type_v || (!model->hparams.is_mla() && arch != LLM_ARCH_DEEPSEEK4 && arch != LLM_ARCH_DEEPSEEK41)) {
-                        GGML_ASSERT(errors.find("FP8 cache is not supported for architecture") != std::string::npos);
+                    if (type_k != type_v) {
+                        // rdna-boosts: every model requires the same K and V cache types, and that check
+                        // runs before the per-architecture one, so a mixed pair reports this diagnostic
+                        // on every architecture instead of only on MLA / DeepSeek4.
+                        GGML_ASSERT(errors.find("models require the same K and V cache types") != std::string::npos);
                     } else {
-                        GGML_ASSERT(errors.find("model does not support different K") != std::string::npos);
+                        GGML_ASSERT(errors.find("FP8 cache is not supported for architecture") != std::string::npos);
                     }
                 }
             }

@@ -196,9 +196,13 @@ bool moe_cache_is_sized();
 // and `split_axis` is the master's split axis (0/1, or -1 for an unsplit whole-expert table).  For a
 // contiguous axis-1 slice `host_pitch` is 0 and the fill is one 1-D copy; for a strided axis-0 slice
 // `host_pitch` is the host row pitch and the fill is a 2-D copy.
+// wip/fix-gemma-4 (TODO #77/C): `slices`/`n_slices` describe a FUSED table whose device slot is the
+// concatenation of several ranges of the host expert blob (gemma4 `ffn_gate_up_exps` under `-sm tensor`).
+// `n_slices == 0` keeps the historical single-slice geometry (`src_off`/`host_pitch`/`split_axis`).
 int moe_cache_table(const void * src0, int layer, const char * role, int n_experts, size_t expert_bytes,
                     size_t host_bytes, size_t src_off, size_t host_pitch, int split_axis,
-                    const void * host, int device);
+                    const void * host, int device,
+                    const struct ggml_backend_moe_slice * slices = nullptr, int n_slices = 0);
 
 // wip/host-expert-dio-cache Phase 1 (plumbing, inert): register the on-disk source of a host-resident
 // expert tensor, keyed by its host data pointer (== the `host` passed to `moe_cache_table`).  Called by
@@ -212,6 +216,14 @@ void moe_cache_set_host_source(const void * tensor_data, const char * path, size
 // `--host-experts pool`: enable the bounded pinned host pool (size from MOE_HOST_POOL_MIB, default
 // MOE_HOST_POOL_FRAC % of the MoE host experts).  Called by the loader before tables are registered.
 void moe_cache_set_host_pool(bool on);
+
+// r362 (issue #368): did the LOADER ask for the explicit `--host-experts pool` tier?  Such a tier has no
+// device-readable host master, so every routed table is gathered at every width by the default
+// `GGML_SCHED_DEVGATHER` mode (see `sched_input_gatherable`) and the whole-table H2D staging transport holds
+// nothing for it.  The slab therefore does not carve its stage region on this tier: the hole's whole extent
+// otherwise comes out of the expert arena when the wide (prefill) compute view is placed.  Query only;
+// never allocates.
+bool moe_cache_host_pool_requested();
 
 // wip/host-expert-tier: the persisted per-expert heat prior, exposed to the model loader so the pinned
 // host-master tier can be filled in DESCENDING HOTNESS (the budget is usually smaller than the host
@@ -272,7 +284,8 @@ bool moe_cache_remap_dev(const struct ggml_tensor * weight, const struct ggml_te
 bool moe_cache_update_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
                            const int32_t * ids, int64_t n_used, int64_t n_tok,
                            size_t ids_nb0, size_t ids_nb1, void * stream,
-                           int device, size_t slice_off, int split_axis);
+                           int device, size_t slice_off, int split_axis,
+                           const struct ggml_backend_moe_slice * slices = nullptr, int n_slices = 0);
 
 // Host-weight expert gather (B2, session 15).  For a `-ncmoe` `MUL_MAT_ID` prefill whose expert upload is
 // NOT staged, copy only the routed experts from the host master into the scheduler's device `input_cpy`,
@@ -305,6 +318,28 @@ bool moe_cache_get_table(const struct ggml_tensor * op, const struct ggml_tensor
                          void ** arena, int64_t * n_slots,
                          size_t * expert_bytes, void ** remap_dev, int64_t * n_used, int64_t * n_tok);
 
+// TODO #335/#336: repair a take-over's broken promise.  `moe_cache_take_over` / `moe_cache_update_host` /
+// `moe_cache_remap_dev` tell the scheduler it may skip filling `input_cpy`, and the slab can still evict the
+// table's arena BETWEEN that hook and the consumer's launch (the eviction runs from inside a graph, when an
+// op's workspace allocation moves the work boundary).  A consumer whose `moe_cache_get_table` then declined
+// calls this with the same (redirected) tensor: when the outstanding promise is for THIS buffer, the table's
+// whole master is copied back into it from the host source and the number of bytes re-filled is returned (0
+// when there was no promise, i.e. the scheduler filled the buffer itself).  Runs on the caller's compute
+// stream, so it is ordered before the kernel that reads the buffer.
+size_t moe_cache_repair_copy(const struct ggml_tensor * weight_cpy, int device, void * stream);
+
+// issue #327: END of a staging pass, called by the backend when it finishes computing one split's graph.
+//
+// A take-over promise ("I skip filling `input_cpy`, the consumer will read the arena") is only valid for the pass
+// that made it: the scheduler stages a split's inputs and then computes that split, so a promise and the op it was
+// made for are always inside ONE `graph_compute` call, while the next call's staging -- or a captured replay that
+// never dispatches at all -- is a different one.  Clearing every outstanding promise here is what keeps
+// `moe_cache_repair_copy`'s premise exact (`TODO` #335/#336 counts a promise broken inside its own pass) instead
+// of an address match against a buffer the next pass recycled (issue #327: 138 routed tables re-read from the host
+// master, ~10.4 s, on every 30-34 token prompt).  Returns the number of promises dropped, and adds it to the
+// `stale` census counter.
+int64_t moe_cache_pass_end(int device);
+
 // Structural takeover for the decode/verify band: true when the table is cache-managed and the consumer
 // can read the arena without the host routing (an identity table, served with the raw ids).  Every other
 // table takes the eager host-routing path (`moe_cache_update_host`), which materializes the remap on the
@@ -336,18 +371,26 @@ bool moe_cache_redirect_fused(const struct ggml_tensor * op,
 // from a staged one, and a run's greedy text a function of the persisted heat prior (TODO #321, r284).  This
 // answers the same question per lane as `moe_cache_get_table` and returns the placement the fusion must use:
 //
-//   MOE_CACHE_SERVE_NONE      -- no lane is served: keep the graph's tensors (the scheduler staged them).
+//   MOE_CACHE_SERVE_NONE      -- no lane is served: keep the graph's tensors (the scheduler staged them).  The
+//                                query has ALREADY re-filled any staged lane whose take-over promise a mid-pass
+//                                eviction broke (`moe_cache_repair_copy`), so the fused launch reads live bytes.
 //   MOE_CACHE_SERVE_IN_PLACE  -- every lane is served: pass `src0_cpy`/`gate_cpy`/`ids_cpy` to the fused launch.
 //   MOE_CACHE_SERVE_MIXED     -- the lanes disagree (or a lane flipped unserveable mid-call): STAND THE FUSION
 //                                DOWN.  A one-lane redirect would read a table the scheduler never copied (its
 //                                in-place decision is per split), so the per-op chain, which resolves each table
 //                                on its own, is the only correct consumer of that state.
 //
+// `gate == nullptr` is a SINGLE-lane caller (the decode down fold, the single-lane routed bias/scale folds, the
+// RDNA3_5 swiglu->down fold): it is served exactly when its one lane is, so a staged table answers NONE (issue
+// #332 -- reading it as "the gate lane is satisfied" made every gate-less fusion stand down for as long as its
+// table was staged, i.e. residency selected its kernel set again).
+//
 // Every returned placement must be fed to `moe_cache_fusion_launched()` with the fusion's census `kind`
 // (0 = mmb-glu, 1 = mmq gate+up+GLU triple, 2 = mmq shared-quantize pair, 3 = mmq swiglu->down fold,
 //  4 = decode mmvf gate+up+GLU, 5 = decode mmvq gate+up+GLU), once the launch actually happens: that census is
 // what a gate reads to prove residency no longer selects the kernel set.  Kinds 4/5 also cover the single-lane
-// routed folds (bias / scale / shared-expert), which have no gate lane; their MIXED count is a decode one.
+// routed folds (bias / scale / shared-expert / down fold), which have no gate lane; their MIXED count is a
+// decode one and now only comes from the mid-call flip, never from a plainly staged table.
 enum moe_cache_serve_status {
     MOE_CACHE_SERVE_NONE     = 0,
     MOE_CACHE_SERVE_IN_PLACE = 1,

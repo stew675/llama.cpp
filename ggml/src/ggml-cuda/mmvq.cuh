@@ -52,10 +52,30 @@ bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const
 void ggml_cuda_mul_mat_id_weighted_rdna3_5(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
+
+bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false);
+
+int ggml_cuda_mul_mat_id_weighted_down_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+bool ggml_cuda_ssm_prescan_match_at(const struct ggml_cgraph * cgraph, int i);
+int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+int ggml_cuda_mul_mat_dual_output_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+int ggml_cuda_mul_mat_row_concat_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+// GDN gate / beta epilogue (GGML_CUDA_FUSE_GDN_EPI=0: off): the row concat's in decode, and this verify-band launch.
+bool ggml_cuda_gdn_epi_enabled();
+int ggml_cuda_gdn_epi_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+int ggml_cuda_moe_down_fold_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+// The down + weighted-reduction fold's NODE-level serve conditions (mmvq-moe.cu's `fusion.red_dst` store).  Anything
+// that stands aside for that fold must ask THIS predicate: ggml_cuda_mwr_fold_mark arms from the graph pattern
+// alone, so a looser test in moe_down_fold_try_fuse would hand back its own fold for a node the reduction fold
+// cannot serve (a warp-64 device, n_embd above the counter span, a non-contiguous down output, ne[3] != 1).
+bool ggml_cuda_mwr_fold_serve_ok(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+
 int ggml_cuda_gate_beta_verify_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 int ggml_cuda_shexp_down_gate_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 
-bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false);
 bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx);
 int  ggml_cuda_match_shared_expert_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

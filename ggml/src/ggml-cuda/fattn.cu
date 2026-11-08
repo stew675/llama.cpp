@@ -5,6 +5,8 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <cstring>
+
 #if !defined(GGML_USE_MUSA)
 
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -261,7 +263,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
             // instead of two (q8_0, gfx1201: -10..-15 % from 4k KV rows, but +2..8 % below 2k, where the
             // 16-warp block is mostly idle), so the KV-length gate cannot change any output either.
             // GGML_HIP_FA_BAND_WIDE=0 restores the two-tile launch.
-            static const bool band_wide_on = getenv("GGML_HIP_FA_BAND_WIDE") == nullptr || atoi(getenv("GGML_HIP_FA_BAND_WIDE")) != 0;
+            static const bool band_wide_on = [] { const char * e = getenv("GGML_HIP_FA_BAND_WIDE"); return e == nullptr || atoi(e) != 0; }();
             if (band_wide_on && ggml_cuda_fattn_band_wmma_ncols1(dst) == 4 && Q->ne[1] > 4 && K->ne[1] >= 4096) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8, 8, true>(ctx, dst);
             } else if (ggml_cuda_fattn_band_wmma_ncols1(dst) == 4) {
@@ -1004,6 +1006,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+thread_local ggml_cuda_fa_had_req ggml_cuda_fa_had;
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
@@ -1034,4 +1038,113 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
         return false;
     }
     return true;
+}
+
+// The packed FA KV-group bitmap shared by the attention layers of one graph evaluation (fattn-common.cuh).
+//
+// WHY: with a unified KV cache every attention layer of a step builds the same packed bitmap of "which 256-cell KV
+// group is fully masked for this (stream, query tile)" -- one memset + one prepass launch per layer, sixteen of them
+// on a dense 27B.  The bitmap is a pure function of the mask's CONTENTS and the producer's arguments, and one graph
+// evaluation reads one mask, so the first layer's build is the other layers' build.  No kernel changes: a reused
+// bitmap is the same words, so the attention arithmetic (and therefore the text) is bit-identical.
+//
+// The state is ggml_backend_cuda_context::fattn_kq -- one per context, freed with it -- so a context created later
+// (at the same address, or on another device) starts with no bitmap, and a stale buffer can no longer be handed to
+// another device's kernel.
+//
+// OPT-IN, OFF BY DEFAULT (GGML_CUDA_FA_KQ_BLOCKS_REUSE=1): the saving is 15 launches per step in the measured shape,
+// worth nothing on this repo's Linux box (31.85 -> 31.89 t/s, gfx1201, 27B UD-Q4_K_XL, 2-slot --kv-unified server
+// with a 25.7k-token parked slot) and expected to matter only where a launch is expensive (Windows/WDDM).  It is in
+// the default set because it is exact and cheap (64 KiB, outside the pool, so --fit does not see it), not because it
+// buys anything here; `patches/README.md` block 10 and WORKLOG 261120.004 carry that record.
+static bool fattn_kq_blocks_reuse_on() {
+    static const bool on = []() {
+        const char * e = getenv("GGML_CUDA_FA_KQ_BLOCKS_REUSE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// 64 KiB: a 2048-token batch at a 256K context needs ~8K words; a larger bitmap is built per layer as before
+static constexpr size_t FATTN_KQ_BLOCKS_REUSE_WORDS = 16384;
+
+void ggml_cuda_fattn_new_graph_eval(ggml_backend_cuda_context & ctx) {
+    if (fattn_kq_blocks_reuse_on()) {
+        ++ctx.fattn_kq.n_eval;
+    }
+}
+
+uint32_t * ggml_cuda_fattn_kq_blocks_reuse(ggml_backend_cuda_context & ctx, const ggml_tensor * mask, const int64_t key[8],
+                                           const size_t n_words, cudaStream_t stream, bool & built) {
+    built = true;
+    auto & s = ctx.fattn_kq;
+    // The call is counted in BOTH arms: with the switch off the census would otherwise read all zeros, i.e. an arm
+    // could not be told from one that never reached this code (`calls` > 0 with `reuse=off` says it did).
+    ++s.calls;
+    if (!fattn_kq_blocks_reuse_on()) {
+        return nullptr;
+    }
+    if (s.n_eval == 0) {
+        s.fb_noeval++;   // not inside a graph evaluation of this context
+        return nullptr;
+    }
+    if (s.eval == s.n_eval && s.mask == mask && s.data == mask->data && s.stream == stream &&
+        memcmp(s.key, key, sizeof(s.key)) == 0) {
+        built = false;
+        s.reused++;
+        return s.buf;
+    }
+    if (s.eval == s.n_eval && s.stream != stream) {
+        s.fb_stream++;   // another stream of this evaluation may still read the buffer: no reuse there
+        return nullptr;
+    }
+    if (n_words > FATTN_KQ_BLOCKS_REUSE_WORDS) {
+        s.fb_size++;     // too large for the shared buffer
+        return nullptr;
+    }
+    if (s.buf == nullptr) {
+        // One fixed buffer (a captured graph keeps its address), never allocated while a graph is captured.
+        if (ctx.capturing) {
+            s.fb_capture++;
+            return nullptr;
+        }
+        if (ggml_cuda_device_malloc((void **) &s.buf, FATTN_KQ_BLOCKS_REUSE_WORDS*sizeof(uint32_t), ctx.device) != cudaSuccess) {
+            // a cache must never abort a run that would otherwise work: decline and build into the pool
+            (void) cudaGetLastError();
+            s.buf = nullptr;
+            if (s.fb_nomem++ == 0) {
+                GGML_LOG_WARN("%s: device %d: no 64 KiB for the shared FA KV-group bitmap; building it per layer\n",
+                              __func__, ctx.device);
+            }
+            return nullptr;
+        }
+    }
+    s.eval   = s.n_eval;
+    s.mask   = mask;
+    s.data   = mask->data;
+    s.stream = stream;
+    memcpy(s.key, key, sizeof(s.key));
+    s.built++;
+    return s.buf;
+}
+
+void ggml_cuda_fattn_kq_blocks_free(ggml_backend_cuda_context & ctx) {
+    auto & s = ctx.fattn_kq;
+    static const bool census = []() {
+        const char * e = getenv("GGML_CUDA_FA_KQ_BLOCKS_CENSUS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (census) {
+        GGML_LOG_WARN("FA_KQ_BLOCKS_CENSUS dev=%d reuse=%s calls=%llu built=%llu reused=%llu "
+                      "declined noeval=%llu stream=%llu size=%llu capture=%llu nomem=%llu\n",
+                      ctx.device, fattn_kq_blocks_reuse_on() ? "on" : "off",
+                      (unsigned long long) s.calls, (unsigned long long) s.built, (unsigned long long) s.reused,
+                      (unsigned long long) s.fb_noeval, (unsigned long long) s.fb_stream,
+                      (unsigned long long) s.fb_size, (unsigned long long) s.fb_capture,
+                      (unsigned long long) s.fb_nomem);
+    }
+    if (s.buf != nullptr) {
+        CUDA_CHECK(cudaFree(s.buf));
+        s.buf = nullptr;
+    }
 }

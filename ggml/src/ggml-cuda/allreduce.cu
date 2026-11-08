@@ -814,6 +814,9 @@ bool ggml_cuda_ar_allreduce(
         for (int i = 0; i < n; ++i) {
             auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
             GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+            // wip/slab-transient-absorption (step 2b): this scratch is held across the copy-engine
+            // sub-launches of the whole all-reduce, so it must not come from the prefill-only wide band.
+            ggml_cuda_pool_wide_pin wide_pin(cuda_ctx->pool());
             bf16_tmp[i].pool = &cuda_ctx->pool();
             bf16_tmp[i].alloc(ne);
             ggml_cuda_set_device(p->devices[i]);

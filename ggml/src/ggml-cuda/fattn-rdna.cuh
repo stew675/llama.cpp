@@ -311,6 +311,35 @@ static inline ggml_type ggml_cuda_fattn_tile_type(const ggml_tensor * K, const g
                                                  : ggml_cuda_fattn_native_ggml_type(tile_native);
 }
 
+// Host-side answer to "does the family this device picks read a K/V cache of these two types WITHOUT
+// the F16 staging copy?".  The prefill staging arena only ever holds the conversion a launch asked
+// for, so a pair the kernels read natively never grows it -- and `--fit` must not reserve for it.  A
+// flat reserve charged for every quantized K cache cost a memory-tight 12 GiB gfx1031 eight layers of
+// offload and ~4x its decode (issue #367: 4.0 t/s against upstream's 15.5), on the delivery default
+// `-ctk q8_0 -ctv q8_0` where no conversion happens at all.
+//
+// The answer is the launcher's OWN predicate (`ggml_cuda_fattn_tile_type`, i.e. the `need_f16_K/V`
+// test of ggml_cuda_flash_attn_ext_get_f16_extra_data) applied to a probe tensor, so the reserve and
+// the launcher cannot drift the way they did before TODO 71 -- a policy switch such as
+// `GGML_CUDA_FA_KV_NATIVE=0` turns both on together.  A pair the tile family reads natively is native
+// for the MMA family too (it types each operand from the same per-type predicates and stages strictly
+// less), so one test answers for both.  The per-tensor layout tests are KV-cache invariants
+// (block-contiguous rows, a head width that is a multiple of the staged chunk), so the probe carries
+// the smallest row the loaders accept.
+static inline bool ggml_cuda_fattn_kv_pair_native_host(int cc, ggml_type type_k, ggml_type type_v) {
+    ggml_tensor k = {};
+    k.type  = type_k;
+    k.ne[0] = GGML_CUDA_FA_Q8_CHUNK;
+    k.nb[0] = ggml_type_size(type_k);
+    ggml_tensor v = k;
+    v.type  = type_v;
+    v.nb[0] = ggml_type_size(type_v);
+    // F16/F32 and the bf16 arm reach the kernel's own T_KV; a quantized pair reaches a native dequant
+    // arm only when both operands name the SAME type (the tile kernel has one K/V type parameter).
+    const ggml_type tile = ggml_cuda_fattn_tile_type(&k, &v, cc);
+    return tile == type_k && tile == type_v;
+}
+
 // Decode/verify band (n_q <= 8) on RDNA4: the whole GQA group is folded into one block
 // (ncols2 = 8) via the WMMA kernel instead of the tile kernel's ncols2 = 2, which fetches and
 // dequantizes every K/V element once per head pair (3x for GQA 6).  This is the default; the env var

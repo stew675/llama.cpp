@@ -42,6 +42,20 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+// wip/flash-next-prefill: the H2D transport's buffer COUNT -- how many host-weight sets the staging pipeline
+// holds.  ONE number, because the scheduler's pipeline depth, this backend's stage slots and the slab's transport
+// region (and, through the `slab_stage_slots` device hook, the Meta backend's per-device depth) must agree: a
+// region carved for fewer buffers than the pipeline uses makes `ggml_cuda_slab_arena_alloc_transient` refuse the
+// fills, and every staged input falls back to the scheduler's serial upload.
+//
+// It is chosen LATE, from the MoE expert cache's SETTLED arena (the residency rule in
+// `ggml_cuda_moe_transport_decide`), not from the free VRAM at startup: the buffers are a carve INSIDE the slab,
+// so their cost is the decode hot set they take out of the arena.  `ggml_backend_cuda_transport_bufs_set` is the
+// only writer and ignores a second, different value (a count that follows every arena re-size flaps).
+// `GGML_SCHED_PIPELINE_BUFS` overrides the count -- a user override always wins, and `set` then declines.
+GGML_BACKEND_API int  ggml_backend_cuda_transport_bufs(void);
+GGML_BACKEND_API void ggml_backend_cuda_transport_bufs_set(int n);
+
 #ifdef  __cplusplus
 }
 #endif
