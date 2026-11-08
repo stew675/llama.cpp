@@ -193,6 +193,17 @@ LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
 // All entries of the batch must be of this kind. Positions are set with llama_batch_ext_set_pos(), n_pos_per_embd of them.
 // Returns the batch index (>= 0), or the llama_batch_ext_add() error codes.
 LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
+// Llama-Frankenstein F1: device-resident layer inputs for draft feature injection
+LLAMA_API void                 llama_lf_set_layer_inp_dev(struct llama_context * ctx, bool enable);
+LLAMA_API struct ggml_tensor * llama_lf_get_layer_inp_dev(struct llama_context * ctx, uint32_t lid);
+// target context: the device buffer row of each row of its last batch, or nullptr when they are the same (the ubatches
+// kept the batch order: always for one sequence); *n_rows = the batch size when not nullptr
+LLAMA_API const int32_t *      llama_lf_get_dev_rows     (struct llama_context * ctx, int32_t * n_rows);
+// draft context: while enabled, a token batch is a KV injection whose token ids are the rows of the target's
+// last batch (its ctx_other) to read from the device layer inputs
+LLAMA_API void                 llama_lf_set_dev_inject   (struct llama_context * ctx, bool enable);
+// draft context: after the injections of a batch were enqueued; the target's next extraction waits for them on the GPU
+LLAMA_API void                 llama_lf_signal_features_consumed(struct llama_context * ctx_dft);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 

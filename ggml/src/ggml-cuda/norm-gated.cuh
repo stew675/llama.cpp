@@ -7,14 +7,15 @@
 // 256-thread block instead of the one-block-per-row rms_norm_f32<256>, which is
 // block-scheduling bound for the model's per-head norms (~786k rows of <= 256 columns).
 struct ggml_cuda_norm_gated_match {
-    const ggml_tensor * x;
-    const ggml_tensor * w;
-    const ggml_tensor * z;
-    ggml_tensor * dst;
-    float eps;
+    const ggml_tensor * x   = nullptr;
+    const ggml_tensor * w   = nullptr;
+    const ggml_tensor * z   = nullptr;   // nullptr => the plain (ungated) form
+    ggml_tensor * dst       = nullptr;
+    float eps               = 0.0f;
     int pre = -1;   // node index of the gate MUL_MAT to compute first (or -1)
 };
 
 int  ggml_cuda_norm_gated_match_at(const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
 int  ggml_cuda_norm_rows_match_at (const ggml_cgraph * cgraph, int i, ggml_cuda_norm_gated_match & m);
 void ggml_cuda_op_norm_gated(ggml_backend_cuda_context & ctx, const ggml_cuda_norm_gated_match & m);
+int  ggml_cuda_norm_rows_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
