@@ -87,14 +87,19 @@ struct llama_model_loader {
     // wip/host-expert-tier: `-lme, --limit-host-experts` (-1 = unset, 0 = auto, >0 = GiB).
     int64_t host_experts_limit_gib = -1;
     // A shared host/device memory pool (an integrated GPU, e.g. gfx1151): "host" and "device" are ONE
-    // physical pool, so hosting an expert set there buys no capacity AND the tier that serves a host master
+    // physical pool, so a PINNED host expert master buys no capacity AND the tier that serves a host master
     // is denied on such a device (`moe-expert-cache.cu` refuses the arena on a shared pool), which leaves the
-    // consumer reading a buffer the GPU cannot address -- a GPU page fault.  Set once from the model's device
-    // list before any placement decision; every host-placement path below returns early when it is true and
-    // the experts stay on their layer's device.  Measured on halo/gfx1151 (r236): `-ncmoe 48` on
-    // Qwen3.8-Flash-Next GSQ-IQ3_XXS faulted in `mul_mat_q<Q2_0,16>` at a host address, and `-ncmoe 24` too,
-    // while `-ncmoe 0` ran; the same arms fault on the pre-re-base r235 binary.
-    bool host_experts_umem = false;
+    // consumer reading a buffer the GPU cannot address -- a GPU page fault.  Measured on halo/gfx1151 (r236):
+    // `-ncmoe 48` on Qwen3.8-Flash-Next GSQ-IQ3_XXS faulted in `mul_mat_q<Q2_0,16>` at a host address, and
+    // `-ncmoe 24` too, while `-ncmoe 0` ran.
+    // Set once from the model's device list before any placement decision.
+    // wip/apu-expert-pool: the topology is not a verdict on the PLACEMENT MODE.  A `pool`/`auto` placement is
+    // a different mechanism (the tensors stay in the read-only model mapping and every GPU read is served
+    // through the bounded pinned pool), it is what makes a host expert set larger than the pool runnable,
+    // and on a shared pool it is the *only* meaningful tier -- so it is allowed; only `pinned` is refused.
+    // `MOE_HOST_EXPERTS_UMA=0` restores the blanket refusal (A/B and kill switch).
+    bool host_experts_umem = false;         // the weights are going to a shared host/device pool
+    bool host_experts_umem_refuse = false;  // ...and host-expert placement is refused on it (see above)
     // The resolved placement plan (see `plan_host_expert_placement`).  `host_experts_plan_done` false means
     // no plan was made and `host_expert_buft` keeps the historical mode-keyed decision.
     bool  host_experts_plan_done = false;
@@ -148,7 +153,8 @@ struct llama_model_loader {
     void plan_host_expert_placement(int n_layer_trunk);
 
     // Tell the loader that the weights are going to a shared host/device memory pool (an integrated GPU).
-    // Called before `plan_host_expert_placement`; refuses every host-expert placement with one message.
+    // Called before `plan_host_expert_placement`.  A `pool`/`auto` placement is allowed there; `pinned` (and
+    // `MOE_HOST_EXPERTS_UMA=0`) refuses every host-expert placement with one message.
     void set_host_experts_umem(bool on);
 
     // The `-ncmoe` tail rule / caller CPU-override match for one tensor (the placement the loader will make).

@@ -1742,10 +1742,37 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+        // wip/apu-expert-pool: `caps.mmap_support` is false for an iGPU BY CONSTRUCTION (the HIP backend sets
+        // it to `type != IGPU`), so `--load-mode auto` resolves to `none` on an APU and the host-expert pool
+        // tier loses the model mapping it is built on -- measured on gfx1151: `-ncmoe 8 --host-experts pool`
+        // silently keeps the FULL PINNED master (`ROCm_Host` 4329 MiB instead of the 3814 MiB pool mirror),
+        // which is the arm whose in-place read is the one that has faulted there.  When the operator asked for
+        // AUTO and a host-expert placement actually needs the mapping, keep mmap: the model mapping IS the
+        // pool-backed master, both the load and every fill are ordinary reads of it, and a forced
+        // `-lm mmap` arm runs byte-identical to the resident one (measured).  `MOE_UMA_MMAP=0` restores the
+        // iGPU exclusion for an A/B.
+        const bool uma_mmap_wanted =
+            (params.host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL ||
+             params.host_experts_mode == LLAMA_HOST_EXPERTS_MODE_AUTO) &&
+            (params.n_cpu_moe_from_end > 0 || params.tensor_buft_overrides != nullptr) &&
+            [] {
+                const char * e = getenv("MOE_UMA_MMAP");
+                const char * k = getenv("MOE_HOST_EXPERTS_UMA");
+                return (e == nullptr || atoi(e) != 0) && (k == nullptr || atoi(k) != 0);
+            }();
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
+                if (uma_mmap_wanted && props.type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    static std::once_flag once_uma_mmap;
+                    std::call_once(once_uma_mmap, [] {
+                        LLAMA_LOG_INFO("%s: keeping mmap on a shared-pool iGPU: a host-expert placement needs "
+                                       "the model mapping as its pool-backed master (MOE_UMA_MMAP=0 restores "
+                                       "the iGPU mmap exclusion)\n", "load_tensors");
+                    });
+                    continue;
+                }
                 ml.use_mmap = false;
                 break;
             }

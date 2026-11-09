@@ -2014,8 +2014,36 @@ static bool pool_mmap_thp_pin(host_pool_t & p) {
     if (p.base == nullptr || p.mmap_bytes == 0 || p.registered) {
         return p.registered;
     }
-    if (cudaHostRegister(p.base, p.mmap_bytes,
-                         cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+    // wip/apu-expert-pool: a READ-ONLY device registration is the fast in-place read on a shared host/device
+    // pool (measured on gfx1151: 233 GB/s against 60 GB/s for the writable one -- the coherent mapping; the
+    // PCIe link on a discrete box masks the difference, so it needs an A/B there).  It is only LEGAL while
+    // nothing writes the backing FROM THE DEVICE: the arena->pool demote (`access_locked`'s sink path, the
+    // one `cudaMemcpyDeviceToHost` into `pool->base`) is that writer, and it cannot exist without an arena.
+    // So: on when the expert cache is disabled for this run (every shared-pool APU today, and any
+    // `MOE_EXPERT_CACHE_MIB=0` run), off when an arena is live.  `MOE_HOST_POOL_RO=1|0` forces either, and
+    // forcing it on with a live arena is refused loudly rather than corrupting the pool.
+    bool pool_ro = !g_enabled;
+    if (const char * e = getenv("MOE_HOST_POOL_RO")) {
+        const bool want = atoi(e) != 0;
+        if (want && g_enabled) {
+            GGML_LOG_WARN("%s: MOE_HOST_POOL_RO=1 refused: the expert arena is live, and the arena->pool demote "
+                          "writes this backing from the device; a read-only registration would corrupt it\n",
+                          __func__);
+        } else {
+            pool_ro = want;
+        }
+    }
+    const unsigned reg_flags = cudaHostRegisterPortable | cudaHostRegisterMapped |
+                               (pool_ro ? cudaHostRegisterReadOnly : 0);
+    {
+        static std::once_flag once_ro;
+        std::call_once(once_ro, [pool_ro, reg_flags] {
+            GGML_LOG_INFO("%s: host pool registered %s (flags=0x%x): a read-only device alias is the fast "
+                          "in-place read on a shared host/device pool (MOE_HOST_POOL_RO)\n",
+                          __func__, pool_ro ? "READ-ONLY" : "writable", reg_flags);
+        });
+    }
+    if (cudaHostRegister(p.base, p.mmap_bytes, reg_flags) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
