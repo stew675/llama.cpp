@@ -10110,8 +10110,17 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
 // keeps the historical pinned master.
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
     const ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
-    if (dev_ctx == nullptr || ggml_cuda_info().devices[dev_ctx->device].integrated) {
+    if (dev_ctx == nullptr) {
         return nullptr;
+    }
+    if (ggml_cuda_info().devices[dev_ctx->device].integrated) {
+        // wip/apu-expert-pool: an APU is offered the pool-backed (model-mapping) master ONLY while the bounded
+        // pinned pool is armed, because that pool is what serves every GPU read of it -- with no pool the GPU
+        // would read the pageable mapping in place, which is a fatal fault without XNACK.  With the pool
+        // armed, the master costs nothing to hold and an expert set larger than RAM becomes runnable, which
+        // the "an APU needs no pinned copy" premise below does not cover.
+        return moe_cache_host_pool_enabled() ? ggml_backend_cuda_host_map_buffer_type_dev(dev_ctx->device)
+                                             : nullptr;
     }
     return ggml_backend_cuda_host_map_buffer_type_dev(dev_ctx->device);
 }

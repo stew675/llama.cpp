@@ -209,36 +209,6 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
                                  "in this placement mode";
         return;
     }
-    // wip/apu-expert-pool: on a shared pool an allowed pool/hole placement is only SOUND when the device can
-    // actually offer the pool-backed master (the read-only model mapping).  Without it `host_expert_buft`
-    // silently falls back to the FULL PINNED master -- which is the arm whose in-place read faulted on
-    // gfx1151 (`-ncmoe 24`/`48`, `mul_mat_q<Q2_0,16>`) -- and the operator gets neither the tier they asked
-    // for nor the truth about it.  Refuse the placement instead and keep the experts on the device: the
-    // default then does exactly what it does today until the pool tier is complete, and says so.
-    if (host_experts_umem && use_mmap) {
-        bool master_ok = false;
-        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-            ggml_backend_dev_t d = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_moe_host_master_buft(d) != nullptr) {
-                master_ok = true;
-                break;
-            }
-        }
-        if (!master_ok) {
-            host_experts_umem_refuse = true;
-            host_experts_plan_done   = false;
-            host_experts_policy      = "shared host/device memory pool (integrated GPU): no pool-backed master "
-                                       "on this backend build, so the placement is refused (a pinned master "
-                                       "there is the arm that faults)";
-            LLAMA_LOG_WARN("%s: a `pool` host-expert placement on a shared host/device pool needs the "
-                           "pool-backed (model-mapping) master, which this backend does not offer for an "
-                           "integrated device (%s).  The placement is REFUSED rather than falling back to the "
-                           "full pinned master, which is the arm that has faulted here.  Experts stay on their "
-                           "layer's device.\n", __func__, "ggml_backend_cuda_device_moe_host_master_buft");
-            return;
-        }
-    }
-
     // --- 1. the candidate set and its byte total ------------------------------------------------
     // The loader owns the whole GGUF index (`weights_map`) before the arch creates a single tensor, which is
     // what makes a budget decidable at all: which tensors to pin depends on the WHOLE set's hotness, not on
@@ -339,6 +309,38 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
                 ggml_backend_dev_t d = ggml_backend_dev_get(i);
                 ggml_backend_dev_moe_cache_set_host_pool_budget(d, budget);
                 ggml_backend_dev_moe_cache_set_host_pool(d, true);
+            }
+        }
+        // wip/apu-expert-pool: on a shared pool an allowed pool/hole placement is only SOUND when the device
+        // can offer the pool-backed master (the read-only model mapping) AND the pool that serves every GPU
+        // read of it is armed -- which is why this check runs HERE, after `set_host_pool` above: without the
+        // master `host_expert_buft` silently falls back to the FULL PINNED master (the arm whose in-place read
+        // faulted on gfx1151), and with the master but no pool the GPU reads a pageable mapping and faults.
+        // Refuse the placement instead and keep every expert on its device.
+        if (host_experts_umem && use_mmap && host_experts_pool_holes) {
+            bool master_ok = false;
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                if (ggml_backend_dev_moe_host_master_buft(ggml_backend_dev_get(i)) != nullptr) {
+                    master_ok = true;
+                    break;
+                }
+            }
+            if (!master_ok) {
+                host_experts_umem_refuse = true;
+                host_experts_holes.clear();
+                host_experts_plan_done = false;
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), false);
+                }
+                host_experts_policy = "shared host/device memory pool (integrated GPU): the pool-backed "
+                                      "(model-mapping) master is not available on this backend, so the "
+                                      "placement is refused (a pinned master there is the arm that faults)";
+                LLAMA_LOG_WARN("%s: a `pool` host-expert placement on a shared host/device pool needs the "
+                               "pool-backed (model-mapping) master, which this backend does not offer for an "
+                               "integrated device.  The placement is REFUSED rather than falling back to the "
+                               "full pinned master (the arm that has faulted here); every expert stays on its "
+                               "layer's device.\n", __func__);
+                return;
             }
         }
         const char * how = budget >= total ? "the whole host expert set (a MIRROR)"

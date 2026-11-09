@@ -52,6 +52,10 @@ void * ggml_cuda_slab_work_base (int device);
 // does not look like a realloc to the graph allocator.
 size_t ggml_cuda_slab_work_size (int device);
 // The arena region's total size on this device (the cache sizes itself against this, not the free VRAM).
+// wip/apu-expert-pool: cap the slab's TOTAL to `bytes` (0 = uncapped).  On a shared host/device pool the slab
+// sizes itself from "free VRAM", which is the whole machine, so `ggml_cuda_slab_init_locked` maps ~everything;
+// the caller (the expert cache's preflight) sets a RAM budget here so the over-commit is unreachable.
+void   ggml_cuda_slab_set_total_cap (size_t bytes);
 size_t ggml_cuda_slab_arena_total (int device);
 // Grow every slab into the VA it reserved but left unmapped, down to `GGML_CUDA_SLAB_HEADROOM_MIB` of free
 // VRAM -- the reserve the fitting probe made the slab hold back is a guess, and this is the measured

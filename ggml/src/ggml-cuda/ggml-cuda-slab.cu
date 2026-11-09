@@ -835,6 +835,13 @@ void ggml_cuda_slab_extend_all() {
 }
 
 // Reserve + map the whole slab ONCE.  `work_min` sets the initial boundary (the first work need).
+// wip/apu-expert-pool: the cap the expert cache's preflight sets on a shared host/device pool (0 = none).
+static size_t g_slab_total_cap = 0;
+
+void ggml_cuda_slab_set_total_cap(size_t bytes) {
+    g_slab_total_cap = bytes;
+}
+
 static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t work_min) {
     // VMM capability first: on a device that does not report it the driver API calls below are not
     // merely useless, they abort (CU_CHECK), so the slab must decline before touching them.  This is
@@ -866,6 +873,13 @@ static bool ggml_cuda_slab_init_locked(int device, ggml_cuda_slab & s, size_t wo
         s.declined       = true;
         s.decline_reason = "cudaMemGetInfo failed";
         return false;
+    }
+    // A capped slab (a shared host/device pool) must treat the cap as the machine it is allowed to use: both
+    // the "free" figure and the total the RESERVE is computed from, so the reserve is sized against the budget
+    // instead of against 121 GiB of GTT.
+    if (g_slab_total_cap != 0) {
+        total_b = g_slab_total_cap < total_b ? g_slab_total_cap : total_b;
+        free_b  = g_slab_total_cap < free_b  ? g_slab_total_cap : free_b;
     }
     const size_t reserve = ggml_cuda_slab_reserve_bytes(total_b);
     if (free_b <= reserve + 2 * s.chunk) {

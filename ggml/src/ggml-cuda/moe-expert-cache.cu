@@ -5586,6 +5586,13 @@ int moe_cache_max_tok() {
     return moe_cache_max_tok_dev(ggml_cuda_get_device());
 }
 
+// wip/apu-expert-pool: is the bounded pinned pool actually armed?  The pool is what serves every GPU read of a
+// pool-backed (model-mapping) host master, so a caller must not hand out that master unless this is true: with
+// no pool the GPU would read the pageable mapping in place, which is a fatal fault without XNACK.
+bool moe_cache_host_pool_enabled() {
+    return g_pool_enabled;
+}
+
 bool moe_cache_enabled() {
     return g_enabled;
 }
@@ -5666,50 +5673,111 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
     // preflight (the `common` draft/MTP aux call) does not repeat the message.
     if (moe_cache_shared_pool_device(device)) {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_unified == 0) {
+        // wip/apu-expert-pool: the UMA arm.  The arena was refused here because AUTO sizing reads "free VRAM"
+        // -- on a shared pool that is the whole machine -- NOT because the tier is meaningless: on an APU the
+        // experts that fit in host RAM already fit the device, but an expert set LARGER than RAM has no tier
+        // at all without the arena.  So size it from a RAM figure instead and cap the movable-boundary slab to
+        // the same number, which makes the over-commit (measured 121 GiB resident + 13 GiB swap, and a
+        // `SLAB_INIT size(VA)=98.44 GiB` on a 123 GiB box) unreachable by construction rather than by an
+        // operator remembering GGML_CUDA_SLAB_RESERVE_MIB.
+        //   * MOE_EXPERT_CACHE_UMA=0            -> the pre-campaign refusal, verbatim (kill switch / A/B)
+        //   * MOE_EXPERT_CACHE_MIB=N            -> authoritative, never re-scaled
+        //   * else MOE_EXPERT_CACHE_UMA_RAM_PCT (60) % of MemAvailable, floored at the slab's arena minimum
+        // The slab cap is load-bearing: without it `ggml_cuda_slab_init_locked` maps `free VRAM - reserve`,
+        // which on a shared pool is the machine.
+        static const bool uma_off = [] {
+            const char * e = getenv("MOE_EXPERT_CACHE_UMA");
+            return e != nullptr && atoi(e) == 0;
+        }();
+        bool uma_sized = false;
+        if (g_unified == 0 && !uma_off) {
+            size_t budget = 0;
+            bool   from_ram = false;
+            // `g_budget` is NOT a source of truth here: the `--fit` pass pre-fills it from free VRAM (measured:
+            // 74 489 620 070 B = 69.4 GiB on a 123 GiB box), so an "explicit budget wins" rule that tests
+            // `!g_auto` would adopt the machine and cap nothing.  Only the OPERATOR's MOE_EXPERT_CACHE_MIB is
+            // authoritative; anything else is re-derived from RAM.
+            const char * mib_env = getenv("MOE_EXPERT_CACHE_MIB");
+            if (mib_env != nullptr && atoi(mib_env) > 0) {
+                budget = (size_t) atoi(mib_env) * 1024 * 1024;
+            } else {
+                const int64_t avail = pool_available_ram_bytes();
+                if (avail <= 0) {
+                    g_enabled = false;
+                    GGML_LOG_WARN("%s: MoE expert cache OFF on device %d: MOE_EXPERT_CACHE_UMA needs a RAM "
+                                  "figure and MemAvailable could not be read; set MOE_EXPERT_CACHE_MIB=N "
+                                  "MiB/device to size it explicitly\n", __func__, device);
+                    return false;
+                }
+                int pct = 60;
+                if (const char * e = getenv("MOE_EXPERT_CACHE_UMA_RAM_PCT")) {
+                    const int v = atoi(e);
+                    if (v > 0 && v <= 95) {
+                        pct = v;
+                    }
+                }
+                const size_t room = (size_t) avail * (size_t) pct / 100;
+                const size_t floor_b = (size_t) ggml_cuda_slab_min_arena_mib() * 1024 * 1024;
+                budget = room > floor_b ? room : floor_b;
+                from_ram = true;
+                g_budget = budget;
+                g_auto   = false;
+            }
+            ggml_cuda_slab_set_total_cap(budget);
+            uma_sized = true;
+            static std::atomic<bool> uma_logged{false};
+            if (!uma_logged.exchange(true)) {
+                GGML_LOG_INFO("%s: MoE expert cache ON on integrated device %d: arena budget %zu MiB/device "
+                              "(%s%s), slab capped to it.  A shared host/device pool has no separate VRAM, so "
+                              "the arena is a disk-backed cache over the same RAM and the slab may not map "
+                              "more than the budget.  MOE_EXPERT_CACHE_UMA=0 restores the refusal.\n",
+                              __func__, device, budget >> 20,
+                              from_ram ? "MOE_EXPERT_CACHE_UMA_RAM_PCT of MemAvailable"
+                                       : "explicit MOE_EXPERT_CACHE_MIB",
+                              from_ram ? "" : ", authoritative");
+            }
+        }
+        if (g_unified == 0 && !uma_sized) {
             g_enabled = false;
             GGML_LOG_WARN("%s: MoE expert cache OFF on device %d: integrated GPU whose \"VRAM\" is the "
                           "same pool as host RAM.  The arena would only copy bytes the device can already "
                           "read through the host master, and AUTO sizing (free VRAM) would read the whole "
                           "shared pool.  Experts that fit in host memory already fit the device here, so "
                           "the host-expert path is used instead (-ncmoe/-cmoe still work).  Set "
-                          "MOE_EXPERT_CACHE_UNIFIED=1 plus an explicit MOE_EXPERT_CACHE_MIB=N only if this "
-                          "platform really partitions host and device memory (e.g. a Windows APU with a "
-                          "fixed VRAM carve-out).\n", __func__, device);
-            return false;
-        }
-        if (g_auto) {
-            g_enabled = false;
-            GGML_LOG_WARN("%s: MoE expert cache OFF on device %d: MOE_EXPERT_CACHE_UNIFIED=1 needs an "
-                          "explicit MOE_EXPERT_CACHE_MIB, because AUTO sizes from \"free VRAM\" and on a "
-                          "shared host/device pool that is host RAM (it would size the arena against the "
-                          "whole machine).  Set MOE_EXPERT_CACHE_MIB=N MiB/device to override.\n",
+                          "MOE_EXPERT_CACHE_MIB=N (or MOE_EXPERT_CACHE_UMA=1, the default) to size the arena "
+                          "from a RAM budget on a shared pool, or MOE_EXPERT_CACHE_UNIFIED=1 plus an explicit "
+                          "MOE_EXPERT_CACHE_MIB and GGML_CUDA_SLAB_RESERVE_MIB for a platform that really "
+                          "partitions host and device memory (e.g. a Windows APU with a fixed carve-out).\n",
                           __func__, device);
             return false;
         }
-        // The arena cannot exist without the movable-boundary slab, and the SLAB sizes itself as
-        // `free VRAM - reserve`: on a shared pool that maps the whole machine (measured: `SLAB_INIT ...
-        // size(VA)=98.44 GiB mapped=98.19 GiB` on a 123 GiB box, which is what over-committed it).  The
-        // only bounded arm is one where the operator asserts how much to leave OUTSIDE the slab, via the
-        // existing override.  Requiring it makes the forced path safe by construction instead of trusting
-        // a heuristic for "is this APU's VRAM aperture a real partition?" (Windows can cap an APU to a
-        // fixed carve-out, which is the one case this exists for).
-        if (getenv("GGML_CUDA_SLAB_RESERVE_MIB") == nullptr) {
-            g_enabled = false;
-            GGML_LOG_WARN("%s: MoE expert cache OFF on device %d: MOE_EXPERT_CACHE_UNIFIED=1 also needs an "
-                          "explicit GGML_CUDA_SLAB_RESERVE_MIB.  The cache requires the movable-boundary "
-                          "slab, and the slab maps `free VRAM - reserve`; on a shared host/device pool "
-                          "\"free VRAM\" is host RAM, so an unset reserve maps the whole machine.  Set "
-                          "GGML_CUDA_SLAB_RESERVE_MIB=<MiB to keep OUTSIDE the slab> as well.\n",
-                          __func__, device);
-            return false;
-        }
-        static std::atomic<bool> unified_logged{false};
-        if (!unified_logged.exchange(true)) {
-            GGML_LOG_WARN("%s: MOE_EXPERT_CACHE_UNIFIED=1: expert cache ON with MOE_EXPERT_CACHE_MIB=%zu "
-                          "MiB/device on integrated device %d (shared host/device pool requested by the "
-                          "user); this is a copy tier over host RAM unless the platform caps VRAM\n",
-                          __func__, g_budget >> 20, device);
+        if (g_unified != 0 && !uma_sized) {
+            if (g_auto) {
+                g_enabled = false;
+                GGML_LOG_WARN("%s: MoE expert cache OFF on device %d: MOE_EXPERT_CACHE_UNIFIED=1 needs an "
+                              "explicit MOE_EXPERT_CACHE_MIB, because AUTO sizes from \"free VRAM\" and on a "
+                              "shared host/device pool that is host RAM (it would size the arena against the "
+                              "whole machine).  Set MOE_EXPERT_CACHE_MIB=N MiB/device to override.\n",
+                              __func__, device);
+                return false;
+            }
+            if (getenv("GGML_CUDA_SLAB_RESERVE_MIB") == nullptr) {
+                g_enabled = false;
+                GGML_LOG_WARN("%s: MoE expert cache OFF on device %d: MOE_EXPERT_CACHE_UNIFIED=1 also needs "
+                              "an explicit GGML_CUDA_SLAB_RESERVE_MIB.  The cache requires the "
+                              "movable-boundary slab, and the slab maps `free VRAM - reserve`; on a shared "
+                              "host/device pool \"free VRAM\" is host RAM, so an unset reserve maps the whole "
+                              "machine.  Set GGML_CUDA_SLAB_RESERVE_MIB=<MiB to keep OUTSIDE the slab> as "
+                              "well.\n", __func__, device);
+                return false;
+            }
+            static std::atomic<bool> unified_logged{false};
+            if (!unified_logged.exchange(true)) {
+                GGML_LOG_WARN("%s: MOE_EXPERT_CACHE_UNIFIED=1: expert cache ON with MOE_EXPERT_CACHE_MIB=%zu "
+                              "MiB/device on integrated device %d (shared host/device pool requested by the "
+                              "user); this is a copy tier over host RAM unless the platform caps VRAM\n",
+                              __func__, g_budget >> 20, device);
+            }
         }
     }
     // WIP moe-upload-overlap: remember the per-device host-expert bytes so the deferred arena sizing can
