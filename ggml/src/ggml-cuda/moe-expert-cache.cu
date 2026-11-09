@@ -1122,9 +1122,9 @@ void parse_env() {
     g_pool_cov_pct     = env_int("MOE_HOST_POOL_COV_PCT", 90);
     if (g_pool_cov_pct < 1)   { g_pool_cov_pct = 1;  }
     if (g_pool_cov_pct > 100) { g_pool_cov_pct = 100; }
-    g_pool_ram_pct     = env_int("MOE_HOST_POOL_RAM_PCT", 85);
-    if (g_pool_ram_pct < 0) {
-        g_pool_ram_pct = 0;
+    g_pool_ram_pct     = env_int("MOE_HOST_POOL_RAM_PCT", -1);   // -1 = auto (UMA-aware, see pool_ram_pct_eff)
+    if (g_pool_ram_pct < -1) {
+        g_pool_ram_pct = -1;
     }
     if (g_pool_ram_pct > 100) {
         g_pool_ram_pct = 100;
@@ -1618,6 +1618,54 @@ static int64_t pool_available_ram_bytes() {
 #endif
 }
 
+// wip/apu-expert-pool: on a shared host/device pool (a UMA APU) "VRAM" and RAM are one medium, so the two
+// tiers must be sized from the SAME figure -- free system memory -- and they must not add up to all of it:
+//   * VRAM (the arena / the slab ceiling) = 75 % of MemAvailable   (MOE_UMA_VRAM_PCT)
+//   * the pinned expert pool (auto)       = 10 % of MemAvailable   (MOE_UMA_POOL_PCT)
+//   * the remaining ~15 %                 = the OS, the page cache and the model mapping the pool fills from
+// The percentages are ceilings, not reservations: a tier only takes what its tables need.  `MOE_HOST_POOL_RAM_PCT`
+// and `MOE_EXPERT_CACHE_MIB` remain the operator's authoritative overrides on any platform.
+static bool uma_any_device() {
+    static const bool v = [] {
+        for (int i = 0; i < GGML_CUDA_MAX_DEVICES; i++) {
+            if (ggml_cuda_info().devices[i].integrated) {
+                return true;
+            }
+        }
+        return false;
+    }();
+    return v;
+}
+
+// The share of free system RAM an APU's "VRAM" is treated as (a percentage; the operator can move it).
+static int uma_vram_pct() {
+    static const int v = [] {
+        const char * e = getenv("MOE_UMA_VRAM_PCT");
+        const int p = e != nullptr ? atoi(e) : 75;
+        return p > 0 && p <= 95 ? p : 75;
+    }();
+    return v;
+}
+
+// The share of free system RAM the pinned expert pool may take on a UMA box (auto mode only).
+static int uma_pool_pct() {
+    static const int v = [] {
+        const char * e = getenv("MOE_UMA_POOL_PCT");
+        const int p = e != nullptr ? atoi(e) : 10;
+        return p > 0 && p <= 95 ? p : 10;
+    }();
+    return v;
+}
+
+// The effective `MOE_HOST_POOL_RAM_PCT`: the operator's value when set (0 = no ceiling), else the UMA default on a
+// shared pool and the historical 85 elsewhere.
+static int pool_ram_pct_eff() {
+    if (g_pool_ram_pct >= 0) {
+        return g_pool_ram_pct;
+    }
+    return uma_any_device() ? uma_pool_pct() : 85;
+}
+
 // wip/host-pool-speed: the slots `t` needs to hold `cov_pct` of its own prior mass, or -1 when there is no
 // prior to rank by (the caller then falls back to the uniform ask).  `t.heat` is the persisted long-horizon
 // prior applied at registration (`heat_apply_loaded_locked`) -- the same ranking the pool's content uses, so a
@@ -1864,8 +1912,8 @@ static void pool_decide_dio_locked(int64_t host_total, int64_t planned_pool) {
         return;
     }
     int64_t pool = planned_pool;
-    if (g_pool_ram_pct > 0) {
-        const int64_t cap = (int64_t) ((double) avail * (double) g_pool_ram_pct / 100.0);
+    if (pool_ram_pct_eff() > 0) {
+        const int64_t cap = (int64_t) ((double) avail * (double) pool_ram_pct_eff() / 100.0);
         if (pool <= 0 || pool > cap) {
             pool = cap;
         }
@@ -1893,7 +1941,7 @@ static void pool_decide_dio_locked(int64_t host_total, int64_t planned_pool) {
 // denominator the ceiling is compared against.  It is a process-wide number, so the scale is too.
 // The `MOE_HOST_POOL_RAM_PCT` ceiling in bytes, measured once (0 = no ceiling: disabled, or no MemAvailable).
 static int64_t pool_ram_cap_locked() {
-    if (g_pool_ram_pct <= 0) {
+    if (pool_ram_pct_eff() <= 0) {
         return 0;
     }
     if (g_pool_ram_cap < 0) {
@@ -1910,10 +1958,10 @@ static int64_t pool_ram_cap_locked() {
         // census, which now reports the pinned tier's total AND, on Windows, the adapter's aperture
         // CommitLimit/resident through `ggml_hip_win_shared_mem_info`.  Add a ceiling here only once that
         // figure is understood.
-        g_pool_ram_cap = avail > 0 ? (int64_t) ((double) avail * (double) g_pool_ram_pct / 100.0) : 0;
+        g_pool_ram_cap = avail > 0 ? (int64_t) ((double) avail * (double) pool_ram_pct_eff() / 100.0) : 0;
         if (g_pool_ram_cap > 0) {
             GGML_LOG_INFO("%s: host pool RAM ceiling: %d%% of MemAvailable = %.1f MiB (MOE_HOST_POOL_RAM_PCT)\n",
-                          __func__, g_pool_ram_pct, (double) g_pool_ram_cap / (1024.0 * 1024.0));
+                          __func__, pool_ram_pct_eff(), (double) g_pool_ram_cap / (1024.0 * 1024.0));
         }
     }
     return g_pool_ram_cap;
@@ -5709,13 +5757,7 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
                                   "MiB/device to size it explicitly\n", __func__, device);
                     return false;
                 }
-                int pct = 60;
-                if (const char * e = getenv("MOE_EXPERT_CACHE_UMA_RAM_PCT")) {
-                    const int v = atoi(e);
-                    if (v > 0 && v <= 95) {
-                        pct = v;
-                    }
-                }
+                const int pct = uma_vram_pct();
                 const size_t room = (size_t) avail * (size_t) pct / 100;
                 const size_t floor_b = (size_t) ggml_cuda_slab_min_arena_mib() * 1024 * 1024;
                 budget = room > floor_b ? room : floor_b;
@@ -5732,7 +5774,8 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
                               "the arena is a disk-backed cache over the same RAM and the slab may not map "
                               "more than the budget.  MOE_EXPERT_CACHE_UMA=0 restores the refusal.\n",
                               __func__, device, budget >> 20,
-                              from_ram ? "MOE_EXPERT_CACHE_UMA_RAM_PCT of MemAvailable"
+                              from_ram ? (uma_any_device() ? "MOE_UMA_VRAM_PCT of MemAvailable"
+                                                            : "MemAvailable")
                                        : "explicit MOE_EXPERT_CACHE_MIB",
                               from_ram ? "" : ", authoritative");
             }

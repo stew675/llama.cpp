@@ -254,6 +254,24 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
         return;
     }
 
+    // wip/apu-expert-pool: on a shared host/device pool, check whether the user is paying for a tier they do
+    // not need.  `-ncmoe`/`-lme` exists to make a set larger than device memory runnable; on a UMA APU the
+    // device memory is RAM, so a model that FITS in it is better off fully device-resident (`-ncmoe 0`): the
+    // host tier gives away decode bandwidth (in-place host reads at DRAM speed, versus device-resident weights
+    // whose reads are the same bus but with no staging decision in the path) for no capacity gain.  We only
+    // INFORM -- the placement is honoured as requested.
+    {
+        const size_t vram = host_experts_available_bytes() * 75 / 100;   // the same 75 % the cache budgets
+        if (vram > 0 && n_bytes > 0 && n_bytes <= vram) {
+            LLAMA_LOG_WARN("%s: this model (%.1f MiB) FITS in this APU's usable device memory (%.1f MiB = 75%% "
+                           "of MemAvailable): host-resident MoE experts (`-ncmoe`/`-cmoe`/`-lme`, "
+                           "`--host-experts %s`) gain nothing here and cost decode bandwidth, because on a "
+                           "shared host/device pool the experts would already be device-resident.  `-ncmoe 0` "
+                           "is almost certainly faster on this box.  Honouring the request anyway.\n", __func__,
+                           (double) n_bytes / (1024.0 * 1024.0), (double) vram / (1024.0 * 1024.0),
+                           host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED ? "pinned" : "pool");
+        }
+    }
     // --- 2. the budget --------------------------------------------------------------------------
     const size_t avail = host_experts_available_bytes();
     // `MOE_HOST_LIMIT_FRAC` (default 80) is the AUTO ceiling as a percentage of MemAvailable.  It is a
