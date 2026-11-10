@@ -269,6 +269,34 @@ static bool qwen4exp_mtp_sparse_arm(int64_t n_tokens, int64_t n_kv,
     return false;
 }
 
+// wip/kv-residency (TODO #118) B2: does the ATTENTION cache stream at this extent?
+//
+// A windowed KV (block 15, `--kv-window`) keeps only its newest W cells in VRAM and the older
+// tail in pinned host RAM.  When the used extent has passed W, every read of a spilled cell comes over the
+// PCIe link instead of VRAM, so the DENSE decode arm -- which reads the whole used extent every step -- pays
+// `bytes/55.7 GB/s` where the sparse arm reads ~top_k cells.  Measured on Flash-Next IQ3_XXS (`-ncmoe 48`,
+// q8_0, 1 GPU, `-n 400`): a streamed KV decodes **+34 % (51k) / +32.5 % (103k) / +49 % (180k)** faster with the
+// sparse arm, while a RESIDENT KV is the other way round (dense +18 / +23 / +46 %, because VRAM is ~10x the
+// link and the sparse arm adds the `O(depth)` indexer score + top-k).  So the arm depends on PLACEMENT, not
+// depth alone -- which is what the arch policy's `qsa_dense_decode_until` could not see
+// (../llama-cpp-rdna-boosts/wip/kv-residency/B1-STRATA-PLAN.md §3.2).
+//
+// Default ON.  `LLAMA_QSA_DENSE_DECODE_STREAM=0` keeps the pre-B2 behaviour (the dense decode arm on a
+// streaming cache) for A/B.  This is a DECODE ARM choice, i.e. a different attention regime, so its greedy
+// text differs from the dense arm by construction (a config difference, GREEDY-PURITY.md §45/§63); prefill is
+// untouched (always QSA), so the prefill-logit gate is unaffected.
+static bool qwen4exp_kv_streams(const llama_memory_hybrid_idx_context * mctx, int64_t n_kv) {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_QSA_DENSE_DECODE_STREAM");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || mctx == nullptr) {
+        return false;
+    }
+    const llama_kv_cache_context * attn = mctx->get_attn();
+    return attn != nullptr && attn->is_streaming((uint32_t) std::max<int64_t>(n_kv, 0));
+}
+
 // The prefill half of the QSA arm policy is the static lambda next to the decode gate in
 // build_layer_attn (default 0 = QSA prefill always, per the documented 2026-09-07 arch policy;
 // LLAMA_QSA_DENSE_PREFILL_UNTIL is the opt-in A/B).
@@ -863,7 +891,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // tail of the collapse launch) or Q8_0 (mmvq rows on the down grid).
     // BF16 hc weights (Flash-Next GSQ-RCO): the BF16 variant of the op replays the BF16 chain bit for bit
     // (LLAMA_HC_MIX_BF16=0 keeps the unfused chain)
-    static const bool hc_mix_bf16 = !getenv("LLAMA_HC_MIX_BF16") || atoi(getenv("LLAMA_HC_MIX_BF16")) != 0;
+    static const bool hc_mix_bf16 = [] { const char * e = getenv("LLAMA_HC_MIX_BF16"); return !e || atoi(e) != 0; }();
     // A post-#31028 converter GGUF stores the down and inject products as ONE [hc_down | hc_inject] tensor, so
     // `w_down` is null and the merged branch below does the pair with one GEMM.  The FUSED mixer needs the two
     // weights separately, and a row view of the merged tensor IS that weight: the kernel addresses every weight
@@ -902,7 +930,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         // verify band needs no ggml_cont of the mixed head; byte-identical at nt == 1.  One switch for both layouts
         // (LLAMA_HC_MIX_PLANAR=0).  A Q8_0 mixer only takes it with its hc weights in a GPU buffer, because only the
         // GPU backend implements the planar layout (the CPU op asserts the packed one).
-        static const bool planar_env = !getenv("LLAMA_HC_MIX_PLANAR") || atoi(getenv("LLAMA_HC_MIX_PLANAR")) != 0;
+        static const bool planar_env = [] { const char * e = getenv("LLAMA_HC_MIX_PLANAR"); return !e || atoi(e) != 0; }();
         const bool planar_q8 = !fused_bf16 && w_down_buf->buffer != nullptr && !ggml_backend_buffer_is_host(w_down_buf->buffer);
         const bool planar = planar_env && (fused_bf16 || planar_q8) && w_inject_f != nullptr;
         if (planar) {
@@ -1049,7 +1077,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     // 256K.  The CUDA combine+norm matcher checks the fused outputs against block_out at run time
     // and reads block_out from a copy when one of them reuses its buffer, so the pin is not needed.
     // LLAMA_HC_PIN_BLOCK_OUT=1 restores it for A/B.  inject is tiny and stays pinned.
-    static const bool pin_block_out = getenv("LLAMA_HC_PIN_BLOCK_OUT") != nullptr && atoi(getenv("LLAMA_HC_PIN_BLOCK_OUT")) != 0;
+    static const bool pin_block_out = [] { const char * e = getenv("LLAMA_HC_PIN_BLOCK_OUT"); return e != nullptr && atoi(e) != 0; }();
     if (pin_block_out) {
         ggml_set_output(block_out);
     }
@@ -2566,9 +2594,32 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
     }
 
+    // wip/kv-residency (TODO #118) B-A step 2: the ATTENDANCE POOL -- the sparse decode reads its K/V out
+    // of a compact device pool through a page table instead of the whole cache (`BA-POOL-DESIGN.md`).  The
+    // pool carries copies only; the CELL-indexed cache tensor (the pinned host mirror) stays authoritative,
+    // so the mask / visibility keys keep addressing cells and only the K/V gather is redirected.
+    //
+    // Decode band only: a prefill's union of selections is not sparse (every block is somebody's top-k), so
+    // a prefill chunks through the pool would thrash it and would need the capacity of the whole context.
+    // A batch too wide for the pool takes the cell-indexed path instead (`kv_pool_serves`).
+    ggml_tensor * top_k_kv = nullptr;
+    if (qsa_sparse && mctx_cur->has_kv_pool()) {
+        const int64_t pool_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
+        if (n_tokens <= pool_band && mctx_cur->kv_pool_serves((uint32_t) n_tokens)) {
+            top_k_kv = mctx_cur->build_kv_pool_resolve(ctx0, top_k, inp->get_k_idxs(), il);
+            ggml_build_forward_expand(gf, top_k_kv);
+        }
+    }
+    // ours: a batch that wrote the mirror without the resolve unmaps the pages it wrote (ggml_kv_pool_drop)
+    if (top_k_kv == nullptr && mctx_cur->has_kv_pool()) {
+        if (ggml_tensor * drop = mctx_cur->build_kv_pool_drop(ctx0, inp->get_k_idxs(), il)) {
+            ggml_build_forward_expand(gf, drop);
+        }
+    }
+
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * k = top_k_kv != nullptr ? mctx_cur->get_k_pool(ctx0, il) : mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = top_k_kv != nullptr ? mctx_cur->get_v_pool(ctx0, il) : mctx_cur->get_v(ctx0, il);
     // the natural cache views, kept for the qsa3 packs (which must cast before permuting)
     ggml_tensor * k_raw = k;
     ggml_tensor * v_raw = v;
@@ -2587,6 +2638,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         // derives each cell's visibility from cell_vis/q_vis instead - see findings 2c
         cur = ggml_flash_attn_qsa(ctx0, q_p, k, v, top_k, kq_mask, kq_scale, 0.0f,
                 qsa_cell_vis, qsa_q_vis);
+        if (top_k_kv != nullptr) {
+            // the K/V gather follows the page table; the mask / visibility keys stay at the cell ids
+            ggml_flash_attn_qsa_set_kv_idx(cur, top_k_kv);
+        }
         // qsa3 (packed-block WMMA) needs the packed F16 layouts; it is prefill-only, so the whole
         // W=1..8 decode/verify band keeps the VEC kernel and width purity holds by construction.
         // Compile-time gate (see LLAMA_QSA3_ENABLE at the top of this file, default 1) plus the
@@ -2747,10 +2802,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         const int64_t qsa_decode_band = std::max<int64_t>(QSA_DECODE_BAND, (int64_t) cparams.n_rs_batch);
         if (shortcut && n_kv <= width) {
             build_qsa_store_k(mctx_hyb, cur, il);
-        } else if (qsa_dense_decode_until > 0 && n_tokens <= qsa_decode_band && n_kv < qsa_dense_decode_until) {
+        } else if (qsa_dense_decode_until > 0 && n_tokens <= qsa_decode_band && n_kv < qsa_dense_decode_until &&
+                   !qwen4exp_kv_streams(mctx_hyb, n_kv)) {
             // arch policy gate: dense decode below the crossover depth (store keys only).
             // qsa_decode_band, not n_tokens == 1: the verify batch must take the same arm as
             // the W=1 decode (see QSA_DECODE_BAND above).
+            // B2: ... but NOT while the KV is streaming -- a spilled read is `bytes/55.7 GB/s` over the link,
+            // so the dense arm's `O(depth)` read dominates and the sparse arm wins (see qwen4exp_kv_streams).
             build_qsa_store_k(mctx_hyb, cur, il);
         } else if (qsa_dense_prefill_until > 0 && n_tokens > qsa_decode_band &&
                    n_kv < qsa_dense_prefill_until) {
@@ -2825,6 +2883,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+        // ours: the dense arm wrote the mirror without the pool's resolve (see build_attn_qsa)
+        if (inp->mctx->has_kv_pool()) {
+            if (ggml_tensor * drop = inp->mctx->build_kv_pool_drop(ctx0, inp->get_k_idxs(), il)) {
+                ggml_build_forward_expand(gf, drop);
+            }
+        }
     }
     cb(cur, "attn_pregate", il);
 
@@ -3311,7 +3375,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
 
         // copy the strided tail straight into the slot (one copy, a 2D memcpy on CUDA) instead of cont + cpy;
         // LLAMA_CONV_TAIL_CONT=1 restores the intermediate contiguous copy for A/B
-        static const bool tail_cont = getenv("LLAMA_CONV_TAIL_CONT") != nullptr && atoi(getenv("LLAMA_CONV_TAIL_CONT")) != 0;
+        static const bool tail_cont = [] { const char * e = getenv("LLAMA_CONV_TAIL_CONT"); return e != nullptr && atoi(e) != 0; }();
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail_cont ? ggml_cont(ctx0, tail) : tail, dst));
     }
 

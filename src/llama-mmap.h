@@ -77,6 +77,14 @@ struct llama_mlock {
     void init(void * ptr);
     void grow_to(size_t target_size);
 
+    // Lock [offset, offset+len) of the range `init` was given, independently of the contiguous grow_to()
+    // sweep.  grow_to() locks everything from the start of the mapping up to its target, which is the right
+    // shape for a load that pins a whole file and the wrong one where a range in between must stay
+    // UNLOCKED -- the `-lme` host-expert holes, which are pageable by contract and are the reason the tier
+    // fits at all (TODO #333).  Granularity-aligned outwards, like grow_to(); the two modes are not mixed
+    // on one object.  `size()` is the pinned byte count in both modes.
+    void lock_range(size_t offset, size_t len);
+
     // bytes actually locked (0 if the last grow_to failed); a short value means the range is not
     // held resident and the pages are ordinary reclaimable page cache
     size_t size() const;

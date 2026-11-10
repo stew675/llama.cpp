@@ -37,6 +37,12 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
 
 common_params common_base_params_to_speculative(const common_params & params);
 
+// The MTP draft context's ubatch (`MTP_DRAFT_N_UBATCH`, default 512, 0 = no cap).  The draft context caps
+// `n_ubatch` here to keep its compute buffer small (TODO #42), and its KV window's "one batch of spare room"
+// is sized from it -- so anything that SIZES the draft context's KV (the slab's draft reserve, `--fit`) must
+// use this value and not the target's `-ub`, or the two disagree about the cache's geometry (issue #297).
+uint32_t common_speculative_draft_n_ubatch(uint32_t n_ubatch_tgt);
+
 struct common_speculative_output_limits {
     int32_t total;
     int32_t per_seq;

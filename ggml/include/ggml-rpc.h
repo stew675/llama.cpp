@@ -9,12 +9,14 @@ extern "C" {
 #define RPC_PROTO_MAJOR_VERSION    10
 #define RPC_PROTO_MINOR_VERSION    0
 // The fork's op set diverges from upstream's (block 11 adds 6 ops -- the qwen4exp hyper-connection pair/quad and
-// the QSA/indexer family -- and block 12 adds ALL_GATHER and the seqpar TOKEN_SCATTER), so the patch version stays
-// non-zero: an RPC peer must already refuse a mismatched op table.  Count: upstream's 100 at this base + 8.
-#define RPC_PROTO_PATCH_VERSION    9
+// the QSA/indexer family; block 12 adds ALL_GATHER and the seqpar TOKEN_SCATTER; block 14 adds the KV_POOL region
+// op), so the patch version stays non-zero: an RPC peer must already refuse a mismatched op table.
+// GGML_OP_COUNT below is the MERGED enum's value, never either side's literal one:
+// upstream's 100 at this base + 6 (block 11) + 2 (block 12) + 1 (block 14) = 109.
+#define RPC_PROTO_PATCH_VERSION    10
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 108, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

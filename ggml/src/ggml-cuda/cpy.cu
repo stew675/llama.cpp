@@ -62,6 +62,45 @@ static __global__ void cpy_2d_vec16(const char * GGML_CUDA_RESTRICT cx, char * G
     *reinterpret_cast<uint4 *>(cdst + row*dpitch + off) = *reinterpret_cast<const uint4 *>(cx + row*spitch + off);
 }
 
+// Byte-wise strided row copy: the fallback for ggml_cuda_cpy_2d_rows when the 16-byte alignment does not hold.
+// One block per row, a grid-stride walk over the row's bytes (the caller chunks the rows to the grid's y limit).
+static __global__ void cpy_2d_rows_bytes(const char * GGML_CUDA_RESTRICT cx, char * GGML_CUDA_RESTRICT cdst,
+        const int64_t width, const int64_t spitch, const int64_t dpitch) {
+    const int64_t row = blockIdx.y;
+    const char * s = cx + row*spitch;
+    char *       d = cdst + row*dpitch;
+    for (int64_t c = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; c < width; c += (int64_t) gridDim.x*blockDim.x) {
+        d[c] = s[c];
+    }
+}
+
+void ggml_cuda_cpy_2d_rows(char * dst, const char * src, size_t width, size_t height,
+                           size_t spitch, size_t dpitch, cudaStream_t stream) {
+    if (width == 0 || height == 0) {
+        return;
+    }
+    // grid.y is 16-bit, so the rows are walked in chunks
+    constexpr size_t rows_max = 65535;
+    const bool vec16 = width % 16 == 0 && spitch % 16 == 0 && dpitch % 16 == 0 &&
+                       (uintptr_t) src % 16 == 0 && (uintptr_t) dst % 16 == 0 &&
+                       (width/16 + 31)/32 <= 65535;
+    for (size_t r0 = 0; r0 < height; r0 += rows_max) {
+        const size_t n = std::min(rows_max, height - r0);
+        const char * s = src + r0*spitch;
+        char *       d = dst + r0*dpitch;
+        if (vec16) {
+            const dim3 cpy_block(32, 8, 1);
+            const dim3 cpy_grid((unsigned) ((width/16 + 31)/32), (unsigned) ((n + 7)/8), 1);
+            cpy_2d_vec16<<<cpy_grid, cpy_block, 0, stream>>>(s, d,
+                    (int64_t) (width/16), (int64_t) n, (int64_t) spitch, (int64_t) dpitch);
+        } else {
+            const dim3 cpy_block(256, 1, 1);
+            const dim3 cpy_grid((unsigned) std::min<size_t>(65535, (width + 255)/256), (unsigned) n, 1);
+            cpy_2d_rows_bytes<<<cpy_grid, cpy_block, 0, stream>>>(s, d, (int64_t) width, (int64_t) spitch, (int64_t) dpitch);
+        }
+    }
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
