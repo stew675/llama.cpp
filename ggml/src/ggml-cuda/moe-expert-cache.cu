@@ -1625,6 +1625,29 @@ static int64_t pool_available_ram_bytes() {
 //   * the remaining ~15 %                 = the OS, the page cache and the model mapping the pool fills from
 // The percentages are ceilings, not reservations: a tier only takes what its tables need.  `MOE_HOST_POOL_RAM_PCT`
 // and `MOE_EXPERT_CACHE_MIB` remain the operator's authoritative overrides on any platform.
+// wip/apu-expert-pool: ONE snapshot of free system memory for the UMA split.  The two shares (VRAM 75 %, pool
+// 10 %) must be percentages of the SAME figure or they do not add up: measured on halo, reading MemAvailable
+// separately gave 118 870 MiB for the advisory's 75 % and 102 190 MiB for the arena's, i.e. two different boxes.
+// The loader takes the snapshot (it runs first, before the model mapping is populated) and passes it in here;
+// `uma_free_bytes()` latches a reading only as a fallback.
+static int64_t g_uma_free = -1;
+
+static void uma_set_free(int64_t bytes) {
+    if (bytes > 0) {   // the loader's snapshot wins: it is the figure the advisory quotes
+        g_uma_free = bytes;
+    }
+}
+
+static int64_t uma_free_bytes() {
+    if (g_uma_free < 0) {
+        const int64_t a = pool_available_ram_bytes();
+        if (a > 0) {
+            g_uma_free = a;
+        }
+    }
+    return g_uma_free;
+}
+
 static bool uma_any_device() {
     static const bool v = [] {
         for (int i = 0; i < GGML_CUDA_MAX_DEVICES; i++) {
@@ -1945,7 +1968,9 @@ static int64_t pool_ram_cap_locked() {
         return 0;
     }
     if (g_pool_ram_cap < 0) {
-        const int64_t avail = pool_available_ram_bytes();
+        // wip/apu-expert-pool: on a shared pool the ceiling is 10 % of the SAME free figure the arena's 75 % came
+        // from, so the two shares add up (85 %) instead of being shares of different instants.
+        const int64_t avail = uma_any_device() ? uma_free_bytes() : pool_available_ram_bytes();
         // issue #274 follow-up (@DanoPTT): on Windows this figure is NOT the pinned ceiling.  WDDM charges
         // pinned host pages against the adapter's SHARED (aperture) segment, and the published model for that
         // is roughly (total RAM / 2) / visible GPUs (ROCM-33542 / rocm-systems#14578, ROCm/TheRock#9339:
@@ -5595,6 +5620,13 @@ void alloc_all_locked() {
 
 } // namespace
 
+// wip/apu-expert-pool: the ONE free-system-memory figure the UMA split (VRAM 75 % / pool 10 %) is computed from.
+// Defined OUTSIDE this file's anonymous namespace on purpose: inside it the symbol has internal linkage and the
+// compiler drops it (measured: libggml-hip.so carried an undefined reference), which fails at load time.
+void moe_cache_set_uma_free_bytes(int64_t bytes) {
+    uma_set_free(bytes);
+}
+
 static void devremap_batch_clear_locked();   // device remap: drop the pending sibling batches (defined with g_dr_batch)
 static void report_locked();                 // the whole exit census (defined with `moe_cache_report` below)
 
@@ -5749,7 +5781,7 @@ bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserv
             if (mib_env != nullptr && atoi(mib_env) > 0) {
                 budget = (size_t) atoi(mib_env) * 1024 * 1024;
             } else {
-                const int64_t avail = pool_available_ram_bytes();
+                const int64_t avail = uma_free_bytes();
                 if (avail <= 0) {
                     g_enabled = false;
                     GGML_LOG_WARN("%s: MoE expert cache OFF on device %d: MOE_EXPERT_CACHE_UMA needs a RAM "

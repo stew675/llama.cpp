@@ -90,6 +90,7 @@ struct moe_cache_alias {
 
 bool moe_cache_enabled();
 bool moe_cache_host_pool_enabled();
+void moe_cache_set_uma_free_bytes(int64_t bytes);
 // true once the cache is sized with host-expert tables: the workspace pool then keeps a free-VRAM floor on its
 // first attempt (ggml_cuda_pool_leg::alloc)
 bool moe_cache_floor_active();

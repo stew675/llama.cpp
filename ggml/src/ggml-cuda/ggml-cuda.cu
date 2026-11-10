@@ -10025,6 +10025,11 @@ static void ggml_backend_cuda_device_moe_cache_set_reserve(ggml_backend_dev_t de
     moe_cache_set_extra_reserve(ctx->device, bytes);
 }
 
+static void ggml_backend_cuda_device_moe_cache_set_uma_free(ggml_backend_dev_t dev, int64_t bytes) {
+    (void) dev;
+    moe_cache_set_uma_free_bytes(bytes);
+}
+
 static bool ggml_backend_cuda_device_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
     (void) dev;
     return moe_cache_get_stats(hits, misses, arena_bytes);
@@ -10266,6 +10271,7 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
     /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
     /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
+    /* .moe_cache_set_uma_free  = */ ggml_backend_cuda_device_moe_cache_set_uma_free,
 };
 
 // backend reg

@@ -261,9 +261,17 @@ void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
     // whose reads are the same bus but with no staging decision in the path) for no capacity gain.  We only
     // INFORM -- the placement is honoured as requested.
     {
-        const size_t vram = host_experts_available_bytes() * 75 / 100;   // the same 75 % the cache budgets
+        // ONE snapshot, handed to the backend so the arena's 75 % and the pool's 10 % are shares of the same
+        // figure (they must add up to 85 %); the advisory below uses the very same bytes.
+        const int64_t free_b = host_experts_available_bytes();
+        if (free_b > 0) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_moe_cache_set_uma_free(ggml_backend_dev_get(i), free_b);
+            }
+        }
+        const size_t vram = free_b > 0 ? (size_t) free_b * 75 / 100 : 0;
         if (vram > 0 && n_bytes > 0 && n_bytes <= vram) {
-            LLAMA_LOG_WARN("%s: this model (%.1f MiB) FITS in this APU's usable device memory (%.1f MiB = 75%% "
+            LLAMA_LOG_WARN("%s: this model (%.1f MiB) FITS in this APU's usable device memory (~%.1f MiB = 75%% "
                            "of MemAvailable): host-resident MoE experts (`-ncmoe`/`-cmoe`/`-lme`, "
                            "`--host-experts %s`) gain nothing here and cost decode bandwidth, because on a "
                            "shared host/device pool the experts would already be device-resident.  `-ncmoe 0` "

@@ -369,6 +369,13 @@ void ggml_backend_dev_moe_cache_set_host_source(ggml_backend_dev_t dev, const vo
 // wip/host-expert-master-drop (TODO #55): the buffer type a pool-backed (mapping-backed, NOT pinned) host
 // expert master should use.  NULL when the backend keeps its pinned master (the default), so no caller
 // changes behaviour unless the backend opts in.
+void ggml_backend_dev_moe_cache_set_uma_free(ggml_backend_dev_t dev, int64_t bytes) {
+    if (dev == nullptr || dev->iface.moe_cache_set_uma_free == nullptr) {
+        return;
+    }
+    dev->iface.moe_cache_set_uma_free(dev, bytes);
+}
+
 ggml_backend_buffer_type_t ggml_backend_dev_moe_host_master_buft(ggml_backend_dev_t dev) {
     if (dev == nullptr || dev->iface.moe_host_master_buft == nullptr) {
         return nullptr;

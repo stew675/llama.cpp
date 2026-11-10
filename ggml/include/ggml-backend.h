@@ -301,6 +301,7 @@ extern "C" {
     // loader backs the tensor with the read-only model mapping (page cache) and every GPU read of it is
     // served through the bounded pinned host pool.
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_moe_host_master_buft(ggml_backend_dev_t device);
+GGML_API void                          ggml_backend_dev_moe_cache_set_uma_free(ggml_backend_dev_t device, int64_t bytes);
 
     // Wrap an existing host pointer (for example a range of the read-only model mapping) in a buffer of
     // `buft` without taking ownership of it, so tensors can be placed directly in it.  Returns NULL when

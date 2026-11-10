@@ -565,6 +565,12 @@ extern "C" {
         // positional-initializer reason above; zero-initialized for backends that do not set it (a backend
         // that never answers leaves the pool on its own default).
         void (*moe_cache_set_host_fill_mode)(ggml_backend_dev_t dev, int direct);
+
+        // (optional) wip/apu-expert-pool: the ONE free-system-memory figure the UMA budget split (VRAM 75 % /
+        // pool 10 %) is computed from, so both shares are shares of the same number and add up to 85 %.  The
+        // loader takes the snapshot (it runs first, before the model mapping is populated) and passes it in.
+        // APPENDED at the end for the same positional-initialization reason as `moe_host_master_buft`.
+        void (*moe_cache_set_uma_free)(ggml_backend_dev_t dev, int64_t bytes);
     };
 
     struct ggml_backend_device {
