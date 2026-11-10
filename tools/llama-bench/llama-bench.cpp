@@ -382,6 +382,7 @@ struct cmd_params {
     std::vector<bool>                repack;
     std::vector<size_t>              fit_params_target;
     std::vector<uint32_t>            fit_params_min_ctx;
+    std::vector<int>                 kv_window;
     ggml_numa_strategy               numa;
     int                              reps;
     ggml_sched_priority              prio;
@@ -429,6 +430,7 @@ static const cmd_params cmd_params_defaults = {
     /* repack               */ { llama_model_default_params().use_extra_bufts },
     /* fit_params_target    */ { 0 },
     /* fit_params_min_ctx   */ { 0 },
+    /* kv_window            */ { 0 },
     /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
@@ -492,6 +494,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
+    printf("  --kv-window <auto|N>                              the resident window of the attention KV, in cells (auto = --fit sizes it); see llama-server --help (default: %s)\n", join(cmd_params_defaults.kv_window, ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio|buffered> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|auto|off|mlock>             (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
@@ -889,6 +892,34 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.host_experts_mode.insert(params.host_experts_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "--kv-window") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<std::string>(argv[i], split_delim);
+                std::vector<int> wins;
+                for (const auto & w : p) {
+                    if (w == "auto") {
+                        wins.push_back(-1);   // --fit owns the number
+                        continue;
+                    }
+                    try {
+                        const int v = std::stoi(w);
+                        if (v < 0) {
+                            invalid_param = true;
+                            break;
+                        }
+                        wins.push_back(v);
+                    } catch (...) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                if (invalid_param) {
+                    break;
+                }
+                params.kv_window.insert(params.kv_window.end(), wins.begin(), wins.end());
             } else if (arg == "-mg" || arg == "--main-gpu") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1263,6 +1294,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.fit_params_min_ctx.empty()) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
     }
+    if (params.kv_window.empty()) {
+        params.kv_window = cmd_params_defaults.kv_window;
+    }
 
     return params;
 }
@@ -1298,6 +1332,7 @@ struct cmd_params_instance {
     bool               repack;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    int                kv_window;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1380,6 +1415,9 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        // the resident window REQUEST (-1 = `--kv-window auto`, i.e. --fit sizes it); 0 leaves the KV fully
+        // resident.  A numeric window needs no fit, so `--kv-window N` measures the streamed KV directly.
+        cparams.kv_resident_cells = kv_window;
 
         return cparams;
     }
@@ -1393,6 +1431,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & m : params.model)
     for (const auto & fpt : params.fit_params_target)
     for (const auto & fpc : params.fit_params_min_ctx)
+    for (const auto & kw : params.kv_window)
     for (const auto & nl : params.n_gpu_layers)
     for (const auto & ncmoe : params.n_cpu_moe)
     for (const auto & sm : params.split_mode)
@@ -1453,6 +1492,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .kv_window             = */ kw,
             };
             instances.push_back(instance);
         }
@@ -1492,6 +1532,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .kv_window             = */ kw,
             };
             instances.push_back(instance);
         }
@@ -1531,6 +1572,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .repack                = */ rpk,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
+                /* .kv_window             = */ kw,
             };
             instances.push_back(instance);
         }
@@ -1575,6 +1617,7 @@ struct test {
     bool                     repack;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
+    int                      kv_window;
     int                      n_prompt;
     int                      n_gen;
     int                      n_depth;
@@ -1617,6 +1660,7 @@ struct test {
         repack         = inst.repack;
         fit_target     = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
+        kv_window      = inst.kv_window;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
         n_depth        = inst.n_depth;
@@ -1676,7 +1720,7 @@ struct test {
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",     "host_experts_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
-            "n_prompt",       "n_gen",          "n_depth",
+            "n_prompt",       "n_gen",          "n_depth",       "kv_window",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1689,7 +1733,7 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "kv_window") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1780,6 +1824,7 @@ struct test {
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
+                                            std::to_string(kv_window),
                                             test_time,
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
@@ -2112,6 +2157,9 @@ struct markdown_printer : public printer {
         }
         if (params.fit_params_min_ctx.size() > 1 || params.fit_params_min_ctx != cmd_params_defaults.fit_params_min_ctx) {
             fields.emplace_back("fit_min_ctx");
+        }
+        if (params.kv_window.size() > 1 || params.kv_window != cmd_params_defaults.kv_window) {
+            fields.emplace_back("kv_window");
         }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
