@@ -86,9 +86,29 @@ struct llama_model_loader {
     llama_host_experts_mode host_experts_mode = LLAMA_HOST_EXPERTS_MODE_PINNED;
     // wip/host-expert-tier: `-lme, --limit-host-experts` (-1 = unset, 0 = auto, >0 = GiB).
     int64_t host_experts_limit_gib = -1;
+    // A shared host/device memory pool (an integrated GPU, e.g. gfx1151): "host" and "device" are ONE
+    // physical pool, so hosting an expert set there buys no capacity AND the tier that serves a host master
+    // is denied on such a device (`moe-expert-cache.cu` refuses the arena on a shared pool), which leaves the
+    // consumer reading a buffer the GPU cannot address -- a GPU page fault.  Set once from the model's device
+    // list before any placement decision; every host-placement path below returns early when it is true and
+    // the experts stay on their layer's device.  Measured on halo/gfx1151 (r236): `-ncmoe 48` on
+    // Qwen3.8-Flash-Next GSQ-IQ3_XXS faulted in `mul_mat_q<Q2_0,16>` at a host address, and `-ncmoe 24` too,
+    // while `-ncmoe 0` ran; the same arms fault on the pre-re-base r235 binary.
+    bool host_experts_umem = false;
     // The resolved placement plan (see `plan_host_expert_placement`).  `host_experts_plan_done` false means
     // no plan was made and `host_expert_buft` keeps the historical mode-keyed decision.
     bool  host_experts_plan_done = false;
+    // The host-expert holes are backed by the READ-ONLY MODEL MAPPING, so the tier costs no RAM and the
+    // bounded pinned pool is the only non-swappable part.  This is a STORAGE property of the tier that
+    // `-lme` decides (there is a hole set), NOT a transport one: EVERY `--load-mode` gets it, `dio` and
+    // `none` included, because a load mode that dropped it would turn the budget into "pin the whole set"
+    // (measured 2026-11-15: `-lme 30` under `dio` pinned 48 284.6 MiB with no pool at all, against
+    // 31 388.0 MiB on the mapped arm).  `--load-mode` only picks the pool's FILL transport, which it already
+    // reports through `moe_cache_set_host_fill_mode`: `dio` -> O_DIRECT, `none` -> the buffered `pread` arm
+    // (upstream's "no special loading mode" IS a plain buffered read), `mmap` -> the page cache.
+    bool host_expert_master_mapped() const {
+        return host_experts_plan_done && !host_experts_holes.empty() && llama_mmap::SUPPORTED;
+    }
     std::set<std::string> host_experts_pinned;      // tensor names that get a pinned host master
     std::set<std::string> host_experts_holes;       // tensor names that stay in the model mapping
     size_t host_experts_total_bytes  = 0;           // Sigma of every host expert tensor the placement will host
@@ -138,6 +158,10 @@ struct llama_model_loader {
     // before the arch creates any tensor.
     void plan_host_expert_placement(int n_layer_trunk);
 
+    // Tell the loader that the weights are going to a shared host/device memory pool (an integrated GPU).
+    // Called before `plan_host_expert_placement`; refuses every host-expert placement with one message.
+    void set_host_experts_umem(bool on);
+
     // The `-ncmoe` tail rule / caller CPU-override match for one tensor (the placement the loader will make).
     bool host_expert_selected(const std::string & name, int layer, int n_layer_trunk) const;
 
@@ -145,6 +169,11 @@ struct llama_model_loader {
     bool host_expert_is_hole(const std::string & name) const {
         return host_experts_plan_done && !name.empty() && host_experts_holes.count(name) > 0;
     }
+
+    // TODO #333: bytes of the hole set a `--load-mode mlock`/`mmap+mlock` pin did NOT take, because the tier's
+    // budget decides host-expert residency and the hole set stays pageable (reported by the mlock census).
+    size_t host_expert_mlock_skipped_bytes() const { return host_experts_mlock_skipped; }
+    size_t host_experts_mlock_skipped = 0;
 
     // True when this tensor got a pinned host master under the plan.
     bool host_expert_is_pinned(const char * name) const {

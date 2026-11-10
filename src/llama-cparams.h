@@ -24,6 +24,15 @@ struct llama_cparams {
 
     int32_t  mtp_draft_vocab = 0; // MTP draft vocabulary subset in use by this context (0 = full vocabulary)
 
+    // The delivery's KV-placement options, from `llama_context_params` (first-class since r246, default OFF
+    // since r247):
+    //   spec_draft_kv_window  the MTP draft cache's TRUNCATING window (-1 = auto, 0 = off, N = N cells)
+    //   kv_region_pool        the attendance pool: 0 = off, non-zero = on (size is derived, not a knob)
+    //   kv_resident_cells     the LOSSLESS resident window: -1 = auto (fit), 0 = off, N = N cells
+    int32_t  spec_draft_kv_window = 0;
+    int32_t  kv_region_pool       = 0;
+    int32_t  kv_resident_cells    = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

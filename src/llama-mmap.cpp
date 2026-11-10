@@ -1078,6 +1078,26 @@ struct llama_mlock::impl {
         }
     }
 
+    // one range at a time, so a range that must stay unlocked can be left out (see the header); `size` counts
+    // the bytes pinned, which is what the caller reports
+    void lock_range(size_t offset, size_t len) {
+        GGML_ASSERT(addr);
+        if (failed_already || len == 0) {
+            return;
+        }
+        size_t granularity = lock_granularity();
+        const size_t first = offset & ~(granularity - 1);
+        const size_t last  = (offset + len + granularity - 1) & ~(granularity - 1);
+        if (last <= first) {
+            return;
+        }
+        if (raw_lock((uint8_t *) addr + first, last - first)) {
+            size += last - first;
+        } else {
+            failed_already = true;
+        }
+    }
+
     void * addr;
     size_t size;
 
@@ -1089,6 +1109,7 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
+void llama_mlock::lock_range(size_t offset, size_t len) { pimpl->lock_range(offset, len); }
 size_t llama_mlock::size() const { return pimpl->size; }
 
 // Release the pin without dropping the pages: `munlock` only clears the VM_LOCKED flag, so everything the
