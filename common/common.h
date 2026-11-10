@@ -377,6 +377,14 @@ struct common_params_speculative_draft {
     // MTP only: draft over token ids < N plus control tokens (0 = full vocabulary)
     int32_t mtp_vocab = 0;
 
+    // MTP only (`--spec-draft-kv-window`): the draft context's KV window in CELLS per sequence.
+    // -1 = `auto` (the cap or nothing), 0 = a full `-c` draft cache, N = N cells.  The delivery's own option
+    // (formerly the LLAMA_SPEC_DRAFT_WINDOW env var, which r246 removed).
+    // DEFAULT 0 since r247: a window below the depth the request reaches costs decode (measured -9.7 % of
+    // MTP decode on a tensor split at 105k tokens), and the default path must not carry a placement
+    // decision.  `auto` and `N` are a conscious opt-in; see benchmarks/mtp-draft-window-depth.md.
+    int32_t kv_window = 0;
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
@@ -678,6 +686,23 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+
+    // `--kv-attendance-pool` (the `--kv-region-pool` spelling is kept as an alias): the ATTENDANCE POOL --
+    // the attention KV as an AUTHORITATIVE pinned host MIRROR plus a compact device pool of indexer pages
+    // that the sparse QSA decode arm resolves through.  0 = off, non-zero = on.  Only a qwen4exp trunk cache
+    // can take it (its decode read is the sparse QSA arm).  The pool's SIZE is derived from the model (one
+    // decode band of the indexer working set, `indexer_top_k x QSA_DECODE_BAND`), so a legacy numeric value
+    // is accepted for compatibility and ignored -- the size is not a user knob (TODO #313, closed r247).
+    int32_t kv_region_pool = 0;
+
+    // `--kv-window`: the RESIDENT WINDOW (block 15 Goal A) -- how much of the attention KV stays in VRAM, in
+    // CELLS.  -1 = `auto` (`--fit` sizes it; without `--fit` the cache declines and says so), 0 = off (fully
+    // resident), N = the newest N cells.  Model-agnostic and LOSSLESS: the older cells live in pinned system
+    // RAM inside the same VA reservation, and every read of one goes over the PCIe link.  Not the same thing
+    // as the pool (which keeps a device CACHE of a host-authoritative copy) and not the draft window (which
+    // TRUNCATES the drafter's cache).  The legacy env var `LLAMA_KV_RESIDENT_CELLS` is still honoured as the
+    // option's deprecated alias.
+    int32_t kv_resident_cells = 0;
 
     size_t moe_cache_size      = 0;    // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
     float  moe_cache_cpu_share = 0.0f; // share of the MoE cache misses computed on the CPU instead of uploaded

@@ -37,8 +37,18 @@ struct common_draft_reserve {
 };
 
 // Estimate the post-slab VRAM `path` (a draft GGUF) will need for `n_ctx` with the given KV types.
+// `shares_model`: the draft runs the TARGET's weights (an embedded MTP head), so the weights term is 0 and
+// `path` is the target's GGUF -- the caller only passes `true` when the draft's KV window is active, so an
+// un-windowed run keeps the flat `LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT` it has always had.
+// `n_seq_max` / `kv_unified` size the MTP draft window the same way the cache does
+// (`llama_spec_draft_kv_cells()`): a unified cache holds every sequence in one stream, so its window is
+// granted per sequence and its cell count is `(win + one batch) x n_seq_max` (issue #264).
 common_draft_reserve common_draft_reserve_estimate(const std::string & path,
                                                    uint32_t n_ctx,
                                                    uint32_t n_ubatch,
                                                    ggml_type type_k,
-                                                   ggml_type type_v);
+                                                   ggml_type type_v,
+                                                   bool shares_model = false,
+                                                   uint32_t n_seq_max = 1,
+                                                   bool kv_unified = false,
+                                                   int32_t draft_kv_window = -1);

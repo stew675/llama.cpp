@@ -2140,6 +2140,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             } break;
         case GGML_OP_INDEXER_SCORE:
         case GGML_OP_INDEXER_FILL:
+        case GGML_OP_KV_POOL:
             {
                 // GPU-only fused indexer ops (no CPU forward): the CPU plan
                 // phase above already aborts on them ("op not implemented")

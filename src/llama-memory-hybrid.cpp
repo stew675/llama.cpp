@@ -30,7 +30,9 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                     bool   kv_pool,
+                     int32_t kv_pool_cells) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -50,7 +52,12 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        /* name_tag   */ "",
+        /* is_indexer */ false,
+        /* v_enabled  */ true,
+        /* kv_pool    */ kv_pool,
+        /* kv_pool_cells */ kv_pool_cells
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -188,6 +195,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
         mb[buft_size.first] += buft_size.second;
     }
     return mb;
+}
+
+void llama_memory_hybrid::kv_pool_bytes(size_t & vram, size_t & ram) const {
+    mem_attn->kv_pool_bytes(vram, ram);
 }
 
 uint32_t llama_memory_hybrid::graph_extra_entries() const {

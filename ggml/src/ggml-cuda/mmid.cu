@@ -331,3 +331,30 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
     }
 }
+
+// Re-seam a tile_spec for a second tile width without repeating the compaction.  `expert_bounds` is what the
+// single helper launch already wrote (expert -> first compact column, with the total at [n_experts]), so one
+// trivial block per expert reproduces exactly the layout the helper's own write path would have produced for
+// this width -- the two-pass walk over `ids` is the only thing skipped (TODO #301).
+static __global__ void mm_id_retile_kernel(
+        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int32_t * __restrict__ expert_bounds,
+        const int n_tokens, const int n_expert_used, const uint3 tile_width) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    const int expert   = blockIdx.x;
+    const int nex_prev = expert_bounds[expert];
+    const int it_compact = expert_bounds[expert + 1] - nex_prev;
+    mm_ids_write_tile_spec(tile_spec, expert, nex_prev, it_compact, tile_width, n_tokens, n_expert_used);
+}
+
+void ggml_cuda_launch_mm_id_retile(
+        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int32_t * __restrict__ expert_bounds,
+        const int n_experts, const int n_tokens, const int n_expert_used, const int tile_width, cudaStream_t stream) {
+    if (tile_spec == nullptr || expert_bounds == nullptr) {
+        return;
+    }
+    const uint3 tile_width_fd = init_fastdiv_values(tile_width);
+    mm_id_retile_kernel<<<dim3(n_experts, 1, 1), dim3(32, 1, 1), 0, stream>>>(
+        tile_spec, expert_bounds, n_tokens, n_expert_used, tile_width_fd);
+}

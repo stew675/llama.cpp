@@ -53,6 +53,404 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
 // read of them goes through the bounded pinned pool, so the non-swappable part of the host expert set
 // becomes the pool budget rather than the whole set -- which is what lets a model whose expert set does
 // not fit in RAM run at all (the page cache is reclaimable; the pool is the only pinned tier).
+ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev, const std::string & name) const {
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    static const bool pin_master = getenv("LLAMA_HOST_MASTER_PINNED") != nullptr;
+    // wip/host-expert-tier: with a `-lme` plan the decision is per TENSOR.  A hole keeps the read-only model
+    // mapping (pageable, served through the bounded pool or the per-table bounce ring); everything else gets
+    // the pinned master, which for a table IS the region: expert `e` lives at `base + e * host_bytes`, so a
+    // fully pinned tensor is byte-for-byte today's `pinned` master and keeps the single-launch staging
+    // branch, the in-place cold read and the UVA alias.
+    const bool want_mapping = host_experts_plan_done ? host_expert_is_hole(name)
+                                                     : host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL;
+    if (want_mapping && use_mmap && !pin_master) {
+        ggml_backend_buffer_type_t master = ggml_backend_dev_moe_host_master_buft(dev);
+        if (master != nullptr) {
+            return master;
+        }
+    }
+    return ggml_backend_dev_host_buffer_type(dev);
+}
+
+// ---------------------------------------------------------------------------------------------
+// wip/host-expert-tier: the `-lme, --limit-host-experts` budget, spent on WHOLE host-expert tensors
+// in descending hotness order.  See `plan_host_expert_placement` in the header for the policy.
+//
+// Why per tensor and not per expert: a pinned master is addressed by expert index (stride `nb[2]`), so a
+// partial one would need holes inside the region and a changed cold-read encoding (the `id - n_res_slots`
+// -> slot encoding is shared with the KV/arena paths).  Whole tensors keep the geometry, so a pinned tensor
+// is byte-for-byte today's `pinned` master and its table keeps the single-launch staging branch and the
+// in-place cold read.  Per-expert residency inside a table remains the pool's job (the fallback below).
+// ---------------------------------------------------------------------------------------------
+
+// MemAvailable, not MemFree: the pinned tier is allowed to sit on reclaimable page cache, and the kernel
+// hands page cache over on demand.  Falls back to the CPU device's free memory on a platform without
+// /proc/meminfo.  Returns 0 when nothing can be measured (the caller then refuses to guess).
+static size_t host_experts_available_bytes() {
+    size_t out = 0;
+#if !defined(_WIN32)
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f != nullptr) {
+        char line[256];
+        while (fgets(line, sizeof(line), f) != nullptr) {
+            long long kib = -1;
+            if (sscanf(line, "MemAvailable: %lld kB", &kib) == 1 && kib > 0) {
+                out = (size_t) kib * 1024;
+                break;
+            }
+        }
+        fclose(f);
+    }
+#endif
+    if (out == 0) {
+        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        size_t total = 0;
+        if (cpu != nullptr) {
+            ggml_backend_dev_memory(cpu, &out, &total);
+        }
+    }
+    return out;
+}
+
+// `blk.12.ffn_gate_exps.weight` -> 12, or -1.
+static int host_expert_layer_of(const std::string & name) {
+    int layer = -1;
+    if (sscanf(name.c_str(), "blk.%d.", &layer) != 1) {
+        return -1;
+    }
+    return layer;
+}
+
+// The placement the loader will actually make for `name` on layer `layer`: the `-ncmoe` tail rule, or an
+// explicit caller pattern (`--cpu-moe`, `--override-tensor exps=CPU`, `-ncmoe` in the forward placement).
+// Mirrors the `create_tensor` override logic, minus the exclusions that can only make it MORE conservative
+// (an excluded tensor that this says is hosted simply keeps the pageable master).
+void llama_model_loader::set_host_experts_umem(bool on) {
+    if (!on || host_experts_umem) {
+        return;
+    }
+    host_experts_umem = true;
+    // One message, and only when something actually asked for host experts: the placement is
+    // deliberately NOT a silent clamp, because on a shared pool the user's `-ncmoe N` is refused rather
+    // than half-honoured, and the run then uses the device's own memory (the whole pool).
+    if (n_cpu_moe_from_end > 0 || tensor_buft_overrides != nullptr) {
+        LLAMA_LOG_WARN("%s: this device's memory is a SHARED host/device pool (an integrated GPU), so "
+                       "host-resident MoE experts are refused: the weights and host RAM are one pool, and the "
+                       "expert staging tier is not available there (it would read a page the GPU cannot "
+                       "address).  All expert weights stay on their layer's device; `-ncmoe`/`-cmoe`/`-lme` and "
+                       "a CPU `--override-tensor` for `*_exps.*` are ignored on such a device.\n", __func__);
+    }
+    // drop the placement outright, so no `blk.<i>` tail patterns are even built
+    n_cpu_moe_from_end = 0;
+}
+
+bool llama_model_loader::host_expert_selected(const std::string & name, int layer, int n_layer_trunk) const {
+    if (host_experts_umem) {
+        return false;   // a shared host/device pool: nothing is hosted (see set_host_experts_umem)
+    }
+    if (layer < 0) {
+        return false;
+    }
+    if (n_cpu_moe_from_end > 0) {
+        return layer >= n_layer_trunk - n_cpu_moe_from_end && layer < n_layer_trunk;
+    }
+    if (tensor_buft_overrides == nullptr) {
+        return false;
+    }
+    std::string tensor_name = name;
+    for (const auto * o = tensor_buft_overrides; o->pattern != nullptr; ++o) {
+        if (o->buft != ggml_backend_cpu_buffer_type()) {
+            continue;
+        }
+        std::regex pattern(o->pattern);
+        if (std::regex_search(tensor_name, pattern)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
+    if (host_experts_plan_done) {
+        return;
+    }
+    host_experts_plan_done = true;
+
+    if (host_experts_umem) {
+        // A shared host/device pool: every expert stays on its layer's device (see set_host_experts_umem).
+        host_experts_plan_done = false;
+        host_experts_policy    = "shared host/device memory pool (integrated GPU): no host expert tensors";
+        return;
+    }
+
+    // --- 1. the candidate set and its byte total ------------------------------------------------
+    // The loader owns the whole GGUF index (`weights_map`) before the arch creates a single tensor, which is
+    // what makes a budget decidable at all: which tensors to pin depends on the WHOLE set's hotness, not on
+    // the order the arch happens to visit them in.
+    struct cand_t {
+        std::string name;
+        int         layer = -1;
+        int         n_experts = 0;
+        size_t      host_bytes = 0;
+        size_t      nbytes = 0;
+        int64_t     score = 0;
+    };
+    std::vector<cand_t> cands;
+    size_t total = 0;
+    for (const auto & kv : weights_map) {
+        const std::string & name = kv.first;
+        if (name.find("exps") == std::string::npos) {
+            continue;
+        }
+        const ggml_tensor * t = kv.second.tensor;
+        if (t == nullptr || t->ne[2] < 2) {
+            continue;   // an expert bank only: a `scale`/`bias` side vector has ne[2] == 1
+        }
+        const int layer = host_expert_layer_of(name);
+        if (!host_expert_selected(name, layer, n_layer_trunk)) {
+            continue;
+        }
+        cand_t c;
+        c.name       = name;
+        c.layer      = layer;
+        c.n_experts  = (int) t->ne[2];
+        c.host_bytes = (size_t) t->nb[2];
+        c.nbytes     = ggml_nbytes(t);
+        total += c.nbytes;
+        cands.push_back(std::move(c));
+    }
+    host_experts_total_bytes = total;
+    if (cands.empty()) {
+        // Nothing is hosted (`-ncmoe 0`), or the placement is not one this pre-pass can see: keep the
+        // historical, mode-keyed decision tensor by tensor.
+        host_experts_plan_done = false;
+        host_experts_policy    = "no host expert tensors to place";
+        return;
+    }
+
+    // --- 2. the budget --------------------------------------------------------------------------
+    const size_t avail = host_experts_available_bytes();
+    // `MOE_HOST_LIMIT_FRAC` (default 80) is the AUTO ceiling as a percentage of MemAvailable.  It is a
+    // separate knob from MOE_HOST_POOL_FRAC, which is a percentage of the host EXPERT BYTES (the pool's
+    // size); the two answer different questions and must not share a variable.
+    int frac = 80;
+    if (const char * e = getenv("MOE_HOST_LIMIT_FRAC")) {
+        const int v = atoi(e);
+        if (v > 0 && v <= 100) {
+            frac = v;
+        }
+    }
+    const size_t auto_cap = avail > 0 ? avail * (size_t) frac / 100 : 0;
+    size_t cap = 0;
+    // `-lme N` with N below the host expert set spends the budget PER EXPERT (the pool), not per tensor: a
+    // whole-tensor pinned master is the wrong shape for a partial budget, because MoE routing is spread across
+    // every layer, so no single tensor is hot (measured: 8 064 MiB of pinned whole tensors = 505 prefill / 50
+    // decode against 713 / 57 for a 9 331 MiB pool at 2 devices, and the pool reads its residents in place
+    // since MOE_HOST_POOL_COLD_MULTIDEV).  At or above the set it is the fit case, where a pinned master wins
+    // decode outright (1105 / 72).
+    auto put = [](size_t b) { return (double) b / (1024.0 * 1024.0); };
+    char policy[512];
+    // The tier for a partial budget.  Default: per EXPERT (the pool) below 90 % of the host expert set, whole
+    // TENSORS at or above it.  Measured anchors (2 devices, 35B-A3B, see `wip/host-expert-eager-push/
+    // P5-RESULTS.md` §7): at 86 % of the bytes the two shapes tie on decode (65.6 pool against 65.7 tensors)
+    // while the pool is far better prefill; at 100 % the whole-tensor tier wins decode outright (71.9 against
+    // 63.9), because only a pinned *master* gets the single-launch staging branch and the native fill.  The
+    // exact crossover was not swept -- `MOE_HOST_TIER=pool|tensor` forces either shape, which is the A/B arm.
+    // wip/host-expert-pool-surplus: the POOL is the mechanism at every budget.  Its per-tensor slot count comes
+    // from the budget, and the pool lays itself out as "the complement of the arena first, then the hottest
+    // arena-resident experts while capacity remains" -- so a budget that only covers the complement stays a
+    // bounded complement, and a budget that covers the whole set turns it into a mirror (i.e. `pinned`'s memory
+    // and transport, measured 19 % better prefill than a pinned master and within 0.4-3 % on decode).  The
+    // whole-tensor pinned-master tier is therefore only the explicit `--host-experts pinned` / MOE_HOST_TIER=tensor
+    // escape hatch.
+    const char * tier_env = getenv("MOE_HOST_TIER");
+    const bool force_tensor = tier_env != nullptr && strcmp(tier_env, "tensor") == 0;
+    const bool pinned_masters = force_tensor || host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED;
+    if (!pinned_masters) {
+        for (const auto & c : cands) {
+            host_experts_holes.insert(c.name);
+        }
+        // `auto` in the fit band spends the WHOLE set (that is the mirror = `pinned`'s memory); in the not-fitting
+        // band it keeps the historical `MOE_HOST_POOL_FRAC` sizing, which the pool derives on its own.
+        const size_t budget = host_experts_limit_gib > 0
+                            ? (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull
+                            : (total <= auto_cap ? total
+                                                 : (auto_cap > 0 ? auto_cap : total));
+        host_experts_cap_bytes = budget;
+        if (use_mmap) {
+            host_experts_pool_holes = true;
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                ggml_backend_dev_moe_cache_set_host_pool_budget(d, budget);
+                ggml_backend_dev_moe_cache_set_host_pool(d, true);
+            }
+        }
+        const char * how = budget >= total ? "the whole host expert set (a MIRROR)"
+                                           : "the arena's complement, plus mirrored residents while capacity lasts";
+        if (host_experts_limit_gib > 0) {
+            snprintf(policy, sizeof(policy),
+                     "-lme %lld -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s, ranked by the heat "
+                     "prior (the masters stay in the model mapping)%s", (long long) host_experts_limit_gib,
+                     put(budget), put(total), how, use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
+        } else {
+            snprintf(policy, sizeof(policy),
+                     "auto -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s%s", put(budget), put(total), how,
+                     use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
+        }
+        host_experts_policy = policy;
+        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
+        return;
+    }
+    if (host_experts_limit_gib > 0) {
+        cap = (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull;
+        snprintf(policy, sizeof(policy),
+                 "-lme %lld -> budget %.1f MiB covers the whole host expert set, so it is spent on whole tensors "
+                 "in descending hotness (the fit case: a pinned master is the fastest decode transport)",
+                 (long long) host_experts_limit_gib, put(cap));
+    } else if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED) {
+        cap = SIZE_MAX;
+        snprintf(policy, sizeof(policy), "host_experts_mode=PINNED -> the whole host expert set");
+    } else if (avail == 0) {
+        cap = SIZE_MAX;
+        snprintf(policy, sizeof(policy), "auto: MemAvailable unknown -> the whole host expert set");
+    } else if (total <= auto_cap) {
+        cap = total;
+        snprintf(policy, sizeof(policy),
+                 "auto: the host expert set (%.1f MiB) fits %d%% of MemAvailable (%.1f MiB) -> pin all of it",
+                 put(total), frac, put(auto_cap));
+    } else {
+        cap = 0;
+        snprintf(policy, sizeof(policy),
+                 "auto: the host expert set (%.1f MiB) does NOT fit %d%% of MemAvailable (%.1f MiB) -> no pinned "
+                 "master; every host expert stays in the model mapping and the bounded pinned pool serves the "
+                 "reads (size it with MOE_HOST_POOL_MIB/MOE_HOST_POOL_FRAC)",
+                 put(total), frac, put(auto_cap));
+    }
+    host_experts_policy = policy;
+
+    if (cap == 0) {
+        // The not-fitting band: today's pool-backed master (pageable), which is the mode the pool exists for.
+        // EVERY candidate is a hole -- without this the per-tensor decision would fall through to the pinned
+        // default and pin the whole set, which is exactly what this branch exists to avoid.
+        for (const auto & c : cands) {
+            host_experts_holes.insert(c.name);
+        }
+        if (use_mmap) {
+            host_experts_pool_holes = true;
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
+            }
+        }
+        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
+        return;
+    }
+
+    // --- 3. rank by the persisted heat prior, then take what fits --------------------------------
+    ggml_backend_dev_t heat_dev = nullptr;
+    if (!files.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (d != nullptr && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                ggml_backend_dev_moe_heat_open(d, files.front()->path().c_str());
+                if (heat_dev == nullptr) {
+                    heat_dev = d;
+                }
+            }
+        }
+    }
+    if (heat_dev != nullptr) {
+        for (auto & c : cands) {
+            const int64_t s = ggml_backend_dev_moe_heat_score(heat_dev, c.layer, c.name.c_str(), c.n_experts, c.host_bytes);
+            if (s >= 0) {
+                c.score = s;
+                host_experts_heat_seen = true;
+            }
+        }
+    }
+    if (host_experts_heat_seen) {
+        std::stable_sort(cands.begin(), cands.end(), [](const cand_t & a, const cand_t & b) {
+            return a.score > b.score;
+        });
+    }
+
+    size_t planned = 0;
+    size_t n_pinned = 0;
+    for (const auto & c : cands) {
+        if (planned + c.nbytes > cap) {
+            host_experts_holes.insert(c.name);   // stays in the model mapping; a smaller one below may still fit
+            continue;
+        }
+        host_experts_pinned.insert(c.name);
+        planned += c.nbytes;
+        ++n_pinned;
+    }
+    host_experts_cap_bytes = cap;
+
+    // Holes keep the read-only model mapping and are served either by the bounded pinned pool or, when the
+    // budget is spent, by the per-table bounce ring (the page cache as the source).  The pool is only given
+    // what the budget has left, so `-lme` stays a cap on the whole non-swappable tier rather than a floor.
+    // An explicit `MOE_HOST_POOL=1` / `MOE_HOST_POOL_MIB=N` still forces it on -- that is the A/B arm for
+    // "the same budget spent per EXPERT (the pool) instead of per TENSOR (a pinned master)".
+    if (!host_experts_holes.empty() && use_mmap) {
+        // The spare is normally smaller than one host expert tensor (a whole tensor is 90-176 MiB, and the
+        // budget buys whole tensors), so it cannot fund a useful pool -- and a pool that fits a small fraction
+        // of the holes buys nothing (measured: a 512 MiB or 1 GiB pool is indistinguishable from none).  The
+        // holes therefore read the page cache directly through the per-table bounce ring.  An explicit
+        // `MOE_HOST_POOL=1` / `MOE_HOST_POOL_MIB=N` still turns the pool on, which is the A/B arm for "the
+        // same RAM spent per EXPERT (a pool) instead of per TENSOR (a pinned master)".
+        host_experts_pool_holes = getenv("MOE_HOST_POOL") != nullptr || getenv("MOE_HOST_POOL_MIB") != nullptr;
+        if (host_experts_pool_holes) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
+            }
+        }
+    }
+
+    snprintf(policy, sizeof(policy),
+             "%.1f of %.1f MiB pinned (%zu of %zu tensors, %s); %.1f MiB pageable%s",
+             put(planned), put(total), n_pinned, cands.size(),
+             host_experts_heat_seen ? "descending hotness" : "model tensor order (no heat prior)",
+             put(total - planned),
+             host_experts_pool_holes ? " via the bounded pinned pool" : " (per-table bounce ring)");
+    host_experts_policy += ": ";
+    host_experts_policy += policy;
+    LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
+}
+
+void llama_model_loader::report_host_expert_placement() {
+    if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
+        return;
+    }
+    // Always at WARN: a user must be able to see which tier they got.  The pageable fallback costs about half
+    // the decode throughput and the only other warning (0008's PINNED HOST ALLOCATION FAILED) fires when a
+    // pinned allocation is refused, not when the policy chose not to pin.
+    //
+    // issue #274: it used to be INFO, which is INVISIBLE at the default verbosity (common/log.cpp maps
+    // GGML_LOG_LEVEL_INFO to LOG_LEVEL_TRACE against a default threshold of LOG_LEVEL_INFO).  The reporter
+    // could see only the WARN lines -- the failures -- and not one of the decisions that produced them.
+    const double mib = 1024.0 * 1024.0;
+    std::string src = "";
+    if (host_experts_sourceable > 0) {
+        // The pool is built per host tensor from this registration; a mismatch against the pageable tensor
+        // count is the first thing a "the pool never appears" report needs to know.
+        src = format(", %zu/%zu pool sources registered", host_experts_sources, host_experts_sourceable);
+        if (host_experts_sources < host_experts_sourceable) {
+            src += " -- the unregistered tensors cannot use the pool (their buffer names no device); the "
+                   "per-table bounce ring serves them";
+        }
+    }
+    LLAMA_LOG_WARN("%s: host experts: pinned %.1f MiB of %.1f MiB (cap %s), pageable %.1f MiB%s; %s\n", __func__,
+                   (double) host_experts_pinned_bytes / mib,
+                   (double) host_experts_total_bytes / mib,
+                   host_experts_cap_bytes == SIZE_MAX ? "none (the whole set)"
+                       : (host_experts_cap_bytes == 0 ? "0 (mapping + pool)"
+                                                      : format("%.1f MiB", (double) host_experts_cap_bytes / mib).c_str()),
+                   (double) host_experts_holes_bytes / mib, src.c_str(),
+                   host_experts_policy.empty() ? "legacy mode-keyed placement" : host_experts_policy.c_str());
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -568,377 +966,6 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
 
-ggml_backend_buffer_type_t llama_model_loader::host_expert_buft(ggml_backend_dev_t dev, const std::string & name) const {
-    if (dev == nullptr) {
-        return nullptr;
-    }
-    static const bool pin_master = getenv("LLAMA_HOST_MASTER_PINNED") != nullptr;
-    // wip/host-expert-tier: with a `-lme` plan the decision is per TENSOR.  A hole keeps the read-only model
-    // mapping (pageable, served through the bounded pool or the per-table bounce ring); everything else gets
-    // the pinned master, which for a table IS the region: expert `e` lives at `base + e * host_bytes`, so a
-    // fully pinned tensor is byte-for-byte today's `pinned` master and keeps the single-launch staging
-    // branch, the in-place cold read and the UVA alias.
-    const bool want_mapping = host_experts_plan_done ? host_expert_is_hole(name)
-                                                     : host_experts_mode == LLAMA_HOST_EXPERTS_MODE_POOL;
-    // The MAPPED (pageable) master a hole is served from is a backend buffer type the device iface grows
-    // later in this series; until it exists the pinned host buft is the one answer, so a hole is placed
-    // exactly like a pinned tensor here.  From the block that introduces it, a hole keeps the model
-    // mapping instead -- which is what makes the pool's pageable master the default for a budget below
-    // the host expert set.
-    (void) want_mapping;
-    (void) pin_master;
-    return ggml_backend_dev_host_buffer_type(dev);
-}
-
-// ---------------------------------------------------------------------------------------------
-// wip/host-expert-tier: the `-lme, --limit-host-experts` budget, spent on WHOLE host-expert tensors
-// in descending hotness order.  See `plan_host_expert_placement` in the header for the policy.
-//
-// Why per tensor and not per expert: a pinned master is addressed by expert index (stride `nb[2]`), so a
-// partial one would need holes inside the region and a changed cold-read encoding (the `id - n_res_slots`
-// -> slot encoding is shared with the KV/arena paths).  Whole tensors keep the geometry, so a pinned tensor
-// is byte-for-byte today's `pinned` master and its table keeps the single-launch staging branch and the
-// in-place cold read.  Per-expert residency inside a table remains the pool's job (the fallback below).
-// ---------------------------------------------------------------------------------------------
-
-// MemAvailable, not MemFree: the pinned tier is allowed to sit on reclaimable page cache, and the kernel
-// hands page cache over on demand.  Falls back to the CPU device's free memory on a platform without
-// /proc/meminfo.  Returns 0 when nothing can be measured (the caller then refuses to guess).
-static size_t host_experts_available_bytes() {
-    size_t out = 0;
-#if !defined(_WIN32)
-    FILE * f = fopen("/proc/meminfo", "r");
-    if (f != nullptr) {
-        char line[256];
-        while (fgets(line, sizeof(line), f) != nullptr) {
-            long long kib = -1;
-            if (sscanf(line, "MemAvailable: %lld kB", &kib) == 1 && kib > 0) {
-                out = (size_t) kib * 1024;
-                break;
-            }
-        }
-        fclose(f);
-    }
-#endif
-    if (out == 0) {
-        ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-        size_t total = 0;
-        if (cpu != nullptr) {
-            ggml_backend_dev_memory(cpu, &out, &total);
-        }
-    }
-    return out;
-}
-
-// `blk.12.ffn_gate_exps.weight` -> 12, or -1.
-static int host_expert_layer_of(const std::string & name) {
-    int layer = -1;
-    if (sscanf(name.c_str(), "blk.%d.", &layer) != 1) {
-        return -1;
-    }
-    return layer;
-}
-
-// The placement the loader will actually make for `name` on layer `layer`: the `-ncmoe` tail rule, or an
-// explicit caller pattern (`--cpu-moe`, `--override-tensor exps=CPU`, `-ncmoe` in the forward placement).
-// Mirrors the `create_tensor` override logic, minus the exclusions that can only make it MORE conservative
-// (an excluded tensor that this says is hosted simply keeps the pageable master).
-bool llama_model_loader::host_expert_selected(const std::string & name, int layer, int n_layer_trunk) const {
-    if (layer < 0) {
-        return false;
-    }
-    if (n_cpu_moe_from_end > 0) {
-        return layer >= n_layer_trunk - n_cpu_moe_from_end && layer < n_layer_trunk;
-    }
-    if (tensor_buft_overrides == nullptr) {
-        return false;
-    }
-    std::string tensor_name = name;
-    for (const auto * o = tensor_buft_overrides; o->pattern != nullptr; ++o) {
-        if (o->buft != ggml_backend_cpu_buffer_type()) {
-            continue;
-        }
-        std::regex pattern(o->pattern);
-        if (std::regex_search(tensor_name, pattern)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void llama_model_loader::plan_host_expert_placement(int n_layer_trunk) {
-    if (host_experts_plan_done) {
-        return;
-    }
-    host_experts_plan_done = true;
-
-    // --- 1. the candidate set and its byte total ------------------------------------------------
-    // The loader owns the whole GGUF index (`weights_map`) before the arch creates a single tensor, which is
-    // what makes a budget decidable at all: which tensors to pin depends on the WHOLE set's hotness, not on
-    // the order the arch happens to visit them in.
-    struct cand_t {
-        std::string name;
-        int         layer = -1;
-        int         n_experts = 0;
-        size_t      host_bytes = 0;
-        size_t      nbytes = 0;
-        int64_t     score = 0;
-    };
-    std::vector<cand_t> cands;
-    size_t total = 0;
-    for (const auto & kv : weights_map) {
-        const std::string & name = kv.first;
-        if (name.find("exps") == std::string::npos) {
-            continue;
-        }
-        const ggml_tensor * t = kv.second.tensor;
-        if (t == nullptr || t->ne[2] < 2) {
-            continue;   // an expert bank only: a `scale`/`bias` side vector has ne[2] == 1
-        }
-        const int layer = host_expert_layer_of(name);
-        if (!host_expert_selected(name, layer, n_layer_trunk)) {
-            continue;
-        }
-        cand_t c;
-        c.name       = name;
-        c.layer      = layer;
-        c.n_experts  = (int) t->ne[2];
-        c.host_bytes = (size_t) t->nb[2];
-        c.nbytes     = ggml_nbytes(t);
-        total += c.nbytes;
-        cands.push_back(std::move(c));
-    }
-    host_experts_total_bytes = total;
-    if (cands.empty()) {
-        // Nothing is hosted (`-ncmoe 0`), or the placement is not one this pre-pass can see: keep the
-        // historical, mode-keyed decision tensor by tensor.
-        host_experts_plan_done = false;
-        host_experts_policy    = "no host expert tensors to place";
-        return;
-    }
-
-    // --- 2. the budget --------------------------------------------------------------------------
-    const size_t avail = host_experts_available_bytes();
-    // `MOE_HOST_LIMIT_FRAC` (default 80) is the AUTO ceiling as a percentage of MemAvailable.  It is a
-    // separate knob from MOE_HOST_POOL_FRAC, which is a percentage of the host EXPERT BYTES (the pool's
-    // size); the two answer different questions and must not share a variable.
-    int frac = 80;
-    if (const char * e = getenv("MOE_HOST_LIMIT_FRAC")) {
-        const int v = atoi(e);
-        if (v > 0 && v <= 100) {
-            frac = v;
-        }
-    }
-    const size_t auto_cap = avail > 0 ? avail * (size_t) frac / 100 : 0;
-    size_t cap = 0;
-    // `-lme N` with N below the host expert set spends the budget PER EXPERT (the pool), not per tensor: a
-    // whole-tensor pinned master is the wrong shape for a partial budget, because MoE routing is spread across
-    // every layer, so no single tensor is hot (measured: 8 064 MiB of pinned whole tensors = 505 prefill / 50
-    // decode against 713 / 57 for a 9 331 MiB pool at 2 devices, and the pool reads its residents in place
-    // since MOE_HOST_POOL_COLD_MULTIDEV).  At or above the set it is the fit case, where a pinned master wins
-    // decode outright (1105 / 72).
-    auto put = [](size_t b) { return (double) b / (1024.0 * 1024.0); };
-    char policy[512];
-    // The tier for a partial budget.  Default: per EXPERT (the pool) below 90 % of the host expert set, whole
-    // TENSORS at or above it.  Measured anchors (2 devices, 35B-A3B, see `wip/host-expert-eager-push/
-    // P5-RESULTS.md` §7): at 86 % of the bytes the two shapes tie on decode (65.6 pool against 65.7 tensors)
-    // while the pool is far better prefill; at 100 % the whole-tensor tier wins decode outright (71.9 against
-    // 63.9), because only a pinned *master* gets the single-launch staging branch and the native fill.  The
-    // exact crossover was not swept -- `MOE_HOST_TIER=pool|tensor` forces either shape, which is the A/B arm.
-    // wip/host-expert-pool-surplus: the POOL is the mechanism at every budget.  Its per-tensor slot count comes
-    // from the budget, and the pool lays itself out as "the complement of the arena first, then the hottest
-    // arena-resident experts while capacity remains" -- so a budget that only covers the complement stays a
-    // bounded complement, and a budget that covers the whole set turns it into a mirror (i.e. `pinned`'s memory
-    // and transport, measured 19 % better prefill than a pinned master and within 0.4-3 % on decode).  The
-    // whole-tensor pinned-master tier is therefore only the explicit `--host-experts pinned` / MOE_HOST_TIER=tensor
-    // escape hatch.
-    const char * tier_env = getenv("MOE_HOST_TIER");
-    const bool force_tensor = tier_env != nullptr && strcmp(tier_env, "tensor") == 0;
-    const bool pinned_masters = force_tensor || host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED;
-    if (!pinned_masters) {
-        for (const auto & c : cands) {
-            host_experts_holes.insert(c.name);
-        }
-        // `auto` in the fit band spends the WHOLE set (that is the mirror = `pinned`'s memory); in the not-fitting
-        // band it keeps the historical `MOE_HOST_POOL_FRAC` sizing, which the pool derives on its own.
-        const size_t budget = host_experts_limit_gib > 0
-                            ? (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull
-                            : (total <= auto_cap ? total
-                                                 : (auto_cap > 0 ? auto_cap : total));
-        host_experts_cap_bytes = budget;
-        if (use_mmap) {
-            host_experts_pool_holes = true;
-            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                ggml_backend_dev_t d = ggml_backend_dev_get(i);
-                ggml_backend_dev_moe_cache_set_host_pool_budget(d, budget);
-                ggml_backend_dev_moe_cache_set_host_pool(d, true);
-            }
-        }
-        const char * how = budget >= total ? "the whole host expert set (a MIRROR)"
-                                           : "the arena's complement, plus mirrored residents while capacity lasts";
-        if (host_experts_limit_gib > 0) {
-            snprintf(policy, sizeof(policy),
-                     "-lme %lld -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s, ranked by the heat "
-                     "prior (the masters stay in the model mapping)%s", (long long) host_experts_limit_gib,
-                     put(budget), put(total), how, use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
-        } else {
-            snprintf(policy, sizeof(policy),
-                     "auto -> a pinned per-EXPERT pool of %.1f MiB of %.1f MiB: %s%s", put(budget), put(total), how,
-                     use_mmap ? "" : " -- NOT APPLIED: a pool needs a mapped load");
-        }
-        host_experts_policy = policy;
-        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
-        return;
-    }
-    if (host_experts_limit_gib > 0) {
-        cap = (size_t) host_experts_limit_gib * 1024ull * 1024ull * 1024ull;
-        snprintf(policy, sizeof(policy),
-                 "-lme %lld -> budget %.1f MiB covers the whole host expert set, so it is spent on whole tensors "
-                 "in descending hotness (the fit case: a pinned master is the fastest decode transport)",
-                 (long long) host_experts_limit_gib, put(cap));
-    } else if (host_experts_mode == LLAMA_HOST_EXPERTS_MODE_PINNED) {
-        cap = SIZE_MAX;
-        snprintf(policy, sizeof(policy), "host_experts_mode=PINNED -> the whole host expert set");
-    } else if (avail == 0) {
-        cap = SIZE_MAX;
-        snprintf(policy, sizeof(policy), "auto: MemAvailable unknown -> the whole host expert set");
-    } else if (total <= auto_cap) {
-        cap = total;
-        snprintf(policy, sizeof(policy),
-                 "auto: the host expert set (%.1f MiB) fits %d%% of MemAvailable (%.1f MiB) -> pin all of it",
-                 put(total), frac, put(auto_cap));
-    } else {
-        cap = 0;
-        snprintf(policy, sizeof(policy),
-                 "auto: the host expert set (%.1f MiB) does NOT fit %d%% of MemAvailable (%.1f MiB) -> no pinned "
-                 "master; every host expert stays in the model mapping and the bounded pinned pool serves the "
-                 "reads (size it with MOE_HOST_POOL_MIB/MOE_HOST_POOL_FRAC)",
-                 put(total), frac, put(auto_cap));
-    }
-    host_experts_policy = policy;
-
-    if (cap == 0) {
-        // The not-fitting band: today's pool-backed master (pageable), which is the mode the pool exists for.
-        // EVERY candidate is a hole -- without this the per-tensor decision would fall through to the pinned
-        // default and pin the whole set, which is exactly what this branch exists to avoid.
-        for (const auto & c : cands) {
-            host_experts_holes.insert(c.name);
-        }
-        if (use_mmap) {
-            host_experts_pool_holes = true;
-            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
-            }
-        }
-        LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
-        return;
-    }
-
-    // --- 3. rank by the persisted heat prior, then take what fits --------------------------------
-    ggml_backend_dev_t heat_dev = nullptr;
-    if (!files.empty()) {
-        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-            ggml_backend_dev_t d = ggml_backend_dev_get(i);
-            if (d != nullptr && ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                ggml_backend_dev_moe_heat_open(d, files.front()->path().c_str());
-                if (heat_dev == nullptr) {
-                    heat_dev = d;
-                }
-            }
-        }
-    }
-    if (heat_dev != nullptr) {
-        for (auto & c : cands) {
-            const int64_t s = ggml_backend_dev_moe_heat_score(heat_dev, c.layer, c.name.c_str(), c.n_experts, c.host_bytes);
-            if (s >= 0) {
-                c.score = s;
-                host_experts_heat_seen = true;
-            }
-        }
-    }
-    if (host_experts_heat_seen) {
-        std::stable_sort(cands.begin(), cands.end(), [](const cand_t & a, const cand_t & b) {
-            return a.score > b.score;
-        });
-    }
-
-    size_t planned = 0;
-    size_t n_pinned = 0;
-    for (const auto & c : cands) {
-        if (planned + c.nbytes > cap) {
-            host_experts_holes.insert(c.name);   // stays in the model mapping; a smaller one below may still fit
-            continue;
-        }
-        host_experts_pinned.insert(c.name);
-        planned += c.nbytes;
-        ++n_pinned;
-    }
-    host_experts_cap_bytes = cap;
-
-    // Holes keep the read-only model mapping and are served either by the bounded pinned pool or, when the
-    // budget is spent, by the per-table bounce ring (the page cache as the source).  The pool is only given
-    // what the budget has left, so `-lme` stays a cap on the whole non-swappable tier rather than a floor.
-    // An explicit `MOE_HOST_POOL=1` / `MOE_HOST_POOL_MIB=N` still forces it on -- that is the A/B arm for
-    // "the same budget spent per EXPERT (the pool) instead of per TENSOR (a pinned master)".
-    if (!host_experts_holes.empty() && use_mmap) {
-        // The spare is normally smaller than one host expert tensor (a whole tensor is 90-176 MiB, and the
-        // budget buys whole tensors), so it cannot fund a useful pool -- and a pool that fits a small fraction
-        // of the holes buys nothing (measured: a 512 MiB or 1 GiB pool is indistinguishable from none).  The
-        // holes therefore read the page cache directly through the per-table bounce ring.  An explicit
-        // `MOE_HOST_POOL=1` / `MOE_HOST_POOL_MIB=N` still turns the pool on, which is the A/B arm for "the
-        // same RAM spent per EXPERT (a pool) instead of per TENSOR (a pinned master)".
-        host_experts_pool_holes = getenv("MOE_HOST_POOL") != nullptr || getenv("MOE_HOST_POOL_MIB") != nullptr;
-        if (host_experts_pool_holes) {
-            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
-            }
-        }
-    }
-
-    snprintf(policy, sizeof(policy),
-             "%.1f of %.1f MiB pinned (%zu of %zu tensors, %s); %.1f MiB pageable%s",
-             put(planned), put(total), n_pinned, cands.size(),
-             host_experts_heat_seen ? "descending hotness" : "model tensor order (no heat prior)",
-             put(total - planned),
-             host_experts_pool_holes ? " via the bounded pinned pool" : " (per-table bounce ring)");
-    host_experts_policy += ": ";
-    host_experts_policy += policy;
-    LLAMA_LOG_INFO("%s: host experts: %s\n", __func__, host_experts_policy.c_str());
-}
-
-void llama_model_loader::report_host_expert_placement() {
-    if (host_experts_total_bytes == 0 && host_experts_pinned.empty() && host_experts_holes_bytes == 0) {
-        return;
-    }
-    // Always at WARN: a user must be able to see which tier they got.  The pageable fallback costs about half
-    // the decode throughput and the only other warning (0008's PINNED HOST ALLOCATION FAILED) fires when a
-    // pinned allocation is refused, not when the policy chose not to pin.
-    //
-    // issue #274: it used to be INFO, which is INVISIBLE at the default verbosity (common/log.cpp maps
-    // GGML_LOG_LEVEL_INFO to LOG_LEVEL_TRACE against a default threshold of LOG_LEVEL_INFO).  The reporter
-    // could see only the WARN lines -- the failures -- and not one of the decisions that produced them.
-    const double mib = 1024.0 * 1024.0;
-    std::string src = "";
-    if (host_experts_sourceable > 0) {
-        // The pool is built per host tensor from this registration; a mismatch against the pageable tensor
-        // count is the first thing a "the pool never appears" report needs to know.
-        src = format(", %zu/%zu pool sources registered", host_experts_sources, host_experts_sourceable);
-        if (host_experts_sources < host_experts_sourceable) {
-            src += " -- the unregistered tensors cannot use the pool (their buffer names no device); the "
-                   "per-table bounce ring serves them";
-        }
-    }
-    LLAMA_LOG_WARN("%s: host experts: pinned %.1f MiB of %.1f MiB (cap %s), pageable %.1f MiB%s; %s\n", __func__,
-                   (double) host_experts_pinned_bytes / mib,
-                   (double) host_experts_total_bytes / mib,
-                   host_experts_cap_bytes == SIZE_MAX ? "none (the whole set)"
-                       : (host_experts_cap_bytes == 0 ? "0 (mapping + pool)"
-                                                      : format("%.1f MiB", (double) host_experts_cap_bytes / mib).c_str()),
-                   (double) host_experts_holes_bytes / mib, src.c_str(),
-                   host_experts_policy.empty() ? "legacy mode-keyed placement" : host_experts_policy.c_str());
-}
-
-
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -958,8 +985,8 @@ llama_model_loader::llama_model_loader(
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
-    if (getenv("LLAMA_TRACE")) {
-        trace = atoi(getenv("LLAMA_TRACE"));
+    if (const char * e = getenv("LLAMA_TRACE")) {
+        trace = atoi(e);
     }
 
     if (param_overrides_p != nullptr) {
@@ -1992,7 +2019,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (n_cpu_moe_from_end > 0 && op == GGML_OP_MUL_MAT_ID && hparams.n_layer() > 0 &&
                 tn.bid >= (int) hparams.n_layer() - n_cpu_moe_from_end &&
                 tn.bid <  (int) hparams.n_layer()) {
-            if (getenv("GGML_STAGE_TRACE")) {
+            // a per-TENSOR read: latch it (issue #273's getenv audit)
+            static const bool stage_trace = getenv("GGML_STAGE_TRACE") != nullptr;
+            if (stage_trace) {
                 fprintf(stderr, "NCMOE_TAIL host blk.%d (n_layer=%d N=%d)\n", (int) tn.bid, (int) hparams.n_layer(), n_cpu_moe_from_end);
                 fflush(stderr);
             }
@@ -2033,6 +2062,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             LLAMA_LOG_INFO("llama_model_loader: keeping the speculative (nextn) layer %d experts "
                                            "on the device; -ncmoe/-cmoe only offload the %u trunk layers\n",
                                            (int) tn.bid, hparams.n_layer());
+                        });
+                        continue;
+                    }
+                    if (overrides->buft == ggml_backend_cpu_buffer_type() && host_experts_umem) {
+                        // A shared host/device memory pool (an integrated GPU): hosting an expert here is a
+                        // page the GPU cannot address (see set_host_experts_umem).  Keep it on the device.
+                        static std::once_flag once_umem;
+                        std::call_once(once_umem, [&] {
+                            LLAMA_LOG_WARN("%s: keeping the expert weights on the device: this device's memory is "
+                                           "a shared host/device pool, so a host-resident expert master cannot be "
+                                           "read by the GPU (set_host_experts_umem)\n", __func__);
                         });
                         continue;
                     }
@@ -2279,7 +2319,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 // is unmapped outright (madvise(MADV_DONTNEED) is not enough: the ROCm runtime re-faults those pages on
 // the next pageable H2D copy).  Default on; LLAMA_LOAD_RELEASE_MMAP=0 disables it.
 static bool llama_load_release_mmap() {
-    static const bool enabled = getenv("LLAMA_LOAD_RELEASE_MMAP") == nullptr || atoi(getenv("LLAMA_LOAD_RELEASE_MMAP")) != 0;
+    static const bool enabled = [] { const char * e = getenv("LLAMA_LOAD_RELEASE_MMAP"); return e == nullptr || atoi(e) != 0; }();
     return enabled;
 }
 

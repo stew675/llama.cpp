@@ -650,6 +650,14 @@ llama_context::llama_context(
     cparams.moe_cache_size      = params.moe_cache_size; // upstream MoE cache (dormant unless --moe-cache-mib)
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
     cparams.drop_compute_buffers = params.drop_compute_buffers;
+    // --- the delivery's KV-placement options (block 15; all three DEFAULT OFF since r247) ---
+    cparams.spec_draft_kv_window = params.spec_draft_kv_window;
+    cparams.kv_region_pool       = params.kv_region_pool;
+    cparams.kv_resident_cells    = params.kv_resident_cells;
+    // hand the resident-window REQUEST to the library before any cache exists (a library consumer sets it
+    // through `llama_context_params`; `common_params_fit` sets the same thing, and its own decision arrives
+    // through `llama_kv_region_set_resident_cells`).
+    llama_kv_region_set_window_request(params.kv_resident_cells);
 
     // resolved after flash attention, see resolve_fused_ops()
     {
@@ -810,6 +818,8 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
             /*.no_alloc  =*/ model.no_alloc(),
+            /*.kv_pool   =*/ cparams.ctx_other == nullptr,
+            /*.kv_pool_cells =*/ cparams.kv_region_pool,
         };
         // the graph builders that choose between quantized-aware attention arms need the same
         // types the memory module was given (see qwen4exp_qsa_sparse)
@@ -6308,6 +6318,9 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.spec_draft_kv_window        =*/ 0,
+        /*.kv_region_pool              =*/ 0,
+        /*.kv_resident_cells           =*/ 0,
     };
 
     return result;
@@ -7106,6 +7119,22 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+void llama_context::kv_pool_bytes(size_t & vram, size_t & ram) const {
+    vram = 0;
+    ram  = 0;
+    if (memory) {
+        memory->kv_pool_bytes(vram, ram);
+    }
+}
+
+void llama_get_kv_pool_bytes(const struct llama_context * ctx, size_t * vram, size_t * ram) {
+    size_t v = 0;
+    size_t r = 0;
+    ctx->kv_pool_bytes(v, r);
+    if (vram != nullptr) { *vram = v; }
+    if (ram  != nullptr) { *ram  = r; }
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

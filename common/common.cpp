@@ -1254,11 +1254,42 @@ static common_draft_reserve common_draft_reserve_derive(const common_params & pa
     }
     // `n_ctx == 0` ("from the model") is resolved inside the estimator from the draft GGUF's own
     // `context_length`: estimating with 0 would UNDER-estimate the reserve, the dangerous direction.
+    //
+    // An MTP draft has no GGUF of its own (it runs the target's nextn layer), and its KV window only reaches
+    // the expert arena if this reserve shrinks with it: the slab reserves `aux` BEFORE the draft context
+    // exists, and the surplus is not handed back.  So for an MTP draft whose window is active, estimate from
+    // the target's own metadata with the weights zeroed (they are shared) -- which is the draft's real
+    // post-slab footprint.  Without a window the flat constant stays, so no existing run changes.
+    // ONLY an embedded-head MTP draft (no `-md`: qwen3.5/3.6/3.8) -- that is the draft whose KV this window
+    // can actually shrink (`create_memory`'s plain kv_cache branch).  A separate MTP draft GGUF
+    // (qwen4exp/Flash-Next) keeps the flat constant: its context has its own geometry (and an indexer cache)
+    // and the window does not apply to it, so deriving 48 layers of KV from the target's metadata would cut
+    // the arena for a draft that is not windowed at all.
+    // The window predicate is the CACHE's own geometry function, not the bare policy: with `--kv-unified` a
+    // window can be declined for the sequence count (issue #264), and a reserve derived from a window the
+    // cache did not take would under-charge the draft's KV.
+    //
+    // The ubatch passed in has to be the DRAFT context's, not the target's `-ub`: `MTP_DRAFT_N_UBATCH` caps it
+    // at 512 (TODO #42), and the window keeps `win + one batch` cells -- so reading the target's `-ub` sized the
+    // estimate for 52224 cells while the cache allocated 51712 (issue #297, the reporter's `kv cells 52224`
+    // against `draft cache 51712`).  `n_batch` bounds it the same way `llama_context` does.
+    const uint32_t n_ubatch_dft = std::min<uint32_t>(params.n_batch, common_speculative_draft_n_ubatch(params.n_ubatch));
+
+    uint32_t mtp_win = 0;
+    const bool mtp_shared = params.speculative.has_mtp() &&
+                            params.speculative.draft.mparams.path.empty() &&
+                            llama_spec_draft_kv_cells(params.n_ctx, n_ubatch_dft,
+                                                      (uint32_t) params.n_parallel, params.kv_unified,
+                                                      params.speculative.draft.kv_window,
+                                                      &mtp_win) != 0;
     return common_draft_reserve_estimate(
-            params.speculative.draft.mparams.path,
+            mtp_shared ? params.model.path : params.speculative.draft.mparams.path,
             params.n_ctx,
-            params.n_ubatch,
-            params.cache_type_k, params.cache_type_v);
+            mtp_shared ? n_ubatch_dft : params.n_ubatch,
+            params.cache_type_k, params.cache_type_v,
+            mtp_shared,
+            (uint32_t) params.n_parallel, params.kv_unified,
+            params.speculative.draft.kv_window);
 }
 
 void common_fit_apply(common_params & params, llama_model_params & mparams, llama_context_params & cparams) {
@@ -2118,6 +2149,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
     cparams.drop_compute_buffers = params.drop_compute_buffers;
+    // the delivery's KV-placement options (block 15; all three default off since r247)
+    cparams.spec_draft_kv_window = params.speculative.draft.kv_window;
+    cparams.kv_region_pool       = params.kv_region_pool;
+    cparams.kv_resident_cells    = params.kv_resident_cells;
 
     // issue #238: a multimodal projector feeds 2-D (M-RoPE) positions into this context, and the packed KQ
     // mask must be part of the compute reserve for those.  Without a projector the context only ever sees

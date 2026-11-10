@@ -498,6 +498,29 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // --- the delivery's KV-placement options (block 15; all three are also command-line flags, and all
+        // three DEFAULT TO OFF: a placement that changes decode cannot be a default) ---
+        int32_t spec_draft_kv_window;  // MTP draft context only (`--spec-draft-kv-window`): its KV window in
+                                       // CELLS per sequence (-1 = auto policy, 0 = a full `n_ctx` cache,
+                                       // N = N cells; DEFAULT 0 since r247).  A window DROPS the drafter's
+                                       // oldest cells; the target verifies every drafted token, so a truncated
+                                       // draft can only be slower, never wrong.  Measured: -9.7 % of MTP
+                                       // decode on a tensor split at 105k tokens past a 65536-cell window
+                                       // [EXPERIMENTAL]
+        int32_t kv_region_pool;        // the ATTENDANCE POOL (`--kv-attendance-pool`, alias
+                                       // `--kv-region-pool`): 0 = off (default), non-zero = on.  The
+                                       // attention KV becomes an authoritative pinned host MIRROR plus a
+                                       // compact device pool of indexer pages the sparse QSA decode resolves
+                                       // through.  Only a qwen4exp trunk cache can take it, and it is the
+                                       // alternative to the resident window, never a layer on top of it.  The
+                                       // pool's SIZE is derived from the model and is not a knob [EXPERIMENTAL]
+        int32_t kv_resident_cells;     // `--kv-window`: the RESIDENT WINDOW, the newest N CELLS of the
+                                       // attention KV that stay in VRAM with the older ones spilled to pinned
+                                       // host RAM (lossless; a model-agnostic placement).  -1 = auto (`--fit`
+                                       // sizes it), 0 = off (default), N = N cells.  The legacy env var
+                                       // `LLAMA_KV_RESIDENT_CELLS` is honoured as this option's deprecated alias
+                                       // [EXPERIMENTAL]
     };
 
     struct llama_model_tensor_override {

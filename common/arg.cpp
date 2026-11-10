@@ -1699,6 +1699,71 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
     add_opt(common_arg(
+        {"--kv-window"}, "[auto|N]",
+        string_format("the RESIDENT WINDOW of the attention KV, in cells: 'auto', '0' (off: fully resident), or N "
+                      "cells (default: %s).  The newest N cells stay in VRAM and everything older moves to pinned "
+                      "system RAM inside the SAME reservation -- one copy, no page table, no kernel change.  "
+                      "LOSSLESS and model-agnostic: nothing is dropped, a spilled cell is just read over the PCIe "
+                      "link, which costs 11-26 %% of decode once your request is deeper than the window.  'auto' "
+                      "is sized by --fit; without --fit the cache declines it and says so.  OFF by default: a "
+                      "placement this consequential is an opt-in.  NOT the attendance pool (which keeps a device "
+                      "CACHE of a host-authoritative copy) and NOT the draft window (which TRUNCATES the "
+                      "drafter's cache).  LLAMA_KV_RESIDENT_CELLS is this option's deprecated alias",
+                      params.kv_resident_cells < 0 ? "auto" : std::to_string(params.kv_resident_cells).c_str()),
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                params.kv_resident_cells = -1;
+            } else if (is_falsey(value)) {
+                params.kv_resident_cells = 0;
+            } else {
+                try {
+                    const int v = std::stoi(value);
+                    if (v < 0) {
+                        throw std::invalid_argument("negative");
+                    }
+                    params.kv_resident_cells = v;
+                } catch (...) {
+                    throw std::invalid_argument(
+                        string_format("error: unknown value for --kv-window: '%s'\n", value.c_str()));
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_KV_WINDOW").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--kv-attendance-pool", "--kv-region-pool"}, "[on|off]",
+        string_format("take the ATTENDANCE POOL for the attention KV: <bool> = on/off (default: %s).  The KV's "
+                      "AUTHORITATIVE copy moves to a pinned host mirror and the device keeps a compact pool of "
+                      "indexer pages plus a page table, which the sparse QSA decode resolves through (a miss is "
+                      "one DMA fill, then it hits).  Only a qwen4exp trunk can take it (a uniform indexer-block "
+                      "geometry, one stream, device-offloaded K/V); it declines everywhere else, on an integrated "
+                      "GPU, and while the resident window is active -- the two are ALTERNATIVES for the same "
+                      "bytes (cache-and-fill vs spill-and-read), never layers.  It buys VRAM (a ~204 MiB pool "
+                      "instead of a 1.6-2.4 GiB KV) but costs prompt throughput on a KV that fits (~48 %% of "
+                      "pp32K), so it is a fittability feature and OFF by default.  The pool's SIZE is derived from "
+                      "the model (one decode band of the indexer working set); a legacy numeric size or 'auto' is "
+                      "accepted for compatibility and IGNORED",
+                      params.kv_region_pool != 0 ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                // the r246 spelling for "the system's size": still ON, and the cache says the value is ignored
+                params.kv_region_pool = -1;
+            } else if (common_arg_utils::is_truthy(value)) {
+                params.kv_region_pool = 1;
+            } else if (is_falsey(value)) {
+                params.kv_region_pool = 0;
+            } else {
+                try {
+                    // a legacy numeric size (r246): accepted, and IGNORED by the cache -- it stays non-zero so
+                    // the cache can SEE that a size was asked for and say it is not a knob any more
+                    params.kv_region_pool = std::stoi(value);
+                } catch (...) {
+                    throw std::invalid_argument(string_format(
+                        "error: unknown value for --kv-attendance-pool: '%s'\n", value.c_str()));
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_KV_REGION_POOL").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
@@ -4320,6 +4385,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_ubatch = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
+    add_opt(common_arg(
+        {"--spec-draft-kv-window"}, "[auto|N]",
+        string_format("MTP only: the draft context's own KV window, in cells per sequence -- 'auto', '0' (a full "
+                      "`-c` draft cache, the DEFAULT), or N cells (default: %s).  The draft context carries a KV of "
+                      "its own, sized `-c` (one draft layer: 256 MiB of a 27B at `-c 65536`, 1 GiB at `-c 262144`), "
+                      "although the drafter only reads its recent prefix; a window makes it a ring instead.  This is "
+                      "an APPROXIMATION the target verifies: a truncated draft is a slower run, never a wrong "
+                      "answer.  'auto' is THE CAP OR NOTHING -- 65536 cells, or no window at all when 65536 would "
+                      "not leave a batch of room below every sequence's own context.  OFF by default since r247: "
+                      "a window the request outgrows costs draft acceptance AND a per-step cost past the ring wrap "
+                      "(measured -9.7 %% of MTP decode on a tensor split at 105k tokens; "
+                      "benchmarks/mtp-draft-window-depth.md), so 'auto' and N are a conscious opt-in.  "
+                      "Formerly the LLAMA_SPEC_DRAFT_WINDOW env var",
+                      params.speculative.draft.kv_window < 0 ? "auto" : std::to_string(params.speculative.draft.kv_window).c_str()),
+        [](common_params & params, const std::string & value) {
+            if (is_autoy(value)) {
+                params.speculative.draft.kv_window = -1;
+            } else if (is_falsey(value)) {
+                params.speculative.draft.kv_window = 0;
+            } else {
+                try {
+                    params.speculative.draft.kv_window = std::max(0, std::stoi(value));
+                } catch (...) {
+                    throw std::invalid_argument(
+                        string_format("error: unknown value for --spec-draft-kv-window: '%s'\n", value.c_str()));
+                }
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_KV_WINDOW"));
     add_opt(common_arg(
         {"--spec-draft-n-min-adaptive"}, "N",
         string_format("minimum adaptive MTP draft depth; the depth never drops below it (the default cold start is three steps below --spec-draft-n-max, bounded by this floor) (default: %d)", params.speculative.draft.n_min_adaptive),

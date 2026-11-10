@@ -9,12 +9,13 @@ extern "C" {
 #define RPC_PROTO_MAJOR_VERSION    10
 #define RPC_PROTO_MINOR_VERSION    0
 // The fork's op set diverges from upstream's (block 11 adds 6 ops, block 12 the ALL_GATHER
-// collective), so the patch version stays non-zero: an RPC peer must already refuse a mismatched
-// op table.  GGML_OP_COUNT below is the MERGED enum's value, never either side's literal one.
-#define RPC_PROTO_PATCH_VERSION    8
+// collective, block 15 the KV_POOL region op), so the patch version stays non-zero: an RPC peer must
+// already refuse a mismatched op table.  GGML_OP_COUNT below is the MERGED enum's value, never either
+// side's literal one.
+#define RPC_PROTO_PATCH_VERSION    9
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

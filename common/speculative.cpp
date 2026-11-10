@@ -1749,6 +1749,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    dev_rows    = false;
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
+    // per-sequence "do not draft" latch, set when the drafter could not place a batch even into an empty
+    // cache (issue #297).  Sticky for the request so one poison chunk cannot make every later chunk pay the
+    // drop-and-retry; `begin()` clears it.  Drafting is optional, so skipping it never changes the text.
+    std::vector<bool> dft_skip;
 
     // Adaptive draft depth (draft-mtp-adaptive), see common_speculative_adaptive
     bool adaptive = false;
@@ -1908,6 +1912,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
+        dft_skip.assign(n_seq, false);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1931,6 +1936,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+
+        // a new request retries drafting even if the previous one disabled it (issue #297)
+        if ((size_t) seq_id < dft_skip.size()) {
+            dft_skip[seq_id] = false;
+        }
 
         // new generation: the depth learned for the previous content is stale,
         // so the controller starts over from --spec-draft-n-start (or the default
@@ -2107,33 +2117,68 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
-            bool ok = true;
-            for (int head = 0; head < n_mtp_layers && batch.size() > 0; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
+            // The drafter's KV is LOSSY by design (a window, or a ring that evicted its oldest cells), so a
+            // batch it cannot place must cost ACCEPTANCE, never the request: a draft-only failure used to
+            // return false, and the server turned that into HTTP 500 "failed to process speculative batch" /
+            // "failed to process mtmd chunk" (issue #297).  Run the heads, and on a failure drop the draft KV
+            // of the batch's sequences -- a batch is always placeable in an empty draft cache -- then retry
+            // once.  A retry that still fails only disables drafting for those sequences until the next
+            // request (`begin()`); the target decodes the tokens itself and the output is unchanged.
+            auto run_heads = [&]() -> int32_t {
+                for (int head = 0; head < n_mtp_layers && batch.size() > 0; ++head) {
+                    if (chain_heads) {
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                            if (i_batch_beg[seq_id] < 0) {
+                                continue;
+                            }
+                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
                         }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                        llama_set_nextn_layer_offset(ctx_dft, head);
                     }
-                    llama_set_nextn_layer_offset(ctx_dft, head);
+
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                        return rc;
+                    }
+                }
+                return 0;
+            };
+
+            int32_t rc = run_heads();
+
+            if (rc != 0) {
+                SPC_WRN("draft decode failed (rc=%d, pos=%d): dropping the draft KV and retrying once\n",
+                        (int) rc, (int) batch_in.tokens[0].pos[0]);
+
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] >= 0) {
+                        llama_memory_seq_rm(mem_dft, seq_id, 0, -1);
+                    }
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                rc = run_heads();
+
                 if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
-                    break;
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        if (i_batch_beg[seq_id] >= 0) {
+                            dft_skip[seq_id] = true;
+                        }
+                    }
+                    SPC_ERR("the drafter cannot place this batch even in an empty cache (rc=%d): drafting is "
+                            "disabled for the rest of this request\n", (int) rc);
                 }
             }
 
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
-            if (!ok) {
-                return false;
+
+            if (rc != 0) {
+                // never fail the request for a drafter-only failure (issue #297)
+                return true;
             }
         }
 
@@ -2214,6 +2259,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             auto & dp = dparams[seq_id];
 
             if (!dp.drafting) {
+                continue;
+            }
+
+            if ((size_t) seq_id < dft_skip.size() && dft_skip[seq_id]) {
+                // the drafter could not place a batch for this sequence (issue #297): decode without drafts
+                // for the rest of the request rather than retrying a poison chunk on every step
+                dp.drafting = false;
                 continue;
             }
 
@@ -3231,6 +3283,15 @@ const std::vector<double> & common_speculative_get_synth_probs(const common_spec
     return spec->synth_probs;
 }
 
+uint32_t common_speculative_draft_n_ubatch(uint32_t n_ubatch_tgt) {
+    const char * e = getenv("MTP_DRAFT_N_UBATCH");
+    const int64_t draft_ub = e != nullptr ? atoll(e) : 512;   // 0 = no cap (use the target's -ub)
+    if (draft_ub > 0) {
+        return (uint32_t) std::max<int64_t>(1, std::min<int64_t>(draft_ub, (int64_t) n_ubatch_tgt));
+    }
+    return n_ubatch_tgt;
+}
+
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
 
@@ -3286,6 +3347,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     // the MoE cache is only used by the target context
     result.moe_cache_size = 0;
+
+    // the ATTENDANCE POOL is the trunk cache's placement (its decode read is the sparse QSA arm); a draft
+    // context reads densely, so it never takes one -- and its layers are nextn/indexer geometry, which the
+    // cache's own eligibility check would decline anyway
+    result.kv_region_pool = 0;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
@@ -3372,12 +3438,12 @@ common_speculative_init_result::common_speculative_init_result(
     // and the injection is fast in small chunks, so cap it at 512 by default; the freed VRAM goes to
     // the MoE expert arena (the `-ub 8192` decode DoD).  `MTP_DRAFT_N_UBATCH=0` restores the target's
     // `-ub`; a positive value overrides the 512 default.
+    //
+    // The cap is the DRAFT CACHE's `n_ubatch`, so it also decides how many spare cells its KV window keeps
+    // (`win + one batch`).  Anything that sizes that KV must ask `common_speculative_draft_n_ubatch()` and
+    // not read the target's `-ub` -- the two disagreed by 512 cells until issue #297.
     if (spec_mtp) {
-        const char * e = getenv("MTP_DRAFT_N_UBATCH");
-        const int64_t draft_ub = e != nullptr ? atoll(e) : 512;   // 0 = no cap (use the target's -ub)
-        if (draft_ub > 0) {
-            cparams.n_ubatch = (uint32_t) std::max<int64_t>(1, std::min<int64_t>(draft_ub, (int64_t) cparams.n_ubatch));
-        }
+        cparams.n_ubatch = common_speculative_draft_n_ubatch(cparams.n_ubatch);
     }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types

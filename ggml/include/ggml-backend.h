@@ -606,6 +606,26 @@ extern "C" {
         const struct ggml_tensor * tensor, const struct ggml_backend_meta_split_state * split_state,
         size_t n_devs, size_t dev);
 
+    // TODO #124: the backend's KV-REGION proc addresses, resolved for a Meta (tensor-split) device.  A Meta
+    // device carries no backend reg of its own, so a per-device VMM region reaches the KV cache and `--fit`
+    // only through these.  Each is a "does every child answer?" query: a child that does not provide the
+    // proc makes the whole call decline (nullptr/0/-1), because a window on some of the devices is exactly
+    // the silent surprise the invariants forbid.  The region itself stays per device (every child commits its
+    // own `cells` cells at its own cell stride).
+    //   - `cells = 0`: the buffer type of a growable region with NO window (the `--fit` probe), the same
+    //     distinction `ggml_backend_cuda_kv_region_buft` / `..._buft_split` makes per device.
+    GGML_API struct ggml_backend_buffer_type * ggml_backend_meta_kv_region_buft(
+        ggml_backend_dev_t meta_dev, size_t cells);
+
+    // 1 = this Meta buffer type is a KV region (every child answers the backend's own predicate), 0 = no.
+    GGML_API int ggml_backend_meta_kv_region_is_kv_buft(ggml_backend_buffer_type_t buft);
+
+    // Grow every child region to `n_cells` cells.
+    //   1 = grown, 0 = no child carries a region, -1 = refused (logged; the caller must not run the batch)
+    // A Meta buffer whose children cannot be reached is a hard error (-1), never a silent 0: an unmapped
+    // extent that the next batch reads faults the GPU instead of returning an error.
+    GGML_API int ggml_backend_meta_kv_region_grow(ggml_backend_buffer_t buffer, uint32_t n_cells);
+
     //
     // Utils
     //
