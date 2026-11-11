@@ -62,6 +62,8 @@ const char * llama_load_mode_name(enum llama_load_mode load_mode) {
             return "mmap+mlock";
         case LLAMA_LOAD_MODE_DIRECT_IO:
             return "dio";
+        case LLAMA_LOAD_MODE_BUFFERED:
+            return "buffered";
     }
     GGML_ABORT("fatal error");
 }
@@ -73,6 +75,7 @@ enum llama_load_mode llama_load_mode_from_str(const char * str) {
     if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
     if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
+    if (std::strcmp(str, "buffered")   == 0) { return LLAMA_LOAD_MODE_BUFFERED;   }
     GGML_ABORT("unknown load mode: %s", str);
 }
 
@@ -374,6 +377,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+        // TODO #58/#78: a DFlash2 drafter with a selector builds `ggml_top_k` over its draft logits, and
+        // `-sm tensor` vocabulary-splits those (the lm_head is the target's, placed by the target's split
+        // policy).  `build_dflash2_selector()` all-gathers the logits on the meta backend before the
+        // selector runs, so the combination is supported: no rejection here any more.
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }

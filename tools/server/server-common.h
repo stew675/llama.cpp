@@ -393,7 +393,15 @@ struct server_chat_params {
     std::string media_path;
     bool media_allow_private_urls = false;
     bool force_pure_content = false;
+    std::vector<std::string> tool_text_protected; // server_tool_text_protected(), longest first
+    std::vector<std::string> tool_text_control;   // the CONTROL / UNKNOWN ones, for assistant text (empty with --special)
 };
+
+// The special-token texts that a tool result or a tool call's arguments must not turn into tokens: every CONTROL and
+// UNKNOWN token, and the USER_DEFINED tokens the chat template itself uses (the rest are vocabulary, e.g. whitespace
+// runs); with control_only, only the CONTROL and UNKNOWN ones (for assistant text).  oaicompat_chat_params_parse()
+// keeps them as ordinary text there (LLAMA_SERVER_TOOL_TEXT=0: off).
+std::vector<std::string> server_tool_text_protected(const llama_vocab * vocab, const common_chat_templates * tmpls, bool control_only);
 
 // used by /completions endpoint
 json oaicompat_completion_params_parse(const json & body);

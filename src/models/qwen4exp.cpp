@@ -4,6 +4,10 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <functional>
+#include <set>
+#include <mutex>
+#include <string>
 #include <cinttypes>
 #include <cstdlib>
 #include <system_error>
@@ -125,6 +129,102 @@ static bool qwen4exp_qsa_off() {
         return env != nullptr && std::atoi(env) != 0;
     }();
     return off;
+}
+
+// Sequence parallelism (default on, LLAMA_SEQPAR=0: off): in a 2-GPU -sm tensor prefill ubatch the
+// per-token hyper-connection work (DSV4_HC_POST/PRE, their norms and BF16 GEMMs, the shared expert, the residual
+// adds) runs on each GPU's half of the tokens instead of on all tokens on both.  The residual streams stay
+// token-split from layer 0 to the last layer; each block gathers its [n_embd, T] input (all_gather, F32) for the
+// feature-split attention / router / MoE, and the attention and MoE partial sums are reduce-scattered by tokens
+// (token_scatter) instead of all-reduced.  The PLE layers and the last layer (output rows, MTP export) run on the
+// gathered streams as before.  Off (LLAMA_SEQPAR=0, or any case it does not engage for): the graph is unchanged.
+// Not bit-identical to off: the per-token work runs at half the batch width on each device, a rounding-level change
+// (same as changing -ub).  Why it does not engage is logged once per reason (seqpar_not_engaged).
+//   LLAMA_SEQPAR_MIN  smallest ubatch that splits (default 512; an odd ubatch splits ceil/floor, LLAMA_SEQPAR_ODD=0: even only)
+//   LLAMA_SEQPAR_RS   bit 0: reduce-scatter the attention output, bit 1: the MoE output (default 3); a cleared
+//                     bit all-reduces that output and slices it locally (same values, more link bytes)
+static int qwen4exp_seqpar_rs_mask() {
+    static const int mask = [] {
+        const char * env = getenv("LLAMA_SEQPAR_RS");
+        return env != nullptr ? std::atoi(env) : 3;
+    }();
+    return mask;
+}
+
+// Once per context and message: the key is the context's cparams, not the process, because common's --fit builds a
+// trial context with the log silenced first, and a process-wide flag would be spent there.
+static bool qwen4exp_seqpar_log_first(const llama_cparams & cparams, int what) {
+    static std::mutex mtx;
+    static std::set<std::pair<const void *, int>> seen;
+    std::lock_guard<std::mutex> lock(mtx);
+    return seen.insert({ (const void *) &cparams, what }).second;
+}
+
+// one INFO line per context and reason when sequence parallelism does not engage; the reason text is only built for
+// the line that is logged (the predicate runs for every graph, decode included)
+static bool qwen4exp_seqpar_not_engaged(const llama_cparams & cparams, int reason, const std::function<std::string()> & why) {
+    if (qwen4exp_seqpar_log_first(cparams, reason)) {
+        LLAMA_LOG_INFO("%s: sequence parallelism not engaged: %s (logged once per reason)\n", __func__, why().c_str());
+    }
+    return false;
+}
+
+static bool qwen4exp_seqpar_enabled(const llama_model & model, const llama_cparams & cparams, int64_t n_tokens) {
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_SEQPAR");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    static const int64_t min_tokens_req = [] {
+        const char * env = getenv("LLAMA_SEQPAR_MIN");
+        return env != nullptr ? (int64_t) std::atoll(env) : (int64_t) 512;
+    }();
+    // The band's floor is the GRAPH's, not an arbitrary number: at or below the fused hyper-connection decode band
+    // (`nt <= HC_BF16_MAX_TOKENS`; the fused mixer and the combine ASSERT mirrored inputs in
+    // `ggml_backend_meta_get_split_state`, and `GGML_OP_HC_MIX`/`HC_COMBINE` have no token-split form), so a
+    // token-split ubatch that small builds a graph with an op the split cannot serve.  One floor for both mixer
+    // families (the Q8_0 band ends at 8) keeps the per-layer weight-type decision out of this predicate; the
+    // 9..16 band is simply not split.  Decode and verify graphs (1..n_draft+1 tokens) are below it by
+    // construction, so they can never split either.
+    static constexpr int64_t seqpar_floor = HC_BF16_MAX_TOKENS + 1;
+    static const int64_t min_tokens = min_tokens_req < seqpar_floor ? seqpar_floor : min_tokens_req;
+    if (min_tokens != min_tokens_req && qwen4exp_seqpar_log_first(cparams, 6)) {
+        LLAMA_LOG_WARN("%s: LLAMA_SEQPAR_MIN=%lld is below the supported floor of %lld tokens (a token-split "
+                       "ubatch inside the fused hyper-connection band selects ops the split cannot serve); "
+                       "using %lld\n", __func__, (long long) min_tokens_req, (long long) seqpar_floor,
+                       (long long) min_tokens);
+    }
+    // LLAMA_SEQPAR_ODD=0: even token counts only (the step-1 rule); default: odd counts split ceil/floor
+    static const bool odd_ok = [] { const char * e = getenv("LLAMA_SEQPAR_ODD"); return e == nullptr || atoi(e) != 0; }();
+    if (!on) {
+        return qwen4exp_seqpar_not_engaged(cparams, 0, [] { return std::string("LLAMA_SEQPAR=0"); });
+    }
+    if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR) {
+        return qwen4exp_seqpar_not_engaged(cparams, 1, [] { return std::string("split mode is not -sm tensor"); });
+    }
+    // checked before the per-layer walk below: decode and verify graphs stop here
+    if (n_tokens < std::max<int64_t>(min_tokens, 2) || (!odd_ok && n_tokens % 2 != 0)) {
+        return qwen4exp_seqpar_not_engaged(cparams, 4, [&] {
+            return "ubatch of " + std::to_string(n_tokens) + " tokens (below LLAMA_SEQPAR_MIN = " + std::to_string(min_tokens) +
+                   ", or odd with LLAMA_SEQPAR_ODD=0); decode and verify never split";
+        });
+    }
+    for (int il = 0; il < (int) model.hparams.n_layer(); ++il) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (dev == nullptr || !ggml_backend_dev_is_meta(dev) || ggml_backend_meta_dev_n_devs(dev) < 2) {
+            return qwen4exp_seqpar_not_engaged(cparams, 2, [&] {
+                const std::string where = dev == nullptr ? "no device" : !ggml_backend_dev_is_meta(dev) ? "1 device" :
+                                          std::to_string(ggml_backend_meta_dev_n_devs(dev)) + " devices";
+                return "layer " + std::to_string(il) + " is on " + where + ", the split needs at least 2";
+            });
+        }
+    }
+    // the drafter taps read the per-layer residual of every token
+    for (bool tap : cparams.embeddings_layer_inp) {
+        if (tap) {
+            return qwen4exp_seqpar_not_engaged(cparams, 3, [] { return std::string("a drafter reads the per-layer inputs (embeddings_layer_inp)"); });
+        }
+    }
+    return true;
 }
 
 static bool qwen4exp_want_derived_vis(const llama_model & model, const llama_hparams & hparams, int il, const llama_cparams & cparams, int64_t n_tokens);
@@ -1039,6 +1139,31 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
     // built as a second tail, so the logits tail can stay gathered (see below)
     ggml_tensor * res_hc_export = nullptr;
 
+    // sequence parallelism (see qwen4exp_seqpar_enabled): res_split = res_hc holds this device's tokens only
+    const bool seqpar = qwen4exp_seqpar_enabled(model, cparams, n_tokens);
+    const int  sp_rs  = seqpar ? qwen4exp_seqpar_rs_mask() : 0;
+    bool res_split    = false;
+    int  n_sp_scatter = 0;
+    int  n_sp_gather  = 0;
+    // token_scatter / all_gather land in the graph right behind their source: a reduce-scatter needs the
+    // scatter to be the node after the partial sum's reduce point
+    auto sp_scatter = [&](ggml_tensor * t, bool rs) {
+        t = ggml_token_scatter(ctx0, t, rs);
+        ggml_build_forward_expand(gf, t);
+        n_sp_scatter++;
+        return t;
+    };
+    // the per-layer hc_mixed gathers ship bf16 (the BF16 GEMMs over them round their src1 to bf16 anyway; it rounds
+    // exactly as its F32-wire round-only control, GGML_SEQPAR_GATHER_ROUND=1); the residual-stream gathers stay F32.
+    // Default on, LLAMA_SEQPAR_GATHER_BF16=0: F32 wire
+    static const int sp_wire = [] { const char * e = getenv("LLAMA_SEQPAR_GATHER_BF16"); return e == nullptr || atoi(e) != 0 ? 1 : 0; }();
+    auto sp_gather = [&](ggml_tensor * t, int wire = 0) {
+        t = ggml_all_gather_wire(ctx0, t, wire);
+        ggml_build_forward_expand(gf, t);
+        n_sp_gather++;
+        return t;
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         // Export the layer input only when a drafter taps it (dflash/dspark set these from the head's
         // target_layers): the tap wants the n_embd-wide mean over the hc streams, not the wide residual
@@ -1050,8 +1175,24 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
 
+        // sequence parallelism: the PLE conv mixes tokens and the last layer drops output rows, so those run
+        // on the gathered streams; every other layer keeps them token-split
+        const bool sp_layer = seqpar && il < n_layer - 1;
+
         if (hparams.is_ple(il)) {
+            if (res_split) {
+                res_hc    = sp_gather(res_hc);
+                res_split = false;
+            }
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+        }
+
+        if (sp_layer && !res_split) {
+            res_hc    = sp_scatter(res_hc, false);
+            res_split = true;
+        } else if (!sp_layer && res_split) {
+            res_hc    = sp_gather(res_hc);
+            res_split = false;
         }
 
         ggml_tensor * inject = nullptr;
@@ -1063,12 +1204,22 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                 model.layers[il].hc_attn_down_inject,
                 &inject, il);
 
+        if (res_split) {
+            // the feature-split projections need every token
+            cur = sp_gather(cur, sp_wire);
+        }
+
         ggml_build_forward_expand(gf, cur);
 
         if (hparams.is_recr(il)) {
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
+        }
+
+        if (res_split) {
+            // the partial attention output: reduce-scattered by tokens (or all-reduced and sliced)
+            cur = sp_scatter(cur, (sp_rs & 1) != 0);
         }
 
         // The last layer's tail is always computed on the gathered output rows, so the
@@ -1111,7 +1262,13 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                 model.layers[il].hc_ffn_down_inject,
                 &inject, il);
 
-        cur = build_layer_ffn(cur, il);
+        if (res_split) {
+            // shared expert on the local tokens, router + routed MoE on all of them
+            cur = build_layer_ffn(cur, il, sp_gather(cur, sp_wire), (sp_rs & 2) != 0);
+            n_sp_scatter++;
+        } else {
+            cur = build_layer_ffn(cur, il);
+        }
         cb(cur, "ffn_out", il);
 
         res_hc = build_hc_combine(res_hc, cur, inject, il);
@@ -1132,6 +1289,15 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
                     &inject_full, il);
             cur_x = build_layer_ffn(cur_x, il);
             res_hc_export = build_hc_combine(res_hc_x, cur_x, inject_full, il);
+        }
+    }
+
+    GGML_ASSERT(!res_split);
+    if (seqpar) {
+        if (qwen4exp_seqpar_log_first(cparams, 5)) {
+            LLAMA_LOG_INFO("%s: sequence parallelism (LLAMA_SEQPAR) on: T = %lld, %d token_scatter + %d all_gather "
+                           "nodes per graph, reduce-scatter mask %d\n", __func__, (long long) n_tokens, n_sp_scatter,
+                           n_sp_gather, sp_rs);
         }
     }
 
@@ -2791,7 +2957,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * cur_full,
+        bool reduce_scatter) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
     // The shared expert is mirrored under -sm tensor while the MoE output is a partial sum: expanding the shared
@@ -2815,7 +2982,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
     }
 
     ggml_tensor * moe_out =
-        build_moe_ffn(cur,
+        build_moe_ffn(cur_full ? cur_full : cur,
             model.layers[il].ffn_gate_inp,
             model.layers[il].ffn_up_exps,
             model.layers[il].ffn_gate_exps,
@@ -2830,6 +2997,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
+
+    if (cur_full != nullptr) {
+        // sequence parallelism: this device's tokens of the routed sum (reduce-scattered when the scatter is the
+        // node right behind the reduce point, which the immediate expansion keeps it)
+        moe_out = ggml_token_scatter(ctx0, moe_out, reduce_scatter);
+        ggml_build_forward_expand(gf, moe_out);
+    }
 
     // shared experts, as in the Qwen3Next reference
     if (ffn_shexp != nullptr) {

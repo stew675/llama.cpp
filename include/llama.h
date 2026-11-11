@@ -212,6 +212,11 @@ extern "C" {
         LLAMA_LOAD_MODE_MLOCK      =  2, // force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_MMAP_MLOCK =  3, // mmap + force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_DIRECT_IO  =  4, // use direct I/O if available
+        LLAMA_LOAD_MODE_BUFFERED   =  5, // mapped master, but every host read is a BUFFERED read: one
+                                         //   `pread` of the expert through the OS page cache instead of a
+                                         //   demand fault per 4 KiB page out of the mapping (rdna-boosts:
+                                         //   the mapping collapses under memory pressure, a buffered read
+                                         //   degrades gracefully -- see ENVIRONMENT.md)
     };
 
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
@@ -237,7 +242,12 @@ extern "C" {
         LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // pinned (the pageable mmap mode was removed; issue #116)
         LLAMA_HOST_EXPERTS_MODE_PINNED =  0, // keep them in the device's pinned host buffer (ROCm_Host) - fast path
         LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // REMOVED: pageable masters fault on no-XNACK GPUs (issue #116)
-        LLAMA_HOST_EXPERTS_MODE_POOL   =  2, // pinned master + a bounded pinned host pool (MOE_HOST_POOL_MIB)
+        LLAMA_HOST_EXPERTS_MODE_POOL   =  2, // NO full pinned master: the tensors live in the read-only model
+                                             // mapping and every GPU read is served through the bounded
+                                             // pinned host pool (MOE_HOST_POOL_MIB/FRAC).  Costs some prefill
+                                             // bandwidth, bounds the non-swappable footprint to the pool, and
+                                             // lets a host expert set larger than RAM run by streaming from
+                                             // disk.  Requires a mapped load (the default).
     };
 
     enum llama_context_type {
@@ -368,6 +378,9 @@ extern "C" {
         //       the bounded pinned host pool (MOE_HOST_POOL_MIB/_FRAC).
         //   >0: that many GiB, spent on whole host-expert tensors in descending hotness order (the rest stays
         //       in the model mapping).  The loader logs the resolved policy once.
+        //   -2: MIRROR -- the whole host expert set, explicitly, whatever this box's free memory is.  An
+        //       explicit request is honoured exactly (it is the operator's call, not a memory guess), so
+        //       neither MOE_HOST_LIMIT_FRAC nor MOE_HOST_POOL_RAM_PCT touches it.
         int64_t host_experts_limit_gib;
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
@@ -648,6 +661,11 @@ extern "C" {
     // context exists, so a "disabled" cache cannot leave the draft sized for it.  No-op when no
     // host-resident expert weights are present or the backend has no cache.
     LLAMA_API void llama_model_moe_cache_preflight(const struct llama_model * model, size_t aux_reserve_bytes);
+
+    // r143: the inverse of the preflight -- the model that registered host-resident expert tables is going
+    // away, so drop those tables before its host masters are freed.  Without it the cache's deferred arena
+    // sizing reads a freed master (a host memcpy SIGSEGV); called by `llama_model_free`.
+    LLAMA_API void llama_model_moe_cache_forget(const struct llama_model * model);
 
     // WIP r42: aggregate the MoE expert cache arena's cumulative hit/miss counters for per-turn logging
     // (a before/after delta gives the turn's decode hit rate).  Returns false when no cache is active.
@@ -1672,6 +1690,26 @@ extern "C" {
                                float   penalty_repeat,   // must be > 0.0, 1.0 = disabled
                                float   penalty_freq,     // must be finite, 0.0 = disabled
                                float   penalty_present); // must be finite, 0.0 = disabled
+
+    /// Read a penalties sampler's parameters.  Returns false when `smpl` is not a penalties sampler (a disabled one is
+    /// created as an empty sampler, so it is not one).  A caller that has to reproduce the sampler's effect itself --
+    /// the exact top-k fast path in common/sampling.cpp -- reads the parameters and the window instead of duplicating
+    /// the state machine.  Any output pointer may be NULL.
+    LLAMA_API bool llama_sampler_penalties_get_params(
+              const struct llama_sampler * smpl,
+                                    int32_t * penalty_last_n,
+                                      float * penalty_repeat,
+                                      float * penalty_freq,
+                                      float * penalty_present);
+
+    /// The (token, count) entries of a penalties sampler's last-n window.  Returns the number of distinct tokens in
+    /// the window (0 when `smpl` is not a penalties sampler); when `tokens` and `counts` are both non-NULL, the first
+    /// min(n, return) entries are written.  The order is unspecified.
+    LLAMA_API int32_t llama_sampler_penalties_get_window(
+              const struct llama_sampler * smpl,
+                                 llama_token * tokens,
+                                    int32_t  * counts,
+                                    int32_t    n);
 
     /// maximum number of distinct DRY sequence breakers, duplicates not counted
     /// processing each breaker scans the entire vocabulary, so the init cost is O(num_breakers x n_vocab)

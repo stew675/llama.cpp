@@ -2966,9 +2966,13 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        // cur_full != nullptr (sequence parallelism): `cur` is this device's token slice of the FFN input and
+        // cur_full all tokens (the routed MoE input); the result is token-split
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
-                            int   il);
+                            int   il,
+                    ggml_tensor * cur_full = nullptr,
+                           bool   reduce_scatter = false);
 
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,

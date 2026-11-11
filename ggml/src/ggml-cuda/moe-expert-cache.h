@@ -112,6 +112,37 @@ void moe_cache_set_extra_reserve(int device, size_t bytes);
 // whole-process activity during the turn.
 bool moe_cache_get_stats(int64_t * hits, int64_t * misses, int64_t * arena_bytes);
 
+// wip/flash-next-prefill: the RESIDENT expert bytes, lock-free, for the slab's own stats line.
+// `moe_cache_get_stats` gives the same figure but takes the cache mutex, and the cache calls INTO the slab
+// with that mutex held, so a slab->cache take would invert the order.  This reads an atomic mirror that the
+// cache maintains beside `g_arena_bytes`, so it is safe under `g_slab_mutex` and never blocks.
+int64_t moe_cache_resident_bytes(int device);
+
+// wip/flash-next-prefill: the transport selector's input -- how much of `device`'s host-resident expert set the
+// cache can KEEP (`covered`) against one copy of that set (`host`), in bytes.  This is the figure the census prints
+// as `resident=<covered> MiB total` beside the host set.
+//
+// issue #368: `gather_read` is the CUMULATIVE host bytes the device gather has actually moved (the experts in
+// neither tier, so exactly the read the gather would repeat per ubatch).  The selector compares that measurement
+// against `(host - covered)`, which is what a staged whole-table fill moves: coverage is the capacity the arena
+// keeps, not the hit rate the routing achieves, and on a shape whose routing is concentrated the staged fill moves
+// many times what the gather reads.  A snapshot-based caller takes deltas.
+//
+// False when the cache holds no tables for the device (a pinned master: covered = host = 0).
+bool moe_cache_residency(int device, int64_t * covered, int64_t * host, int64_t * gather_read);
+
+// issue #368: the cumulative host bytes a device gather has read (the experts it took from the pool or the master,
+// counted in the gather kernel), stale by at most one graph and never behind a synchronize.
+int64_t moe_cache_gather_read(int device);
+
+// r143: the model that registered this device's host-resident expert tables is going away
+// (`llama_model_free`), so drop them BEFORE its host masters are freed.  The cache is process-global and
+// its deferred arena sizing fills every registered table, so a table whose master was freed is a
+// host-memory use-after-free (a SIGSEGV inside the fill's host memcpy).  Frees each dropped table's arena
+// slice, remap staging, bounce ring and host pool, then un-sizes the cache so the next model re-sizes on
+// its own first band pass instead of silently running uncached.  `device < 0` drops every device.
+void moe_cache_forget_all(int device);
+
 // WIP r42: fail-soft guard -- free the whole arena (once) so a compute allocation that needs the VRAM
 // can succeed; the cache is disabled for the rest of the run.  Returns true when it released anything.
 bool moe_cache_release_arena();
@@ -167,6 +198,12 @@ bool moe_cache_ready();
 // an input over, so its fusions must behave exactly as if it were disabled.
 bool moe_cache_has_tables();
 
+// wip/host-pool-speed (#131): true when the routed expert table backing `weight` on `device` is served by
+// the bounded pinned host POOL (`--host-experts pool`) instead of a pinned master.  The scheduler uses this
+// to send a pool-backed table to the device gather unconditionally: its whole-table staging is the slow
+// path at every width, while the gather reads the two pinned tiers on the device.
+bool moe_cache_table_is_pool(const struct ggml_tensor * weight, int device);
+
 // True only when EVERY table has a usable arena.  The cache-band fusion guard is global (one answer
 // for the whole graph) and the gate+up fused kernel indexes the gate lane with the up table's remap, so
 // a partially-failed cache (any allocation failed, or a budget below one expert) must stand its fusions
@@ -181,7 +218,23 @@ bool moe_cache_has_arena();
 // tensor the fused call site would redirect (the scheduler's copy or the original).
 bool moe_cache_table_serves(const struct ggml_tensor * op, const struct ggml_tensor * weight, int device);
 
-// wip/slab-ring-region: the deferred arena sizing has run.  The slab's H2D-ring hole must stay ARMED
+// Geometry-only registration of a host-resident expert table (no routing needed).  The scheduler calls it
+// for every routed host-expert input of every split BEFORE the first split of a graph runs, which is what
+// arms the arena on a workload that never runs a <=8-token warmup pass and on `-sm tensor` (where the Meta
+// update hook declines every prefill width).  Idempotent.  Returns the table id, or -1 when the table must
+// stay on the scheduler's own copy path.  `slice_off`/`split_axis`/`slices` are this device's slice geometry
+// (0/-1/null for an unsplit table), exactly as `moe_cache_update_host` takes them.
+int moe_cache_register_host(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, int device,
+                            size_t slice_off, int split_axis,
+                            const struct ggml_backend_moe_slice * slices, int n_slices);
+
+// The cache is enabled, this device expects host expert tables, and the arena has NOT armed yet: the
+// scheduler keeps a routed host-expert table on the host path (off the staging ring) while this is true, so
+// the cache can observe/register/prime its table set and latch the deferred sizing.  See the comment at the
+// definition for the measurement that makes this necessary (a prefill-only workload never warmed up).
+bool moe_cache_pending(int device);
+
+// wip/slab-ring-region: the deferred arena sizing has run.  The slab's staging region must stay ARMED
 // through sizing, so the auto-sized arena never allocates its highest tables into the hole (a disarm
 // before that makes the next arm evict those hot tables, and the cold re-arm corrupts a wide consumer).
 bool moe_cache_is_sized();
@@ -241,6 +294,11 @@ void    moe_cache_heat_open(const char * model_path);
 // slots are also the region's presence bitmap, and with `MOE_HOST_POOL_COLD_MULTIDEV` a resident expert is read
 // in place by any device's kernel, so residency there buys the native transport at any device count.
 void    moe_cache_set_host_pool_budget(size_t bytes);
+// r212: the loader's RESOLVED `--load-mode` (1 = O_DIRECT), so the host pool's fill mode can mirror it.
+// The pool fills the same way the model was loaded, because `--load-mode` is the operator's caching
+// decision; `MOE_HOST_POOL_DIO=0|1` still forces either arm.  -1 (never told) keeps the historical
+// MemAvailable heuristic for a consumer that is not the CLI loader.
+void    moe_cache_set_host_fill_mode(int direct);
 int64_t moe_cache_heat_table_score(int layer, const char * name, int n_experts, size_t host_bytes);
 
 // LFRU residency decision + alias for expert `expert` of `table`.  The single compute-path seam.
@@ -298,6 +356,18 @@ bool moe_cache_gather_host(const struct ggml_tensor * weight, const struct ggml_
                            const struct ggml_tensor * ids, void * stream, int device,
                            size_t slice_off, int split_axis);
 
+// wip/host-expert-master-drop (TODO #55): true when `p` lies inside a host expert master that is NOT
+// pinned (the pool-backed, file-mapping-backed master).  A device copy must not treat such a pointer as a
+// pinned source, and a kernel must not read it in place.
+bool moe_cache_source_pageable(const void * p);
+
+// wip/host-expert-master-drop (TODO #55): copy `size` bytes of a POOL-BACKED host expert master (the
+// pageable model mapping) at `src_host` into the device pointer `dst`, staging through the pinned pool or
+// the per-table pinned bounce -- never a pageable H2D.  Returns false when `src_host` is not inside a
+// registered pool-backed master of `device` (the caller keeps its normal copy path), so this is safe to
+// call for every host-to-device upload.
+bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, void * stream, int device);
+
 // Fill a whole-table staging copy from the expert-cache arena (the
 // immutable prefill residency snapshot) + the pinned host master, instead of re-uploading every expert
 // over PCIe.  `host_src`/`offset` identify a registered table; `width`/`stride_src`/`n_copies` are the
@@ -344,7 +414,27 @@ int64_t moe_cache_pass_end(int device);
 // can read the arena without the host routing (an identity table, served with the raw ids).  Every other
 // table takes the eager host-routing path (`moe_cache_update_host`), which materializes the remap on the
 // host and republishes it before the graph.
-bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, int device);
+//
+// r258 (TODO #133): the scheduler calls this at EVERY width now, not only in the decode/verify band.  An
+// identity table is served from the arena with the raw ids whatever the ubatch is, so a wide prefill no
+// longer stages the whole table into the split input only to read the same bytes back out of the arena
+// (measured 1489.6 -> ~3.8 k t/s prefill on 3 x RDNA4, 35B-A3B Q8_0 `-ncmoe 48 -ub 2048 -sm tensor`).
+bool moe_cache_take_over(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
+                         int64_t n_tok, int device);
+
+// Side-effect-free form of `moe_cache_take_over`: true iff that call would take `weight` over, i.e. this
+// table is an identity (fully resident) one with a usable arena.  The scheduler asks it BEFORE it plans a
+// split's staging (`moe_cache_in_place`), so the staging never fills a ring slot the take-over then makes
+// dead.  It must NOT bump `g_write_seq` or publish the alias the way the take-over does: the staging
+// snapshot's freshness is keyed on that sequence, and a query that bumped it would force every other
+// table in the pass to rebuild its two-tier map (and to order the copy stream behind the compute stream).
+bool moe_cache_serves_in_place(const struct ggml_tensor * weight, int64_t n_tok, int device);
+
+// Is the in-place prefill read armed at all (`MOE_EXPERT_PREFILL_IN_PLACE`)?  A fusion guard that stands a
+// prefill MoE fusion down for a served-in-place table must ask this too, or the kill-switch arm would also
+// lose its fusions and would no longer be the pre-r258 path -- every A/B of this feature, including the
+// prefill-logit gate's `--ab` arm, would then measure two changes at once.
+bool moe_cache_prefill_in_place_enabled();
 
 // wip/moe-expert-cache: redirect a fused decode MoE (gate+up+GLU) onto the cache arenas.  When the
 // routed up table (`src0`) and the gate table (`gate`) are both cache-managed for the current routing,

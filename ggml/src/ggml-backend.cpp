@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+
 // getenv() is cheap on Linux but takes a lock and rescans the environment block on Windows.  These
 // debug / A-B gates sit on per-graph and per-split paths, so resolve each one once per call site:
 // the static inside the immediately-invoked lambda is unique to each macro expansion.
@@ -321,6 +322,13 @@ int64_t ggml_backend_dev_moe_heat_score(ggml_backend_dev_t dev, int layer, const
     return dev->iface.moe_heat_score(dev, layer, name, n_experts, host_bytes);
 }
 
+void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int direct) {
+    if (dev == nullptr || dev->iface.moe_cache_set_host_fill_mode == nullptr) {
+        return;
+    }
+    dev->iface.moe_cache_set_host_fill_mode(dev, direct);
+}
+
 bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
     if (dev == nullptr || dev->iface.moe_cache_stats == nullptr) {
         return false;
@@ -356,6 +364,40 @@ void ggml_backend_dev_moe_cache_set_host_source(ggml_backend_dev_t dev, const vo
         return;
     }
     dev->iface.moe_cache_set_host_source(dev, tensor_data, path, offs, n_experts, host_bytes, total_bytes);
+}
+
+// wip/host-expert-master-drop (TODO #55): the buffer type a pool-backed (mapping-backed, NOT pinned) host
+// expert master should use.  NULL when the backend keeps its pinned master (the default), so no caller
+// changes behaviour unless the backend opts in.
+ggml_backend_buffer_type_t ggml_backend_dev_moe_host_master_buft(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.moe_host_master_buft == nullptr) {
+        return nullptr;
+    }
+    return dev->iface.moe_host_master_buft(dev);
+}
+
+// Wrap an existing host pointer in a buffer of `buft` without owning it.  The buffer is built over the
+// public CPU_Mapped machinery (whose free is a no-op and whose set/get operate on `tensor->data`, which is
+// in host memory) and then re-typed, so the tensors placed in it look like any other buffer of `buft` to
+// the scheduler while the bytes stay where the caller put them.  Requires a device-carrying host buft: a
+// CPU buffer type has no device, and an op whose weight sits in it would be scheduled on the CPU backend
+// instead of the GPU that owns the expert table.
+ggml_backend_buffer_t ggml_backend_host_buffer_from_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size, size_t max_tensor_size) {
+    if (buft == nullptr || ptr == nullptr || size == 0) {
+        return nullptr;
+    }
+    if (!ggml_backend_buft_is_host(buft) || ggml_backend_buft_get_device(buft) == nullptr) {
+        return nullptr;
+    }
+    if (ggml_backend_buft_get_max_size(buft) < max_tensor_size) {
+        return nullptr;
+    }
+    if ((uintptr_t) ptr % ggml_backend_buft_get_alignment(buft) != 0) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    return buffer;
 }
 
 void ggml_backend_dev_slab_stage_set(ggml_backend_dev_t dev, bool arm) {
@@ -580,7 +622,16 @@ void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backe
 }
 
 enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage(ggml_backend_buffer_t buffer) {
-    GGML_ASSERT(buffer);
+    // A tensor needs no `ggml` buffer to be read by a kernel: the MoE expert cache redirects a routed
+    // `MUL_MAT_ID` weight to its own arena (a raw `cudaMalloc`) and drops `buffer` so the compute-buffer
+    // padding clears cannot offset by the full expert count (see `moe_cache_get_table`).  Those clears all
+    // read this as `== GGML_BACKEND_BUFFER_USAGE_COMPUTE`, so a null buffer must answer "not a compute
+    // buffer" rather than abort -- the widening is to EVERY width in r258 (an identity table is served in
+    // place in the prefill band too, so MMQ/MMB now take a buffer-less table), which would otherwise be a
+    // null dereference in `ggml_cuda_mul_mat_q`.
+    if (buffer == NULL) {
+        return GGML_BACKEND_BUFFER_USAGE_ANY;
+    }
     return buffer->usage;
 }
 
@@ -1414,6 +1465,13 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+// r220: per-copy events for the cross-backend input copies (see `ggml_backend_sched_next_copy_event`).
+// Must exceed the copies queued between two host synchronizations, because a slot is only re-recorded
+// after its previous record has completed.
+#ifndef GGML_SCHED_COPY_EVENTS
+#define GGML_SCHED_COPY_EVENTS 16
+#endif
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -1469,6 +1527,13 @@ struct ggml_backend_sched {
     int cur_copy;
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+
+    // r220: per-copy events for `cpy_tensor_async_nowait`, keyed by the SOURCE backend (the event is
+    // recorded on the source stream).  One event per queued copy, so no consumer wait is ever re-bound
+    // to a later record; `copy_event_used` guards the ring wrap (see the iface comment).
+    ggml_backend_event_t copy_events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPY_EVENTS];
+    int copy_event_next[GGML_SCHED_MAX_BACKENDS];
+    int copy_event_used[GGML_SCHED_MAX_BACKENDS];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1489,25 +1554,44 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
-    // Op-offload H2D staging ring (issue #50 WIP): overlap host->device weight uploads with compute.
-    // GGML_SCHED_STAGE=1 enables it; a stage-capable backend is required.  stage_consumed is the
-    // per-split list of staged inputs produced by sched_stage_issue and drained by the input loop.
-    bool stage_enabled;
-    int  stage_slot_next;
-    int  stage_n_slots;
-    int  stage_consumed_n;
-    bool stage_split_ok; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
-    // wip/moe-expert-cache (B2): device-side expert gather for an offloaded `MUL_MAT_ID` upload whose
-    // width did not qualify for the staging ring.  GGML_SCHED_DEVGATHER=0 opts out.
-    bool devgather_enabled;
-    struct {
-        struct ggml_tensor * dst;
-        size_t size;
-        int    slot;
-        int    backend_id;
-    } stage_consumed[GGML_SCHED_STAGE_SLOTS];
-    struct ggml_backend_event * stage_done_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
-    struct ggml_backend_event * stage_free_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
+    // Op-offload H2D staging (issue #50 WIP): overlap host->device weight uploads with compute.
+    // wip/flash-next-prefill: the staging transport is a PIPELINE of one to three buffers, each sized ONCE to the
+    // largest host-weight set of the graph, filled one set ahead and consumed IN PLACE (the split input's `data`
+    // points at its offset inside the buffer, so nothing is drained).  The buffers are backend stage slots
+    // 0..pipe_n_buf-1, with one done/free event pair each; the count comes from `sched_pipe_choose_bufs` and is
+    // fixed for the process.
+    bool    pipe_on;
+    size_t  pipe_size;                             // bytes per buffer (the largest set seen, grown once)
+    void *  pipe_base[GGML_SCHED_PIPE_MAX_BUFS];   // the buffers (backend stage slots 0..n-1)
+    int     pipe_backend[GGML_SCHED_PIPE_MAX_BUFS];// which backend owns each buffer (device-local!)
+    int     pipe_n_ent[GGML_SCHED_PIPE_MAX_BUFS];  // entries laid out in each buffer
+    int     pipe_cur;                              // buffer being consumed by the current split
+    int     pipe_n_buf;                            // 1..3, fixed for the process
+    bool    pipe_held;                             // the buffers are currently allocated (released at decode)
+    // wip/flash-next-prefill: has a PREVIOUS graph been a wide (prefill) one?  The selector needs it because the
+    // FIRST wide ubatch pays the whole fill with nothing to overlap it (measured, a 5 218-token prompt in one
+    // ubatch: staged 1266 t/s against the gather's 1612, decode 48.3 against 50.2), while an 89k prompt (11
+    // ubatches) reads 2445 against 2108.  So the first wide graph keeps the gather and the staged transport takes
+    // over from the second.
+    bool    pipe_wide_prev;                        // a wide graph has already been executed
+    bool    pipe_wide_cur;                         // ... and this one is wide
+    // issue #368: the MEASURED alternative to the exposure model.  `tr_gather_bpt` is the largest host-bytes-per-token
+    // any wide graph's device gather has been observed to pull (a snapshot delta over the graph's tokens), i.e. the
+    // read a staged whole-table fill would replace.  The exposure model can only guess at it from COVERAGE, which is
+    // the capacity the arena keeps and not the hit rate the routing achieves: on a shape whose routing concentrates,
+    // the gather reads a small fraction of the exposed set and the model stages a transport that moves many times
+    // more.  Monotone (max), so the answer cannot flap as the width changes.
+    int64_t tr_gather_bpt;                         // 0 = nothing measured yet
+    int64_t tr_gather_tok;                         // the width it was measured at (a sample is kept only when WIDER)
+    int64_t tr_read0;                              // the gather-read counter at the start of this graph (-1 = n/a)
+    bool    tr_gathered_cur;                       // this graph let the gather take an offloaded expert table
+    struct pipe_ent { struct ggml_tensor * dst; size_t off; size_t size; } pipe_ent[GGML_SCHED_PIPE_MAX_BUFS][64];
+    bool    stage_enabled;
+    // wip/moe-expert-cache: device-side expert gather for offloaded `MUL_MAT_ID` uploads (0 = off, 1 = pool-backed
+    // tables above the cache band (default), 2 = force).  `GGML_SCHED_DEVGATHER`.
+    int     devgather_mode;
+    struct ggml_backend_event * stage_done_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_PIPE_MAX_BUFS];   // one per buffer
+    struct ggml_backend_event * stage_free_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_PIPE_MAX_BUFS];
 
     int debug;
 
@@ -2870,6 +2954,21 @@ static int sched_pipe_split_set(ggml_backend_sched_t sched, struct ggml_backend_
     return n;
 }
 
+// issue #368: the cumulative host bytes the device gather has moved, summed over the backends that report it.
+// -1 when none does, so a caller can tell "nothing measured" from "nothing read".
+static int64_t sched_gather_read(ggml_backend_sched_t sched) {
+    int64_t total = -1;
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->backends[b]->iface.moe_cache_residency == nullptr) {
+            continue;
+        }
+        int64_t c = 0, h = 0, r = 0;
+        sched->backends[b]->iface.moe_cache_residency(sched->backends[b], &c, &h, &r);
+        total = (total < 0 ? 0 : total) + r;
+    }
+    return total;
+}
+
 // Is this input one of the entries the CURRENT pipeline buffer holds?  Returns the offset, or (size_t) -1.
 static size_t sched_pipe_entry_off(ggml_backend_sched_t sched, const struct ggml_tensor * input_cpy) {
     for (int k = 0; k < sched->pipe_n_ent[sched->pipe_cur]; k++) {
@@ -2967,21 +3066,48 @@ static bool sched_pipe_issue(ggml_backend_sched_t sched, struct ggml_backend_sch
 static constexpr size_t SCHED_GATHER_TABLE_MIN_BYTES = (size_t) 224 * 1024 * 1024;
 
 static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
-                                   const struct ggml_tensor * input_cpy) {
-    if (!sched->devgather_enabled) {
+                                   const struct ggml_tensor * input, const struct ggml_tensor * input_cpy) {
+    if (sched->devgather_mode == 0) {
         return false;
     }
-    if (sched->backends[split->backend_id]->iface.moe_cache_gather == NULL) {
+    ggml_backend_t split_backend = sched->backends[split->backend_id];
+    if (split_backend->iface.moe_cache_gather == NULL) {
         return false;
     }
-    // The gather serves the below-gate band, where `sched_stage_issue` skips whole-shard staging
-    // entirely.  At or above the staging width gate, staging (the ring for `-sm layer`, the meta
-    // `stage_input` for `-sm tensor`) is the faster path (Q4_K_M ub8192: staging 5283 vs gather 4035;
-    // `-sm layer` ncmoe 40 4511 vs 2625), EXCEPT for a large expert table (see above).
+    // wip/host-pool-speed (#131): a POOL-BACKED table (`--host-experts pool`) gathers at EVERY width.
+    // Its whole-table staging is the slow path at every width because the source is the pageable model
+    // mapping plus the pool's host alias, and it degrades as coverage rises -- measured on the 122B-A10B
+    // across three RDNA4 GPUs, 5258-token prompt: staging 134.3 t/s at FRAC 80 and 12.9 at FRAC 95,
+    // versus **969.3 / 1623.5** with the gather, against `pinned`'s 555.1 (`README.md` §18.2).  A PINNED
+    // master keeps the staging path: the gather costs it ~47 % prefill at two devices.
+    const bool pool_backed = split_backend->iface.moe_cache_pool_backed != NULL &&
+                             split_backend->iface.moe_cache_pool_backed(split_backend, input);
+    if (sched->devgather_mode == 1) {
+        if (!pool_backed) {
+            return false;
+        }
+        // PREFILL BAND ONLY.  At or below the cache's decode/verify band the routed op is served from the
+        // ARENA (the slot-remap read), and taking it over with the gather costs an order of magnitude:
+        // measured on the 3-GPU pool arm, decode fell to 1.2-4.1 t/s against 22-47 with staging.
+        // wip/flash-next-prefill: ABOVE the band the transport is decided by the measured host-exposure test
+        // (`sched_stage_exposure_decides`), which stages when the gather's per-token host read is large enough
+        // to be worth the copy engine's overlap and keeps the gather when the set is resident (its costless
+        // case) or the profile is unknown.
+        const int64_t band = sched_moe_cache_band(split_backend);
+        if (band > 0 && sched_stage_batch_tokens(split) <= band) {
+            return false;   // the decode/verify arm, unchanged
+        }
+        if (sched_stage_exposure_decides(sched, split, split_backend)) {
+            return false;   // stage at this prefill width
+        }
+        return true;        // gather
+    }
+    // mode 2 (`GGML_SCHED_DEVGATHER=1|force`): the historical A/B arm -- gather below the staging width
+    // gate and for a large table, in either host-expert mode.
     const bool below_gate = sched_stage_min_tokens(sched) > 0 &&
                             sched_stage_batch_tokens(split) < sched_stage_min_tokens(sched);
     const bool big_table  = ggml_nbytes(input_cpy) >= SCHED_GATHER_TABLE_MIN_BYTES;
-    if (!below_gate && !big_table) {
+    if (!below_gate && !big_table && !pool_backed) {
         return false;
     }
     for (int ni = 0; ni < split->graph.n_nodes; ni++) {
@@ -2994,124 +3120,209 @@ static bool sched_input_gatherable(ggml_backend_sched_t sched, struct ggml_backe
     return false;
 }
 
-// wip/moe-expert-cache (item 3): the device-side expert gather moves only the *routed* experts, while
-// whole-tensor staging moves the device's entire shard every ubatch.  The ring path already prefers the
-// gather for a routed expert table (`sched_input_gatherable` in `sched_stage_issue`); the meta
-// backend's `stage_input` path defers routed expert tables to the gather there too.
-static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
-    sched->stage_consumed_n = 0;
-    sched->stage_split_ok = false;
-    if (!sched->stage_enabled || split->n_inputs == 0) {
-        return;
+// wip/flash-next-prefill: STAGE vs GATHER at prefill width, decided from the ONE quantity that separated every
+// measured arm -- the host bytes the device gather would have to pull over the link per token.  Measured, one
+// card on Gen5 x8 (28.7 GB/s), 89k prompt, `-ub 8192`, 3 rotated cycles per arm, coverage = what the expert
+// cache can keep of the host set:
+//
+//   shape             host set   coverage   exposed = (1-cov) x set   gather   staged   winner
+//   35B-A3B Q8_0       16.3 GB      30 %          11.2 GB / ub        2807.7   2943.9   staged +4.9 %
+//   35B-A3B Q8_0       16.3 GB      45 %           8.8 GB / ub        2966.7   2961.7   TIE
+//   35B-A3B Q8_0       16.3 GB      56 %           7.0 GB / ub        3072.5   2956.3   gather +3.9 %
+//   Flash-Next GSQ     40.0 GB      51 %          16.5 GB / ub        2105     2509     staged +19 %
+//   Flash-Next, 2 dev  (tensor)    100 %           ~0                 3419     3029     gather +13 %
+//   Flash-Next, 3 dev  (tensor)    100 %           ~0                 3205     3144     gather +1.9 %
+//
+// So COVERAGE alone is not the predicate (Flash-Next stages at 51 % while the 35B gathers at 56 %); the
+// exposure is.  The tie sits at 8.8 GB per 8192-token ubatch = 1.07 MB/token, which at this link is
+// ~38 us/token -- the point where a compute-stream host read stops being hideable behind the split, so the
+// copy engine's overlap (the pipeline buffers) wins above it and the gather's used-only, copy-free read wins
+// below it.  `GGML_SCHED_STAGE_EXPOSE_US` tunes the threshold; `GGML_SCHED_STAGE_SELECT=0` restores the
+// gather-every-pool-backed-table rule.
+//
+// Side effect: a wide graph that reaches the exposure test marks `pipe_wide_cur`, which is what lets the NEXT
+// wide graph stage (see `pipe_wide_prev`).
+static bool sched_stage_exposure_decides(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split,
+                                         ggml_backend_t backend) {
+    static const bool on = [] {
+        const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_SELECT");
+        return e == nullptr || e[0] == '\0' || atoi(e) != 0;
+    }();
+    static const double thr_us = [] {
+        const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_EXPOSE_US");
+        const double v = e != nullptr ? atof(e) : 0.0;
+        return v > 0.0 ? v : 38.0;
+    }();
+    if (!on || backend->iface.moe_cache_residency == nullptr) {
+        return false;   // no selector, or the backend cannot say: keep the gather
     }
-    if (sched_stage_min_tokens_for(sched, split) > 0 &&
-        sched_stage_batch_tokens(split) < sched_stage_min_tokens_for(sched, split)) {
-        return;
+    // STAGE ONLY WHERE SOMETHING CAN STAGE -- and keep BOTH transports reachable.  A backend may own its staged
+    // transport in either of two forms:
+    //
+    //   * BACKEND SLOTS: `stage_buffer`/`stage_upload`/`stage_wait`.  One buffer per pipeline stage, owned by the
+    //     scheduler and consumed IN PLACE (a single device, and a `-sm layer` split).  This is the form the
+    //     pipeline drives, and it is the faster one.
+    //   * BACKEND-OWNED: `stage_input`.  The backend stages per DEVICE itself -- the META backend under
+    //     `-sm tensor` fills each device's own slot on that device's copy stream and then copies it into the
+    //     split input before the consumer runs.  That copy is not laziness: the in-place redirect is NOT correct
+    //     for an offloaded expert table, whose consumer does not read `simple_tensor->data` (measured: one layer
+    //     is destroyed, `ggml_backend_meta_stage_input`'s drain comment keeps the receipt).
+    //
+    // Both are legitimate transports, and which one is FASTER is a measurement that moves as the code moves: the
+    // slot form wins by ~17 % on one card, while the `stage_input` form has measured both behind the gather
+    // (100 % coverage, 2 cards) and -- the reason this decision was re-keyed -- in a configuration where it had
+    // never been exercised at all.  So this function must never encode "the gather always wins on that tier": it
+    // only rules out a backend that has NEITHER form, and the exposure test below decides the transport.  A
+    // PINNED master never reaches here (mode 1 returns `false` for it above: the gather costs it ~47 % at two
+    // devices).
+    const bool has_slots = backend->iface.stage_buffer != nullptr &&
+                           backend->iface.stage_upload != nullptr &&
+                           backend->iface.stage_wait != nullptr;
+    const bool has_owned = backend->iface.stage_input  != nullptr;
+    if (!has_slots && !has_owned) {
+        return false;
     }
-    // A large expert table is always gathered (see `sched_input_gatherable`), so it must not be
-    // staged above the width gate either: skip the ring/meta hand-off and let the input loop gather.
-    for (int i = 0; i < split->n_inputs; i++) {
-        if (!sched_stage_is_host_weight(split->inputs[i])) {
-            continue;
-        }
-        struct ggml_tensor * in_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
-        if (sched_input_gatherable(sched, split, in_cpy)) {
-            return;
-        }
+    // IS THE REGION THERE?  The transport region is carved by the WIDE compute view's placement and released at
+    // every prefill -> decode transition, while the scheduler issues its first fill BEFORE that placement.  Staging
+    // into an uncarved slab is refused (`h2d_stage_buffer`: "slab-only here ... per-slot capacity 0") and the split
+    // then takes the SERIAL whole-table upload -- measured on the field shape, a single-ubatch 582-token prompt:
+    // 12.3 s at 47 t/s against ~2 s for the gather, because 40 GB of host weights moved through the pageable path.
+    // So ask first: no carved region means GATHER this graph (much the better of the two), and the NEXT ubatch
+    // stages once the wide view's placement has carved the band.  This also covers the legitimate zero-carve
+    // configurations (the cache keeps the whole host set, or staging is off), where the gather is the transport.
+    if (ggml_backend_dev_slab_enabled(ggml_backend_get_device(backend)) &&
+        ggml_backend_dev_slab_stage_region(ggml_backend_get_device(backend)) == 0) {
+        return false;
     }
-    // The split passed the enable and width gates.  A backend that owns its own staging (the meta
-    // backend under -sm tensor) is driven from the input loop through `stage_input`; the ring below
-    // needs a stage-capable backend plus one slot per *host-weight* input.  Count only the host-weight
-    // inputs: a merged routed-MoE split carries one big expert weight plus dozens of tiny view/ids
-    // inputs (measured 31 inputs on qwen4exp), so comparing the raw `n_inputs` to the ring slots
-    // skipped staging for the whole split and left its 450 MiB weight to the serial host path.
-    sched->stage_split_ok = true;
-    ggml_backend_t backend = sched->backends[split->backend_id];
-    int n_host_inputs = 0;
-    for (int i = 0; i < split->n_inputs; i++) {
-        if (!sched_stage_is_host_weight(split->inputs[i])) {
-            continue;
-        }
-        // A routed expert table is deferred to the gather (see sched_input_gatherable).
-        struct ggml_tensor * input_cpy = tensor_copy(split->inputs[i], split->backend_id, sched->cur_copy);
-        if (sched_input_gatherable(sched, split, input_cpy)) {
-            continue;
-        }
-        n_host_inputs++;
+    int64_t covered = 0, host_bytes = 0, gather_read = -1;
+    backend->iface.moe_cache_residency(backend, &covered, &host_bytes, &gather_read);
+    GGML_UNUSED(gather_read);
+    const int64_t tok = sched_stage_batch_tokens(split);
+    if (tok <= 0 || host_bytes <= covered) {
+        return false;   // fully resident (or nothing to read): the gather fetches nothing
     }
-    if (n_host_inputs == 0 || n_host_inputs > sched->stage_n_slots) {
-        return;
+    // Mark this graph WIDE (it is what lets the NEXT wide graph stage).  The width gate's own answer counts as
+    // wide, and so does an explicit "stage every batch" (`GGML_SCHED_STAGE_MIN_TOKENS=0`, gate <= 0) above the
+    // capture limit -- otherwise that arm would never reach this selector at all and would silently gather, which
+    // is not what the knob says.
+    const int64_t gate = sched_stage_min_tokens(sched);
+    if (gate > 0 ? tok >= gate : tok > SCHED_STAGE_CAPTURE_SAFE_TOKENS) {
+        sched->pipe_wide_cur = true;
     }
-    if (backend->iface.stage_buffer == NULL) {
-        return;
+    if (!sched->pipe_wide_prev) {
+        return false;   // the first wide ubatch has nothing to overlap the fill with: gather this one
     }
-
-    // Plan the whole split before issuing any upload: a partially staged split is worse than either
-    // path (its non-staged input forces the ids readback + a full device sync).  Every host-weight
-    // input gets a ring slot; if the ring cannot hold the whole split (GGML_SCHED_STAGE_MAX_MB, or a
-    // cudaMalloc failure), skip this split **without disabling the ring** -- a later split may use
-    // slots that do fit, so the fallback is a partial pipeline instead of the old cliff where one
-    // failed growth killed staging for the rest of the run (issue #93).
-    struct stage_plan {
-        struct ggml_tensor * input;
-        struct ggml_tensor * input_cpy;
-        size_t               size;
-        int                  slot;
-    };
-    stage_plan plan[GGML_SCHED_STAGE_SLOTS];
-    int n_plan = 0;
-    const int slot_first = sched->stage_slot_next;
-    for (int i = 0; i < split->n_inputs; i++) {
-        struct ggml_tensor * input = split->inputs[i];
-        if (!sched_stage_is_host_weight(input)) {
-            continue;
-        }
-        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
-        if (sched_input_gatherable(sched, split, input_cpy)) {
-            continue;
-        }
-        const size_t size = ggml_nbytes(input);
-        const int slot = (slot_first + n_plan) % sched->stage_n_slots;
-        // The free event must be waited on before the slot is grown/reused: in redirect mode the
-        // previous split's kernels may still be reading it, and growing frees the old allocation.
-        backend->iface.stage_wait(backend, sched_stage_ev(sched, split->backend_id, slot, false));
-        if (backend->iface.stage_buffer(backend, slot, size) == NULL) {
-            // Fall back for this split only.  Advance one slot so the next split starts somewhere
-            // else; the slots that do fit keep being reused.
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                GGML_LOG_WARN("%s: H2D staging shortfall: a %zu-byte upload does not fit "
-                              "GGML_SCHED_STAGE_MAX_MB; staging what fits, serial for the rest\n",
-                              __func__, size);
+    const double exposed = (double) (host_bytes - covered);
+    // THE MEASURED RULE (issue #368).  Once any wide graph has let the gather take an offloaded expert table, this
+    // scheduler knows what that gather actually reads per token on THIS box, shape and prompt -- so the transport is
+    // decided by comparing it against what a staged whole-table fill has to move, `(host - covered)` per ubatch:
+    //
+    //   * a staged fill moves every expert the arena does not hold, USED OR NOT;
+    //   * the gather moves only the experts that are in neither tier AND routed by this ubatch.
+    //
+    // Staging's whole advantage is the copy engine's overlap, and the overlap can save at most the read the gather
+    // would have done -- so a fill that moves more than about twice the gather's read has nothing left to win, and
+    // it still costs the carve, the prefill-time eviction and the arena refill after the drop.  Measured on the
+    // delivery's own flash-next shape (89k prompt, `-ub 8192`, `-ncmoe 47 --host-experts pool`): a ratio near 1 on
+    // RDMA-class links and on the x8 box, where staging wins by 19-30 %, against ~9 on the reporter's PCIe 3.0 x16
+    // box, where its routing concentrates (arena hit rate 0.97 against our 0.59-0.66) and the gather reads almost
+    // nothing -- there staging loses by 38 %.  Coverage alone cannot see that difference; the measurement can.
+    static const double fill_ratio = [] {
+        const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_FILL_RATIO");
+        const double v = e != nullptr ? atof(e) : 0.0;
+        return v > 0.0 ? v : 2.0;
+    }();
+    float bw = 0.0f;
+    if (backend->iface.stage_h2d_gbps != nullptr) {
+        bw = backend->iface.stage_h2d_gbps(backend);
+    }
+    const bool measured = sched->tr_gather_bpt > 0;
+    const double fill_bpt = exposed / (double) tok;
+    const double ratio    = measured ? fill_bpt / (double) sched->tr_gather_bpt : 0.0;
+    const double us_per_tok = bw > 0.0f ? fill_bpt / ((double) bw * 1.0e9) * 1.0e6 : 0.0;
+    const bool stage = measured ? ratio <= fill_ratio : us_per_tok >= thr_us;
+    if (getenv("GGML_SCHED_STAGE_SELECT_DEBUG") != nullptr) {
+        static int64_t n_logged = 0;
+        if (n_logged++ < 400) {
+            if (measured) {
+                GGML_LOG_INFO("%s: transport: fill %.2f MB/tok (exposed %.1f MiB / %lld tok) against the gather's "
+                              "MEASURED %.2f MB/tok = %.2fx vs %.1fx -> %s (cache band %lld tok)\n",
+                              __func__, fill_bpt / 1e6, exposed / (1024.0 * 1024.0), (long long) tok,
+                              (double) sched->tr_gather_bpt / 1e6, ratio, fill_ratio,
+                              stage ? "STAGE" : "gather", (long long) sched_moe_cache_band(backend));
+            } else {
+                GGML_LOG_INFO("%s: transport: exposed %.1f MiB / %lld tok at %.1f GB/s = %.1f us/tok vs %.1f "
+                              "(nothing measured yet) -> %s (cache band %lld tok)\n",
+                              __func__, exposed / (1024.0 * 1024.0), (long long) tok, (double) bw, us_per_tok,
+                              thr_us, stage ? "STAGE" : "gather", (long long) sched_moe_cache_band(backend));
             }
-            sched->stage_slot_next = (slot_first + 1) % sched->stage_n_slots;
-            return;
         }
-        plan[n_plan].input     = input;
-        plan[n_plan].input_cpy = input_cpy;
-        plan[n_plan].size      = size;
-        plan[n_plan].slot      = slot;
-        n_plan++;
     }
+    return stage;
+}
 
-    for (int k = 0; k < n_plan; k++) {
-        const int    slot = plan[k].slot;
-        const size_t size = plan[k].size;
-        void * buf = backend->iface.stage_buffer(backend, slot, size); // allocated in the plan pass
-        GGML_ASSERT(buf != NULL);
-        backend->iface.stage_upload(backend, buf, plan[k].input->data, size,
-                                    sched_stage_ev(sched, split->backend_id, slot, true));
+static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
+    return input->buffer != NULL &&
+           ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+           ggml_backend_buffer_is_host(input->buffer);
+}
 
-        sched->stage_consumed[sched->stage_consumed_n].dst        = plan[k].input_cpy;
-        sched->stage_consumed[sched->stage_consumed_n].size       = size;
-        sched->stage_consumed[sched->stage_consumed_n].slot       = slot;
-        sched->stage_consumed[sched->stage_consumed_n].backend_id = split->backend_id;
-        sched->stage_consumed_n++;
+// Adaptive gate (issue #50 WIP): whole-tensor staging bypasses the used-expert pruning, so it only
+// wins when the batch is wide enough that pruning would not prune much.  The crossover width is
+// **link-dependent** (measured: ~2048 tokens at ~14.5 GB/s PCIe5 x4, ~700 at ~25 GB/s PCIe4 x16), so
+// the default threshold is calibrated from the backend's measured H2D bandwidth.  An explicit
+// GGML_SCHED_STAGE_MIN_TOKENS overrides it (0 = stage for every batch).
+static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
+    const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_MIN_TOKENS");
+    if (e != nullptr) {
+        return (int64_t) atoll(e);
     }
-    sched->stage_slot_next = (slot_first + n_plan) % sched->stage_n_slots;
-    GGML_LOG_DEBUG("%s: batch_tokens=%lld n_inputs=%d staged=%d\n",
-                   __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs, sched->stage_consumed_n);
+    static int64_t calibrated = -1;
+    if (calibrated < 0) {
+        float bw = 0.0f;
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (sched->backends[b]->iface.stage_h2d_gbps != NULL) {
+                bw = sched->backends[b]->iface.stage_h2d_gbps(sched->backends[b]);
+                break;
+            }
+        }
+        // Two measured crossover points (issue #50 WIP): ~14.5 GB/s (PCIe5 x4) crosses between 1024
+        // and 2048 tokens, ~25 GB/s (PCIe4 x16) below 1024.  Anchor at 1536 for 14.5 GB/s and take a
+        // first-order slope; GGML_SCHED_STAGE_MIN_TOKENS overrides it.
+        const double t = 1536.0 - 132.0*(double(bw) - 14.5);
+        // Floor the gate above the widest verify batch (16), so a decode/verify batch can never stage
+        // whole expert tensors even on a link fast enough to push the crossover to 0.  An unknown link
+        // (bw <= 0) falls to the same conservative floor, since t is then large anyway.
+        calibrated = (int64_t) (t > 64.0 ? t : 64.0);
+        GGML_LOG_INFO("%s: H2D staging calibration: %.1f GB/s -> min_tokens=%lld\n",
+                      __func__, double(bw), (long long) calibrated);
+        if (GGML_ENV_STR("GGML_SCHED_STAGE") != nullptr) {
+            // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
+            // so a field log would not show which gate this host actually chose (only the messages
+            // emitted before llama_log_set installs the filter get through by default).  An explicit
+            // GGML_SCHED_STAGE=1 means the user asked for staging and wants to see the decision, so
+            // that case also gets a notice at the level that survives by default.  If staging ever
+            // becomes default-on this stays silent unless the variable is set.
+            GGML_LOG_WARN("%s: H2D staging: %.1f GB/s link -> whole-weight uploads staged from %lld tokens\n",
+                          __func__, double(bw), (long long) calibrated);
+        }
+    }
+    return calibrated;
+}
+
+static int64_t sched_stage_batch_tokens(const struct ggml_backend_sched_split * split) {
+    if (split->graph.n_nodes == 0) {
+        return 0;
+    }
+    const struct ggml_tensor * node = split->graph.nodes[0];
+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[2] != NULL) {
+        // MUL_MAT_ID: src[2] is the router's expert ids, ne[1] is the token count
+        return node->src[2]->ne[1];
+    }
+    if (node->src[1] != NULL) {
+        return node->src[1]->ne[1];
+    }
+    return 0;
 }
 
 // r35 (default ON; this was the r33 opt-in A/B candidate).  A split input that is (a view of) a user
@@ -3122,6 +3333,19 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
 // This forces the synchronous copy for these tensors while leaving the host-resident weight uploads
 // on the async/staged path.  Issue #87; the reporter confirmed the fix.
 // `GGML_SCHED_SYNC_GRAPH_INPUTS=0` restores the r26 behaviour (A/B / bisect only).
+// r220: `GGML_SCHED_COPY_EVENT=shared` restores the pre-r220 behaviour, where every cross-backend
+// input copy re-records the backend's shared per-device `copy_event` and the destination stream waits on
+// it.  Kept as the kill switch for A/B and bisection: on HIP a queued stream wait resolves against the
+// latest record, so the shared event re-binds consumers of copies still in flight and serializes
+// independent copies (see the iface comment).  Default: one event per copy.
+static bool sched_shared_copy_event(void) {
+    static const bool shared = [] {
+        const char * e = GGML_ENV_STR("GGML_SCHED_COPY_EVENT");
+        return e != nullptr && strcmp(e, "shared") == 0;
+    }();
+    return shared;
+}
+
 static bool sched_sync_graph_inputs(void) {
     static const bool enabled = [] {
         const char * e = GGML_ENV_STR("GGML_SCHED_SYNC_GRAPH_INPUTS");
@@ -3170,6 +3394,24 @@ struct ggml_backend_sched_copy_state {
 // then used-expert pruning); upstream #29943 moved the pruning to llama_context::
 // sched_copy_experts, but the delivery keeps it here so the scheduler stays cache-aware
 // and upstream's llama_moe_cache (behind --moe-cache-mib) stays dormant.
+// r220: the next per-copy event for a source backend.  A ring, so a wrap re-records a slot only after its
+// previous record has completed: re-recording one that a consumer still has queued would re-bind that
+// consumer to the new record (the very hazard per-copy events exist to remove).
+static ggml_backend_event_t ggml_backend_sched_next_copy_event(ggml_backend_sched_t sched, int backend_id) {
+    ggml_backend_event_t & ev = sched->copy_events[backend_id][sched->copy_event_next[backend_id]];
+    sched->copy_event_next[backend_id] = (sched->copy_event_next[backend_id] + 1) % GGML_SCHED_COPY_EVENTS;
+    const bool wrapped = ++sched->copy_event_used[backend_id] > GGML_SCHED_COPY_EVENTS;
+    if (ev == NULL) {
+        ev = ggml_backend_event_new(sched->backends[backend_id]->device);
+        if (ev == NULL) {
+            return NULL;
+        }
+    } else if (wrapped) {
+        ggml_backend_event_synchronize(ev);
+    }
+    return ev;
+}
+
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input, ggml_backend_sched_copy_state & st) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -3272,13 +3514,20 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         // wip/moe-expert-cache (session 7) takeover fast path: an identity table reads the
         // arena with its own routing ids.  Take the input over BEFORE the ids readback so the
         // readback, the full device synchronize it forces, the used-expert pruning and the copy
-        // are all skipped.  Restricted to the decode/verify band: prefill keeps the staged
-        // upload and its direct-reading MMQ fusions (which are not cache-aware).
-        if (node != nullptr && node_n_consumers == 1 && node->ne[2] <= sched_moe_cache_band(split_backend) &&
+        // are all skipped.
+        //
+        // TODO #133: NO band restriction.  It used to be decode/verify only, on the assumption that
+        // prefill needs the scheduler's staged copy -- but an IDENTITY table (slot == expert, every
+        // expert resident) is served from the arena with the raw ids at ANY width, and the staged copy
+        // was the whole per-ubatch defect: on three RDNA4 GPUs with a 100 %-resident arena it re-copied
+        // 61 GiB out of VRAM for a 3049-token prompt (once per table per ubatch, serialised against the
+        // compute) and left 3-GPU prefill SLOWER than 1-GPU.  `moe_cache_take_over` is identity-only by
+        // construction, so a non-identity table above the band still takes the staging/upload path below.
+        if (node != nullptr && node_n_consumers == 1 &&
             ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             ggml_backend_buffer_is_host(input->buffer) &&
             split_backend->iface.moe_cache_take_over != NULL) {
-            if (split_backend->iface.moe_cache_take_over(split_backend, input, input_cpy)) {
+            if (split_backend->iface.moe_cache_take_over(split_backend, input, input_cpy, node->ne[2])) {
                 return;
             }
         }
@@ -3348,7 +3597,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             // experts from the host master into `input_cpy`, reading the routing on the device,
             // so the host ids readback and its full device synchronize are skipped.  A backend
             // that cannot serve the layout (or the gate off) falls through to the host path.
-            if (sched_input_gatherable(sched, split, input_cpy) &&
+            if (sched_input_gatherable(sched, split, input, input_cpy) &&
                 ids_tensor->buffer != NULL && !ggml_backend_buffer_is_host(ids_tensor->buffer) &&
                 split_backend->iface.moe_cache_gather != NULL) {
                 // NO `wait_before_overwrite()`: the gather runs on the split backend's COMPUTE
@@ -3358,6 +3607,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                 // per-op full device synchronize (SCHEDSYNC 1.12 -> ~0.1 ms/call on `-sm tensor`).
                 if (split_backend->iface.moe_cache_gather(
                         split_backend, input, input_cpy, ids_tensor, 0, -1)) {
+                    // issue #368: this graph's transport was the gather for at least one host table, so its host
+                    // read is measurable at the end of the graph (see the sample in `compute_splits`).
+                    sched->tr_gathered_cur = true;
                     return;
                 }
             }
@@ -3494,10 +3746,27 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                     ggml_backend_synchronize(split_backend);
                 }
                 ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input_cpy));
-            } else
+            } else {
+            // r220: issue the cross-backend copy on the SOURCE stream and order this split on a PER-COPY
+            // event.  The plain `cpy_tensor_async` below records the backend's shared per-device
+            // `copy_event` and makes the destination stream wait on it, and a queued HIP stream wait binds
+            // to the LATEST record at execution: a copy still in flight from another split (or another lane)
+            // re-records the shared event and re-binds this wait to it, so independent copies serialize
+            // against each other.  With an event per copy nothing is ever re-bound.  A backend without
+            // events (CPU, the meta backend) keeps the old path.
+            bool copied = false;
+            const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
+            if (!sched_shared_copy_event() && input_backend_id >= 0 && split_backend->iface.cpy_tensor_async_nowait != NULL &&
+                input_backend->iface.event_record != NULL && split_backend->iface.event_wait != NULL) {
+                ggml_backend_event_t copy_ev = ggml_backend_sched_next_copy_event(sched, input_backend_id);
+                if (copy_ev != NULL && split_backend->iface.cpy_tensor_async_nowait(input_backend, split_backend, input, input_cpy, copy_ev)) {
+                    ggml_backend_event_wait(split_backend, copy_ev);
+                    copied = true;
+                }
+            }
             // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
             // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-            if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+            if (!copied && (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy))) {
                 ggml_backend_synchronize(input_backend);
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -3505,6 +3774,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                     ggml_backend_synchronize(split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
+            }
             }
         }
     }
@@ -3571,19 +3841,240 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
     }
 }
 
+// MoE expert cache: give the cache its routed host-expert table set BEFORE the first split of this graph
+// computes.  Registration is geometry-only (no routing readback, no sync) and idempotent, so this is a
+// pointer lookup per host table while the cache is still unarmed and a no-op after.
+//
+// Why it has to happen here and not in the per-op hook: the deferred arena sizing waits for the expected
+// table set to be complete, and the per-op hooks only see a table when that table's op RUNS -- one split at a
+// time, and under `-sm tensor` not at all above the decode band (the Meta update hook declines every prefill
+// width).  The consequence was measured: a prefill-only workload never armed the arena (`tables=0`,
+// `arena 0.0 MiB`) and streamed the whole host expert set over the link on every ubatch -- 438 t/s on
+// 35B-A3B Q8_0 `-ncmoe 48` against 1194 with the arena armed, and 790 against 2493 on a 2-device
+// `-sm tensor` arm.  With the pre-pass the arena arms before the first ubatch, so the very first pass already
+// stages `1 - residency` of the bytes.
+static void sched_moe_register_tables(ggml_backend_sched_t sched, struct ggml_backend_sched_split * splits) {
+    bool pending = false;
+    for (int b = 0; b < sched->n_backends && !pending; b++) {
+        ggml_backend_t backend = sched->backends[b];
+        pending = backend->iface.moe_cache_pending != NULL && backend->iface.moe_cache_pending(backend);
+    }
+    if (!pending) {
+        return;
+    }
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        struct ggml_backend_sched_split * split = &splits[split_id];
+        ggml_backend_t backend = sched->backends[split->backend_id];
+        if (backend->iface.moe_cache_register == NULL) {
+            continue;
+        }
+        for (int i = 0; i < split->n_inputs; i++) {
+            struct ggml_tensor * in = split->inputs[i];
+            if (in == NULL || in->ne[2] < 2 || !sched_stage_is_host_weight(in)) {
+                continue;   // only a routed host-resident expert table is cacheable
+            }
+            struct ggml_tensor * in_cpy = tensor_copy(in, split->backend_id, sched->cur_copy);
+            if (in_cpy == NULL) {
+                continue;
+            }
+            // The per-device slice geometry is the backend's business: a simple backend gets the unsplit
+            // form (it owns the whole table), the Meta backend derives each device's slice from `in_cpy`.
+            backend->iface.moe_cache_register(backend, in, in_cpy, 0, -1, NULL, 0);
+        }
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    sched_moe_register_tables(sched, splits);
+    sched->pipe_wide_cur = false;
+    sched->tr_gathered_cur = false;
+    // issue #368: snapshot the gather's cumulative read here and take the delta at the end of this graph, so the
+    // selector's fallback (`GGML_SCHED_STAGE_EXPOSE_US`) has a MEASURED alternative on every wide graph that let the
+    // gather work.  A snapshot of a counter is immune to the warm-up bias a wall-clock sample would carry.
+    sched->tr_read0 = sched_gather_read(sched);
+
+    int64_t tr_tok = 0;   // the widest hosted set's token count, for the per-token normalisation
+    for (int i = 0; i < sched->n_splits; i++) {
+        const int64_t t = sched_stage_batch_tokens(&splits[i]);
+        if (t > tr_tok) {
+            tr_tok = t;
+        }
+    }
+
     int prev_backend_id = -1;
     ggml_backend_sched_copy_state st;
+
+    // ---- the staging PIPELINE, per graph execution ----
+    // Collect the splits that carry a stageable host-weight set, size the buffers ONCE from the largest set,
+    // fill buffer 0 with the first split and buffer 1 with the second BEFORE the first split computes, then per
+    // host split k: consume buf[k % n] IN PLACE, and after its compute is enqueued record buf[k % n] free and fill
+    // split k+n into it.  One to three buffers, one fill in flight per buffer, always n host sets ahead -- the
+    // split's input is an offset inside its buffer, so nothing is drained.
+    //
+    // The list holds one entry per split that carries a stageable host-weight set, and a split is one layer's
+    // routed tables, so its ceiling is ~(host-expert MoE layers x roles that do not fuse): the deepest shape
+    // measured is Flash-Next at 144 (48 layers x 3) and 122B-A10B at 120.  A shape past the cap loses the pipeline
+    // for its TAIL -- those splits take the serial upload, the unstaged path this transport exists to replace --
+    // which is why filling it warns once instead of being silent.  The array is 2 KiB of stack in a function that
+    // already had 1 KiB.
+    int  pipe_host[512];
+    int  pipe_n_host = 0;
+    int  pipe_k      = -1;   // this split's index in pipe_host, or -1
+    if (getenv("GGML_SCHED_STAGE_SELECT_DEBUG") != nullptr) {
+        static int64_t n = 0;
+        if (n++ < 12) {
+            GGML_LOG_WARN("%s: pipe_on=%d pipe_n_buf=%d n_splits=%d min_tokens=%lld\n", __func__,
+                          (int) sched->pipe_on, sched->pipe_n_buf, sched->n_splits,
+                          (long long) sched_stage_min_tokens(sched));
+        }
+    }
+    if (sched->pipe_on) {
+        // Size the buffers from the LARGEST set in this graph, not from the first one filled: a graph's sets are
+        // not all the same size (gate/up and down of a layer land in different splits -- 231 MiB against 450 MiB on
+        // the field shape), so filling from the first one would reallocate the buffer mid-graph.  One pass, one
+        // size.
+        size_t graph_max = 0;
+        for (int i = 0; i < sched->n_splits && pipe_n_host < (int) (sizeof(pipe_host) / sizeof(pipe_host[0])); i++) {
+            size_t need = 0;
+            if (sched_pipe_split_set(sched, &splits[i], &need) > 0) {
+                pipe_host[pipe_n_host++] = i;
+                if (need > graph_max) {
+                    graph_max = need;
+                }
+            }
+        }
+        if (graph_max > sched->pipe_size) {
+            sched->pipe_size = graph_max;
+        }
+        if (pipe_n_host == (int) (sizeof(pipe_host) / sizeof(pipe_host[0])) && sched->n_splits > pipe_n_host) {
+            // Never silent: the splits past the cap are NOT staged, and that is a different (slower) transport for
+            // those layers -- the one state in which this array's size is a behaviour, not a bookkeeping detail.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_WARN("%s: %d stageable splits fill the pipeline's split list (of %d in this graph); the "
+                              "rest take the serial upload.  Raise the list's cap in ggml-backend.cpp if this "
+                              "shape is meant to be staged\n",
+                              __func__, pipe_n_host, sched->n_splits);
+            }
+        }
+        sched->pipe_cur = 0;
+        // THE PREFILL -> DECODE TRANSITION, keyed on WIDTH (not on the presence of host weights: every graph,
+        // decode steps included, still carries the routed expert table as a host-weight input).  The staging width
+        // gate is the same predicate that decides whether a split is staged at all, so "no split in this graph is
+        // wide enough to stage" IS the decode-only case.  Give the buffers back to the slab there, so the arena can
+        // take their VRAM; the next prefill graph re-creates them from `pipe_size`, which is remembered.
+        if (sched->pipe_held) {
+            int64_t widest = 0;
+            for (int i = 0; i < sched->n_splits; i++) {
+                const int64_t t = sched_stage_batch_tokens(&splits[i]);
+                if (t > widest) { widest = t; }
+            }
+            const bool narrow = widest > 0 && widest <= sched_stage_min_tokens(sched);
+            if (narrow) {
+                // Each backend keeps its own stage slots, and on a layer split the split that consumes a buffer need
+                // not be the split that fills it, so EVERY backend that implements the hook gives slots 0..n-1 back
+                // (a backend whose slot is empty returns at once).  One synchronize per backend first: nothing may
+                // be in flight when the VRAM is handed back.
+                bool all = true;
+                for (int bi = 0; bi < sched->n_backends; bi++) {
+                    ggml_backend_t be_rel = sched->backends[bi];
+                    if (be_rel == NULL || be_rel->iface.stage_release == NULL) {
+                        continue;
+                    }
+                    ggml_backend_synchronize(be_rel);
+                    for (int b = 0; b < sched->pipe_n_buf; b++) {
+                        be_rel->iface.stage_release(be_rel, b);
+                    }
+                }
+                for (int b = 0; b < sched->pipe_n_buf; b++) {
+                    ggml_backend_t owner = sched->backends[sched->pipe_backend[b]];
+                    if (owner == NULL || owner->iface.stage_release == NULL) {
+                        all = false;   // this owner cannot give its slot back: keep `pipe_held`
+                    }
+                    sched->pipe_base[b]  = NULL;
+                    sched->pipe_n_ent[b] = 0;
+                }
+                sched->pipe_held = !all;   // a backend without the hook keeps its slots: do not re-grow them
+                if (all) {
+                    static bool rel_logged = false;
+                    if (!rel_logged) {
+                        rel_logged = true;
+                        GGML_LOG_INFO("%s: pipeline staging: %d buffer(s) released at the prefill -> decode "
+                                      "transition (%lld tokens <= the %lld-token staging gate); the slab gets the "
+                                      "VRAM back for the arena\n", __func__, sched->pipe_n_buf,
+                                      (long long) widest, (long long) sched_stage_min_tokens(sched));
+                    }
+                }
+                pipe_n_host = 0;   // nothing to stage at this width
+            }
+        }
+        // No fill survives a graph: drop every entry first, so a graph that stages NOTHING cannot leave a stale
+        // entry that the input loop would match against this graph's copy tensors (they are allocated from one
+        // reused context buffer, so an address repeats) and point at a buffer the fill never filled.
+        for (int b = 0; b < GGML_SCHED_PIPE_MAX_BUFS; b++) {
+            sched->pipe_n_ent[b] = 0;
+        }
+        // fill every buffer with its first set: with N buffers that is the first N host splits, so split 0 can
+        // compute while the other N-1 sets stream in (N = 2 is the pipeline, N = 3 adds the extra stage you
+        // asked for: the fill for k+2 is still running while k+1 computes).
+        //
+        // wip/flash-next-prefill: the depth is RE-DERIVED here, because the number it depends on arrives after
+        // this scheduler was built -- the residency rule reads the expert cache's arena, which is sized at first
+        // use.  Only while no buffer is held, so a shrink can never strand one.
+        const char * pipe_source = NULL;
+        if (!sched->pipe_held) {
+            const int nb = sched_pipe_choose_bufs(sched, &pipe_source);
+            if (nb > 0 && nb != sched->pipe_n_buf) {
+                sched->pipe_n_buf = nb;
+            }
+        }
+        for (int b = 0; b < sched->pipe_n_buf && b < pipe_n_host; b++) {
+            sched_pipe_issue(sched, &splits[pipe_host[b]], b);
+        }
+        if (pipe_n_host > 0) {
+            // Log on CHANGE, not once: the depth is re-derived per graph execution (the first graph runs while
+            // the slab has VRAM at its tightest, and the residency decision that settles the arena lands after
+            // the scheduler exists), and a one-shot line would print only the first choice.  A depth the user
+            // forced never changes.
+            static int logged_n = -1;
+            if (sched->pipe_n_buf != logged_n) {
+                logged_n = sched->pipe_n_buf;
+                GGML_LOG_INFO("%s: pipeline staging: %d host-weight split(s), %d buffer(s) of %.1f MiB "
+                              "(the largest set, sized once; %s)\n",
+                              __func__, pipe_n_host, sched->pipe_n_buf,
+                              (double) sched->pipe_size / (1024.0 * 1024.0),
+                              pipe_source != NULL ? pipe_source : "kept from the previous graph");
+            }
+        }
+    }
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
-        sched_stage_issue(sched, split);
+        split->stage_ok = false;
+        if (sched->pipe_on) {
+            // which pipeline buffer this split consumes (the input loop below reads `pipe_cur`)
+            pipe_k = -1;
+            for (int h = 0; h < pipe_n_host; h++) {
+                if (pipe_host[h] == split_id) { pipe_k = h; break; }
+            }
+            if (pipe_k >= 0) {
+                sched->pipe_cur = pipe_k % sched->pipe_n_buf;
+            }
+        } else if (sched->stage_enabled && split_backend->iface.stage_input != NULL) {
+            // A backend-owned staged transport (the Meta backend under `-sm tensor`): it has no pipeline and no
+            // backend slots, so "is this split stageable" is asked here, through the same gates the pipeline
+            // uses -- the gather (`GGML_SCHED_DEVGATHER` mode 1) and the staging width gate decide, and the
+            // selector's answer for a backend that cannot run the pipeline is "gather".
+            size_t need = 0;
+            split->stage_ok = sched_pipe_split_set(sched, split, &need) > 0;
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -3671,6 +4162,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    // issue #368: sample what this graph's gather READ, per token.  The read SATURATES with width (at prefill width
+    // the routing touches essentially every expert of a table), so a narrow graph's per-token figure is the largest
+    // one and says nothing about a wide ubatch -- the sample is therefore taken from the WIDEST graph so far, which
+    // is also the width the decision is made at in a steady prefill.  Only a graph that actually let the gather
+    // take a host table is a sample; anything else leaves the last measurement standing.
+    if (sched->tr_gathered_cur && sched->tr_read0 >= 0 && tr_tok > 0) {
+        const int64_t now = sched_gather_read(sched);
+        if (now > sched->tr_read0 && tr_tok > sched->tr_gather_tok) {
+            sched->tr_gather_bpt = (now - sched->tr_read0) / tr_tok;
+            sched->tr_gather_tok = tr_tok;
+        }
     }
 
     // After the whole graph: a wide graph has now been executed, so the NEXT one may stage (the selector keeps
@@ -3794,6 +4298,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->pipe_cur  = 0;
         sched->pipe_wide_prev = false;
         sched->pipe_wide_cur  = false;
+        sched->tr_gather_bpt  = 0;
+        sched->tr_gather_tok  = 0;
+        sched->tr_read0       = -1;
+        sched->tr_gathered_cur = false;
         sched->pipe_n_buf    = sched_pipe_choose_bufs(sched, NULL);   // re-derived per graph (the arena lands later)
         sched->pipe_held     = false;
         for (int i = 0; i < GGML_SCHED_PIPE_MAX_BUFS; i++) {
@@ -3813,8 +4321,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
         // win over staging was an artifact of the corruption.  `GGML_SCHED_DEVGATHER=1` re-enables it
         // (A/B only - it is not reliable for a multi-ubatch prefill until its destination is made
         // persistent/never-reused).
+        // wip/host-pool-speed (#131): three-valued.  UNSET = "pool-backed tables gather" (the default: a
+        // pool table's staging is the slow path at every width, measured 7x-126x behind the gather on a
+        // 3-GPU split, `README.md` §18.2).  `0` is the kill switch.  `1`/`force` is the historical A/B arm
+        // (gather below the staging width gate and for large tables, in either host-expert mode) -- it is
+        // NOT the default because it costs a pinned master ~47 % prefill at two devices.
         const char * devgather_env = GGML_ENV_STR("GGML_SCHED_DEVGATHER");
-        sched->devgather_enabled = devgather_env != NULL && atoi(devgather_env) != 0;
+        if (devgather_env == NULL || devgather_env[0] == '\0') {
+            sched->devgather_mode = 1;
+        } else if (atoi(devgather_env) == 0 && strcmp(devgather_env, "force") != 0) {
+            sched->devgather_mode = 0;
+        } else {
+            sched->devgather_mode = 2;
+        }
         if (sched->stage_enabled) {
             bool stage_capable = false;
             for (int b = 0; b < sched->n_backends; b++) {
@@ -3852,7 +4371,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->events[b][c]);
         }
         ggml_backend_event_free(sched->prefetch_events[b]);
-        for (int s = 0; s < GGML_SCHED_STAGE_SLOTS; s++) {
+        for (int e = 0; e < GGML_SCHED_COPY_EVENTS; e++) {
+            ggml_backend_event_free(sched->copy_events[b][e]);
+        }
+        for (int s = 0; s < GGML_SCHED_PIPE_MAX_BUFS; s++) {   // one done/free event per pipeline buffer
             ggml_backend_event_free(sched->stage_done_ev[b][s]);
             ggml_backend_event_free(sched->stage_free_ev[b][s]);
         }
@@ -3979,6 +4501,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+        // r220: every queued copy has completed, so no per-copy event can still be waited on.  Restarting
+        // the rings keeps them from synchronizing on the host at every wrap in a long prefill.
+        sched->copy_event_next[i] = 0;
+        sched->copy_event_used[i] = 0;
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization

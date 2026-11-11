@@ -67,6 +67,12 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
 // meta backend device
 //
 
+// Upper bound on the "rows" (elements of every dim above the split axis) an ALL_GATHER collective copies
+// per (source, destination) pair.  The only producer is the DFlash2 selector's draft batch, whose row count
+// is the draft block size times the number of sequences: 16 sequences of an 8-token block is far above any
+// supported --parallel.  A larger batch trips the bound assert instead of overrunning the view pool.
+#define GGML_META_GATHER_MAX_ROWS 128
+
 struct ggml_backend_meta_device_context {
     std::vector<ggml_backend_dev_t>     simple_devs;
     ggml_backend_meta_get_split_state_t get_split_state;
@@ -212,6 +218,11 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    // ALL_GATHER is the meta backend's own collective (cross-device copies between the simple backends);
+    // no simple backend has to implement it for the meta device to run it.
+    if (op->op == GGML_OP_ALL_GATHER) {
+        return true;
+    }
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
@@ -1299,6 +1310,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return handle_generic(src_ss, /*scalar_only =*/ true);
     };
 
+    // ALL_GATHER: the result is the whole tensor on every backend, so it is MIRRORED whatever the source
+    // split is.  The collective itself runs between the subgraphs (see `graph_compute`): each device's
+    // slice is written into every device's copy at that slice's own offset, which keeps the element
+    // positions of a split axis-0 input (the Draft/DFlash2 selector's global vocabulary indices).
+    auto handle_all_gather = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                (src_ss[0].axis >= GGML_BACKEND_SPLIT_AXIS_0 && src_ss[0].axis < GGML_MAX_DIMS));
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+    };
+
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -1431,6 +1452,50 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
     };
 
+    // Sequence parallelism (LLAMA_SEQPAR): a per-token op whose operands are all split along their TOKEN axis
+    // (the slowest dim with more than one element) with the same per-device token counts computes each
+    // device's tokens locally; the result is split along its own token axis.  The hyper-connection mixers
+    // DSV4_HC_PRE ([n_embd, hc, T] x2 -> [n_embd, T]) and DSV4_HC_POST ([n_embd, T], [n_embd, hc, T], [hc, T]
+    // -> [n_embd, hc, T]) are such ops.  Every other combination keeps the old rule (all mirrored, else abort).
+    auto handle_token_split = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        bool    token_split = true;
+        bool    any_split   = false;
+        int64_t ext[GGML_MAX_DIMS*4] = {0};   // per-device token count of the first split operand
+        if (n_bufs > GGML_MAX_DIMS*4) {
+            token_split = false;   // ext[] holds at most GGML_MAX_DIMS*4 devices
+        }
+        for (size_t i = 0; i < GGML_MAX_SRC && token_split; i++) {
+            const ggml_tensor * t = tensor->src[i];
+            if (t == nullptr || t == tensor) {
+                continue;
+            }
+            if (src_ss[i].axis != ggml_n_dims(t) - 1 || src_ss[i].axis < 0 || src_ss[i].axis >= GGML_MAX_DIMS) {
+                token_split = false;
+                break;
+            }
+            for (size_t j = 0; j < n_bufs; j++) {
+                int64_t e = 0;
+                for (size_t sg = 0; sg < src_ss[i].n_segments; sg++) {
+                    e += src_ss[i].ne[sg*n_bufs + j] * src_ss[i].nr[sg];
+                }
+                if (!any_split) {
+                    ext[j] = e;
+                } else if (ext[j] != e) {
+                    token_split = false;
+                }
+            }
+            any_split = true;
+        }
+        if (!token_split || !any_split || n_bufs > GGML_MAX_DIMS*4) {
+            return handle_generic(src_ss, /*scalar_only =*/ true);
+        }
+        ggml_backend_meta_split_state ret = {ggml_backend_meta_split_axis(ggml_n_dims(tensor) - 1), {0}, {1}, 1};
+        for (size_t j = 0; j < n_bufs; j++) {
+            ret.ne[j] = ext[j];
+        }
+        return ret;
+    };
+
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -1476,6 +1541,27 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
             GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+        }
+
+        // TOKEN_SCATTER (sequence parallelism): contiguous token slices (equal, or one token more on the first
+        // T % n devices) of a mirrored input -- or of a partial sum
+        // whose all-reduce graph_compute turns into a reduce-scatter (assume_sync sees that one as mirrored
+        // too).  Returned here: no source is split, so the ratio bookkeeping below has nothing to take over.
+        if (tensor->op == GGML_OP_TOKEN_SCATTER) {
+            const int axis = ggml_get_op_params_i32(tensor, 0);
+            GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                        "token_scatter needs a mirrored input (or the partial sum that ends a reduction segment)");
+            GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
+            for (int k = axis + 1; k < GGML_MAX_DIMS; k++) {
+                GGML_ASSERT(tensor->ne[k] == 1 && "token_scatter: the token axis must be the slowest dim");
+            }
+            // an odd token count: the first T % n_bufs devices take one token more
+            ggml_backend_meta_split_state ret = {ggml_backend_meta_split_axis(axis), {0}, {1}, 1};
+            const int64_t nt = tensor->ne[axis];
+            for (size_t j = 0; j < n_bufs; j++) {
+                ret.ne[j] = nt / (int64_t) n_bufs + ((int64_t) j < nt % (int64_t) n_bufs ? 1 : 0);
+            }
+            return ret;
         }
 
         ggml_backend_meta_split_state split_state;
@@ -1623,6 +1709,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_TOP_K: {
                 split_state = handle_per_row(src_ss);
             } break;
+            case GGML_OP_ALL_GATHER: {
+                split_state = handle_all_gather(src_ss);
+            } break;
             case GGML_OP_LEAKY_RELU: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
@@ -1692,9 +1781,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
             } break;
-            case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:
-            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_DSV4_HC_POST: {
+                split_state = handle_token_split(src_ss);
+            } break;
+            case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_TOP_K_MASK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -2069,6 +2160,15 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+        if (tensor->op == GGML_OP_TOKEN_SCATTER && split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
+            // the first token of this device's slice: the per-device kernel copies from there
+            GGML_ASSERT(split_state.n_segments == 1 && split_state.nr[0] == 1);
+            int64_t first = 0;
+            for (size_t jj = 0; jj < j; jj++) {
+                first += split_state.ne[jj];
+            }
+            ggml_set_op_params_i32(t_ij, 1, (int32_t) first);
+        }
         ggml_set_name(t_ij, tensor->name);
         t_ij->buffer = simple_buf;
         t_ij->view_src = tensor->view_src;
@@ -2091,6 +2191,16 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                     }
                 }
                 if (!split_internal_offset) {
+                    // uneven splits (odd seqpar token counts) can make this inexact: flag it once
+                    if ((t_ij->view_offs * ne[split_dim]) % tensor->ne[split_dim] != 0) {
+                        static bool warned = false;
+                        if (!warned) {
+                            warned = true;
+                            GGML_LOG_WARN("%s: inexact proportional view offset for %s (view_offs %zu, %lld of %lld): truncated\n",
+                                          __func__, tensor->name, (size_t) t_ij->view_offs, (long long) ne[split_dim],
+                                          (long long) tensor->ne[split_dim]);
+                        }
+                    }
                     t_ij->view_offs = t_ij->view_offs * ne[split_dim]/tensor->ne[split_dim];
                 }
             }
@@ -2807,6 +2917,10 @@ struct ggml_backend_meta_context {
     ggml_context_ptr            ctx;
     std::vector<ggml_cgraph *>  cgraphs_aux;
     std::vector<ggml_tensor *>  nodes_aux;
+    // ALL_GATHER collectives: the node to run after each subgraph (or -1) and the scratch destination
+    // views the copies write through, one per (source device, destination device) pair
+    std::vector<int>            gather_nodes;
+    std::vector<ggml_tensor *>  gather_views;
     size_t                      n_reduce_steps;
     int                         max_nnodes    = 0;
     size_t                      max_tmp_size  = 0;
@@ -2859,6 +2973,16 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
+    // sequence parallelism (TOKEN_SCATTER / token-axis ALL_GATHER); null = the generic paths in graph_compute
+    ggml_backend_comm_reduce_scatter_tensor_t comm_reduce_scatter = nullptr;
+    ggml_backend_comm_all_gather_tensor_t     comm_all_gather     = nullptr;
+    // per subgraph: the TOKEN_SCATTER node whose reduce-scatter replaces the subgraph's all-reduce (or -1);
+    // per node: 1 = that node is filled by a collective and left out of the per-device subgraphs
+    std::vector<int>            scatter_nodes;
+    // sequence parallelism: executed-form totals of this backend and the set of forms already reported
+    int64_t                     seqpar_exec_total[5] = { 0, 0, 0, 0, 0 };
+    unsigned                    seqpar_forms_logged = 0;
+    std::vector<char>           collective_node;
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2919,6 +3043,12 @@ struct ggml_backend_meta_context {
                 ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
+            comm_reduce_scatter = (ggml_backend_comm_reduce_scatter_tensor_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_reduce_scatter_tensor");
+            comm_all_gather = (ggml_backend_comm_all_gather_tensor_t)
+                ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(
+                    ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_all_gather_tensor");
         }
     }
 
@@ -3805,6 +3935,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             };
 
             int i_start = 0;
+            std::vector<int> gather_nodes_new;
+            std::vector<int> scatter_nodes_new;
+            backend_ctx->collective_node.assign(cgraph->n_nodes, 0);
+            int n_seqpar_rs = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
@@ -3814,12 +3948,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                // ALL_GATHER is a collective that replaces the node's own computation, so it is a boundary
+                // of its own: the subgraph ends just before it, the gather runs, and the following subgraph
+                // starts after it.  Without the cut the per-device kernels would each write their own slice
+                // into the front of their copy.
+                const bool is_gather = i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_ALL_GATHER;
+                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL || is_gather;
                 if (!new_subgraph) {
                     continue;
                 }
 
-                const int i_delayed = get_i_delayed(i);
+                // the delayed-reduce search walks forward looking for a better reduce point and must not
+                // step over the gather node
+                const int i_delayed = is_gather ? i : get_i_delayed(i);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -3838,14 +3979,63 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
                 i = i_delayed;
 
+                // Sequence parallelism: a TOKEN_SCATTER right behind the reduce point whose only reader it
+                // is turns this segment's all-reduce into a reduce-scatter that fills the scatter node
+                // directly (each device gets the summed rows of its own tokens).  Anything else keeps the
+                // all-reduce, and the scatter then runs as a local slice of the reduced tensor.
+                int scatter_node = -1;
+                if (!is_gather && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && n_backends == 2 &&
+                        i + 1 < cgraph->n_nodes) {
+                    ggml_tensor * red = cgraph->nodes[i];
+                    ggml_tensor * nx  = cgraph->nodes[i + 1];
+                    if (nx->op == GGML_OP_TOKEN_SCATTER && nx->src[0] == red && (ggml_get_op_params_i32(nx, 2) & 1) &&
+                            ggml_node_get_use_count(cgraph, i) == 1 && !(red->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                            red->type == GGML_TYPE_F32 && nx->type == GGML_TYPE_F32) {
+                        scatter_node = i + 1;
+                        backend_ctx->collective_node[scatter_node] = 1;
+                        n_seqpar_rs++;
+                    }
+                }
+
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
                     bcj.cgraphs[n_subgraphs].offset = i_start;
                 }
+                gather_nodes_new.push_back(is_gather ? i + 1 : -1);
+                scatter_nodes_new.push_back(scatter_node);
                 n_subgraphs++;
                 i_start = i + 1;
             }
             GGML_ASSERT(i_start == cgraph->n_nodes);
+            backend_ctx->gather_nodes  = std::move(gather_nodes_new);
+            backend_ctx->scatter_nodes = std::move(scatter_nodes_new);
+
+            // one-time note that a sequence-parallel graph ran (LLAMA_SEQPAR), with its collective counts
+            {
+                int n_scatter = 0;
+                int n_gather  = 0;
+                int64_t n_tok = 0;
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    const ggml_tensor * t = cgraph->nodes[i];
+                    if (t->op == GGML_OP_TOKEN_SCATTER) {
+                        n_scatter++;
+                        n_tok = t->ne[ggml_get_op_params_i32(t, 0)];
+                    } else if (t->op == GGML_OP_ALL_GATHER) {
+                        n_gather++;
+                    }
+                }
+                // graph shape: the nodes ELIGIBLE to fold the all-reduce into a reduce-scatter; what each one actually
+                // runs as is counted at compute time (the executed-form census in graph_compute)
+                static bool seqpar_logged = false;
+                if (n_scatter > 0 && !seqpar_logged) {
+                    seqpar_logged = true;
+                    GGML_LOG_INFO("%s: sequence parallelism engaged: T = %lld, %d token_scatter nodes (%d fold an all-reduce, "
+                                  "%d are local slices), %d all_gather nodes, %zu subgraphs\n",
+                                  __func__, (long long) n_tok, n_scatter, n_seqpar_rs, n_scatter - n_seqpar_rs,
+                                  n_gather, n_subgraphs);
+                }
+
+            }
         }
 
         backend_ctx->uid         = cgraph->uid;
@@ -3867,7 +4057,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
-            const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
+            const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead()
+                                                  + 2*n_backends*GGML_META_GATHER_MAX_ROWS*ggml_tensor_overhead(); // ALL_GATHER views
             const ggml_init_params params = {
                 /*.mem_size   =*/ n_backends * (mem_per_device_graphs_main + mem_per_device_graphs_aux + mem_per_device_nodes_aux),
                 /*.mem_buffer =*/ nullptr,
@@ -3888,6 +4079,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             for (size_t k = 0; k < backend_ctx->nodes_aux.size(); k++) {
                 backend_ctx->nodes_aux[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
             }
+            // scratch views for the ALL_GATHER collectives: one (source, destination, row) triple takes
+            // two 1-D view tensors.  The row count is a runtime property of the gathered tensor, so the
+            // pool is sized for the largest token batch a split can carry plus slack, and `all_gather`
+            // asserts rather than overrunning it.
+            backend_ctx->gather_views.resize(2*n_backends*n_backends*GGML_META_GATHER_MAX_ROWS);
+            for (size_t k = 0; k < backend_ctx->gather_views.size(); k++) {
+                backend_ctx->gather_views[k] = ggml_new_tensor_1d(backend_ctx->ctx.get(), GGML_TYPE_F32, 1);
+            }
         }
 
         for (size_t j = 0; j < n_backends; j++) {
@@ -3896,11 +4095,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
                 const size_t i_node_start = bcj.cgraphs[i_graph].offset;
                 const size_t i_node_stop = i_graph + 1 < n_subgraphs ? bcj.cgraphs[i_graph + 1].offset : cgraph->n_nodes;
-                cgraph_ij->n_nodes = i_node_stop - i_node_start;
+                cgraph_ij->n_nodes = 0;
                 ggml_hash_set_reset(&cgraph_ij->visited_hash_set);
                 for (size_t i_node = i_node_start; i_node < i_node_stop; i_node++) {
+                    if (cgraph->nodes[i_node]->op == GGML_OP_ALL_GATHER || backend_ctx->collective_node[i_node]) {
+                        // the meta collective fills this tensor (each device's slice written into every
+                        // device's copy, or a reduce-scatter's slice of the sum); a device-local execution
+                        // would copy its own slice only
+                        continue;
+                    }
                     ggml_tensor * node_ij = bcj.nodes[i_node];
-                    cgraph_ij->nodes[i_node - i_node_start] = node_ij;
+                    cgraph_ij->nodes[cgraph_ij->n_nodes++] = node_ij;
                     const size_t hash_pos_orig = ggml_hash_find(&cgraph->visited_hash_set, cgraph->nodes[i_node]);
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
@@ -4089,6 +4294,246 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // Sequence parallelism (LLAMA_SEQPAR): the per-device element offsets of a tensor split along its slowest
+    // non-trivial axis, i.e. each device's slice is one contiguous run of the whole tensor.
+    auto token_slice_offsets = [&](const ggml_tensor * t, const ggml_backend_meta_split_state & ss,
+                                   std::vector<int64_t> & offs) {
+        const int axis = ss.axis;
+        GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
+        GGML_ASSERT(ss.n_segments == 1 && ss.nr[0] == 1);
+        for (int k = axis + 1; k < GGML_MAX_DIMS; k++) {
+            GGML_ASSERT(t->ne[k] == 1 && "token-axis collective: the split axis must be the slowest dim");
+        }
+        int64_t row = 1;
+        for (int k = 0; k < axis; k++) {
+            row *= t->ne[k];
+        }
+        offs.assign(n_backends, 0);
+        int64_t acc = 0;
+        for (size_t j = 0; j < n_backends; j++) {
+            offs[j] = acc * row;
+            acc += ss.ne[j];
+        }
+        GGML_ASSERT(acc == t->ne[axis]);
+    };
+
+    // a 1-D-shaped view of `src` with the layout of `like` starting `offs` bytes in (gather_views pool)
+    auto slice_view = [&](size_t & i_view, ggml_tensor * src, const ggml_tensor * like, size_t offs) -> ggml_tensor * {
+        GGML_ASSERT(i_view < backend_ctx->gather_views.size());
+        ggml_tensor * v = backend_ctx->gather_views[i_view++];
+        memset(v, 0, sizeof(ggml_tensor));
+        v->type = like->type;
+        for (int k = 0; k < GGML_MAX_DIMS; k++) {
+            v->ne[k] = like->ne[k];
+            v->nb[k] = like->nb[k];
+        }
+        v->view_src  = src;
+        v->view_offs = offs;
+        GGML_ASSERT(offs + ggml_nbytes(v) <= ggml_nbytes(src));
+        if (ggml_backend_view_init(v) != GGML_STATUS_SUCCESS) {
+            return nullptr;
+        }
+        return v;
+    };
+
+    // executed-form census of the sequence-parallel collectives: reduce-scatter by the comm backend, all-reduce (comm)
+    // + local slice, all-reduce (meta fallback) + local slice; token-axis all_gather by the comm backend, generic copies.
+    // Totals per backend, logged when a form runs for the first time (a ubatch spans several graph computes, one per
+    // scheduler split, so a per-compute mix would repeat every ubatch).
+    int sp_exec[5] = { 0, 0, 0, 0, 0 };
+
+    // ALL_GATHER of a tensor split along its slowest axis (a token-split activation): each device's slice is
+    // one contiguous block of the whole tensor.  The comm backend's gather if it has one, else synchronous
+    // per-pair copies (correct, slow).
+    auto all_gather_token_axis = [&](const int i_node, const int i_src, const ggml_backend_meta_split_state & ss) -> ggml_status {
+        ggml_tensor * node = cgraph->nodes[i_node];
+        GGML_ASSERT(ggml_is_contiguous(node) && ggml_is_contiguous(cgraph->nodes[i_src]));
+        std::vector<int64_t> offs;
+        token_slice_offsets(node, ss, offs);
+        std::vector<ggml_tensor *> srcs(n_backends), dsts(n_backends);
+        for (size_t j = 0; j < n_backends; j++) {
+            srcs[j] = backend_ctx->backend_configs[j].nodes[i_src];
+            dsts[j] = backend_ctx->backend_configs[j].nodes[i_node];
+            GGML_ASSERT(srcs[j] != nullptr && dsts[j] != nullptr);
+        }
+        if (backend_ctx->comm_ctx != nullptr && backend_ctx->comm_all_gather != nullptr &&
+                backend_ctx->comm_all_gather(backend_ctx->comm_ctx, srcs.data(), dsts.data(), offs.data())) {
+            sp_exec[3]++;
+            return GGML_STATUS_SUCCESS;
+        }
+        sp_exec[4]++;
+        if (ggml_get_op_params_i32(node, 0) != 0) {
+            // a bf16-wire gather taking the plain F32 copies: correct, but not the rounded values the CE path gives
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_WARN("%s: bf16-wire all_gather fell back to the generic F32 copies (unrounded)\n", __func__);
+            }
+        }
+        // generic: quiesce every device (the destination may reuse memory a device is still reading), then
+        // one copy per (source, destination) pair
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
+        }
+        const size_t elem = ggml_element_size(node);
+        size_t i_view = 0;
+        for (size_t s = 0; s < n_backends; s++) {
+            for (size_t d = 0; d < n_backends; d++) {
+                ggml_tensor * dst_v = slice_view(i_view, dsts[d], srcs[s], (size_t) offs[s] * elem);
+                if (dst_v == nullptr) {
+                    return GGML_STATUS_FAILED;
+                }
+                ggml_backend_tensor_copy_async(backend_ctx->backend_configs[s].backend,
+                        backend_ctx->backend_configs[d].backend, srcs[s], dst_v);
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    };
+
+    // The ALL_GATHER collective: every device ends up holding the WHOLE input tensor.
+    //
+    // On a Meta device an op that reduces along an axis-0 split (the DFlash2 selector's `ggml_top_k`
+    // over vocab-split draft logits, and the `ggml_get_rows` that reads the candidate values back)
+    // cannot be computed per device: no device holds the whole row.  This op is the split state's way
+    // of saying "I need all of it": each device's slice is copied into every device's full copy at
+    // that slice's own offset.  The slices are disjoint (they tile the tensor) and nothing is summed,
+    // so the element positions of the split axis are preserved across devices -- which is what makes a
+    // vocabulary index produced by one device meaningful on the others.
+    //
+    // Only a plain axis-0 split (one segment, no repeats: each device holds a contiguous run of rows) is
+    // implemented here, plus a split along the slowest axis (all_gather_token_axis above); anything else is a
+    // deliberate abort rather than a silently wrong gather.
+    auto all_gather = [&](const int i_node) -> ggml_status {
+        ggml_tensor * node = cgraph->nodes[i_node];
+        ggml_tensor * src  = node->src[0];
+        GGML_ASSERT(node->op == GGML_OP_ALL_GATHER && src != nullptr);
+
+        int i_src = -1;
+        for (int k = 0; k < i_node; k++) {
+            if (cgraph->nodes[k] == src) {
+                i_src = k;
+                break;
+            }
+        }
+        GGML_ASSERT(i_src >= 0);
+
+        const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(src, /*assume_sync =*/ false);
+        const bool split = ss.axis >= 0 && ss.axis < GGML_MAX_DIMS;
+        if (split && ss.axis != GGML_BACKEND_SPLIT_AXIS_0) {
+            return all_gather_token_axis(i_node, i_src, ss);
+        }
+        if (split) {
+            GGML_ASSERT(ss.axis == GGML_BACKEND_SPLIT_AXIS_0);
+            GGML_ASSERT(ss.n_segments == 1 && ss.nr[0] == 1);
+            GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(node));
+        } else {
+            GGML_ASSERT(ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
+        // Each device's slice is contiguous in its OWN copy, but the destination is the full tensor, where
+        // the split axis (0) is the slowest: the copies have to go one "row" (one element of every dim > 0)
+        // at a time, exactly like the canonical host assembly in `ggml_backend_meta_get_tensor_impl`.
+        const int64_t ne0     = src->ne[0];
+        const int64_t n_rows  = src->ne[1] * src->ne[2] * src->ne[3];
+        const size_t  elem    = ggml_element_size(src);
+
+        const size_t n_src = split ? n_backends : 1;
+        GGML_ASSERT(n_rows <= GGML_META_GATHER_MAX_ROWS && "ALL_GATHER row batch exceeds GGML_META_GATHER_MAX_ROWS");
+        GGML_ASSERT(2*n_src*n_backends*n_rows <= backend_ctx->gather_views.size());
+
+        size_t   i_view    = 0;
+        int64_t  elems     = 0; // elements that precede this source's slice in the full tensor
+        for (size_t s = 0; s < n_src; s++) {
+            ggml_tensor * src_s = backend_ctx->backend_configs[s].nodes[i_src];
+            GGML_ASSERT(src_s != nullptr);
+            const int64_t ne_j  = split ? ss.ne[s] * ss.nr[0] : ne0;
+            const size_t  nbytes_row = size_t(ne_j) * elem;
+            GGML_ASSERT(elems + ne_j * n_rows <= ggml_nelements(node));
+            for (size_t d = 0; d < n_backends; d++) {
+                ggml_tensor * dst_d = backend_ctx->backend_configs[d].nodes[i_node];
+                GGML_ASSERT(dst_d != nullptr);
+                for (int64_t r = 0; r < n_rows; r++) {
+                    ggml_tensor * row_src = backend_ctx->gather_views[i_view++];
+                    ggml_tensor * row_dst = backend_ctx->gather_views[i_view++];
+                    memset(row_src, 0, sizeof(ggml_tensor));
+                    memset(row_dst, 0, sizeof(ggml_tensor));
+                    for (ggml_tensor * t : { row_src, row_dst }) {
+                        t->type    = src_s->type;
+                        t->ne[0]   = ne_j;
+                        t->nb[0]   = elem;
+                        // ne/nb of the trailing dims must be a valid 1-element row: the copy sizes the
+                        // transfer with `ggml_nbytes`, which returns 0 for a zero extent
+                        for (int k = 1; k < GGML_MAX_DIMS; k++) {
+                            t->ne[k] = 1;
+                            t->nb[k] = nbytes_row;
+                        }
+                    }
+                    // 1-D views: the source row of this device's slice, the destination row of the full tensor
+                    row_src->view_src  = src_s;
+                    row_src->view_offs = r * src_s->nb[1];
+                    row_dst->view_src  = dst_d;
+                    row_dst->view_offs = (r * ne0 + elems) * elem;
+                    GGML_ASSERT(row_src->view_offs + nbytes_row <= ggml_nbytes(src_s));
+                    GGML_ASSERT(row_dst->view_offs + nbytes_row <= ggml_nbytes(dst_d));
+                    if (ggml_backend_view_init(row_src) != GGML_STATUS_SUCCESS ||
+                        ggml_backend_view_init(row_dst) != GGML_STATUS_SUCCESS) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    ggml_backend_tensor_copy_async(backend_ctx->backend_configs[s].backend,
+                            backend_ctx->backend_configs[d].backend, row_src, row_dst);
+                }
+            }
+            elems += ne_j;
+        }
+        GGML_ASSERT(elems == ne0);
+
+        return GGML_STATUS_SUCCESS;
+    };
+
+    // The reduce-scatter that replaces subgraph i_graph's all-reduce (sequence parallelism): the subgraph's last
+    // node is the partial sum, the TOKEN_SCATTER node right behind it receives each device's token slice of the
+    // sum.  Without a comm reduce-scatter: all-reduce as usual, then each device copies its own slice.
+    auto reduce_scatter = [&](const size_t i_graph, const int i_node) -> ggml_status {
+        ggml_tensor * node = cgraph->nodes[i_node];
+        GGML_ASSERT(node->op == GGML_OP_TOKEN_SCATTER);
+        const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
+        std::vector<int64_t> offs;
+        token_slice_offsets(node, ss, offs);
+        std::vector<ggml_tensor *> srcs(n_backends), dsts(n_backends);
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_cgraph * cgraph_ij = bcj.cgraphs[i_graph].cgraph_main;
+            GGML_ASSERT(cgraph_ij->n_nodes > 0);
+            srcs[j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
+            dsts[j] = bcj.nodes[i_node];
+            GGML_ASSERT(dsts[j] != nullptr && dsts[j]->src[0] == srcs[j]);
+        }
+        if (backend_ctx->comm_ctx != nullptr && backend_ctx->comm_reduce_scatter != nullptr &&
+                backend_ctx->comm_reduce_scatter(backend_ctx->comm_ctx, srcs.data(), dsts.data(), offs.data())) {
+            sp_exec[0]++;
+            return GGML_STATUS_SUCCESS;
+        }
+        bool ok = backend_ctx->comm_ctx != nullptr && backend_ctx->comm_allreduce(backend_ctx->comm_ctx, srcs.data());
+        sp_exec[ok ? 1 : 2]++;
+        if (!ok) {
+            const ggml_status status = allreduce_fallback(i_graph);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+        const size_t elem = ggml_element_size(node);
+        size_t i_view = 0;
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_tensor * src_v = slice_view(i_view, srcs[j], dsts[j], (size_t) offs[j] * elem);
+            if (src_v == nullptr) {
+                return GGML_STATUS_FAILED;
+            }
+            ggml_backend_t b = backend_ctx->backend_configs[j].backend;
+            ggml_backend_tensor_copy_async(b, b, src_v, dsts[j]);
+        }
+        return GGML_STATUS_SUCCESS;
+    };
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -4096,6 +4541,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+        }
+
+        if (i < backend_ctx->n_subgraphs - 1 && i < backend_ctx->gather_nodes.size() && backend_ctx->gather_nodes[i] >= 0) {
+            const ggml_status status = all_gather(backend_ctx->gather_nodes[i]);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            continue;
+        }
+
+        if (i < backend_ctx->n_subgraphs - 1 && i < backend_ctx->scatter_nodes.size() && backend_ctx->scatter_nodes[i] >= 0) {
+            const ggml_status status = reduce_scatter(i, backend_ctx->scatter_nodes[i]);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            continue;
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
@@ -4117,6 +4578,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+        }
+    }
+    if (sp_exec[0] + sp_exec[1] + sp_exec[2] + sp_exec[3] + sp_exec[4] > 0) {
+        unsigned forms = 0;
+        for (int k = 0; k < 5; ++k) {
+            backend_ctx->seqpar_exec_total[k] += sp_exec[k];
+            forms |= backend_ctx->seqpar_exec_total[k] > 0 ? 1u << k : 0u;
+        }
+        if (forms != backend_ctx->seqpar_forms_logged) {
+            backend_ctx->seqpar_forms_logged = forms;
+            const int64_t * n = backend_ctx->seqpar_exec_total;
+            GGML_LOG_INFO("%s: sequence parallelism executed so far: reduce-scatter %lld by the comm backend (copy engine), "
+                          "%lld as all-reduce + slice, %lld as fallback all-reduce + slice; token all_gather %lld by the comm "
+                          "backend (copy engine), %lld as generic copies\n", __func__,
+                          (long long) n[0], (long long) n[1], (long long) n[2], (long long) n[3], (long long) n[4]);
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -4236,11 +4712,83 @@ static bool ggml_backend_meta_moe_cache_update(ggml_backend_t backend, const str
     return all;
 }
 
+// MoE expert cache: the geometry-only half of `moe_cache_update`, forwarded per device.  Same derivation as
+// the update hook above (the running sum of each device's slice stride, the split axis, or an explicit fused
+// slice list), but it needs no routing -- which is the whole point: it runs BEFORE the first split of a graph
+// computes, so the cache can register, prime and size on a prefill-only workload and under `-sm tensor` (where
+// the update hook declines every `n_tok > band`).  Returns true only if every device registered.
+static bool ggml_backend_meta_moe_cache_register(ggml_backend_t backend, const struct ggml_tensor * weight,
+        const struct ggml_tensor * weight_cpy, size_t slice_off, int split_axis,
+        const struct ggml_backend_moe_slice * slices_in, int n_slices_in) {
+    GGML_UNUSED(slice_off);
+    GGML_UNUSED(split_axis);
+    GGML_UNUSED(slices_in);
+    GGML_UNUSED(n_slices_in);
+    if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_meta(weight_cpy->buffer)) {
+        return false;
+    }
+    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
+    if (ss.axis < 0 || ss.axis >= GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return false;   // a mirrored table has no per-device slice geometry
+    }
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    bool all = true;
+    if (ss.n_segments != 1 || ss.nr[0] != 1) {
+        struct ggml_backend_moe_slice slice[GGML_BACKEND_MOE_MAX_SLICES];
+        int  n_slices = 0;
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+            ggml_tensor *  simple_tensor  = ggml_backend_meta_buffer_simple_tensor(weight_cpy, j);
+            if (simple_tensor == nullptr || simple_backend->iface.moe_cache_register == nullptr ||
+                !ggml_backend_meta_moe_slices(ss, weight, simple_tensor, j, n_backends, slice, &n_slices)) {
+                return false;
+            }
+            all = all && simple_backend->iface.moe_cache_register(
+                    simple_backend, weight, simple_tensor, 0, (int) ss.axis, slice, n_slices);
+        }
+        return all;
+    }
+    size_t off = 0;
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+        ggml_tensor *  simple_tensor  = ggml_backend_meta_buffer_simple_tensor(weight_cpy, j);
+        if (simple_tensor == nullptr || simple_backend->iface.moe_cache_register == nullptr) {
+            return false;
+        }
+        all = all && simple_backend->iface.moe_cache_register(
+                simple_backend, weight, simple_tensor, off, (int) ss.axis, nullptr, 0);
+        off += simple_tensor->nb[ss.axis + 1];
+    }
+    return all;
+}
+
+// MoE expert cache: forward "is the arena still unarmed" / "can this table be filled from it" to the simple
+// devices.  Both are sound only now that registration no longer depends on the prefill routing: a forwarded
+// `pending` used to be able to stay true forever (the update hook declines every prefill width, so nothing
+// ever registered and the ring stayed disabled for the whole run -- measured 356 vs 799 t/s on a 2-device
+// `-sm tensor` arm).  With the registration pre-pass below, `pending` clears on the first graph.
+static bool ggml_backend_meta_moe_cache_pending(ggml_backend_t backend) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+        if (simple_backend != nullptr && simple_backend->iface.moe_cache_pending != nullptr &&
+            simple_backend->iface.moe_cache_pending(simple_backend)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// A split table must be servable on EVERY device before the ring is skipped, so this is all-or-nothing (and
+// "asked" -- a split of devices that do not implement the query keeps the ring as before).
 // wip/moe-expert-cache (session 7) identity fast path: forward to every simple backend and take the
 // input over only if ALL of them can (a mixed outcome would leave one device reading an arena nobody
 // filled).
 static bool ggml_backend_meta_moe_cache_take_over(ggml_backend_t backend, const struct ggml_tensor * weight,
-        const struct ggml_tensor * weight_cpy) {
+        const struct ggml_tensor * weight_cpy, int64_t n_tok) {
     if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 2) {
         return false;
     }
@@ -4259,9 +4807,42 @@ static bool ggml_backend_meta_moe_cache_take_over(ggml_backend_t backend, const 
         if (simple_tensor == nullptr || simple_backend->iface.moe_cache_take_over == nullptr) {
             return false;
         }
-        all = all && simple_backend->iface.moe_cache_take_over(simple_backend, weight, simple_tensor);
+        all = all && simple_backend->iface.moe_cache_take_over(simple_backend, weight, simple_tensor, n_tok);
     }
     return all;
+}
+
+// TODO #133: side-effect-free form of the take-over query, forwarded per device.  `stage_input` stages the
+// whole split input from the host master, so the scheduler asks this BEFORE it lets the meta backend stage:
+// an identity table is served in place at any width (the take-over below skips the copy), and staging it
+// first would fill every device's ring slot with bytes no kernel then reads -- the per-ubatch re-copy
+// `TODO` #133 is about, charged once more on top.  Every device must agree, exactly as for the take-over.
+static bool ggml_backend_meta_moe_cache_in_place(ggml_backend_t backend, const struct ggml_tensor * weight,
+        const struct ggml_tensor * weight_cpy, int64_t n_tok) {
+    if (weight == nullptr || weight_cpy == nullptr || weight->ne[2] < 1) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_meta(weight_cpy->buffer)) {
+        return false;
+    }
+    const ggml_backend_meta_split_state ss = ggml_backend_meta_get_split_state(weight_cpy, /*assume_sync =*/ false);
+    if (ss.n_segments != 1 || ss.nr[0] != 1 || ss.axis < 0 || ss.axis >= GGML_MAX_DIMS) {
+        return false;
+    }
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    bool any = false;
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+        ggml_tensor *  simple_tensor  = ggml_backend_meta_buffer_simple_tensor(weight_cpy, j);
+        if (simple_tensor == nullptr || simple_backend->iface.moe_cache_in_place == nullptr) {
+            return false;
+        }
+        if (!simple_backend->iface.moe_cache_in_place(simple_backend, weight, simple_tensor, n_tok)) {
+            return false;
+        }
+        any = true;
+    }
+    return any;
 }
 
 // wip/moe-expert-cache (B2): forward the device-side expert gather to each simple device.  The gather
@@ -4294,27 +4875,45 @@ static int64_t ggml_backend_meta_moe_cache_band(ggml_backend_t backend) {
     return n_backends > 0 ? band : 8;
 }
 
+// wip/host-pool-speed (#131): forward the pool-backed query to the simple devices.  A tensor split gives
+// every simple device the SAME host master, so the answer is uniform; report true if any device says so.
+static bool ggml_backend_meta_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight) {
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    for (size_t j = 0; j < n_backends; j++) {
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+        if (simple_backend != nullptr && simple_backend->iface.moe_cache_pool_backed != nullptr &&
+            simple_backend->iface.moe_cache_pool_backed(simple_backend, weight)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // wip/flash-next-prefill: the transport selector's input, summed over the children.  A tensor split
 // keeps each device's shard in that device's own arena, so the per-device sums are the aggregate coverage --
 // and the exposure the selector computes from them is the bytes the whole split would pull over N links.
-static void ggml_backend_meta_moe_cache_residency(ggml_backend_t backend, int64_t * covered, int64_t * host) {
+static void ggml_backend_meta_moe_cache_residency(ggml_backend_t backend, int64_t * covered, int64_t * host,
+                                                  int64_t * gather_read) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     if (covered != nullptr) { *covered = 0; }
     if (host != nullptr)    { *host    = 0; }
+    if (gather_read != nullptr) { *gather_read = 0; }
     const size_t n = ggml_backend_meta_n_backends(backend);
-    int64_t cov = 0, all = 0;
+    int64_t cov = 0, all = 0, rd = 0;
     for (size_t j = 0; j < n; j++) {
         ggml_backend_t simple = ggml_backend_meta_simple_backend(backend, j);
         if (simple == nullptr || simple->iface.moe_cache_residency == nullptr) {
             continue;
         }
-        int64_t c = 0, h = 0;
-        simple->iface.moe_cache_residency(simple, &c, &h);
+        int64_t c = 0, h = 0, r = 0;
+        simple->iface.moe_cache_residency(simple, &c, &h, &r);
         cov += c;
         all += h;
+        rd  += r;
     }
     if (covered != nullptr) { *covered = cov; }
     if (host != nullptr)    { *host    = all; }
+    if (gather_read != nullptr) { *gather_read = rd; }
 }
 
 static bool ggml_backend_meta_moe_cache_gather(ggml_backend_t backend, const struct ggml_tensor * weight,
@@ -4467,6 +5066,12 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .moe_cache_band          = */ ggml_backend_meta_moe_cache_band,
     /* .moe_cache_gather        = */ ggml_backend_meta_moe_cache_gather,
     /* .moe_cache_remap         = */ ggml_backend_meta_moe_cache_remap,
+    /* .moe_cache_pool_backed   = */ ggml_backend_meta_moe_cache_pool_backed,
+    /* .cpy_tensor_async_nowait = */ nullptr,
+    /* .moe_cache_pending      = */ ggml_backend_meta_moe_cache_pending,
+    /* .moe_cache_register     = */ ggml_backend_meta_moe_cache_register,
+    /* .moe_cache_stage_ready  = */ ggml_backend_meta_moe_cache_stage_ready,
+    /* .moe_cache_in_place     = */ ggml_backend_meta_moe_cache_in_place,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

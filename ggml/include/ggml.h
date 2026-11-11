@@ -438,6 +438,8 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_SLEEP,
+        GGML_OP_ALL_GATHER,
+        GGML_OP_TOKEN_SCATTER,
 
         GGML_OP_COUNT,
     };
@@ -743,6 +745,38 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_dup_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // The result holds the WHOLE input on every backend.
+    //
+    // On a single backend this is a plain copy (GGML_OP_DUP).  On a Meta (tensor-parallel) device it is
+    // the collective the split state cannot otherwise express: the input may be split along its axis 0
+    // (each backend holds a slice) and the output is MIRRORED, so every backend holds all of it and ops
+    // that need the whole tensor -- a reduction along the split axis such as TOP_K over a vocab-split
+    // logits row -- can run locally without a cross-device reduction.
+    GGML_API struct ggml_tensor * ggml_all_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    // ggml_all_gather with a wire format (op_params[0]): 0 = native, 1 = bf16 (F32 only).  A backend that honours it
+    // (the CUDA copy-engine token-axis gather) stores fp32(bf16(x)) on every device, own slice included, so the
+    // gathered tensor stays identical on all devices; any other path (single backend, generic copies) is plain F32.
+    GGML_API struct ggml_tensor * ggml_all_gather_wire(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   wire);
+
+    // Sequence parallelism (token split) on a Meta (tensor-parallel) device.  The result has the shape of
+    // `a`, and on a single backend it is a plain copy.  On a Meta device it is split along the token axis
+    // (the last dim of `a` with ne > 1, recorded in op_params[0]) into equal per-device halves:
+    //   - when `a` is the partial sum that ends a reduction segment (the node right before this one) and
+    //     `allow_reduce_scatter` is set, the meta backend replaces that segment's all-reduce by a
+    //     reduce-scatter that writes each device's token slice of the sum;
+    //   - otherwise (a mirrored input) each device copies its own token slice (op_params[1] = the first
+    //     token of the slice, set per device by the meta backend; 0 on a single backend).
+    GGML_API struct ggml_tensor * ggml_token_scatter(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            bool                  allow_reduce_scatter);
 
     GGML_API struct ggml_tensor * ggml_add(
             struct ggml_context * ctx,
@@ -2907,6 +2941,8 @@ extern "C" {
     GGML_API struct ggml_tensor *  ggml_graph_node   (struct ggml_cgraph * cgraph, int i); // if i < 0, returns nodes[n_nodes + i]
     GGML_API struct ggml_tensor ** ggml_graph_nodes  (struct ggml_cgraph * cgraph);
     GGML_API int                   ggml_graph_n_nodes(struct ggml_cgraph * cgraph);
+    // the graph's leaf count: the scheduler's per-tensor tables are indexed for nodes AND leafs
+    GGML_API int                   ggml_graph_n_leafs(struct ggml_cgraph * cgraph);
 
     GGML_API void   ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
 

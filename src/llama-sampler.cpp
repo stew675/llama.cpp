@@ -3197,6 +3197,54 @@ struct llama_sampler * llama_sampler_init_penalties(
     );
 }
 
+bool llama_sampler_penalties_get_params(
+        const struct llama_sampler * smpl,
+        int32_t * penalty_last_n,
+        float   * penalty_repeat,
+        float   * penalty_freq,
+        float   * penalty_present) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_penalties_i) {
+        return false;
+    }
+
+    const auto * ctx = (const llama_sampler_penalties *) smpl->ctx;
+
+    if (penalty_last_n ) { *penalty_last_n  = ctx->penalty_last_n;  }
+    if (penalty_repeat ) { *penalty_repeat  = ctx->penalty_repeat;  }
+    if (penalty_freq   ) { *penalty_freq    = ctx->penalty_freq;    }
+    if (penalty_present) { *penalty_present = ctx->penalty_present; }
+
+    return true;
+}
+
+int32_t llama_sampler_penalties_get_window(
+        const struct llama_sampler * smpl,
+        llama_token * tokens,
+        int32_t     * counts,
+        int32_t       n) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_penalties_i) {
+        return 0;
+    }
+
+    const auto * ctx = (const llama_sampler_penalties *) smpl->ctx;
+
+    const int32_t n_used = (int32_t) ctx->token_count.size();
+
+    if (tokens != nullptr && counts != nullptr) {
+        int32_t i = 0;
+        for (const auto & entry : ctx->token_count) {
+            if (i == n || i == n_used) {
+                break;
+            }
+            tokens[i] = entry.first;
+            counts[i] = entry.second;
+            ++i;
+        }
+    }
+
+    return n_used;
+}
+
 // top-n-sigma
 
 struct llama_sampler_top_n_sigma {
