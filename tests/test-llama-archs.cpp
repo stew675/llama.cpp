@@ -197,14 +197,27 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-// MoE archs that are also tested with the experts in host memory
+// MoE archs that are also tested with the experts in host memory.
+// Run ONE host-expert arch per process (`-a deepseek2`, `-a deepseek4`, `-a deepseek41`): the row arms the
+// movable-boundary slab, and a slab holds its VRAM for the rest of the process (ROCm cannot unmap a
+// sub-range), so a later arch's model would only have the slab headroom to load into.  The dsv4 arches are
+// here for the raw cache's synthetic reserve probe (its full-cache context and its write-index shape,
+// issue #300), which only runs when the model has host-resident experts.
 static bool host_experts_test(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
             return true;
         default:
             return false;
     }
+}
+
+// ... and of those, the ones whose fixture experts also fit the tiny device cache of the MoE-cache rows
+// (64 experts of the dsv4 fixture are 192 MiB in f16: too many for the few evicting slots those rows use)
+static bool moe_cache_test(const llm_arch arch) {
+    return arch == LLM_ARCH_DEEPSEEK2;
 }
 
 // writes arch-resolved GGUF keys into the fixture context, the test-side equivalent of llama_model_saver
@@ -1355,6 +1368,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
                 if (dc.host_experts && (!moe || !host_experts_test(arch))) {
+                    continue;
+                }
+                if (dc.moe_cache_size > 0 && !moe_cache_test(arch)) {
                     continue;
                 }
                 const llama_model_tensor_buft_override * overrides = dc.host_experts ? host_experts_overrides : nullptr;

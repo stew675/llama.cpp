@@ -1688,11 +1688,35 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx, 
     const ggml_tensor * node = cgraph->nodes[i];
 
     // gate+up+GLU, the routed pair, and the qwen4exp weighted-down all start at the routed
-    // matmul; `ne[2]` is its token count, so gate on the cache band (prefill stays fused).
+    // matmul; `ne[2]` is its token count, so gate on the cache band.
     if (node->op == GGML_OP_MUL_MAT_ID) {
         if (node->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
+            // TODO #133: ABOVE the band an IDENTITY (fully resident) table is now served IN PLACE -- the
+            // scheduler takes the input over and skips the `input_cpy` copy entirely, so the table's bytes
+            // live only in the arena.  Every fused MUL_MAT_ID site that can fire above the band reads the
+            // expert table DIRECTLY (`gate->src[0]`/`up->src[0]`, mmb/fused-MMQ/MMQ-swiglu), bypassing the
+            // dispatch's `moe_cache_get_table` redirect, so it would read the stale split input.  Stand the
+            // fusion down for such a table and let the per-op chain run, which redirects to the arena.
+            // Cost: the prefill MoE fusions are worth ~0-2 % on this shape (measured with
+            // `GGML_CUDA_MMB=0` / `GGML_CUDA_DISABLE_MOE_MMQ_FUSION=1` against the same staged arm),
+            // against the 2.5x the in-place read is worth, and it is confined to identity tables.
+            const int device = cuda_ctx->device;
+            const bool in_place_armed = moe_cache_prefill_in_place_enabled();
+            if (in_place_armed && moe_cache_has_tables() && moe_cache_table_serves(node, node->src[0], device)) {
+                moe_fuse_trace((int) node->ne[2], true, "prefill-in-place");
+                return true;
+            }
+            // the gate+up pair: the fused kernel reads BOTH lanes, so either one being served in place
+            // is enough to make the fused read stale.
+            if (in_place_armed && moe_cache_has_tables() && i + 1 < cgraph->n_nodes &&
+                    cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
+                    cgraph->nodes[i + 1]->ne[2] > MOE_EXPERT_CACHE_MAX_TOK &&
+                    moe_cache_table_serves(cgraph->nodes[i + 1], cgraph->nodes[i + 1]->src[0], device)) {
+                moe_fuse_trace((int) node->ne[2], true, "prefill-in-place-pair");
+                return true;
+            }
             moe_fuse_trace((int) node->ne[2], false, "prefill");
-            return false;   // prefill: the cache does not take these inputs over
+            return false;   // prefill, neither table served in place: keep the staged path and its fusions
         }
         // No routed expert table at all (the model is fully device-resident: `-ncmoe 0`, or a `-ncmoe`
         // that did not offload, e.g. on unified memory).  The cache can never take an input over, so its
@@ -1748,11 +1772,18 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx, 
     }
 
     // swiglu -> routed-down fold (leading GLU, consuming the next MUL_MAT_ID).  Prefill-only in
-    // practice, but guard it too so a cache-band variant can never read the redirected table.
+    // practice (the MMQ `mul_mat_q_swiglu` arm), and it reads the DOWN table directly, so it must stand
+    // down for a table that is served in place (TODO #133) as well as for a cache-band one.
     if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes &&
-            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID &&
-            cgraph->nodes[i + 1]->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
-        return true;
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID) {
+        if (cgraph->nodes[i + 1]->ne[2] <= MOE_EXPERT_CACHE_MAX_TOK) {
+            return true;
+        }
+        if (moe_cache_prefill_in_place_enabled() && moe_cache_has_tables() &&
+                moe_cache_table_serves(cgraph->nodes[i + 1], cgraph->nodes[i + 1]->src[0], cuda_ctx->device)) {
+            moe_fuse_trace((int) cgraph->nodes[i + 1]->ne[2], true, "prefill-in-place-glu");
+            return true;
+        }
     }
 
     return false;

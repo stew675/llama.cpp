@@ -4565,6 +4565,18 @@ void llm_graph_context::build_layer_inp_dev() const {
     inp->idxs = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tokens);
     ggml_set_input(inp->idxs);
 
+    // Each copy goes right after the layer's output (the next layer's input), where F1's per-layer store put it, instead of
+    // after the whole graph: the layer input is free from there on.  Appended at the end (upstream #31506's order), every
+    // extracted layer input lives through every later layer: measured on dense 27B + DFlash2's 5 layers at -ub 2048, the
+    // target's compute buffer took 756.97 MiB and now takes 624.99 MiB (llama-cli, -np 1) / 580.99 MiB (server, -np 2
+    // --kv-unified), and steady-state VRAM on the card fell 185 MB.  Only the node order moves; every node computes the
+    // same.  The move needs the next layer's input to be a node of its own, taken after the copy's source; otherwise the
+    // copy stays where upstream appended it.  LLAMA_LAYER_INP_EARLY=0: at the end, as upstream.
+    static const bool early = [] {
+        const char * e = getenv("LLAMA_LAYER_INP_EARLY");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
     // row layout: [layer_0 | layer_1 | ...] in ascending layer id order
     int64_t col = 0;
     for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
@@ -4576,9 +4588,25 @@ void llm_graph_context::build_layer_inp_dev() const {
         GGML_ASSERT(src != nullptr && "layer input tensor is null");
         GGML_ASSERT(src->ne[0] == n_embd);
 
+        const int n0 = ggml_graph_n_nodes(gf);
         ggml_tensor * dst = ggml_view_2d(ctx0, layer_inp_dev, n_embd, layer_inp_dev->ne[1], layer_inp_dev->nb[1], col*n_embd*ggml_element_size(layer_inp_dev));
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst, ggml_reshape_2d(ctx0, src, n_embd, n_tokens), inp->idxs));
         col++;
+
+        const int n1 = ggml_graph_n_nodes(gf);
+        ggml_tensor * next = il + 1 < res->t_layer_inp.size() ? res->t_layer_inp[il + 1] : nullptr;
+        if (early && next != nullptr && n1 > n0) {
+            ggml_tensor ** nodes = ggml_graph_nodes(gf);
+            int i_src = -1, i_next = -1;
+            for (int k = 0; k < n0; ++k) {
+                if (nodes[k] == src)  i_src  = k;
+                if (nodes[k] == next) i_next = k;
+            }
+            // src computed before (or a leaf), and the next layer's input is a node of its own: the new nodes move there
+            if (i_next >= 0 && i_src < i_next) {
+                std::rotate(nodes + i_next + 1, nodes + n0, nodes + n1);
+            }
+        }
     }
     GGML_ASSERT(col*n_embd == layer_inp_dev->ne[0]);
 

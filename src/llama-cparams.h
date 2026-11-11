@@ -73,11 +73,6 @@ struct llama_cparams {
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
     bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
 
-    // Llama-Frankenstein F1: keep the extracted layer inputs on the device (target context) and let a draft
-    // context read them there (lf_dev_inject is set only while such a draft KV injection is being decoded)
-    bool lf_layer_inp_dev = false;
-    bool lf_dev_inject    = false;
-
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;

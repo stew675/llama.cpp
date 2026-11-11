@@ -150,6 +150,18 @@ struct llama_memory_i {
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
+    // the graph entries (nodes + leafs) this memory module's graph builders add to EVERY graph, on top of
+    // what the model's own builder produces.  Today that is the KV Hadamard rotation: a rotated cache
+    // inserts two `llama_mul_mat_hadamard` chains (cont/reshape + mul_mat + reshape = 3 nodes each) per
+    // rotated tensor per layer, and -- since upstream #31073 keeps the rotation constants on the device --
+    // one graph LEAF per rotated tensor per layer.  `graph_max_nodes()` is what sizes the scheduler's hash
+    // table and its node/leaf id arrays, and both are indexed over nodes AND leafs, so a budget that does
+    // not cover this aborts inside `ggml_backend_sched_split_graph` with "visited all hash table entries"
+    // (github.com/stew675/llama-cpp-rdna-boosts/issues/302: phi-4 with a q8_0 cache adds 12 nodes and 2
+    // leafs per layer, ~560 entries of a 1944-entry budget).  Counted from the tensors the cache really
+    // created, so there is no second copy of the predicate to keep in sync.
+    virtual uint32_t graph_extra_entries() const { return 0; }
+
     //
     // state write/read
     //

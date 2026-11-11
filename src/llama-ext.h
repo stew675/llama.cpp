@@ -130,6 +130,20 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 
+// Parking (unified KV cache).  park = true moves the cells of an idle sequence to the top of the attention cache(s) of
+// mem: the sequences that are decoded keep the low cells, and attend over the same range at the same cell indices as
+// in a cache that holds nothing else, so their results no longer depend on what is parked.  park = false moves a
+// parked sequence back to the lowest free cells.  Returns false, changing nothing, when the move is not possible
+// (a split cache, shared or fragmented cells, no room); a memory without an attention cache returns true.  The K/V data
+// are copied on the device, so synchronize the context first.  A memory whose second cache mirrors the attention cells
+// (the qwen4exp/glm5-next indexer) moves both, or neither.
+LLAMA_API bool llama_memory_seq_park(llama_memory_t mem, llama_seq_id seq_id, bool park);
+
+// Whether the attention cache(s) of mem support parking at all (see llama_memory_seq_park): a unified cache whose cells
+// no other cache shares, with V not transposed and no sliding window, plus, for a memory whose second cache mirrors the
+// attention cells, that cache as well.  A memory without an attention cache: true.
+LLAMA_API bool llama_memory_can_park(llama_memory_t mem);
+
 // Turn the KV cache attention rotation on or off for the contexts created from this model.
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
@@ -182,24 +196,18 @@ LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
 // All entries of the batch must be of this kind. Positions are set with llama_batch_ext_set_pos(), n_pos_per_embd of them.
 // Returns the batch index (>= 0), or the llama_batch_ext_add() error codes.
 LLAMA_API int32_t llama_batch_ext_add_embd_row(struct llama_batch_ext * batch, llama_seq_id seq_id, int32_t row);
-// Llama-Frankenstein F1: device-resident layer inputs for draft feature injection
-LLAMA_API void                 llama_lf_set_layer_inp_dev(struct llama_context * ctx, bool enable);
-LLAMA_API struct ggml_tensor * llama_lf_get_layer_inp_dev(struct llama_context * ctx, uint32_t lid);
-// target context: the device buffer row of each row of its last batch, or nullptr when they are the same (the ubatches
-// kept the batch order: always for one sequence); *n_rows = the batch size when not nullptr
-LLAMA_API const int32_t *      llama_lf_get_dev_rows     (struct llama_context * ctx, int32_t * n_rows);
-// draft context: while enabled, a token batch is a KV injection whose token ids are the rows of the target's
-// last batch (its ctx_other) to read from the device layer inputs
-LLAMA_API void                 llama_lf_set_dev_inject   (struct llama_context * ctx, bool enable);
-// draft context: after the injections of a batch were enqueued; the target's next extraction waits for them on the GPU
-LLAMA_API void                 llama_lf_signal_features_consumed(struct llama_context * ctx_dft);
-
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
 // model/context data extraction
 //
 
+// number of layers that attend over a sliding window of llama_model_n_swa() positions
+//
+// (D8: upstream's `llama : prune (#30565)` promoted the other three declarations this block appended --
+// llama_model_dflash_selector_top_k(), llama_model_target_layer_ids() and its _n() -- into include/llama.h's
+// "NextN / speculative draft model queries" section, so only the missing one is re-added here.  No duplicate.)
+LLAMA_API int32_t llama_model_n_layer_swa(const struct llama_model * model);
 // layers whose input embeddings contexts created from this model extract from the start (as if
 // llama_set_embeddings_layer_inp(ctx, lid, true) had been called before the context's first graph reserve).
 // For a target whose draft will turn the extraction on (DFlash): the compute buffers are then sized for it once,

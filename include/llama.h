@@ -212,6 +212,11 @@ extern "C" {
         LLAMA_LOAD_MODE_MLOCK      =  2, // force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_MMAP_MLOCK =  3, // mmap + force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_DIRECT_IO  =  4, // use direct I/O if available
+        LLAMA_LOAD_MODE_BUFFERED   =  5, // mapped master, but every host read is a BUFFERED read: one
+                                         //   `pread` of the expert through the OS page cache instead of a
+                                         //   demand fault per 4 KiB page out of the mapping (rdna-boosts:
+                                         //   the mapping collapses under memory pressure, a buffered read
+                                         //   degrades gracefully -- see ENVIRONMENT.md)
     };
 
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
@@ -237,7 +242,12 @@ extern "C" {
         LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // pinned (the pageable mmap mode was removed; issue #116)
         LLAMA_HOST_EXPERTS_MODE_PINNED =  0, // keep them in the device's pinned host buffer (ROCm_Host) - fast path
         LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // REMOVED: pageable masters fault on no-XNACK GPUs (issue #116)
-        LLAMA_HOST_EXPERTS_MODE_POOL   =  2, // pinned master + a bounded pinned host pool (MOE_HOST_POOL_MIB)
+        LLAMA_HOST_EXPERTS_MODE_POOL   =  2, // NO full pinned master: the tensors live in the read-only model
+                                             // mapping and every GPU read is served through the bounded
+                                             // pinned host pool (MOE_HOST_POOL_MIB/FRAC).  Costs some prefill
+                                             // bandwidth, bounds the non-swappable footprint to the pool, and
+                                             // lets a host expert set larger than RAM run by streaming from
+                                             // disk.  Requires a mapped load (the default).
     };
 
     enum llama_context_type {
@@ -638,6 +648,11 @@ extern "C" {
     // context exists, so a "disabled" cache cannot leave the draft sized for it.  No-op when no
     // host-resident expert weights are present or the backend has no cache.
     LLAMA_API void llama_model_moe_cache_preflight(const struct llama_model * model, size_t aux_reserve_bytes);
+
+    // r143: the inverse of the preflight -- the model that registered host-resident expert tables is going
+    // away, so drop those tables before its host masters are freed.  Without it the cache's deferred arena
+    // sizing reads a freed master (a host memcpy SIGSEGV); called by `llama_model_free`.
+    LLAMA_API void llama_model_moe_cache_forget(const struct llama_model * model);
 
     // WIP r42: aggregate the MoE expert cache arena's cumulative hit/miss counters for per-turn logging
     // (a before/after delta gives the turn's decode hit rate).  Returns false when no cache is active.

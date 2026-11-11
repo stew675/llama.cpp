@@ -77,6 +77,8 @@ extern "C" {
     // No-op for a backend without the host pool.
     GGML_API void                  ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_t dev, bool on);
     GGML_API void                  ggml_backend_dev_moe_cache_set_host_source(ggml_backend_dev_t dev, const void * tensor_data, const char * path, size_t offs, int n_experts, size_t host_bytes, size_t total_bytes);
+    // r143: the model owning this device's host-expert masters is going away; drop the tables it registered.
+    GGML_API void                  ggml_backend_dev_moe_cache_forget(ggml_backend_dev_t dev);
 
     // wip/host-expert-tier: the persisted per-expert heat prior, so the model loader can fill the pinned
     // host-master tier in descending hotness.  `open` once (with the GGUF path) before any placement
@@ -85,6 +87,8 @@ extern "C" {
     GGML_API void                  ggml_backend_dev_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes);
     GGML_API void                  ggml_backend_dev_moe_heat_open(ggml_backend_dev_t dev, const char * model_path);
     GGML_API int64_t               ggml_backend_dev_moe_heat_score(ggml_backend_dev_t dev, int layer, const char * name, int n_experts, size_t host_bytes);
+    // r212: tell the host pool how the model was loaded (1 = O_DIRECT) so its fills can mirror it.
+    GGML_API void                  ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int direct);
 
     // wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.  Armed at a wide
     // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.
@@ -289,6 +293,20 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_buffer_type(ggml_backend_dev_t device);
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device);
     GGML_API ggml_backend_buffer_t         ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size);
+
+    // wip/host-expert-master-drop (TODO #55): the host buffer type a POOL-BACKED host expert MASTER should
+    // use, or NULL when the backend has no such mode (then host expert weights stay in the pinned host
+    // buffer).  The returned type is a host buffer type that carries its device (so the scheduler still
+    // places the expert op on that GPU) but whose allocation is NOT pinned: with `--host-experts pool` the
+    // loader backs the tensor with the read-only model mapping (page cache) and every GPU read of it is
+    // served through the bounded pinned host pool.
+    GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_moe_host_master_buft(ggml_backend_dev_t device);
+
+    // Wrap an existing host pointer (for example a range of the read-only model mapping) in a buffer of
+    // `buft` without taking ownership of it, so tensors can be placed directly in it.  Returns NULL when
+    // `buft` is not a host type, does not carry a device (that is what keeps such tensors on the GPU
+    // backend's schedule), or cannot hold a `max_tensor_size` tensor.
+    GGML_API ggml_backend_buffer_t         ggml_backend_host_buffer_from_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size, size_t max_tensor_size);
 
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
