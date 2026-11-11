@@ -81,6 +81,74 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+static bool prompt_cache_reuse() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SERVER_CACHE_REUSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
+// a new state buffer of a long context (GiBs) is faulted in by its zero fill, and in 4 KiB pages that fault in is most of
+// a prompt cache save: a 3.5 GiB slot state took 1.6-1.7 s to zero-fill on a 3900X, against ~0.4 s in 2 MiB pages
+// (transparent huge pages, madvise mode) and ~0.3 s for the state copy itself.  Measured on the 9950X3D, 3.47 GiB
+// alloc+zero: 470 -> 125 ms, and the server's prompt-cache update for a 100K-token slot's new buffer 828 -> 497 ms.
+// LLAMA_SERVER_CACHE_HUGEPAGE=0: 4 KiB pages
+static bool prompt_cache_hugepage() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_SERVER_CACHE_HUGEPAGE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return v;
+}
+
+common_state_data server_prompt_cache::take(size_t n) {
+    // the smallest spare that holds n bytes; resizing it down keeps the memory, resizing it up zero-fills only the tail
+    size_t best = spare.size();
+    for (size_t i = 0; i < spare.size(); ++i) {
+        if (spare[i].capacity() >= n && (best == spare.size() || spare[i].capacity() < spare[best].capacity())) {
+            best = i;
+        }
+    }
+    common_state_data buf;
+    if (best < spare.size()) {
+        buf = std::move(spare[best]);
+        spare.erase(spare.begin() + best);
+    }
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    else if (prompt_cache_hugepage() && n >= (64u << 20)) {
+        // reserve() only maps the buffer, so the advice is in place before the zero fill below touches a page; the huge
+        // pages cover the 2 MiB-aligned part of it (a failed madvise leaves 4 KiB pages, as before)
+        buf.reserve(n);
+        const uintptr_t huge = 2u << 20;
+        const uintptr_t beg  = ((uintptr_t) buf.data() + huge - 1) & ~(huge - 1);
+        const uintptr_t end  = ((uintptr_t) buf.data() + n) & ~(huge - 1);
+        if (end > beg) {
+            madvise((void *) beg, end - beg, MADV_HUGEPAGE);
+        }
+    }
+#endif
+    buf.resize(n);
+    return buf;
+}
+
+void server_prompt_cache::recycle(common_state_data && buf) {
+    if (!prompt_cache_reuse() || buf.capacity() == 0) {
+        return;
+    }
+    spare.push_back(std::move(buf));
+    // the cached states and the spare buffers stay within the cache size limit together; the smallest spares go first
+    size_t total = size();
+    for (const auto & b : spare) {
+        total += b.capacity();
+    }
+    while (!spare.empty() && limit_size > 0 && total > limit_size) {
+        auto it = std::min_element(spare.begin(), spare.end(), [](const auto & a, const auto & b) { return a.capacity() < b.capacity(); });
+        total -= it->capacity();
+        spare.erase(it);
+    }
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -114,6 +182,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size() && are_lora_equal(it->prompt.lora, prompt.lora)) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
+            recycle(std::move(it->data.main));
+            recycle(std::move(it->data.drft));
             it = states.erase(it);
         } else {
             ++it;
@@ -126,6 +196,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
+            recycle(std::move(states.front().data.main));
+            recycle(std::move(states.front().data.drft));
             states.pop_front();
         }
     }
@@ -135,8 +207,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        state_data_tgt = take(state_size_tgt);
+        state_data_dft = take(state_size_dft);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -164,7 +236,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find(const server_prompt & prompt, const server_tokens & tokens_new,
+        const std::vector<common_adapter_lora_info> & lora_new) {
     // a prompt made with another lora config is cleared before the new one starts, so it counts as empty
     const bool is_empty = prompt.tokens.empty() || lora_should_clear_cache(prompt.lora, lora_new);
 
@@ -181,6 +254,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     for (auto it = states.begin(); it != states.end(); ++it) {
         if (lora_should_clear_cache(it->prompt.lora, lora_new)) {
             SRV_TRC("   - prompt with length %7zu, skipping, other lora config\n", it->prompt.tokens.size());
+            continue;
+        }
+
+        if (it->data.main.empty()) {
+            // already consumed: a restore that failed after the main buffer was transferred leaves the entry behind
+            // with no state to restore.  Matching it again would compare against zero bytes and report success.
             continue;
         }
 
@@ -205,7 +284,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    return it_best;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    auto it_best = find(prompt, tokens_new, lora_new);
+
     if (it_best != states.end()) {
+        // find() logs the whole comparison; the entry it chose carries the winning ratios, so they are recomputed
+        // here rather than handed back through an out-parameter (block 12 split find() out of load())
+        const int   lcp_best    = it_best->prompt.tokens.get_common_prefix(tokens_new);
+        const float f_keep_best = float(lcp_best) / it_best->prompt.tokens.size();
+        const float f_sim_best  = float(lcp_best) / tokens_new.size();
+
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         const int64_t t_start = ggml_time_us();
@@ -221,8 +312,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            recycle(std::move(data));
+            data = {};
         }
 
         {
@@ -239,8 +330,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                recycle(std::move(data));
+                data = {};
             }
         }
 

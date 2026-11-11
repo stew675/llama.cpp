@@ -2695,7 +2695,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
         "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
         "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
-        "- dio: use DirectIO if available\n",
+        "  (mlock is a RESIDENCY request for the tensors the CPU reads -- a CPU-only or partly CPU-offloaded\n"
+        "  model -- and for the load itself; it is not a read transport.  A fully offloaded model has nothing\n"
+        "  left to keep resident, and host-resident MoE experts (--n-cpu-moe/-lme) are pinned by the expert\n"
+        "  tier whatever this flag says, because an RDNA GPU has no XNACK)\n"
+        "- dio: use DirectIO if available\n"
+        "- buffered: mmap the model, but read host weights with buffered reads (a `pread` through the page\n"
+        "  cache) instead of faulting them out of the mapping\n",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "auto")       { params.load_mode = LLAMA_LOAD_MODE_AUTO;       }
             else if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
@@ -2703,6 +2709,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
             else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
             else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
+            else if (value == "buffered")   { params.load_mode = LLAMA_LOAD_MODE_BUFFERED;   }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
@@ -2710,7 +2717,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--host-experts"}, "MODE",
         "how to back host-resident MoE expert weights (--n-cpu-moe/--cpu-moe) (default: pinned)\n"
         "- pinned / auto: the device's pinned host buffer (ROCm_Host) - the only host master a no-XNACK GPU can read in place\n"
-        "- pool: the pinned master plus a bounded pinned host pool (MOE_HOST_POOL_MIB, default 25% of the MoE host expert bytes)\n"
+        "- pool: NO full pinned master - the weights stay in the read-only model mapping and every GPU read goes\n"
+        "        through a bounded pinned host pool (MOE_HOST_POOL_MIB/FRAC, default MOE_HOST_POOL_FRAC=80% of\n"
+        "        the host expert bytes, capped by MOE_HOST_POOL_RAM_PCT of MemAvailable).\n"
+        "        Bounds the non-swappable footprint to the pool (the rest is reclaimable page cache) so a host\n"
+        "        expert set larger than RAM can stream from disk; costs some prefill bandwidth.\n"
         "- mmap: removed on RDNA (a pageable host master faults; issue #116)",
         [](common_params & params, const std::string & value) {
             fprintf(stderr, "warning: --host-experts is deprecated; use --limit-host-experts [auto|N] "
@@ -2726,7 +2737,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"-lme", "--limit-host-experts"}, "auto|N",
+        {"-lme", "--limit-host-experts"}, "auto|mirror|N",
         "cap the NON-SWAPPABLE memory used by host-resident MoE experts (--n-cpu-moe/-ncmoe) (default: auto)\n"
         "- auto: pin the whole host expert set when it fits MOE_HOST_LIMIT_FRAC (default 80%) of the available\n"
         "        memory; otherwise no pinned master -- the experts stay in the read-only model mapping and the\n"
@@ -2736,6 +2747,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "        expert heat map ranks them, so the bytes that are actually read are the ones that are pinned).\n"
         "        The rest stays in the model mapping.  N above 90% of the available memory is refused, because\n"
         "        that memory cannot be swapped out.\n"
+        "- mirror: the WHOLE host expert set, explicitly -- a covering pool, every expert resident (h=1.0000).\n"
+        "        This is what `auto` resolves to on a box with memory to spare, but stated as a request instead of\n"
+        "        inferred: neither MOE_HOST_LIMIT_FRAC nor MOE_HOST_POOL_RAM_PCT may scale it, and it is not\n"
+        "        refused for exceeding the memory available -- an explicit mirror that does not fit is the\n"
+        "        operator's call, not something to second-guess.\n"
         "A pinned master is the fastest host-expert transport (no per-call staging, and the in-place cold read\n"
         "is available), but it is a second copy of the bytes, which is why a set that does not fit is not\n"
         "pinned wholesale.  (--host-experts pinned|pool are deprecated shorthands for the same budget.)",
@@ -2745,10 +2761,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
                 return;
             }
+            if (value == "mirror") {
+                // -2 is the MIRROR sentinel (`llama.h`): the whole host-expert set, stated rather than inferred.
+                // Nothing else modifies it -- an explicit request is honoured, and a mirror that does not fit is
+                // the operator's own call (see the help above).
+                params.host_experts_limit_gib = -2;
+                params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
+                return;
+            }
             char * end = nullptr;
             const long long n = strtoll(value.c_str(), &end, 10);
             if (end == value.c_str() || *end != '\0' || n < 0) {
-                throw std::invalid_argument("expected 'auto' or a number of GiB");
+                throw std::invalid_argument("expected 'auto', 'mirror' or a number of GiB");
             }
             params.host_experts_limit_gib = (int64_t) n;
             params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;

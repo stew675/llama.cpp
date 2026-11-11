@@ -888,19 +888,18 @@ int ggml_cuda_hc_combine_norm_try_fuse(ggml_backend_cuda_context & ctx, const gg
                                     // block_out is not pinned: it dies at the repeat, so add or mulg may reuse its buffer.
                                     // Nothing in the window runs before the fused kernel, so the base is still intact here:
                                     // read it from a pool copy instead of falling back to the unfused nodes.
-                                    ggml_cuda_pool_alloc<char> base_copy_buf(ctx.pool());
-                                    ggml_tensor base_copy;
-                                    if (!alias_ok && alias_ok_but_base && n_tok > 1 && ggml_is_contiguous(base_root)) {
-                                        base_copy = *base_root;
-                                        base_copy.data = base_copy_buf.alloc(ggml_nbytes(base_root));
-                                        CUDA_CHECK(cudaMemcpyAsync(base_copy.data, base_root->data, ggml_nbytes(base_root),
-                                            cudaMemcpyDeviceToDevice, ctx.stream()));
-                                        args.block_out = &base_copy;
+                                    //
+                                    // The copy is a kernel argument and nothing else reads it, so it is made as the
+                                    // LAST pool allocation of this window and killed right after the launch (below).
+                                    // That ordering is what makes the kill free it: the device pool is a LIFO stack,
+                                    // and a copy registered BEFORE the set_bf16*() blocks (bf16_src1_cache_put, the mmb
+                                    // reserve) can only reach the top at the END of the graph -- one ~84 MiB copy per
+                                    // layer stayed live for the whole prefill graph under `-sm layer` and ran device
+                                    // 0 out of memory on a 255k-token prompt (GitHub issue #290).
+                                    const bool need_base_copy = !alias_ok && alias_ok_but_base && n_tok > 1 &&
+                                        ggml_is_contiguous(base_root);
+                                    if (need_base_copy) {
                                         alias_ok = true;
-                                        if (hc_cn_dbg) {
-                                            static unsigned d3 = 0;
-                                            if (d3++ < 24) fprintf(stderr, "HC_CN[repeat] base copy n_tok=%lld\n", (long long) n_tok);
-                                        }
                                     }
                                     if (!alias_ok && n_tok == 1 && hc <= 4) {
                                         args.single_block = true;
@@ -928,7 +927,39 @@ int ggml_cuda_hc_combine_norm_try_fuse(ggml_backend_cuda_context & ctx, const gg
                                     if (alias_ok && supp && canf) {
                                         ggml_cuda_hc_combine_norm_set_bf16(ctx, args);
                                         ggml_cuda_hc_combine_norm_set_bf16_src1(ctx, args);
+                                        // The base copy is made AFTER the set_bf16*() pushes so that it is the
+                                        // newest pool block (see the note above), and killed after the launch.
+                                        // set_bf16*() only READ block_out, so the copy is taken from the same,
+                                        // still-intact base.
+                                        struct hc_base_copy_del {
+                                            static void del(void * p) { delete (ggml_cuda_pool_alloc<char> *) p; }
+                                        };
+                                        ggml_cuda_pool_alloc<char> * base_copy_buf = nullptr;
+                                        ggml_tensor base_copy;
+                                        if (need_base_copy) {
+                                            ctx.pool_stack_hc_made++;
+                                            base_copy = *base_root;
+                                            base_copy_buf = new ggml_cuda_pool_alloc<char>(ctx.pool());
+                                            ctx.pool_stack_push(base_copy_buf, hc_base_copy_del::del,
+                                                ggml_nbytes(base_root), ggml_backend_cuda_context::POOL_STACK_HC);
+                                            base_copy.data = base_copy_buf->alloc(ggml_nbytes(base_root));
+                                            CUDA_CHECK(cudaMemcpyAsync(base_copy.data, base_root->data, ggml_nbytes(base_root),
+                                                cudaMemcpyDeviceToDevice, ctx.stream()));
+                                            args.block_out = &base_copy;
+                                            // set_bf16*() armed the BF16 block read off the base itself; the copy
+                                            // holds the same bytes, so the read follows it.
+                                            if (args.blk_in_bf16 != nullptr) {
+                                                args.blk_in_bf16 = (const uint16_t *) base_copy.data;
+                                            }
+                                            if (hc_cn_dbg) {
+                                                static unsigned d3 = 0;
+                                                if (d3++ < 24) fprintf(stderr, "HC_CN[repeat] base copy n_tok=%lld\n", (long long) n_tok);
+                                            }
+                                        }
                                         ggml_cuda_op_hc_combine_norm(ctx, args);
+                                        // read only by the kernel just queued: release it now (it is the newest
+                                        // pool block, so this frees rather than defers)
+                                        ctx.pool_stack_kill(base_copy_buf);
                                         return g - i;
                                     }
                                 }

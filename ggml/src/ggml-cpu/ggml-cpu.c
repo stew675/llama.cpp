@@ -2073,6 +2073,25 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_unary(params, tensor);
             } break;
+        case GGML_OP_ALL_GATHER:
+            {
+                // single backend: the result is a plain copy of the input
+                ggml_compute_forward_dup(params, tensor);
+            } break;
+        case GGML_OP_TOKEN_SCATTER:
+            {
+                // single backend: a copy of the token slice that starts at op_params[1] (0 unless the
+                // meta backend split the tokens across devices, which never runs on the CPU)
+                if (params->ith == 0) {
+                    const int32_t axis = ggml_get_op_params_i32(tensor, 0);
+                    const int32_t off  = ggml_get_op_params_i32(tensor, 1);
+                    const struct ggml_tensor * src = tensor->src[0];
+                    GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(tensor));
+                    const size_t offs = (size_t) off * src->nb[axis];
+                    GGML_ASSERT(offs + ggml_nbytes(tensor) <= ggml_nbytes(src));
+                    memcpy(tensor->data, (const char *) src->data + offs, ggml_nbytes(tensor));
+                }
+            } break;
         case GGML_OP_GLU:
             {
                 ggml_compute_forward_glu(params, tensor);
@@ -2296,9 +2315,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     }
 
     switch (node->op) {
+        case GGML_OP_TOKEN_SCATTER:
+            {
+                n_tasks = 1;
+            } break;
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT:
+        case GGML_OP_ALL_GATHER:
         case GGML_OP_ADD:
         case GGML_OP_ADD_ID:
         case GGML_OP_ACC:
