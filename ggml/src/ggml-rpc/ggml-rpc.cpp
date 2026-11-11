@@ -1357,6 +1357,14 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .moe_cache_band          = */ NULL,
     /* .moe_cache_gather        = */ NULL,
     /* .moe_cache_remap         = */ NULL,
+    /* .moe_cache_pool_backed   = */ NULL,
+    /* .cpy_tensor_async_nowait = */ NULL,
+    /* .moe_cache_pending       = */ NULL,
+    /* .moe_cache_register      = */ NULL,
+    /* .moe_cache_in_place      = */ NULL,
+    /* .moe_cache_prefill_stream = */ NULL,
+    /* .stage_release           = */ NULL,
+    /* .moe_cache_residency     = */ NULL,
 };
 
 ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
@@ -3199,10 +3207,24 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .moe_cache_set_host_pool   = */ nullptr,
     /* .moe_cache_set_host_source = */ nullptr,
     /* .slab_compute_plain   = */ nullptr,
-    /* .slab_ring_region     = */ nullptr,
-    /* .slab_set_ring_cap    = */ nullptr,
+    /* .slab_stage_region     = */ nullptr,
+    /* .slab_set_stage_cap    = */ nullptr,
+    /* .slab_set_stage_unit   = */ nullptr,
     /* .slab_enabled         = */ nullptr,
-    /* .slab_ring_slots      = */ nullptr,
+    /* .slab_stage_slots      = */ nullptr,
+    /* .moe_host_master_buft      = */ nullptr,
+    /* .moe_cache_band            = */ nullptr,
+    /* .moe_cache_forget          = */ nullptr,
+    /* .moe_cache_set_host_pool_budget = */ nullptr,
+    /* .moe_heat_open             = */ nullptr,
+    /* .moe_heat_score            = */ nullptr,
+    /* .moe_cache_set_host_fill_mode = */ nullptr,
+    /* .gtt_store_open            = */ nullptr,
+    /* .gtt_store_report          = */ nullptr,
+    /* .gtt_store_lockable        = */ nullptr,
+    /* .gtt_store_arena           = */ nullptr,
+    /* .gtt_store_free_bytes      = */ nullptr,
+    /* .gtt_store_arena_min       = */ nullptr,
 };
 
 // backend reg interface

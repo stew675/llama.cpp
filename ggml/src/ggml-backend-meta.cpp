@@ -390,23 +390,30 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .moe_cache_set_host_pool   = */ nullptr,
     /* .moe_cache_set_host_source = */ nullptr,
     /* .slab_compute_plain   = */ ggml_backend_meta_device_slab_compute_plain,
-    /* .slab_ring_region     = */ nullptr,
-    /* .slab_set_ring_cap    = */ nullptr,
+    /* .slab_stage_region     = */ ggml_backend_meta_device_slab_stage_region,
+    /* .slab_set_stage_cap    = */ ggml_backend_meta_device_slab_set_stage_cap,
+    /* .slab_set_stage_unit   = */ ggml_backend_meta_device_slab_set_stage_unit,
     /* .slab_enabled         = */ nullptr,
-    /* .slab_ring_slots      = */ nullptr,
-    // the host-expert tier's device hooks (appended to `ggml_backend_device_i` after the slab ones): the meta
-    // device owns no host master and no heat prior of its own -- the host experts are placed on the simple
-    // devices' own buffer types, and the meta BACKEND forwards `moe_cache_band` itself
-    // (`ggml_backend_meta_moe_cache_band`).  Listed explicitly so the positional initializer above cannot be
-    // read as "this device forgot them"; whether the `-sm tensor` arms of `scripts/gate-host-pool.sh` need any
-    // of these forwarded is an open question (R13 finding), and a forwarded hook would have to pick a device.
-    /* .moe_host_master_buft            = */ nullptr,
-    /* .moe_cache_band                  = */ nullptr,
-    /* .moe_cache_forget                = */ nullptr,
-    /* .moe_cache_set_host_pool_budget  = */ nullptr,
-    /* .moe_heat_open                   = */ nullptr,
-    /* .moe_heat_score                  = */ nullptr,
-    /* .moe_cache_set_host_fill_mode    = */ nullptr,
+    /* .slab_stage_slots      = */ ggml_backend_meta_device_slab_stage_slots,
+    // The optional hooks appended to `ggml_backend_device_i` after the slab ones: the meta device owns no host
+    // master, no heat prior and no GTT store of its own -- host experts are backed by the simple devices' own
+    // buffer types, the meta BACKEND forwards `moe_cache_band` itself
+    // (`ggml_backend_meta_moe_cache_band`), and the GTT store is an APU feature a device implements or not.
+    // Listed explicitly so the positional initializer above cannot be read as "this device forgot them"; if a
+    // hook ever must be forwarded, it has to pick one simple device, so that is a decision, not a default.
+    /* .moe_host_master_buft           = */ nullptr,
+    /* .moe_cache_band                 = */ nullptr,
+    /* .moe_cache_forget               = */ nullptr,
+    /* .moe_cache_set_host_pool_budget = */ nullptr,
+    /* .moe_heat_open                  = */ nullptr,
+    /* .moe_heat_score                 = */ nullptr,
+    /* .moe_cache_set_host_fill_mode   = */ nullptr,
+    /* .gtt_store_open                 = */ nullptr,
+    /* .gtt_store_report               = */ nullptr,
+    /* .gtt_store_lockable             = */ nullptr,
+    /* .gtt_store_arena                = */ nullptr,
+    /* .gtt_store_free_bytes           = */ nullptr,
+    /* .gtt_store_arena_min            = */ nullptr,
 };
 
 bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -5277,8 +5284,13 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .cpy_tensor_async_nowait = */ nullptr,
     /* .moe_cache_pending      = */ ggml_backend_meta_moe_cache_pending,
     /* .moe_cache_register     = */ ggml_backend_meta_moe_cache_register,
-    /* .moe_cache_stage_ready  = */ ggml_backend_meta_moe_cache_stage_ready,
     /* .moe_cache_in_place     = */ ggml_backend_meta_moe_cache_in_place,
+    /* .moe_cache_prefill_stream = */ nullptr,
+    // wip/flash-next-prefill: the pipeline's prefill -> decode release is a BACKEND-SLOT operation; this backend
+    // stages per device through `stage_input`, so it has none (which is also why the pipeline declines on a Meta
+    // split instead of calling it).
+    /* .stage_release           = */ nullptr,
+    /* .moe_cache_residency     = */ ggml_backend_meta_moe_cache_residency,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

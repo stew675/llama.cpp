@@ -106,16 +106,44 @@ struct llama_model_loader {
     // 31 388.0 MiB on the mapped arm).  `--load-mode` only picks the pool's FILL transport, which it already
     // reports through `moe_cache_set_host_fill_mode`: `dio` -> O_DIRECT, `none` -> the buffered `pread` arm
     // (upstream's "no special loading mode" IS a plain buffered read), `mmap` -> the page cache.
+    //
+    // issue #347: the GTT ARENA arm has holes but NO plan.  `plan_gtt_expert_store` records every expert
+    // table in `host_experts_holes` (they all stay in the mapping; the arena is a separate registered region) and
+    // leaves `host_experts_plan_done` false, because there is no pinned tier to balance.  A hole set is exactly
+    // what makes the master mapping-backed, so the ARENA counts too -- without it `llama-model.cpp` took the
+    // allocating branch and materialised the whole expert set as a pageable copy (measured +18 662 MiB on
+    // 35B-A3B, a 46 800 MiB `ROCm_HostMap` buffer on the reporter's Flash-Next Q2_K), which is the memory the
+    // tier exists to avoid.
     bool host_expert_master_mapped() const {
-        return host_experts_plan_done && !host_experts_holes.empty() && llama_mmap::SUPPORTED;
+        return (host_experts_plan_done || host_experts_store_arena) && !host_experts_holes.empty() &&
+               llama_mmap::SUPPORTED;
     }
     std::set<std::string> host_experts_pinned;      // tensor names that get a pinned host master
     std::set<std::string> host_experts_holes;       // tensor names that stay in the model mapping
+
     size_t host_experts_total_bytes  = 0;           // Sigma of every host expert tensor the placement will host
     size_t host_experts_cap_bytes    = 0;           // the budget the plan may spend (SIZE_MAX = the whole set)
     size_t host_experts_pinned_bytes = 0;           // actual pinned bytes, accumulated at load
     size_t host_experts_holes_bytes  = 0;           // actual pageable bytes, accumulated at load
     bool   host_experts_pool_holes   = false;        // the holes are served by the bounded pinned pool
+    // wip/apu-expert-gtt P2: the GTT expert store's placement and its census.  `host_experts_store_buft` is
+    // non-null only while a GTT store is open on this load, so `host_expert_is_store()` is false everywhere else
+    // (a discrete box, `MOE_EXPERT_GTT=0`, a platform the GTT store declined).
+    std::set<std::string>       host_experts_store;
+    // wip/apu-expert-gtt P3c: the subset of `host_experts_store` that is the MTP/nextn HEAD's tables.  They are
+    // placed first and pinned (they are read on every draft step) and their bytes are NOT part of `-lme`'s
+    // budget -- see `plan_gtt_expert_store`.
+    std::set<std::string>       host_experts_store_pinned;
+    size_t                      host_experts_store_head_bytes = 0;   // the head's padded bytes, on top of the budget
+    ggml_backend_buffer_type_t  host_experts_store_buft   = nullptr;
+    size_t                      host_experts_store_extent = 0;   // the budget, in bytes
+    size_t                      host_experts_store_filled = 0;   // bytes read from the GGUF into it
+    int                         host_experts_store_tables = 0;   // expert tensors placed in it
+    int64_t                     host_experts_store_slots  = 0;   // (tensor, expert) slots those tables are
+    // wip/apu-expert-gtt P3: the GTT store is this run's expert ARENA (the set does not fit it, so residency
+    // replaces placement).  Every expert tensor then stays in the read-only model mapping -- nothing is
+    // allocated, nothing is pinned -- and the cache serves every read from the arena.
+    bool                        host_experts_store_arena = false;
     std::string host_experts_policy;                // the resolved policy, for the census line
     bool   host_experts_heat_seen    = false;        // the heat prior answered for at least one tensor
     // issue #274: how many host-expert tensors actually got an on-disk source registered for the pool
@@ -158,6 +186,22 @@ struct llama_model_loader {
     // before the arch creates any tensor.
     void plan_host_expert_placement(int n_layer_trunk);
 
+    // wip/apu-expert-gtt P2: the UMA arm of the same budget.  On an integrated GPU there is no host-expert
+    // tier (`-ncmoe`/`-cmoe` are refused there, r236), so `-lme` becomes the size of the registered GTT EXPERT
+    // STORE and has to engage it by itself.  The budget, the ceiling and the ranking are the SAME code as the
+    // discrete arm (`MOE_HOST_LIMIT_FRAC` of MemAvailable, descending hotness from the persisted prior); only
+    // the granularity differs -- a whole expert tensor here rather than a per-expert pool slot, because the
+    // GTT store is a placement, not a cache (eviction is P3).
+    //
+    // P3c: `n_layer_trunk` splits the candidate set into the TRUNK (what `-lme` buys) and the MTP/nextn HEAD
+    // (`layers[n_layer()]` and above), whose tables are pinned outside that budget.
+    void plan_gtt_expert_store(int n_layer_trunk);
+
+    // True when this tensor was placed in the GTT expert store (so its fill is a direct `pread` into the slot).
+    bool host_expert_is_store(const std::string & name) const {
+        return !name.empty() && host_experts_store.count(name) > 0;
+    }
+
     // Tell the loader that the weights are going to a shared host/device memory pool (an integrated GPU).
     // Called before `plan_host_expert_placement`; refuses every host-expert placement with one message.
     void set_host_experts_umem(bool on);
@@ -165,9 +209,11 @@ struct llama_model_loader {
     // The `-ncmoe` tail rule / caller CPU-override match for one tensor (the placement the loader will make).
     bool host_expert_selected(const std::string & name, int layer, int n_layer_trunk) const;
 
-    // True when this tensor keeps the read-only model mapping (a hole in the -lme budget).
+    // True when this tensor keeps the read-only model mapping (a hole in the -lme budget, or -- issue #347 --
+    // any expert table on the ARENA arm, whose whole set is a hole because the arena holds slots, not tensors).
     bool host_expert_is_hole(const std::string & name) const {
-        return host_experts_plan_done && !name.empty() && host_experts_holes.count(name) > 0;
+        return (host_experts_plan_done || host_experts_store_arena) && !name.empty() &&
+               host_experts_holes.count(name) > 0;
     }
 
     // TODO #333: bytes of the hole set a `--load-mode mlock`/`mmap+mlock` pin did NOT take, because the tier's
