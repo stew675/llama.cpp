@@ -1760,7 +1760,7 @@ static bool ggml_cuda_cache_blocks_fusion(ggml_backend_cuda_context * cuda_ctx, 
     const ggml_tensor * node = cgraph->nodes[i];
 
     // gate+up+GLU, the routed pair, and the qwen4exp weighted-down all start at the routed
-    // matmul; `ne[2]` is its token count, so gate on the cache band (prefill stays fused).
+    // matmul; `ne[2]` is its token count, so gate on the cache band.
     if (node->op == GGML_OP_MUL_MAT_ID) {
         if (node->ne[2] > MOE_EXPERT_CACHE_MAX_TOK) {
             // TODO #133 / TODO #327: ABOVE the band an identity (fully resident) table is served IN PLACE -- the

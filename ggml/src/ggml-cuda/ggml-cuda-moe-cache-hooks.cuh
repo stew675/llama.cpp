@@ -17,8 +17,12 @@ void   ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t
 void   ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, const void * src, size_t size);
 float  ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend);
 bool   ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices);
-bool   ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy);
+bool   ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, int64_t n_tok);
+bool   ggml_backend_cuda_moe_cache_in_place(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, int64_t n_tok);
 int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend);
+bool   ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend);
+bool   ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const ggml_tensor * weight);
+bool   ggml_backend_cuda_moe_cache_register(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices);
 bool   ggml_backend_cuda_moe_cache_gather(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, size_t slice_off, int split_axis);
 bool   ggml_backend_cuda_moe_cache_remap(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const ggml_tensor * ids, bool check_only);
 size_t ggml_backend_cuda_fattn_stage_bound(ggml_backend_t backend);

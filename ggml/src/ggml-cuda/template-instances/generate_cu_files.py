@@ -120,6 +120,20 @@ for ncols in [8, 16, 32, 64]:
             continue
         ncols1 = ncols // ncols2
 
+        # One translation unit per (ncols1, ncols2, head size) instead of one per
+        # (ncols1, ncols2).  The set of emitted template instantiations is exactly the
+        # same; only their grouping changes, so this is build-time only (the native-KV
+        # arm chain in fattn-mma-f16.cuh duplicates the whole WMMA kernel per KV type,
+        # which made the 8-case files ~200 s each and the backend build one-file-bound).
+        # CMake globs template-instances/fattn-mma*.cu, so no CMake change is needed.
+        #
+        # NO head-size is skipped here, including 40 and 72: upstream's head-agnostic
+        # `fattn-mma-f16-instance-ncols1_*-ncols2_*.cu` files (which carried those two heads in
+        # the block's own tree) do not exist on this base -- the R09r repair replaced them with
+        # this typed set, and `fattn-mma-f16-instance-*-dkq40-dv40.cu` / `-dkq72-dv72.cu` are the
+        # ONLY instantiation of the dispatch's unconditional head-40/72 cases (D5-a: skipping
+        # them deletes 32 needed files and returns 32 undefined symbols).  Regenerating must
+        # reproduce the tree byte for byte; that is the invariant R09r established.
         for head_size_kq in HEAD_SIZES_KQ:
             # Skip compilation of unused ncols2 values for niche head sizes:
             if head_size_kq == 192 and ncols2 not in (8, 16): # MiMo-V2.5

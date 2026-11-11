@@ -2857,6 +2857,10 @@ struct ggml_backend_cuda_comm_context {
     // re-attempting or re-logging.
     bool                        ce_grow_disabled  = false;
     bool                        ce_fallback_warned = false;
+    // the same for the sequence-parallel collectives that share the scratch (GGML_CUDA_CE_FOR_*): each caller
+    // warns once with its own fallback, without consuming the all-reduce's message
+    bool                        ce_rs_warned      = false;
+    bool                        ce_ag_warned      = false;
     // `GGML_CUDA_ALLREDUCE=q8ce` (r259): the copy-engine large-tensor arm sends its staged payload as
     // Walsh-Hadamard-rotated q8_0 blocks instead of bf16 (see the ce_q8 kernels).  Fixed for the life of
     // the context by the chain that created it; no env variable other than the algorithm name.
@@ -3372,6 +3376,113 @@ static bool ggml_cuda_ar_ce_single() {
     return on;
 }
 
+// Grow the copy-engine scratch (ce_buf / ce_tmp / ce_tmp2, `need` bytes each on every rank) if it is smaller.
+// false = it cannot be grown (OOM or over GGML_CUDA_AR_CE_SCRATCH_MIB); the caller falls back before any
+// collective phase has run.  Shared by the all-reduce and the sequence-parallel reduce-scatter / all-gather.
+// Callers of the copy-engine scratch: the all-reduce, and the sequence-parallel reduce-scatter / all-gather.
+enum ggml_cuda_ce_for { GGML_CUDA_CE_FOR_ALLREDUCE, GGML_CUDA_CE_FOR_REDUCE_SCATTER, GGML_CUDA_CE_FOR_ALL_GATHER };
+
+// A sequence-parallel collective that cannot use the scratch: one warning per caller, naming what runs instead.
+static bool ggml_backend_cuda_comm_ce_seqpar_unavailable(ggml_backend_cuda_comm_context * comm_ctx, ggml_cuda_ce_for who,
+                                                         size_t need, const char * why) {
+    bool & warned = who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? comm_ctx->ce_rs_warned : comm_ctx->ce_ag_warned;
+    if (!warned) {
+        warned = true;
+        GGML_LOG_WARN("%s: copy-engine scratch %.2f MiB for the sequence-parallel %s unavailable (%s); %s for the rest "
+                      "of this run\n", __func__, need / 1024.0 / 1024.0,
+                      who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "reduce-scatter" : "all_gather", why,
+                      who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "all-reduce + local slice" : "the meta backend's generic copies");
+    }
+    return false;
+}
+
+static bool ggml_backend_cuda_comm_ce_reserve(ggml_backend_cuda_comm_context * comm_ctx, size_t need,
+                                              ggml_cuda_ce_for who = GGML_CUDA_CE_FOR_ALLREDUCE) {
+    const size_t nb = comm_ctx->backends.size();
+    if (comm_ctx->ce_bytes < need) {
+        // Optional scratch budget (`GGML_CUDA_AR_CE_SCRATCH_MIB`; 0 = unlimited, the default): an
+        // oversized prefill degrades to the internal pipeline instead of eating the slab reserve.  CE is
+        // an opt-in (+2..4 % prefill), so a graceful fallback is strictly better than an abort.
+        static const size_t ce_budget = []() {
+            const char * e = getenv("GGML_CUDA_AR_CE_SCRATCH_MIB");
+            return e != nullptr ? (size_t) atoll(e) << 20 : (size_t) 0;
+        }();
+        if (comm_ctx->ce_grow_disabled || (ce_budget > 0 && need > ce_budget)) {
+            // Issue #136 (item C): the scratch could not be grown (or exceeds the budget).  Return false
+            // BEFORE any collective phase runs, so the dispatcher falls back cleanly to the internal
+            // pipeline (`ggml_backend_cuda_comm_allreduce_tensor`).  Never a hard abort.
+            if (who != GGML_CUDA_CE_FOR_ALLREDUCE) {
+                return ggml_backend_cuda_comm_ce_seqpar_unavailable(comm_ctx, who, need,
+                    comm_ctx->ce_grow_disabled ? "an earlier allocation failed" : "over GGML_CUDA_AR_CE_SCRATCH_MIB");
+            }
+            if (!comm_ctx->ce_fallback_warned) {
+                comm_ctx->ce_fallback_warned = true;
+                GGML_LOG_WARN("%s: copy-engine all-reduce scratch %.2f MiB unavailable%s; falling back to the "
+                              "internal all-reduce for the rest of this run (GGML_CUDA_AR_CE_SCRATCH_MIB=%zu)\n",
+                              __func__, need / 1024.0 / 1024.0,
+                              comm_ctx->ce_grow_disabled ? " (allocation failed)" : " (over the scratch budget)",
+                              ce_budget >> 20);
+            }
+            return false;
+        }
+        // Grow without ever freeing mid-run: a previous call's peer copy may still be writing the old
+        // scratch from the OTHER device's stream (a cross-device use-after-free), and cudaFree /
+        // cudaDeviceSynchronize are not safe under graph capture.  Retire the old buffers to teardown at
+        // the END, and only if every rank got all three buffers.  Issue #136 (item C): every allocation
+        // goes through `ggml_cuda_device_malloc` (the fail-soft choke point) instead of a bare cudaMalloc,
+        // so an OOM retires the partial attempt and returns false instead of aborting the process.
+        std::vector<void *> new_buf (nb, nullptr);
+        std::vector<void *> new_tmp (nb, nullptr);
+        std::vector<void *> new_tmp2(nb, nullptr);
+        bool ok = true;
+        for (size_t i = 0; i < nb && ok; ++i) {
+            const int dev = (int) comm_ctx->dev_ids[i];
+            ok = ggml_cuda_device_malloc(&new_buf [i], need, dev) == cudaSuccess &&
+                 ggml_cuda_device_malloc(&new_tmp [i], need, dev) == cudaSuccess &&
+                 ggml_cuda_device_malloc(&new_tmp2[i], need, dev) == cudaSuccess;
+            if (!ok) {
+                (void) cudaGetLastError();
+                comm_ctx->ce_grow_disabled = true;
+                for (size_t j = 0; j <= i; ++j) {
+                    const int d = (int) comm_ctx->dev_ids[j];
+                    if (new_buf [j] != nullptr) comm_ctx->ce_old.push_back({ d, new_buf [j] });
+                    if (new_tmp [j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp [j] });
+                    if (new_tmp2[j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp2[j] });
+                }
+                if (who != GGML_CUDA_CE_FOR_ALLREDUCE) {
+                    return ggml_backend_cuda_comm_ce_seqpar_unavailable(comm_ctx, who, need, "allocation failed");
+                }
+                if (!comm_ctx->ce_fallback_warned) {
+                    comm_ctx->ce_fallback_warned = true;
+                    GGML_LOG_WARN("%s: could not allocate the copy-engine all-reduce scratch (%.2f MiB on "
+                                  "device %d); falling back to the internal all-reduce for the rest of this "
+                                  "run\n", __func__, need / 1024.0 / 1024.0, dev);
+                }
+                return false;
+            }
+        }
+        // Success: retire the old buffers (freed at teardown) and install the new ones.
+        for (size_t i = 0; i < nb; ++i) {
+            const int d = (int) comm_ctx->dev_ids[i];
+            if (comm_ctx->ce_buf [i] != nullptr) comm_ctx->ce_old.push_back({ d, comm_ctx->ce_buf [i] });
+            if (comm_ctx->ce_tmp [i] != nullptr) comm_ctx->ce_old.push_back({ d, comm_ctx->ce_tmp [i] });
+            if (comm_ctx->ce_tmp2[i] != nullptr) comm_ctx->ce_old.push_back({ d, comm_ctx->ce_tmp2[i] });
+            comm_ctx->ce_buf [i] = new_buf [i];
+            comm_ctx->ce_tmp [i] = new_tmp [i];
+            comm_ctx->ce_tmp2[i] = new_tmp2[i];
+        }
+        // the scratch is raw device memory outside the ggml allocators: say what it holds (3 buffers per device; the
+        // retired ones stay until teardown)
+        const size_t old_bytes = comm_ctx->ce_bytes;
+        GGML_LOG_INFO("%s: copy-engine scratch now 3 x %.2f MiB per device (%s; was 3 x %.2f MiB, kept until teardown)\n",
+                      __func__, need / 1048576.0,
+                      who == GGML_CUDA_CE_FOR_ALLREDUCE ? "all-reduce" : who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "seqpar reduce-scatter" : "seqpar all_gather",
+                      old_bytes / 1048576.0);
+        comm_ctx->ce_bytes = need;
+    }
+    return true;
+}
+
 static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
     const int64_t ne = ggml_nelements(tensors[0]);
     if (ne == 0) {
@@ -3408,72 +3519,8 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
     const size_t need_bf16 = (size_t) n * (size_t) chunk_max * sizeof(nv_bfloat16);
     const size_t need_q8   = (size_t) std::max<int64_t>(nblk_q8, (int64_t) n * blk_max) * sizeof(block_q8_0);
     const size_t need = comm_ctx->ce_wire_q8 ? std::max(need_bf16, need_q8) : need_bf16;
-    if (comm_ctx->ce_bytes < need) {
-        // Optional scratch budget (`GGML_CUDA_AR_CE_SCRATCH_MIB`; 0 = unlimited, the default): an
-        // oversized prefill degrades to the internal pipeline instead of eating the slab reserve.  CE is
-        // an opt-in (+2..4 % prefill), so a graceful fallback is strictly better than an abort.
-        static const size_t ce_budget = []() {
-            const char * e = getenv("GGML_CUDA_AR_CE_SCRATCH_MIB");
-            return e != nullptr ? (size_t) atoll(e) << 20 : (size_t) 0;
-        }();
-        if (comm_ctx->ce_grow_disabled || (ce_budget > 0 && need > ce_budget)) {
-            // Issue #136 (item C): the scratch could not be grown (or exceeds the budget).  Return false
-            // BEFORE any collective phase runs, so the dispatcher falls back cleanly to the internal
-            // pipeline (`ggml_backend_cuda_comm_allreduce_tensor`).  Never a hard abort.
-            if (!comm_ctx->ce_fallback_warned) {
-                comm_ctx->ce_fallback_warned = true;
-                GGML_LOG_WARN("%s: copy-engine all-reduce scratch %.2f MiB unavailable%s; falling back to the "
-                              "internal all-reduce for the rest of this run (GGML_CUDA_AR_CE_SCRATCH_MIB=%zu)\n",
-                              __func__, need / 1024.0 / 1024.0,
-                              comm_ctx->ce_grow_disabled ? " (allocation failed)" : " (over the scratch budget)",
-                              ce_budget >> 20);
-            }
-            return false;
-        }
-        // Grow without ever freeing mid-run: a previous call's peer copy may still be writing the old
-        // scratch from the OTHER device's stream (a cross-device use-after-free), and cudaFree /
-        // cudaDeviceSynchronize are not safe under graph capture.  Retire the old buffers to teardown at
-        // the END, and only if every rank got all three buffers.  Issue #136 (item C): every allocation
-        // goes through `ggml_cuda_device_malloc` (the fail-soft choke point) instead of a bare cudaMalloc,
-        // so an OOM retires the partial attempt and returns false instead of aborting the process.
-        std::vector<void *> new_buf (nb, nullptr);
-        std::vector<void *> new_tmp (nb, nullptr);
-        std::vector<void *> new_tmp2(nb, nullptr);
-        bool ok = true;
-        for (size_t i = 0; i < nb && ok; ++i) {
-            const int dev = (int) comm_ctx->dev_ids[i];
-            ok = ggml_cuda_device_malloc(&new_buf [i], need, dev) == cudaSuccess &&
-                 ggml_cuda_device_malloc(&new_tmp [i], need, dev) == cudaSuccess &&
-                 ggml_cuda_device_malloc(&new_tmp2[i], need, dev) == cudaSuccess;
-            if (!ok) {
-                (void) cudaGetLastError();
-                comm_ctx->ce_grow_disabled = true;
-                for (size_t j = 0; j <= i; ++j) {
-                    const int d = (int) comm_ctx->dev_ids[j];
-                    if (new_buf [j] != nullptr) comm_ctx->ce_old.push_back({ d, new_buf [j] });
-                    if (new_tmp [j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp [j] });
-                    if (new_tmp2[j] != nullptr) comm_ctx->ce_old.push_back({ d, new_tmp2[j] });
-                }
-                if (!comm_ctx->ce_fallback_warned) {
-                    comm_ctx->ce_fallback_warned = true;
-                    GGML_LOG_WARN("%s: could not allocate the copy-engine all-reduce scratch (%.2f MiB on "
-                                  "device %d); falling back to the internal all-reduce for the rest of this "
-                                  "run\n", __func__, need / 1024.0 / 1024.0, dev);
-                }
-                return false;
-            }
-        }
-        // Success: retire the old buffers (freed at teardown) and install the new ones.
-        for (size_t i = 0; i < nb; ++i) {
-            const int d = (int) comm_ctx->dev_ids[i];
-            if (comm_ctx->ce_buf [i] != nullptr) comm_ctx->ce_old.push_back({ d, comm_ctx->ce_buf [i] });
-            if (comm_ctx->ce_tmp [i] != nullptr) comm_ctx->ce_old.push_back({ d, comm_ctx->ce_tmp [i] });
-            if (comm_ctx->ce_tmp2[i] != nullptr) comm_ctx->ce_old.push_back({ d, comm_ctx->ce_tmp2[i] });
-            comm_ctx->ce_buf [i] = new_buf [i];
-            comm_ctx->ce_tmp [i] = new_tmp [i];
-            comm_ctx->ce_tmp2[i] = new_tmp2[i];
-        }
-        comm_ctx->ce_bytes = need;
+    if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need)) {
+        return false;
     }
 
     to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
@@ -3764,6 +3811,348 @@ static bool ggml_backend_cuda_comm_allreduce_ce(ggml_backend_cuda_comm_context *
         CUDA_CHECK(cudaGetLastError());
     }
 
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sequence parallelism (LLAMA_SEQPAR): the token-split collectives of the meta backend, on the copy-engine
+// scratch and events of the all-reduce above.  Both use the SAME buffers with the SAME event protocol as the
+// all-reduce phases they mirror, so they interleave with all-reduce calls in any order:
+//   reduce-scatter : ce_buf (own bf16 staging) + ce_tmp (peer's chunk), ce_ev_send / ce_ev_done -- the 2-rank
+//                    single-exchange all-reduce, minus the half of the data the receiver does not keep;
+//   all-gather     : ce_tmp2 (receive region), ce_ev_recv / ce_ev_out -- the all-reduce's phase 2.
+// Neither writes into another device's compute buffer: a peer copy only lands in the receiver's scratch and
+// the receiver's own stream copies it into place, so the meta allocator's reuse of the destination is ordered
+// on that device's stream like any other kernel.
+// ---------------------------------------------------------------------------------------------
+
+// src[i]: rank i's whole partial (F32, contiguous, ne elements).  dst[i]: rank i's token slice of the sum,
+// elements [off[i], off[i] + nelements(dst[i])).  Per element the result is fp32(bf16(fp32(bf16(own)) +
+// fp32(bf16(peer)))), the same rounding as the copy-engine all-reduce (single-exchange form, and the two-phase
+// form's reduce + to_fp32), so the slice is bit-identical to all-reduce + slice.  2 ranks; false = not
+// available (no copy-engine scratch), the caller then all-reduces and slices.
+// A sequence-parallel collective the copy engine does not take: one INFO line per process, collective and reason
+// (the meta backend then runs the generic form; its executed-form census counts both).
+static bool ggml_cuda_seqpar_ce_declined(ggml_cuda_ce_for who, int reason, const char * why) {
+    static bool logged[2][4] = {};
+    bool & l = logged[who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? 0 : 1][reason];
+    if (!l) {
+        l = true;
+        GGML_LOG_INFO("%s: sequence-parallel %s not on the copy engine: %s; %s\n", __func__,
+                      who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "reduce-scatter" : "all_gather", why,
+                      who == GGML_CUDA_CE_FOR_REDUCE_SCATTER ? "all-reduce (the selected arm) + local slice instead"
+                                                             : "the meta backend's generic copies instead");
+    }
+    return false;
+}
+
+static void ggml_backend_cuda_comm_select_arm(ggml_backend_cuda_comm_context * comm_ctx);
+
+static bool ggml_backend_cuda_comm_reduce_scatter_tensor(void * comm_ctx_v, struct ggml_tensor ** src,
+                                                         struct ggml_tensor ** dst, const int64_t * off) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    // 2 ranks by construction: one exchange of the other rank's half, one event pair (see the protocol below)
+    if (comm_ctx->backends.size() != 2) {
+        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_REDUCE_SCATTER, 0, "the copy-engine exchange is 2-rank only");
+    }
+    if (!comm_ctx->ce_ready || comm_ctx->world_size > 0) {
+        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_REDUCE_SCATTER, 1, "no copy-engine scratch (multi-process or not set up)");
+    }
+    // Only when the all-reduce itself would take the bf16 copy-engine arm: with another arm selected (the RCCL ring
+    // for host-resident experts, the q8 wire of GGML_CUDA_ALLREDUCE=q8ce, a not-yet-selected auto chain) the caller's
+    // all-reduce + slice follows that arm, so the result is always what the selected all-reduce gives.
+    // the default chain picks its large arm at the first large all-reduce; a reduce-scatter can come first (the
+    // attention output of layer 0), so pick it here, or the early reduce-scatters would take the copy engine
+    // while the rest follow the RCCL ring
+    if (comm_ctx->auto_select) {
+        ggml_backend_cuda_comm_select_arm(comm_ctx);
+    }
+    if (comm_ctx->ce_wire_q8) {
+        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_REDUCE_SCATTER, 2, "the all-reduce uses the q8 wire (GGML_CUDA_ALLREDUCE=q8ce)");
+    }
+    if (comm_ctx->try_allreduce != ggml_backend_cuda_comm_allreduce_ce) {
+        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_REDUCE_SCATTER, 3,
+            "the selected all-reduce arm is not the bf16 copy engine (e.g. the RCCL ring with host experts)");
+    }
+    const int64_t ne = ggml_nelements(src[0]);
+    for (int i = 0; i < 2; ++i) {
+        GGML_ASSERT(src[i] != nullptr && dst[i] != nullptr);
+        GGML_ASSERT(src[i]->type == GGML_TYPE_F32 && dst[i]->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(src[i]) == ne && ggml_is_contiguously_allocated(src[i]) && ggml_is_contiguous(dst[i]));
+        GGML_ASSERT(off[i] >= 0 && off[i] + ggml_nelements(dst[i]) <= ne);
+    }
+    if (ne == 0) {
+        return true;
+    }
+    // the all-reduce of the same tensor asks for this much (2 * ceil(ne/2) bf16), so the scratch never grows
+    // past what the all-reduce it replaces would have grown it to
+    const size_t esz  = sizeof(nv_bfloat16);
+    const size_t need = (size_t) 2 * (size_t) ((ne + 1) / 2) * esz;
+    if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need, GGML_CUDA_CE_FOR_REDUCE_SCATTER)) {
+        return false;
+    }
+
+    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+    auto cctx = [&](int i) -> ggml_backend_cuda_context * {
+        return (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+    };
+    auto cdev  = [&](int i) -> int { return (int) comm_ctx->dev_ids[i]; };
+    auto cbuf  = [&](int i) -> char * { return (char *) comm_ctx->ce_buf[i]; };
+    auto ctmp1 = [&](int i) -> char * { return (char *) comm_ctx->ce_tmp[i]; };
+
+    // phase 0: stage the whole partial as bf16, exactly as the all-reduce does
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(cctx(i)->device);
+        if (src[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+            to_bf16(src[i]->data, (nv_bfloat16 *) cbuf(i), ne, cctx(i)->stream());
+        } else {
+            CUDA_CHECK(cudaMemsetAsync(cbuf(i), 0, (size_t) ne * esz, cctx(i)->stream()));
+        }
+    }
+    // phase 1: rank i ships the peer's token slice of its partial into the peer's tmp1 (guarded by the
+    // peer's previous read of it, ce_ev_done -- the all-reduce's own cross-call guard)
+    for (int i = 0; i < 2; ++i) {
+        const int p = 1 - i;
+        ggml_cuda_set_device(cctx(i)->device);
+        cudaStream_t s = cctx(i)->stream();
+        CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_done[p], 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(ctmp1(p), cdev(p), cbuf(i) + (size_t) off[p] * esz, cdev(i),
+                                       (size_t) ggml_nelements(dst[p]) * esz, s));
+        CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_send[i], s));
+    }
+    // phase 2: own slice + peer's slice -> this rank's output, own operand first like the all-reduce
+    for (int i = 0; i < 2; ++i) {
+        const int p = 1 - i;
+        ggml_cuda_set_device(cctx(i)->device);
+        cudaStream_t s = cctx(i)->stream();
+        CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_send[p], 0));
+        ggml_cuda_ce_add_bf16_to_f32<<<256, 256, 0, s>>>(
+            (const nv_bfloat16 *) (cbuf(i) + (size_t) off[i] * esz), (const nv_bfloat16 *) ctmp1(i),
+            (float *) dst[i]->data, (long) ggml_nelements(dst[i]));
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_done[i], s));
+    }
+    return true;
+}
+
+// The bf16-wire all-gather (see ggml_backend_cuda_comm_all_gather_tensor).  Per chunk: rank i converts its slice
+// chunk to bf16 in its own ce_buf, ships it into every peer's ce_tmp2 region for it, and widens its own copy into
+// place; the receivers widen the peer chunks from ce_tmp2 into place.  ce_tmp2 keeps the gather's event protocol
+// (ce_ev_out guards a region against the peer's previous read, ce_ev_recv publishes the copies).
+static bool ggml_backend_cuda_comm_all_gather_bf16(ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** src,
+                                                   struct ggml_tensor ** dst, const int64_t * off) {
+    const int n = (int) comm_ctx->backends.size();
+    const size_t esz = sizeof(nv_bfloat16);
+    int64_t n_max = 0;
+    for (int i = 0; i < n; ++i) {
+        GGML_ASSERT(src[i]->type == GGML_TYPE_F32 && dst[i]->type == GGML_TYPE_F32);
+        n_max = std::max<int64_t>(n_max, ggml_nelements(src[i]));
+    }
+    // ce_buf holds one chunk of the own slice, ce_tmp2 (n-1) peer chunks: both are ce_bytes long
+    // TEST: GGML_SEQPAR_GATHER_CHUNK caps the chunk (elements) to exercise the multi-chunk path
+    static const int64_t chunk_cap = [] { const char * e = getenv("GGML_SEQPAR_GATHER_CHUNK"); return e ? (int64_t) atoll(e) : (int64_t) 0; }();
+    int64_t chunk = (int64_t) (comm_ctx->ce_bytes / ((size_t) (n - 1) * esz));
+    if (chunk_cap > 0) {
+        chunk = std::min(chunk, chunk_cap);
+    }
+    GGML_ASSERT(chunk > 0);
+    const size_t region = (size_t) chunk * esz;
+    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+
+    auto cctx = [&](int i) -> ggml_backend_cuda_context * {
+        return (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+    };
+    auto cdev  = [&](int i) -> int { return (int) comm_ctx->dev_ids[i]; };
+    auto cbuf  = [&](int i) -> char * { return (char *) comm_ctx->ce_buf[i]; };
+    auto ctmp2 = [&](int i) -> char * { return (char *) comm_ctx->ce_tmp2[i]; };
+    auto slot  = [&](int s, int d) -> size_t { return (size_t) (s < d ? s : s - 1) * region; };
+
+    for (int64_t c0 = 0; c0 < n_max; c0 += chunk) {
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(cctx(i)->device);
+            cudaStream_t s = cctx(i)->stream();
+            const int64_t w = std::min<int64_t>(chunk, ggml_nelements(src[i]) - c0);
+            if (w > 0) {
+                to_bf16((const float *) src[i]->data + c0, (nv_bfloat16 *) cbuf(i), w, s);
+            }
+            for (int p = 0; p < n; ++p) {
+                if (p != i) {
+                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_out[p], 0));
+                }
+            }
+            for (int p = 0; p < n && w > 0; ++p) {
+                if (p == i) {
+                    continue;
+                }
+                CUDA_CHECK(cudaMemcpyPeerAsync(ctmp2(p) + slot(i, p), cdev(p), cbuf(i), cdev(i), (size_t) w * esz, s));
+            }
+            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_recv[i], s));
+            if (w > 0) {
+                // own slice: the same fp32(bf16(x)) the peers store (src and dst are distinct allocations)
+                to_fp32((const nv_bfloat16 *) cbuf(i), (float *) dst[i]->data + off[i] + c0, w, s);
+            }
+        }
+        for (int d = 0; d < n; ++d) {
+            ggml_cuda_set_device(cctx(d)->device);
+            cudaStream_t s = cctx(d)->stream();
+            for (int p = 0; p < n; ++p) {
+                if (p != d) {
+                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_recv[p], 0));
+                }
+            }
+            for (int p = 0; p < n; ++p) {
+                const int64_t w = std::min<int64_t>(chunk, ggml_nelements(src[p]) - c0);
+                if (p == d || w <= 0) {
+                    continue;
+                }
+                to_fp32((const nv_bfloat16 *) (ctmp2(d) + slot(p, d)), (float *) dst[d]->data + off[p] + c0, w, s);
+            }
+            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[d], s));
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    return true;
+}
+
+// src[i]: rank i's slice (contiguous).  dst[i]: rank i's whole tensor (contiguous); rank r's slice lands at
+// element off[r].  Plain copies, no conversion (any non-quantized type).  The peer slices go through ce_tmp2 in
+// chunks of the scratch size, so a gather larger than the all-reduce scratch does not grow it.  false = no
+// copy-engine scratch; the caller then gathers with synchronous copies.
+static bool ggml_backend_cuda_comm_all_gather_tensor(void * comm_ctx_v, struct ggml_tensor ** src,
+                                                     struct ggml_tensor ** dst, const int64_t * off) {
+    if (comm_ctx_v == nullptr) {
+        return false;
+    }
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    const int n = (int) comm_ctx->backends.size();
+    // TEST: GGML_SEQPAR_CE_GATHER=0 declines, so the meta backend takes its generic gather
+    static const bool ce_gather = [] { const char * e = getenv("GGML_SEQPAR_CE_GATHER"); return e == nullptr || atoi(e) != 0; }();
+    if (!ce_gather) {
+        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_ALL_GATHER, 0, "GGML_SEQPAR_CE_GATHER=0 (test switch)");
+    }
+    if (n < 2 || !comm_ctx->ce_ready || comm_ctx->world_size > 0) {
+        return ggml_cuda_seqpar_ce_declined(GGML_CUDA_CE_FOR_ALL_GATHER, 1, "no copy-engine scratch (multi-process or not set up)");
+    }
+    const ggml_type type = dst[0]->type;
+    GGML_ASSERT(ggml_blck_size(type) == 1);
+    const size_t  esz = ggml_type_size(type);
+    const int64_t ne  = ggml_nelements(dst[0]);
+    int64_t n_max = 0;
+    for (int i = 0; i < n; ++i) {
+        GGML_ASSERT(src[i] != nullptr && dst[i] != nullptr && src[i]->type == type && dst[i]->type == type);
+        GGML_ASSERT(ggml_is_contiguous(src[i]) && ggml_is_contiguous(dst[i]) && ggml_nelements(dst[i]) == ne);
+        GGML_ASSERT(off[i] >= 0 && off[i] + ggml_nelements(src[i]) <= ne);
+        n_max = std::max<int64_t>(n_max, ggml_nelements(src[i]));
+    }
+    if (n_max == 0) {
+        return true;
+    }
+    // receive region per peer: (n-1) of them per rank.  Grow to the whole slice up to 24 MiB (the -ub 4096
+    // all-reduce of a 2560-wide activation already takes 20 MiB) or what is already there; chunk anything
+    // larger rather than growing the three scratch buffers for it.
+    {
+        // never grow a scratch that already exists -- growth retires the old buffers
+        // until teardown (~72 MiB per GPU at -ub 4096).  Chunk through what is there; only an empty scratch is
+        // created (up to 24 MiB).
+        const size_t want = (size_t) (n - 1) * (size_t) n_max * esz;
+        const size_t need = comm_ctx->ce_bytes > 0 ? comm_ctx->ce_bytes : std::min(want, (size_t) 24 << 20);
+        if (!ggml_backend_cuda_comm_ce_reserve(comm_ctx, need, GGML_CUDA_CE_FOR_ALL_GATHER)) {
+            return false;
+        }
+    }
+    // bf16 wire (ggml_all_gather_wire): every slice crosses the link as bf16 and every rank -- own
+    // slice included -- stores fp32(bf16(x)), the GEMMs' own src1 rounding.  Staging: the own ce_buf, whose every
+    // read and write is on this rank's stream.  GGML_SEQPAR_GATHER_ROUND=1 (control): F32 wire, then the same
+    // rounding in place -- the same values, no link saving.
+    const int  wire  = ggml_get_op_params_i32(dst[0], 0);
+    static const bool round_only = [] { const char * e = getenv("GGML_SEQPAR_GATHER_ROUND"); return e != nullptr && atoi(e) != 0; }();
+    if (wire == 1) {
+        GGML_ASSERT(type == GGML_TYPE_F32);
+        if (!round_only) {
+            return ggml_backend_cuda_comm_all_gather_bf16(comm_ctx, src, dst, off);
+        }
+    }
+    const int64_t chunk = (int64_t) (comm_ctx->ce_bytes / ((size_t) (n - 1) * esz));
+    GGML_ASSERT(chunk > 0);
+    const size_t region = (size_t) chunk * esz;
+
+    auto cctx = [&](int i) -> ggml_backend_cuda_context * {
+        return (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+    };
+    auto cdev  = [&](int i) -> int { return (int) comm_ctx->dev_ids[i]; };
+    auto ctmp2 = [&](int i) -> char * { return (char *) comm_ctx->ce_tmp2[i]; };
+    // the receive region rank `d` keeps for sender `s` (s != d)
+    auto slot  = [&](int s, int d) -> size_t { return (size_t) (s < d ? s : s - 1) * region; };
+
+    // own slice: a local copy on the own stream
+    for (int i = 0; i < n; ++i) {
+        ggml_cuda_set_device(cctx(i)->device);
+        const int64_t ni = ggml_nelements(src[i]);
+        if (ni > 0) {
+            CUDA_CHECK(cudaMemcpyAsync((char *) dst[i]->data + (size_t) off[i] * esz, src[i]->data, (size_t) ni * esz,
+                                       cudaMemcpyDeviceToDevice, cctx(i)->stream()));
+        }
+    }
+    for (int64_t c0 = 0; c0 < n_max; c0 += chunk) {
+        // send: rank i ships chunk [c0, c0 + chunk) of its slice into every peer's region for it, once the
+        // peer has finished reading that region (ce_ev_out, the all-reduce's phase-2 guard)
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(cctx(i)->device);
+            cudaStream_t s = cctx(i)->stream();
+            for (int p = 0; p < n; ++p) {
+                if (p != i) {
+                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_out[p], 0));
+                }
+            }
+            const int64_t w = std::min<int64_t>(chunk, ggml_nelements(src[i]) - c0);
+            for (int p = 0; p < n && w > 0; ++p) {
+                if (p == i) {
+                    continue;
+                }
+                CUDA_CHECK(cudaMemcpyPeerAsync(ctmp2(p) + slot(i, p), cdev(p), (const char *) src[i]->data + (size_t) c0 * esz,
+                                               cdev(i), (size_t) w * esz, s));
+            }
+            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_recv[i], s));
+        }
+        // receive: rank d copies every peer's chunk from its region into place on its own stream
+        for (int d = 0; d < n; ++d) {
+            ggml_cuda_set_device(cctx(d)->device);
+            cudaStream_t s = cctx(d)->stream();
+            for (int p = 0; p < n; ++p) {
+                if (p != d) {
+                    CUDA_CHECK(cudaStreamWaitEvent(s, comm_ctx->ce_ev_recv[p], 0));
+                }
+            }
+            for (int p = 0; p < n; ++p) {
+                const int64_t w = std::min<int64_t>(chunk, ggml_nelements(src[p]) - c0);
+                if (p == d || w <= 0) {
+                    continue;
+                }
+                CUDA_CHECK(cudaMemcpyAsync((char *) dst[d]->data + (size_t) (off[p] + c0) * esz, ctmp2(d) + slot(p, d),
+                                           (size_t) w * esz, cudaMemcpyDeviceToDevice, s));
+            }
+            CUDA_CHECK(cudaEventRecord(comm_ctx->ce_ev_out[d], s));
+        }
+    }
+    if (wire == 1) {
+        // round_only control: fp32(bf16(x)) in place, through the own ce_buf, chunked like the wire path
+        to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+        to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+        const int64_t rc = (int64_t) (comm_ctx->ce_bytes / sizeof(nv_bfloat16));
+        for (int i = 0; i < n; ++i) {
+            ggml_cuda_set_device(cctx(i)->device);
+            cudaStream_t s = cctx(i)->stream();
+            for (int64_t c0 = 0; c0 < ne; c0 += rc) {
+                const int64_t w = std::min<int64_t>(rc, ne - c0);
+                to_bf16((const float *) dst[i]->data + c0, (nv_bfloat16 *) comm_ctx->ce_buf[i], w, s);
+                to_fp32((const nv_bfloat16 *) comm_ctx->ce_buf[i], (float *) dst[i]->data + c0, w, s);
+            }
+        }
+    }
     return true;
 }
 
@@ -4316,6 +4705,77 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type_dev(int dev
 
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     return ggml_backend_cuda_host_buffer_type_dev(0);
+}
+
+// wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
+//
+// It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
+// is still scheduled on the owning GPU -- exactly like `ROCm_Host`.  The difference is what backs the
+// bytes: with `--host-experts pool` the loader does NOT allocate (or fill) a pinned master; it places the
+// tensors directly in the read-only model mapping (`ggml_backend_host_buffer_from_ptr`), so the source of
+// truth is the page cache / the GGUF on disk, and every GPU read of it is served through the bounded
+// pinned host pool (moe-expert-cache.cu).  This is what makes a model whose host-expert set does not fit
+// in RAM runnable: the page cache is reclaimable, the pinned pool is the only non-swappable part.
+//
+// It must NOT report `ROCm_Host`'s name: the pinned buft's allocation path (cudaMallocHost) is precisely
+// what this mode removes, and `ggml_backend_cuda_host_buffer_type_alloc_buffer` would be used for a
+// non-mmap load.  The generic alloc below is a pageable aligned allocation, which is only reached when
+// the loader cannot map the file (`--load-mode none`); the usual mapping path bypasses it entirely.
+static const char * ggml_backend_cuda_host_map_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_HostMap";
+
+    GGML_UNUSED(buft);
+}
+
+static void ggml_backend_cuda_host_map_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_aligned_free(buffer->context, buffer->size);
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_host_map_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    // Only a `--load-mode none` load gets here (no file mapping to place the tensors in).  The bytes are
+    // then a pageable full copy of the host expert set: swappable and reclaimable (so still not the
+    // non-swappable pinned master), but not a memory win either.  Warn once so the state is visible.
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        GGML_LOG_WARN("%s: host expert master is not file-mapped (load mode without mmap); the set is "
+                      "held as a pageable copy instead of being read from disk on demand\n", __func__);
+    }
+    void * ptr = ggml_aligned_malloc(size);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_map_buffer_free_buffer;
+    return buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_host_map_buffer_type_dev(int device) {
+    GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+
+    static struct ggml_backend_buffer_type bufts[GGML_CUDA_MAX_DEVICES];
+    static bool init[GGML_CUDA_MAX_DEVICES] = {};
+
+    if (!init[device]) {
+        bufts[device] = {
+            /* .iface    = */ {
+                /* .get_name            = */ ggml_backend_cuda_host_map_buffer_type_name,
+                /* .alloc_buffer        = */ ggml_backend_cuda_host_map_buffer_type_alloc_buffer,
+                /* .alloc_buffer_n      = */ NULL,
+                /* .get_alignment       = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+                /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+                /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+                /* .get_alloc_size_n    = */ NULL,
+                /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            },
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+            /* .context  = */ nullptr,
+        };
+        init[device] = true;
+    }
+
+    return &bufts[device];
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
@@ -5574,6 +6034,21 @@ bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tens
         case GGML_OP_DUP:
             ggml_cuda_dup(ctx, dst);
             break;
+        case GGML_OP_ALL_GATHER:
+            // single backend: the collective degenerates to a copy of the input
+            ggml_cuda_dup(ctx, dst);
+            break;
+        case GGML_OP_TOKEN_SCATTER: {
+            // this device's token slice of a mirrored input: one contiguous copy starting at the token
+            // the meta backend recorded in op_params[1] (0, i.e. a plain copy, on a single backend)
+            const ggml_tensor * src = dst->src[0];
+            GGML_ASSERT(ggml_is_contiguous(src) && ggml_is_contiguous(dst) && src->type == dst->type);
+            const int32_t axis = ggml_get_op_params_i32(dst, 0);
+            const size_t  offs = (size_t) ggml_get_op_params_i32(dst, 1) * src->nb[axis];
+            GGML_ASSERT(offs + ggml_nbytes(dst) <= ggml_nbytes(src));
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, (const char *) src->data + offs, ggml_nbytes(dst),
+                                       cudaMemcpyDeviceToDevice, ctx.stream()));
+            } break;
         case GGML_OP_CPY:
             ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
             break;
@@ -5972,6 +6447,24 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     }
     ggml_cuda_async_input_drain(cuda_ctx->device);
 
+    // wip/host-expert-master-drop (TODO #55): a host expert master may be backed by the read-only model
+    // mapping (`--host-experts pool`), which is PAGEABLE.  A pageable `cudaMemcpyAsync` is staged through
+    // a shared internal bounce and tears under back-to-back use (measured: nondeterministic greedy text),
+    // so the bytes are staged through the expert pool / the per-table pinned bounce instead.  The helper
+    // is a no-op for any other source (a pooled table is the only thing it matches).
+    if (data != nullptr && size > 0 &&
+        moe_cache_upload_pageable((char *) tensor->data + offset, data, size, cuda_ctx->stream(), cuda_ctx->device)) {
+        return;
+    }
+    if (moe_cache_source_pageable(data)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: a pool-backed host expert master is being uploaded with a PAGEABLE copy "
+                          "(%zu bytes); this is slow and may tear -- please report\n", __func__, size);
+        }
+    }
+
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -6169,7 +6662,8 @@ static void ggml_cuda_peer_copy_staged(
     ggml_cuda_set_device(src_device);
 }
 
-static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+static bool ggml_backend_cuda_cpy_tensor_async_impl(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst,
+        ggml_backend_event_t ev_nowait) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
@@ -6223,21 +6717,39 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
-        // record event on src stream after the copy
-        if (!cuda_ctx_src->copy_event) {
+        if (ev_nowait != NULL) {
+            // r220: the caller owns the ordering.  Record ITS event on the source stream, right behind the
+            // copy, and touch neither the shared `copy_event` nor the destination stream: re-recording the
+            // shared event (or queueing a destination wait on it) is what serializes independent copies on
+            // HIP, where a queued `hipStreamWaitEvent` binds to the latest record at execution time.
             ggml_cuda_set_device(cuda_ctx_src->device);
-            CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev_nowait->context, cuda_ctx_src->stream()));
+        } else {
+            // record event on src stream after the copy
+            if (!cuda_ctx_src->copy_event) {
+                ggml_cuda_set_device(cuda_ctx_src->device);
+                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+            }
+
+            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
+
+            // wait on dst stream for the copy to complete
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
         }
-
-        CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
-
-        // wait on dst stream for the copy to complete
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
     } else {
         // src and dst are on the same backend
         CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
     }
     return true;
+}
+
+static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    return ggml_backend_cuda_cpy_tensor_async_impl(backend_src, backend_dst, src, dst, nullptr);
+}
+
+// r220: the same copy, but the caller passes the event to order the consumer on (`cpy_tensor_async_nowait`)
+static bool ggml_backend_cuda_cpy_tensor_async_nowait(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst, ggml_backend_event_t ev) {
+    return ggml_backend_cuda_cpy_tensor_async_impl(backend_src, backend_dst, src, dst, ev);
 }
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
@@ -8376,6 +8888,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 }
 
 
+static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight);
+
 static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_get_name,
     /* .free                    = */ ggml_backend_cuda_free,
@@ -8405,6 +8919,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .moe_cache_band          = */ ggml_backend_cuda_moe_cache_band,
     /* .moe_cache_gather        = */ ggml_backend_cuda_moe_cache_gather,
     /* .moe_cache_remap         = */ ggml_backend_cuda_moe_cache_remap,
+    /* .moe_cache_pool_backed   = */ ggml_backend_cuda_moe_cache_pool_backed,
+    /* .cpy_tensor_async_nowait = */ ggml_backend_cuda_cpy_tensor_async_nowait,
+    /* .moe_cache_pending      = */ ggml_backend_cuda_moe_cache_pending,
+    /* .moe_cache_register     = */ ggml_backend_cuda_moe_cache_register,
+    /* .moe_cache_stage_ready  = */ ggml_backend_cuda_moe_cache_stage_ready,
+    /* .moe_cache_in_place     = */ ggml_backend_cuda_moe_cache_in_place,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
@@ -8956,6 +9476,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
         case GGML_OP_DUP:
                 return true;
+        case GGML_OP_ALL_GATHER:
+                return ggml_is_contiguous(op->src[0]);
+        case GGML_OP_TOKEN_SCATTER:
+                return ggml_is_contiguous(op->src[0]);
         case GGML_OP_ARGMAX:
         case GGML_OP_COUNT_EQUAL:
             return true;
@@ -9252,7 +9776,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 // tier, and it is added by block 12, which defines that buffer type -- naming it here would leave blocks 09-11
 // uncompilable (`INVARIANTS.md` r307 fact 5).
 static bool ggml_backend_buft_is_cuda_host_expert(ggml_backend_buffer_type_t buft) {
-    return buft != nullptr && ggml_backend_buft_is_cuda_host(buft);
+    // r307: the pageable model mapping behind the pool (`ROCm_HostMap`) is the second half of the tier.  It is
+    // recognised by its name because `ggml_backend_buft_is_cuda_host()` above is the PINNED type's identity, and
+    // this block is where that buffer type is defined.
+    return buft != nullptr && (ggml_backend_buft_is_cuda_host(buft) ||
+        buft->iface.get_name == ggml_backend_cuda_host_map_buffer_type_name);
 }
 
 // Issue #323: the host-expert offload relaxation, default ON.  `GGML_MOE_HOST_OFFLOAD=0` restores the
@@ -9406,6 +9934,22 @@ static int ggml_backend_cuda_device_moe_cache_band(ggml_backend_dev_t dev) {
     return moe_cache_enabled() ? moe_cache_max_tok_dev(ctx->device) : 0;
 }
 
+static bool ggml_backend_cuda_moe_cache_pool_backed(ggml_backend_t backend, const struct ggml_tensor * weight) {
+    // wip/host-pool-speed (#131): see the iface comment.  `backend->context` is the CUDA backend context.
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    return moe_cache_table_is_pool(weight, ctx->device);
+}
+
+static void ggml_backend_cuda_device_moe_cache_forget(ggml_backend_dev_t dev) {
+    // r143: the model that registered this device's host-expert tables is being freed (`llama_model_free`).
+    // Drop them before its host masters go: the deferred arena sizing fills EVERY registered table, so a
+    // surviving table would read freed memory (a host memcpy SIGSEGV in `fill_slot_from_host`).
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (moe_cache_enabled() || moe_cache_has_tables()) {
+        moe_cache_forget_all(ctx->device);
+    }
+}
+
 static bool ggml_backend_cuda_device_moe_cache_rearm(ggml_backend_dev_t dev) {
     // OPEN 2 (TODO #42): re-arm the expert-cache arena after a compute-buffer drop returned the VRAM.
     (void) dev;
@@ -9425,6 +9969,11 @@ static void ggml_backend_cuda_device_moe_cache_set_host_pool(ggml_backend_dev_t 
 
 // wip/host-expert-tier: the persisted heat prior, so the loader can fill the pinned host-master tier in
 // descending hotness.  The prior is process-global in the cache, so any CUDA device serves.
+static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int direct) {
+    GGML_UNUSED(dev);
+    moe_cache_set_host_fill_mode(direct);
+}
+
 static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
     (void) dev;
     moe_cache_set_host_pool_budget(bytes);
@@ -9446,6 +9995,19 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
         int n_experts, size_t host_bytes, size_t total_bytes) {
     (void) dev;
     moe_cache_set_host_source(tensor_data, path, offs, n_experts, host_bytes, total_bytes);
+}
+
+// wip/host-expert-master-drop (TODO #55): the pool-backed host expert master buffer type, or NULL when
+// this device must keep the pinned master.  A discrete GPU reads a pageable mapping only through the
+// pinned pool, so the mode is offered there.  An INTEGRATED (APU) device shares host memory with the
+// GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
+// keeps the historical pinned master.
+static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
+    const ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (dev_ctx == nullptr || ggml_cuda_info().devices[dev_ctx->device].integrated) {
+        return nullptr;
+    }
+    return ggml_backend_cuda_host_map_buffer_type_dev(dev_ctx->device);
 }
 
 static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
@@ -9582,11 +10144,13 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .slab_set_ring_cap         = */ ggml_backend_cuda_device_slab_set_ring_cap,
     /* .slab_enabled              = */ ggml_backend_cuda_device_slab_enabled,
     /* .slab_ring_slots           = */ ggml_backend_cuda_device_slab_ring_slots,
+    /* .moe_host_master_buft      = */ ggml_backend_cuda_device_moe_host_master_buft,
     /* .moe_cache_band            = */ ggml_backend_cuda_device_moe_cache_band,
-    /* .moe_cache_forget          = */ nullptr,   // implemented by a later block
+    /* .moe_cache_forget          = */ ggml_backend_cuda_device_moe_cache_forget,
     /* .moe_cache_set_host_pool_budget = */ ggml_backend_cuda_device_moe_cache_set_host_pool_budget,
     /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
     /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
+    /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
 };
 
 // backend reg
@@ -9700,6 +10264,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_reduce_scatter_tensor") == 0) {
+        return (void *)ggml_backend_cuda_comm_reduce_scatter_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_all_gather_tensor") == 0) {
+        return (void *)ggml_backend_cuda_comm_all_gather_tensor;
     }
 #ifdef GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
