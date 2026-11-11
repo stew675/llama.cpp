@@ -100,11 +100,30 @@ struct llama_model_loader {
     bool  host_experts_plan_done = false;
     std::set<std::string> host_experts_pinned;      // tensor names that get a pinned host master
     std::set<std::string> host_experts_holes;       // tensor names that stay in the model mapping
+
     size_t host_experts_total_bytes  = 0;           // Sigma of every host expert tensor the placement will host
     size_t host_experts_cap_bytes    = 0;           // the budget the plan may spend (SIZE_MAX = the whole set)
     size_t host_experts_pinned_bytes = 0;           // actual pinned bytes, accumulated at load
     size_t host_experts_holes_bytes  = 0;           // actual pageable bytes, accumulated at load
     bool   host_experts_pool_holes   = false;        // the holes are served by the bounded pinned pool
+    // wip/apu-expert-gtt P2: the GTT expert store's placement and its census.  `host_experts_store_buft` is
+    // non-null only while a GTT store is open on this load, so `host_expert_is_store()` is false everywhere else
+    // (a discrete box, `MOE_EXPERT_GTT=0`, a platform the GTT store declined).
+    std::set<std::string>       host_experts_store;
+    // wip/apu-expert-gtt P3c: the subset of `host_experts_store` that is the MTP/nextn HEAD's tables.  They are
+    // placed first and pinned (they are read on every draft step) and their bytes are NOT part of `-lme`'s
+    // budget -- see `plan_gtt_expert_store`.
+    std::set<std::string>       host_experts_store_pinned;
+    size_t                      host_experts_store_head_bytes = 0;   // the head's padded bytes, on top of the budget
+    ggml_backend_buffer_type_t  host_experts_store_buft   = nullptr;
+    size_t                      host_experts_store_extent = 0;   // the budget, in bytes
+    size_t                      host_experts_store_filled = 0;   // bytes read from the GGUF into it
+    int                         host_experts_store_tables = 0;   // expert tensors placed in it
+    int64_t                     host_experts_store_slots  = 0;   // (tensor, expert) slots those tables are
+    // wip/apu-expert-gtt P3: the GTT store is this run's expert ARENA (the set does not fit it, so residency
+    // replaces placement).  Every expert tensor then stays in the read-only model mapping -- nothing is
+    // allocated, nothing is pinned -- and the cache serves every read from the arena.
+    bool                        host_experts_store_arena = false;
     std::string host_experts_policy;                // the resolved policy, for the census line
     bool   host_experts_heat_seen    = false;        // the heat prior answered for at least one tensor
     // issue #274: how many host-expert tensors actually got an on-disk source registered for the pool
@@ -146,6 +165,22 @@ struct llama_model_loader {
     // Called from `llama_model_base::load_tensors` (it needs `n_layer_all`), after the buft lists exist and
     // before the arch creates any tensor.
     void plan_host_expert_placement(int n_layer_trunk);
+
+    // wip/apu-expert-gtt P2: the UMA arm of the same budget.  On an integrated GPU there is no host-expert
+    // tier (`-ncmoe`/`-cmoe` are refused there, r236), so `-lme` becomes the size of the registered GTT EXPERT
+    // STORE and has to engage it by itself.  The budget, the ceiling and the ranking are the SAME code as the
+    // discrete arm (`MOE_HOST_LIMIT_FRAC` of MemAvailable, descending hotness from the persisted prior); only
+    // the granularity differs -- a whole expert tensor here rather than a per-expert pool slot, because the
+    // GTT store is a placement, not a cache (eviction is P3).
+    //
+    // P3c: `n_layer_trunk` splits the candidate set into the TRUNK (what `-lme` buys) and the MTP/nextn HEAD
+    // (`layers[n_layer()]` and above), whose tables are pinned outside that budget.
+    void plan_gtt_expert_store(int n_layer_trunk);
+
+    // True when this tensor was placed in the GTT expert store (so its fill is a direct `pread` into the slot).
+    bool host_expert_is_store(const std::string & name) const {
+        return !name.empty() && host_experts_store.count(name) > 0;
+    }
 
     // Tell the loader that the weights are going to a shared host/device memory pool (an integrated GPU).
     // Called before `plan_host_expert_placement`; refuses every host-expert placement with one message.

@@ -126,6 +126,7 @@
 #include "ggml-cuda-vmm-region.h"
 #include "ggml-cuda-moe-cache-hooks.cuh"
 #include "ggml-cuda-arena.cuh"
+#include "gtt-expert-store.cuh"
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -5500,6 +5501,176 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_kv_pool_mirror_buft_for_dev(
     return nullptr;
 }
 
+// wip/apu-expert-gtt P2: the GTT expert store's buffer type -- the UMA-only resident expert tier.
+//
+// The region itself (one `mmap` + `MADV_HUGEPAGE`, registered ONCE `Mapped|ReadOnly`, sliced into
+// per-(tensor, expert) slots) is `gtt-expert-store.cu`; this is only the buffer type that carves tensors out
+// of it, and it follows the delivery's KV-region pattern (`ggml_backend_cuda_kv_region_buffer_type_split`):
+//
+//   * a DEVICE buffer type (`is_host` NULL, `device` = the owning GPU), so the scheduler places the expert
+//     tables among that device's weights and `MUL_MAT_ID` reads them IN PLACE -- no new op, no new dispatch,
+//     no per-layer copy, and no scheduler input-copy of the table (which is what a HOST buffer type would
+//     cost: every ubatch would re-upload the expert bank);
+//   * the plain device type's vtable CONTRACT (alignment, alloc-size, the same `alloc_buffer` shape), so
+//     `ggml_backend_cuda_device_supports_op` needs no knowledge of it and a shape it cannot hold is declined
+//     by a NULL from `alloc_buffer`;
+//   * a name that is UNIQUE per device.  `llama_kv_cache` (and any future caller that keys a buft -> context
+//     map by name) collapses two device bufts that answer the same string into the FIRST one's context -- the
+//     same discipline the windowed KV region and the KV pool mirror already follow.
+//
+// Nothing here is reachable on a discrete device: the model loader only asks for a GTT store on an
+// IGPU (`prop.integrated`), and `MOE_EXPERT_GTT=0` never asks at all.
+static const char * ggml_backend_cuda_gtt_store_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return ((ggml_backend_cuda_buffer_type_context *) buft->context)->name.c_str();
+}
+
+static bool ggml_backend_buft_is_cuda_gtt_store(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.get_name == ggml_backend_cuda_gtt_store_buffer_type_name;
+}
+
+static void * ggml_backend_cuda_gtt_store_get_base(ggml_backend_buffer_t buffer) {
+    return buffer->context;
+}
+
+// The buffer is a VIEW of the GTT store: the region outlives every buffer cut from it, so freeing releases
+// nothing.  The region is released once, by `ggml_cuda_gtt_store_free()`.
+static void ggml_backend_cuda_gtt_store_free_buffer(ggml_backend_buffer_t buffer) {
+    // Hand the carve back to the store's allocator.  The carve comment says "never released", which was true of
+    // the placement arm and is exactly what made a SECOND load in the same process (a separate MTP drafter, or
+    // llama-bench reloading) run out of region and then fail its load.  The region itself, its registration and
+    // its extent are untouched; only the byte range returns to the free list.
+    if (buffer == nullptr || buffer->context == nullptr || buffer->buft == nullptr) {
+        return;
+    }
+    const ggml_backend_cuda_buffer_type_context * buft_ctx =
+        (const ggml_backend_cuda_buffer_type_context *) buffer->buft->context;
+    if (buft_ctx == nullptr) {
+        return;
+    }
+    ggml_cuda_gtt_store_release(buft_ctx->device, buffer->context, buffer->size);
+}
+
+// The GTT store is ordinary host memory that the GPU also reads (one address, `iommu=off`), so every host-side
+// copy is a plain `memcpy` with no flush and no staging -- measured coherent in both registration modes
+// (probe 10) and after a fill that overwrote resident bytes (probe 12).
+static void ggml_backend_cuda_gtt_store_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        uint8_t value, size_t offset, size_t size) {
+    if (tensor->buffer->buft != buffer->buft) {
+        GGML_ABORT("tensor is not in the GTT store");
+    }
+    memset((char *) tensor->data + offset, value, size);
+}
+
+static void ggml_backend_cuda_gtt_store_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    if (tensor->buffer->buft != buffer->buft) {
+        GGML_ABORT("tensor is not in the GTT store");
+    }
+    memcpy((char *) tensor->data + offset, data, size);
+}
+
+static void ggml_backend_cuda_gtt_store_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
+        void * data, size_t offset, size_t size) {
+    if (tensor->buffer->buft != buffer->buft) {
+        GGML_ABORT("tensor is not in the GTT store");
+    }
+    memcpy(data, (const char *) tensor->data + offset, size);
+}
+
+static void ggml_backend_cuda_gtt_store_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    memset(buffer->context, value, buffer->size);
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_gtt_store_buffer_i = {
+    /* .free_buffer     = */ ggml_backend_cuda_gtt_store_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_gtt_store_get_base,
+    /* .init_tensor     = */ NULL,
+    /* .memset_tensor   = */ ggml_backend_cuda_gtt_store_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_gtt_store_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_gtt_store_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_cuda_gtt_store_clear,
+    /* .reset           = */ NULL,
+};
+
+static size_t ggml_backend_cuda_gtt_store_get_alignment(ggml_backend_buffer_type_t buft) {
+    // One page: every resident expert table starts page-aligned inside the region, so every per-expert slot
+    // is at `base + e * nb[2]` in both addresses and a future `O_DIRECT` arm would have an aligned head.
+    GGML_UNUSED(buft);
+    return 4096;
+}
+
+static size_t ggml_backend_cuda_gtt_store_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    // The plain device type's own rule, deliberately: a quantized tensor whose `ne[0]` is not a multiple of
+    // `MATRIX_ROW_PADDING` reserves one padded row past its end, and several kernels read a full padded row.
+    // In a GTT store the bytes after a tensor belong to the NEXT expert table, so dropping that reservation would
+    // turn a padded read into a read of a neighbour's data -- or, at the end of the region, past the mapping.
+    return ggml_backend_cuda_buffer_type_get_alloc_size(buft, tensor);
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_gtt_store_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    const ggml_backend_cuda_buffer_type_context * buft_ctx =
+        (const ggml_backend_cuda_buffer_type_context *) buft->context;
+
+    if (size == 0) {
+        // `--fit` / `--no-alloc` probe load: a dummy buffer, and NO region (a probe must not reserve the
+        // budget's non-swappable RAM).  `ggml_backend_buffer_init` with a zero size and no base is enough.
+        return ggml_backend_buffer_init(buft, ggml_backend_cuda_gtt_store_buffer_i, nullptr, 0);
+    }
+
+    ggml_cuda_set_device(buft_ctx->device);
+    void * base = ggml_cuda_gtt_store_carve(buft_ctx->device, size);
+    if (base == nullptr) {
+        // NOT a soft decline, which the old comment here claimed: `llama_model_load` turns a null buffer into
+        // `unable to allocate ROCmGTTStore0 buffer` and the model does not load (measured: a separate MTP
+        // drafter whose head did not fit the store the target's placement had already filled).  The loader
+        // therefore sizes the placement against the store's real free bytes
+        // (`ggml_backend_dev_gtt_store_free_bytes`) and must never ask for more than it can place.
+        GGML_LOG_ERROR("%s: device %d: the GTT expert store could not carve %.2f MiB (largest free run %.2f "
+                       "MiB); the model cannot be placed in the store -- this is a sizing bug, not a fallback, "
+                       "because a null buffer fails the load\n", __func__, buft_ctx->device,
+                       (double) size / 1048576.0, (double) ggml_cuda_gtt_store_largest_free(buft_ctx->device) / 1048576.0);
+        return nullptr;
+    }
+    GGML_LOG_INFO("%s: device %d: %.2f MiB of expert tables placed in the GTT store at %p\n", __func__,
+                  buft_ctx->device, (double) size / 1048576.0, base);
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_gtt_store_buffer_i, base, size);
+}
+
+// One instance per device (the extent and the registration live in the GTT store module, not here).
+static ggml_backend_buffer_type_t ggml_backend_cuda_gtt_store_buffer_type(int device) {
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static struct ggml_backend_buffer_type bufts[GGML_CUDA_MAX_DEVICES];
+    static bool init[GGML_CUDA_MAX_DEVICES] = {};
+
+    if (!init[device]) {
+        bufts[device] = {
+            /* .iface    = */ {
+                /* .get_name            = */ ggml_backend_cuda_gtt_store_buffer_type_name,
+                /* .alloc_buffer        = */ ggml_backend_cuda_gtt_store_buffer_type_alloc_buffer,
+                /* .alloc_buffer_n      = */ NULL,
+                /* .get_alignment       = */ ggml_backend_cuda_gtt_store_get_alignment,
+                /* .get_max_size        = */ NULL, // defaults to SIZE_MAX: the GTT store is ONE carve per device
+                /* .get_alloc_size      = */ ggml_backend_cuda_gtt_store_get_alloc_size,
+                /* .get_alloc_size_n    = */ NULL,
+                /* .is_host             = */ NULL,
+            },
+            /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device),
+            /* .context  = */ new ggml_backend_cuda_buffer_type_context{device,
+                std::string(GGML_CUDA_NAME) + "GTTStore" + std::to_string(device), 0},
+        };
+        init[device] = true;
+    }
+
+    return &bufts[device];
+}
+
 // wip/host-expert-master-drop (TODO #55): the POOL-BACKED host expert master buffer type.
 //
 // It is a host buffer type that carries its device (`ROCm_HostMap`), so a `MUL_MAT_ID` weight placed in it
@@ -9761,6 +9932,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .moe_cache_register     = */ ggml_backend_cuda_moe_cache_register,
     /* .moe_cache_stage_ready  = */ ggml_backend_cuda_moe_cache_stage_ready,
     /* .moe_cache_in_place     = */ ggml_backend_cuda_moe_cache_in_place,
+    /* .moe_cache_prefill_stream = */ ggml_backend_cuda_moe_cache_prefill_stream,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
@@ -10579,6 +10751,11 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
     return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
+        // wip/apu-expert-gtt P2: the GTT expert store.  It is a DEVICE buffer type on this device (its backing
+        // is registered host memory, one address with the device VA), so an expert table placed in it stays in
+        // this device's split and `MUL_MAT_ID` reads it in place.  Not a host buft on purpose: a host buft would
+        // make the table a scheduler INPUT and re-upload the expert bank on every ubatch.
+        (ggml_backend_buft_is_cuda_gtt_store(buft) && buft->device == dev) ||
         (ggml_backend_buft_is_cuda_kv_pool_mirror(buft) && buft->device == dev);
 }
 
@@ -10666,6 +10843,16 @@ void ggml_cuda_h2d_ring_cap_set(size_t bytes) {
 static bool ggml_backend_cuda_device_moe_cache_preflight(ggml_backend_dev_t dev, size_t host_expert_bytes, size_t aux_reserve_bytes, size_t max_host_table_bytes) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool on = moe_cache_preflight(ctx->device, host_expert_bytes, aux_reserve_bytes);
+    if (on && moe_cache_gtt_arena()) {
+        // wip/apu-expert-gtt P3: the GTT tier's arena is REGISTERED HOST MEMORY, not a VRAM slab, so the
+        // movable-boundary slab has nothing to do here -- and arming it is actively wrong on a UMA device:
+        // it sizes itself as `free VRAM - reserve`, which on a shared host/device pool is the whole machine
+        // (measured elsewhere at `SLAB_INIT size(VA)=98.44 GiB mapped=98.19 GiB` on this 123 GiB box, the
+        // over-commit).  The tier's budget is the store's extent and nothing else.  Disarm so the compute
+        // buffers take their plain path and the census has no slab to report.
+        ggml_cuda_slab_disarm();
+        return on;
+    }
     if (on) {
         // fit-slab-accounting revival (G3): remember the draft-context estimate for the slab reserve (it
         // is created BEFORE the draft context, so the reserve has to leave room for it).
@@ -10749,9 +10936,10 @@ static void ggml_backend_cuda_device_moe_cache_set_host_fill_mode(ggml_backend_d
     moe_cache_set_host_fill_mode(direct);
 }
 
-static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
+static void ggml_backend_cuda_device_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes,
+                                                                    bool explicit_abs) {
     (void) dev;
-    moe_cache_set_host_pool_budget(bytes);
+    moe_cache_set_host_pool_budget(bytes, explicit_abs);
 }
 
 static void ggml_backend_cuda_device_moe_heat_open(ggml_backend_dev_t dev, const char * model_path) {
@@ -10778,11 +10966,95 @@ static void ggml_backend_cuda_device_moe_cache_set_host_source(ggml_backend_dev_
 // GPU, so there is no pinned duplicated copy to drop and its host buffers are directly usable -- it
 // keeps the historical pinned master.
 static ggml_backend_buffer_type_t ggml_backend_cuda_device_moe_host_master_buft(ggml_backend_dev_t dev) {
-    const ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
-    if (dev_ctx == nullptr || ggml_cuda_info().devices[dev_ctx->device].integrated) {
+    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    if (dev_ctx == nullptr) {
         return nullptr;
     }
+    if (ggml_cuda_info().devices[dev_ctx->device].integrated) {
+        // wip/apu-expert-gtt P3: with the GTT store as the ARENA there is no pinned master at all -- the expert
+        // tensors stay in the read-only model mapping (nothing allocated, nothing pinned) and the cache serves
+        // every read from the GTT store.  `llama-model.cpp`'s `host_master_mapped` path then places them straight
+        // into the mapping, which is the zero-copy source of truth this tier wants, and the buffer type still
+        // carries this device so the scheduler offloads each expert op to its own layer's GPU.
+        return moe_cache_gtt_arena() ? ggml_backend_cuda_host_map_buffer_type_dev(dev_ctx->device) : nullptr;
+    }
     return ggml_backend_cuda_host_map_buffer_type_dev(dev_ctx->device);
+}
+
+// wip/apu-expert-gtt P2: the two device hooks the model loader reaches the GTT expert store through.
+//
+// `open` accepts (or refuses) a budget and answers the buffer type the resident expert tables should be
+// placed in; the loader makes the placement decision itself (`plan_host_expert_placement`, so `-lme` and the
+// heat ranking are the DISCRETE path's own code, not a second policy).  `report` prints the once-per-load
+// census, with the bytes the loader read from the GGUF into the GTT store.
+static ggml_backend_buffer_type_t ggml_backend_cuda_device_gtt_store_open(ggml_backend_dev_t dev,
+        size_t extent_bytes, const char * source) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (dev_ctx == nullptr || !ggml_cuda_gtt_store_wanted()) {
+        return nullptr;
+    }
+    // An APU only: on a discrete device the expert set belongs in VRAM, and this tier would be host memory
+    // read across PCIe.  Same `prop.integrated` question the expert cache's own guard asks, and the reason
+    // the GTT store must be provably inert on every non-APU device.
+    if (!ggml_cuda_info().devices[dev_ctx->device].integrated) {
+        return nullptr;
+    }
+    ggml_cuda_set_device(dev_ctx->device);
+    char err[192] = {0};
+    if (!ggml_cuda_gtt_store_open(dev_ctx->device, extent_bytes, source, err, sizeof(err))) {
+        GGML_LOG_WARN("%s: device %d: no GTT expert store: %s\n", __func__, dev_ctx->device, err);
+        return nullptr;
+    }
+    return ggml_backend_cuda_gtt_store_buffer_type(dev_ctx->device);
+}
+
+static bool ggml_backend_cuda_device_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes,
+                                                    const int * pinned_layers, int n_pinned_layers) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    if (dev_ctx == nullptr || !ggml_cuda_gtt_store_wanted() || moe_cache_gtt_arena()) {
+        return moe_cache_gtt_arena();
+    }
+    if (!ggml_cuda_info().devices[dev_ctx->device].integrated) {
+        return false;
+    }
+    ggml_cuda_set_device(dev_ctx->device);
+    char err[192] = {0};
+    if (!ggml_cuda_gtt_store_open(dev_ctx->device, extent_bytes, "arena", err, sizeof(err))) {
+        GGML_LOG_WARN("%s: device %d: no GTT arena: %s\n", __func__, dev_ctx->device, err);
+        return false;
+    }
+    return moe_cache_preflight_store(dev_ctx->device, extent_bytes, pinned_layers, n_pinned_layers);
+}
+
+static size_t ggml_backend_cuda_device_gtt_store_free_bytes(ggml_backend_dev_t dev) {
+    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    if (dev_ctx == nullptr) {
+        return SIZE_MAX;
+    }
+    if (moe_cache_gtt_arena()) {
+        // The live store IS this run's arena: its extent is the trunk's budget and the cache reserves its slots
+        // out of the same free list, so there is nothing to share.  A second model taking bytes from here would
+        // silently shrink the trunk's residency (measured: a 2 550 MiB head out of an 8 192 MiB arena).
+        return 0;
+    }
+    return ggml_cuda_gtt_store_free_bytes(dev_ctx->device);
+}
+
+static size_t ggml_backend_cuda_device_gtt_store_lockable(ggml_backend_dev_t dev) {
+    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    if (dev_ctx == nullptr) {
+        return SIZE_MAX;
+    }
+    return ggml_cuda_gtt_store_lockable();
+}
+
+static void ggml_backend_cuda_device_gtt_store_report(ggml_backend_dev_t dev, size_t filled_bytes,
+        int n_tables, int64_t n_slots) {
+    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    if (dev_ctx == nullptr) {
+        return;
+    }
+    ggml_cuda_gtt_store_report(dev_ctx->device, filled_bytes, n_tables, n_slots);
 }
 
 static size_t ggml_backend_cuda_device_slab_work_size(ggml_backend_dev_t dev) {
@@ -10926,6 +11198,11 @@ static const ggml_backend_device_i ggml_backend_cuda_device_interface = {
     /* .moe_heat_open             = */ ggml_backend_cuda_device_moe_heat_open,
     /* .moe_heat_score            = */ ggml_backend_cuda_device_moe_heat_score,
     /* .moe_cache_set_host_fill_mode = */ ggml_backend_cuda_device_moe_cache_set_host_fill_mode,
+    /* .gtt_store_open            = */ ggml_backend_cuda_device_gtt_store_open,
+    /* .gtt_store_report          = */ ggml_backend_cuda_device_gtt_store_report,
+    /* .gtt_store_lockable        = */ ggml_backend_cuda_device_gtt_store_lockable,
+    /* .gtt_store_arena           = */ ggml_backend_cuda_device_gtt_store_arena,
+    /* .gtt_store_free_bytes      = */ ggml_backend_cuda_device_gtt_store_free_bytes,
 };
 
 // backend reg

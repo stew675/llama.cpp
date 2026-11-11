@@ -242,6 +242,16 @@ bool ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_te
 
 // TODO #133: the side-effect-free pre-staging query (see the iface comment).  Answers for the host master
 // `weight`, keyed exactly like the take-over that will follow it.
+// wip/apu-expert-gtt P5: the tier's prefill-band fill path (see `moe_cache_prefill_stream`).  Runs on the
+// backend's COMPUTE stream: that is the stream that read `input_cpy` for the previous ubatch, so the write needs
+// no cross-stream event (exactly like the device gather below), and the fills then overlap the split's compute.
+bool ggml_backend_cuda_moe_cache_prefill_stream(ggml_backend_t backend, const ggml_tensor * weight,
+        const ggml_tensor * weight_cpy, const void * used, int64_t n_expert, int64_t n_tok) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    return moe_cache_prefill_stream(weight, weight_cpy, used, n_expert, n_tok, ctx->stream(), ctx->device);
+}
+
 bool ggml_backend_cuda_moe_cache_in_place(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, int64_t n_tok) {
     GGML_UNUSED(weight_cpy);
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;

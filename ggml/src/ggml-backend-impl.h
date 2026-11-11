@@ -372,6 +372,20 @@ extern "C" {
         // below will succeed.  NULL = never in place.  APPENDED at the very end.
         bool (*moe_cache_in_place)(ggml_backend_t backend, const struct ggml_tensor * weight,
                                    const struct ggml_tensor * weight_cpy, int64_t n_tok);
+
+        // MoE expert cache (wip/apu-expert-gtt P5): PREFILL STREAMING.  Fill the split-input copy (`weight_cpy`)
+        // for a PREFILL-band routed op with the used experts of THIS ubatch, streaming only what is not already
+        // resident: a D2D for every used expert the backend's own store holds, and one COALESCED storage read per
+        // run of the rest.  `used` is the scheduler's own used-expert bitset of `n_expert` bits -- the SAME set
+        // its used-expert copy below would copy -- so this hook never re-reads the routing and can never disagree
+        // with the copy it replaces (`n_tok` is the ubatch width, for the backend's band decision).  Returns true
+        // when `weight_cpy` now holds every used expert, in which case the caller MUST skip its own copy; false
+        // declines (or failed part-way), and the caller's copy then overwrites the destination exactly as before
+        // -- so an unimplemented, declining or failing hook can only be slower, never wrong.  APPENDED so the
+        // other backends' positional initializers stay valid (NULL).
+        bool (*moe_cache_prefill_stream)(ggml_backend_t backend, const struct ggml_tensor * weight,
+                                         const struct ggml_tensor * weight_cpy, const void * used,
+                                         int64_t n_expert, int64_t n_tok);
     };
 
     struct ggml_backend {
@@ -562,7 +576,7 @@ extern "C" {
         // sum for one tensor, or -1 when the sidecar has no record of it.  APPENDED at the very end for the
         // positional-initializer reason above; zero-initialized for backends that do not set them, so a
         // backend that does not answer simply leaves the loader in its own tensor order.
-        void    (*moe_cache_set_host_pool_budget)(ggml_backend_dev_t dev, size_t bytes);
+        void    (*moe_cache_set_host_pool_budget)(ggml_backend_dev_t dev, size_t bytes, bool explicit_abs);
         void    (*moe_heat_open)(ggml_backend_dev_t dev, const char * model_path);
         int64_t (*moe_heat_score)(ggml_backend_dev_t dev, int layer, const char * name, int n_experts, size_t host_bytes);
 
@@ -577,6 +591,51 @@ extern "C" {
         // positional-initializer reason above; zero-initialized for backends that do not set it (a backend
         // that never answers leaves the pool on its own default).
         void (*moe_cache_set_host_fill_mode)(ggml_backend_dev_t dev, int direct);
+
+        // (optional) wip/apu-expert-gtt P2: the GTT EXPERT STORE -- a UMA-only resident expert tier (one
+        // registered anonymous region, `mmap` + MADV_HUGEPAGE + `cudaHostRegister(Mapped|ReadOnly)`, sliced into
+        // per-(tensor, expert) slots) that the resident MoE expert tables are placed in and that `MUL_MAT_ID`
+        // reads in place.  `open` accepts (or refuses) a budget of `extent_bytes` -- the model loader resolves
+        // `-lme` into that number, so the same flag sizes the discrete box's pinned tier and this one -- and
+        // answers the DEVICE buffer type the loader should place the resident expert tables in, or NULL when
+        // this device offers no GTT store (a discrete device, `MOE_EXPERT_GTT=0`, or a platform where the region
+        // cannot have one address for host and device).  `report` prints the once-per-load census with the bytes
+        // the loader read from the GGUF into the GTT store.  APPENDED at the very end for the positional-initializer
+        // reason above; zero-initialized for backends that do not set them, so a backend without a GTT store simply
+        // never answers and the loader keeps today's placement.
+        ggml_backend_buffer_type_t (*gtt_store_open)(ggml_backend_dev_t dev, size_t extent_bytes, const char * source);
+        void (*gtt_store_report)(ggml_backend_dev_t dev, size_t filled_bytes, int n_tables, int64_t n_slots);
+
+        // (optional) how many bytes the GTT store may LOCK in this process (`RLIMIT_MEMLOCK`), or SIZE_MAX for
+        // unlimited.  Locking is what makes the tier a reservation: probe 16 (`wip/apu-expert-gtt`) measured
+        // that a merely-registered region is reclaimable under memory pressure.  The model loader clamps the
+        // store's extent to this, and REFUSES a model that only fits because of the store when it cannot be
+        // locked at all -- so a system configuration that cannot lock returns a small number and the loader
+        // decides, never this backend.  SIZE_MAX also means "the store does not lock", which is what the
+        // `MOE_EXPERT_GTT_MLOCK=0` kill switch must look like to the policy.  APPENDED at the very end for
+        // the positional-initializer reason above; zero-initialized means "no answer" -> SIZE_MAX below.
+        size_t (*gtt_store_lockable)(ggml_backend_dev_t dev);
+
+        // (optional) wip/apu-expert-gtt P3: make the GTT store this run's expert ARENA -- the slot storage the
+        // expert cache's tables allocate from, with `extent_bytes` as the cache's budget.  Called instead of
+        // `gtt_store_open` when the store cannot hold the whole expert set, because then the set is served by
+        // residency rather than by placement.  Returns false when the tier is declined (the store is too small
+        // to be a useful arena), and the caller then falls back to whole-tensor placement.  APPENDED at the very
+        // end for the positional-initializer reason above; zero-initialized = no arena tier.
+        //
+        // P3c: `pinned_layers` are the MTP/nextn HEAD's expert layers.  They are sized at their full slot count
+        // and are NOT part of the `-lme` arithmetic (the head is read on every draft step, so the residency
+        // policy must not trade it away, and its bytes must not eat the trunk's budget).
+        bool (*gtt_store_arena)(ggml_backend_dev_t dev, size_t extent_bytes,
+                                const int * pinned_layers, int n_pinned_layers);
+
+        // (optional) wip/apu-expert-gtt P3c follow-up: SIZE_MAX when no GTT store is open on this device (the
+        // caller sizes its own), otherwise the largest run the LIVE store can still hand out.  A second model in
+        // one process (a separate MTP drafter's head, or a reload) must place within that and must never size,
+        // grow or take the arena tier: the region's extent is the FIRST model's budget.  APPENDED at the very
+        // end for the positional-initializer reason above; zero-initialized = "no store", which is what a
+        // backend without one must answer.
+        size_t (*gtt_store_free_bytes)(ggml_backend_dev_t dev);
     };
 
     struct ggml_backend_device {

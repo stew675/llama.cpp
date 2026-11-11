@@ -2760,18 +2760,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"-lme", "--limit-host-experts"}, "auto|N",
-        "cap the NON-SWAPPABLE memory used by host-resident MoE experts (--n-cpu-moe/-ncmoe) (default: auto)\n"
+        "cap the NON-SWAPPABLE memory spent on MoE experts that are not in VRAM (default: auto)\n"
+        "On a discrete GPU (host-resident experts, --n-cpu-moe/-ncmoe):\n"
         "- auto: pin the whole host expert set when it fits MOE_HOST_LIMIT_FRAC (default 80%) of the available\n"
         "        memory; otherwise no pinned master -- the experts stay in the read-only model mapping and the\n"
         "        bounded pinned pool (MOE_HOST_POOL_MIB/MOE_HOST_POOL_FRAC) serves the reads.  It is decided at\n"
         "        load, before any tensor is placed, and logged once.\n"
         "- N:    pin N GiB of host experts, spent on WHOLE tensors in descending hotness order (the persisted\n"
         "        expert heat map ranks them, so the bytes that are actually read are the ones that are pinned).\n"
-        "        The rest stays in the model mapping.  N above 90% of the available memory is refused, because\n"
-        "        that memory cannot be swapped out.\n"
-        "A pinned master is the fastest host-expert transport (no per-call staging, and the in-place cold read\n"
-        "is available), but it is a second copy of the bytes, which is why a set that does not fit is not\n"
-        "pinned wholesale.  (--host-experts pinned|pool are deprecated shorthands for the same budget.)",
+        "        The rest stays in the model mapping.  An explicit N is honoured EXACTLY: the pool's\n"
+        "        MOE_HOST_POOL_RAM_PCT ceiling scales only a DERIVED budget, never a number you typed.\n"
+        "        N is refused only at or above 100% of the memory currently available (that memory cannot be\n"
+        "        swapped out); between 85% and 100% it is accepted with a warning, and if headroom runs out the\n"
+        "        pool's prewarm stops placing and the rest grows on demand.\n"
+        "On an integrated GPU (APU, one shared host/device memory pool) this is the SIZE OF THE REGISTERED GTT\n"
+        "EXPERT STORE: a registered, huge-page region of host memory that the GPU reads in place, sliced into\n"
+        "per-(tensor, expert) slots.  No -ncmoe is needed (host-expert offload is refused there), and the same\n"
+        "budget and the same heat ranking apply -- N GiB spent on the hottest expert tables, the rest stays\n"
+        "on its layer's device buffer:\n"
+        "- auto: the whole expert set when it fits MOE_HOST_LIMIT_FRAC of MemAvailable (then nothing is ever\n"
+        "        evicted), otherwise that ceiling as a bounded hot subset.\n"
+        "- N:    exactly N GiB of registered GTT store (capped at the set).  N is refused only at or above 100%\n"
+        "        of the memory currently available, for the same reason as above.\n"
+        "The store must be LOCKED to be a reservation: a registered-but-unlocked region is reclaimable under\n"
+        "memory pressure (pages swapped, huge pages split, the next read 12-37x slower -- measured).  So the\n"
+        "extent is clamped to RLIMIT_MEMLOCK (`ulimit -l`), and a model that only fits because of the store is\n"
+        "REFUSED when it cannot be locked at all, rather than silently degrading.  `-lme auto` sizes to whatever\n"
+        "the limit allows.  MOE_EXPERT_GTT=0 disables the store on an APU; MOE_EXPERT_GTT_MLOCK=0 leaves it\n"
+        "unlocked (diagnostic: reclaimable by design).  (--host-experts pinned|pool are deprecated shorthands\n"
+        "for the same budget.)",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.host_experts_limit_gib = 0;
@@ -2786,9 +2803,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.host_experts_limit_gib = (int64_t) n;
             params.host_experts_mode      = LLAMA_HOST_EXPERTS_MODE_AUTO;
             if (n > 0) {
-                // Refuse a budget that would make most of RAM non-swappable.  Checked here, where the user
-                // gets the error before a 20-70 GiB model load; the exact figure is re-checked when the pool
-                // is sized (the loader knows the host expert bytes then).
+                // Refuse a budget that would make most of RAM non-swappable -- on a discrete box that is the
+                // pinned host master, on an APU it is the registered GTT expert store, and both are registered
+                // (non-swappable) host memory.  Checked here, where the user gets the error before a 20-70 GiB
+                // model load; the exact figure is re-checked when the tier is sized (the loader knows the
+                // expert bytes and MemAvailable then).
                 FILE * mi = fopen("/proc/meminfo", "r");
                 long long avail_mib = -1;
                 if (mi != nullptr) {
@@ -2798,11 +2817,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     }
                     fclose(mi);
                 }
-                if (avail_mib > 0 && (long long) n * 1024 > avail_mib * 90 / 100) {
-                    throw std::invalid_argument(
-                        "--limit-host-experts " + value + " (GiB) is more than 90% of the available memory (" +
-                        std::to_string(avail_mib / 1024) + " GiB): that memory is non-swappable, so it is refused. "
-                        "Use 'auto', a smaller N, or free memory first.");
+                // r273: REFUSE ONLY AT (OR ABOVE) 100 % OF WHAT IS AVAILABLE, and say so in the same units the
+                // operator used.  The old test was `n*1024 > avail_mib*90/100` but the message rounded the
+                // allowance to whole GiB, so it refused `-lme 75` while telling the operator they were allowed
+                // 80 -- an explicit number is the operator deliberately spending the non-swappable budget, and
+                // the refusal has to be both TRUE and legible to be worth having.  Below 100 % the pin is
+                // honoured in full (a verified `cudaHostAlloc` refusal reports itself, and the prewarm gate
+                // stops placing when headroom runs out), so the band in between is a WARNING, not an error.
+                if (avail_mib > 0) {
+                    const long long want_mib = (long long) n * 1024;
+                    const double    pct      = 100.0 * (double) want_mib / (double) avail_mib;
+                    char msg[640];
+                    if (want_mib >= avail_mib) {
+                        snprintf(msg, sizeof(msg),
+                            "--limit-host-experts %lld GiB (%lld MiB) is not less than the memory currently "
+                            "available (%lld MiB = %.1f GiB, %.0f %%): that memory is non-swappable, so it is "
+                            "refused.  Use 'auto', a smaller N, or free memory first.",
+                            (long long) n, want_mib, avail_mib, (double) avail_mib / 1024.0, pct);
+                        throw std::invalid_argument(msg);
+                    }
+                    if (pct >= 85.0) {
+                        fprintf(stderr,
+                            "warning: --limit-host-experts %lld GiB is %.1f %% of the %lld MiB (%.1f GiB) "
+                            "currently available.  It is honoured in full; if the box runs out of headroom the "
+                            "host pool's prewarm stops placing and the rest grows on demand "
+                            "(MOE_HOST_POOL_PREWARM_RESERVE_MIB, default 1024 MiB), and a refused pinned "
+                            "allocation is reported rather than silently retried.\n",
+                            (long long) n, pct, avail_mib, (double) avail_mib / 1024.0);
+                    }
                 }
             }
         }

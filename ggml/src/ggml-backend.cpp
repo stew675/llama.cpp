@@ -301,11 +301,11 @@ void ggml_backend_dev_moe_cache_forget(ggml_backend_dev_t dev) {
 
 // wip/host-expert-tier: the persisted per-expert heat prior, for the loader's pinned-master placement.
 // A backend that does not answer leaves `moe_heat_score` at -1, and the caller keeps its own tensor order.
-void ggml_backend_dev_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes) {
+void ggml_backend_dev_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes, bool explicit_abs) {
     if (dev == nullptr || dev->iface.moe_cache_set_host_pool_budget == nullptr) {
         return;
     }
-    dev->iface.moe_cache_set_host_pool_budget(dev, bytes);
+    dev->iface.moe_cache_set_host_pool_budget(dev, bytes, explicit_abs);
 }
 
 void ggml_backend_dev_moe_heat_open(ggml_backend_dev_t dev, const char * model_path) {
@@ -327,6 +327,43 @@ void ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int d
         return;
     }
     dev->iface.moe_cache_set_host_fill_mode(dev, direct);
+}
+
+// wip/apu-expert-gtt P2: the GTT expert store (see ggml-backend-impl.h for the contract).
+ggml_backend_buffer_type_t ggml_backend_dev_gtt_store_open(ggml_backend_dev_t dev, size_t extent_bytes, const char * source) {
+    if (dev == nullptr || dev->iface.gtt_store_open == nullptr) {
+        return nullptr;
+    }
+    return dev->iface.gtt_store_open(dev, extent_bytes, source);
+}
+
+void ggml_backend_dev_gtt_store_report(ggml_backend_dev_t dev, size_t filled_bytes, int n_tables, int64_t n_slots) {
+    if (dev == nullptr || dev->iface.gtt_store_report == nullptr) {
+        return;
+    }
+    dev->iface.gtt_store_report(dev, filled_bytes, n_tables, n_slots);
+}
+
+bool ggml_backend_dev_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes,
+                                      const int * pinned_layers, int n_pinned_layers) {
+    if (dev == nullptr || dev->iface.gtt_store_arena == nullptr) {
+        return false;
+    }
+    return dev->iface.gtt_store_arena(dev, extent_bytes, pinned_layers, n_pinned_layers);
+}
+
+size_t ggml_backend_dev_gtt_store_free_bytes(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.gtt_store_free_bytes == nullptr) {
+        return SIZE_MAX;
+    }
+    return dev->iface.gtt_store_free_bytes(dev);
+}
+
+size_t ggml_backend_dev_gtt_store_lockable(ggml_backend_dev_t dev) {
+    if (dev == nullptr || dev->iface.gtt_store_lockable == nullptr) {
+        return SIZE_MAX;
+    }
+    return dev->iface.gtt_store_lockable(dev);
 }
 
 bool ggml_backend_dev_moe_cache_stats(ggml_backend_dev_t dev, int64_t * hits, int64_t * misses, int64_t * arena_bytes) {
@@ -3429,6 +3466,18 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
                     // full-tensor expert copy below is skipped for this input.
                     return;
                 }
+            }
+
+            // wip/apu-expert-gtt P5: PREFILL STREAMING.  The backend's own store may already hold some of these
+            // experts (a D2D fills them), and the rest are read COALESCED instead of one `set_tensor_async` per
+            // run.  `used_ids` is the very bitset the copy below would use, so this can never disagree with it,
+            // and a decline (or a fill that failed part-way) falls through to the copy, which overwrites whatever
+            // was written.  It runs on the backend's compute stream -- the one that read `input_cpy` last -- so
+            // it takes no `wait_before_overwrite()`, exactly like the device gather above.
+            if (split_backend->iface.moe_cache_prefill_stream != NULL &&
+                split_backend->iface.moe_cache_prefill_stream(split_backend, input, input_cpy, used_ids.data(),
+                        n_expert, ids_tensor->ne[1])) {
+                return;
             }
 
             // group consecutive experts and copy them together

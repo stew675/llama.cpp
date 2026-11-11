@@ -84,11 +84,41 @@ extern "C" {
     // host-master tier in descending hotness.  `open` once (with the GGUF path) before any placement
     // decision; `score` per candidate host expert tensor, or -1 when the prior has no record of it (the
     // caller then keeps its own tensor order).  No-op / -1 for a backend that does not answer.
-    GGML_API void                  ggml_backend_dev_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes);
+    // r273: `explicit_abs` = the operator typed this number (`-lme N`, `MOE_HOST_POOL_MIB`).  An explicit
+    // absolute budget is a RESERVATION and is honoured in full; a derived one (`-lme auto`'s resolution)
+    // is still subject to the pool's own MOE_HOST_POOL_RAM_PCT ceiling.
+    GGML_API void                  ggml_backend_dev_moe_cache_set_host_pool_budget(ggml_backend_dev_t dev, size_t bytes, bool explicit_abs);
     GGML_API void                  ggml_backend_dev_moe_heat_open(ggml_backend_dev_t dev, const char * model_path);
     GGML_API int64_t               ggml_backend_dev_moe_heat_score(ggml_backend_dev_t dev, int layer, const char * name, int n_experts, size_t host_bytes);
     // r212: tell the host pool how the model was loaded (1 = O_DIRECT) so its fills can mirror it.
     GGML_API void                  ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_t dev, int direct);
+
+    // wip/apu-expert-gtt P2: the GTT EXPERT STORE -- a UMA-only resident expert tier.  `open` accepts (or
+    // refuses) a budget of `extent_bytes` and answers the DEVICE buffer type to place the resident MoE expert
+    // tables in, or NULL when this device offers no GTT store (a discrete device, `MOE_EXPERT_GTT=0`, or a platform
+    // where the region cannot have one address for host and device -- with `iommu=off` the host VA IS the device
+    // VA, which is what lets one pointer be both the fill destination and the kernel's source).  The budget is
+    // the model loader's: it resolves `-lme` into bytes, so the same flag sizes the discrete box's pinned tier
+    // and this one, and `source` says which arm produced the number for the census.  `report` prints the
+    // once-per-load census with the bytes the loader read from the GGUF into the GTT store.  No-op for a backend
+    // without a GTT store.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_dev_gtt_store_open(ggml_backend_dev_t dev, size_t extent_bytes, const char * source);
+    GGML_API void                  ggml_backend_dev_gtt_store_report(ggml_backend_dev_t dev, size_t filled_bytes, int n_tables, int64_t n_slots);
+    // How many bytes the GTT store may lock (`RLIMIT_MEMLOCK`), or SIZE_MAX for unlimited / no lock.  The
+    // loader clamps the store's extent to it and refuses a model that only fits because of the store when it
+    // cannot be locked.  SIZE_MAX for a backend without a store.
+    GGML_API size_t                ggml_backend_dev_gtt_store_lockable(ggml_backend_dev_t dev);
+    // wip/apu-expert-gtt P3: make the GTT store this run's expert ARENA (the cache's slot storage, with
+    // `extent_bytes` as its budget) instead of a whole-tensor placement.  Used when the store cannot hold the
+    // whole set -- the set is then served by residency.  False = declined, fall back to placement.
+    // `pinned_layers` (P3c) are the MTP/nextn head's expert layers: full residency, outside the budget.
+    GGML_API bool                  ggml_backend_dev_gtt_store_arena(ggml_backend_dev_t dev, size_t extent_bytes,
+                                                                  const int * pinned_layers, int n_pinned_layers);
+
+    // wip/apu-expert-gtt P3c: SIZE_MAX when no GTT store is open on `dev` (the caller sizes its own), otherwise
+    // the largest run the LIVE store can still hand out.  A second model in one process must place within it and
+    // must not size, grow or take the arena tier (the extent is the first model's budget).
+    GGML_API size_t                ggml_backend_dev_gtt_store_free_bytes(ggml_backend_dev_t dev);
 
     // wip/slab-ring-region: arm/disarm the allocator's reserved H2D staging-ring hole.  Armed at a wide
     // (prefill) pass, disarmed at the prefill -> decode drop, so a decode-only stretch gets the VRAM back.

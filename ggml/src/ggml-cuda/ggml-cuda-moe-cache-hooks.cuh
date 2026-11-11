@@ -19,6 +19,10 @@ float  ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend);
 bool   ggml_backend_cuda_moe_cache_update(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, const int32_t * ids, int64_t n_used, int64_t n_tok, size_t ids_nb0, size_t ids_nb1, size_t slice_off, int split_axis, const struct ggml_backend_moe_slice * slices, int n_slices);
 bool   ggml_backend_cuda_moe_cache_take_over(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, int64_t n_tok);
 bool   ggml_backend_cuda_moe_cache_in_place(ggml_backend_t backend, const ggml_tensor * weight, const ggml_tensor * weight_cpy, int64_t n_tok);
+// wip/apu-expert-gtt P5 (prefill streaming): fill the split-input copy for a prefill-band routed op from the GTT
+// arena + a coalesced storage read of only what is not resident.  True = the caller skips its used-expert copy.
+bool   ggml_backend_cuda_moe_cache_prefill_stream(ggml_backend_t backend, const ggml_tensor * weight,
+        const ggml_tensor * weight_cpy, const void * used, int64_t n_expert, int64_t n_tok);
 int64_t ggml_backend_cuda_moe_cache_band(ggml_backend_t backend);
 bool   ggml_backend_cuda_moe_cache_pending(ggml_backend_t backend);
 bool   ggml_backend_cuda_moe_cache_stage_ready(ggml_backend_t backend, const ggml_tensor * weight);

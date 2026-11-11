@@ -102,6 +102,17 @@ bool moe_cache_floor_active();
 // the first call; returns true when the cache remains active.
 bool moe_cache_preflight(int device, size_t host_expert_bytes, size_t aux_reserve_bytes);
 
+// wip/apu-expert-gtt P3: enable the cache with the GTT store as its arena and `extent_bytes` as its budget.
+// Returns false (cache left inert) when the store is too small to be a useful tier.
+//
+// P3c: `pinned_layers` are the MTP/nextn HEAD's expert layers.  Their tables are resident at their FULL slot
+// count and their bytes are NOT part of `-lme`'s arithmetic: the head is metadata overhead read on every draft
+// step, so the residency policy must not be able to trade it away, and it must not eat the trunk's budget.
+bool moe_cache_preflight_store(int device, size_t extent_bytes, const int * pinned_layers, int n_pinned_layers);
+
+// True when this run's arena is the GTT store (see `moe_cache_preflight_store`).
+bool moe_cache_gtt_arena();
+
 // WIP r42 (TODO #42): hold `bytes` of the free VRAM on `device` for the post-prefill compute layout,
 // so the auto-sized arena does not take the space a later compute growth needs.  Called at the
 // prefill -> decode transition, before the arena is sized.
@@ -266,7 +277,9 @@ void    moe_cache_heat_open(const char * model_path);
 // (pool residency, ranked by the heat prior) instead of per TENSOR (a pinned master).  The pool's expert-indexed
 // slots are also the region's presence bitmap, and with `MOE_HOST_POOL_COLD_MULTIDEV` a resident expert is read
 // in place by any device's kernel, so residency there buys the native transport at any device count.
-void    moe_cache_set_host_pool_budget(size_t bytes);
+// `explicit_abs` (r273): the operator typed this number, so it is a reservation and is honoured in full.
+// False = a DERIVED budget (`-lme auto`'s resolution), which the RAM ceiling may still scale.
+void    moe_cache_set_host_pool_budget(size_t bytes, bool explicit_abs);
 // r212: the loader's RESOLVED `--load-mode` (1 = O_DIRECT), so the host pool's fill mode can mirror it.
 // The pool fills the same way the model was loaded, because `--load-mode` is the operator's caching
 // decision; `MOE_HOST_POOL_DIO=0|1` still forces either arm.  -1 (never told) keeps the historical
@@ -351,6 +364,21 @@ bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, v
 bool moe_cache_stage_table(int device, const void * host_src, size_t offset, size_t width, size_t stride_src,
                            size_t n_copies, void * dst, void * compute_stream, void * copy_stream,
                            void * order_event);
+
+// wip/apu-expert-gtt P5 -- PREFILL STREAMING.  Fill the scheduler's split-input copy (`weight_cpy->data`) for a
+// prefill-band routed op from the GTT arena (a D2D for every used expert that is RESIDENT) plus a COALESCED
+// storage read of only the used experts that are not (`stage_span_fill`'s span shape, the tier's buffered read
+// transport), and skip an expert the destination buffer still holds from a previous ubatch.  The used set comes
+// from `ids` (host memory, the scheduler's own readback), so this never adds a readback.
+//
+// Returns true when `weight_cpy` holds every used expert of this op, in which case the caller MUST skip its
+// used-expert copy.  Returns false on any decline or failure -- including a partial fill -- and the caller's
+// own copy then serves the op exactly as before (it overwrites whatever this wrote), so a decline can only be
+// slower, never wrong.  Prefill band only: at or below the cache's band the arena take-over owns the op.
+// Kill switch: `MOE_EXPERT_GTT_PREFILL=0` (the whole path; the delivery's per-expert copy as before).
+// Tuning: `MOE_EXPERT_GTT_PREFILL_READERS` (the reader-pool width, default 4).
+bool moe_cache_prefill_stream(const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy,
+                              const void * used, int64_t n_expert, int64_t n_tok, void * stream, int device);
 
 // Kernel consumer seam.  Given the op (`op`) and the (redirected) expert table the op will read
 // (`weight_cpy`) plus the CUDA ordinal running it, return the compact arena the op must read instead:

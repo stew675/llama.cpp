@@ -342,6 +342,18 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .slab_set_ring_cap    = */ nullptr,
     /* .slab_enabled         = */ nullptr,
     /* .slab_ring_slots      = */ nullptr,
+    /* .moe_host_master_buft      = */ nullptr,
+    /* .moe_cache_band            = */ nullptr,
+    /* .moe_cache_forget          = */ nullptr,
+    /* .moe_cache_set_host_pool_budget = */ nullptr,
+    /* .moe_heat_open             = */ nullptr,
+    /* .moe_heat_score            = */ nullptr,
+    /* .moe_cache_set_host_fill_mode = */ nullptr,
+    /* .gtt_store_open            = */ nullptr,
+    /* .gtt_store_report          = */ nullptr,
+    /* .gtt_store_lockable        = */ nullptr,
+    /* .gtt_store_arena           = */ nullptr,
+    /* .gtt_store_free_bytes      = */ nullptr,
 };
 
 bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -4858,6 +4870,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .moe_cache_register     = */ ggml_backend_meta_moe_cache_register,
     /* .moe_cache_stage_ready  = */ ggml_backend_meta_moe_cache_stage_ready,
     /* .moe_cache_in_place     = */ ggml_backend_meta_moe_cache_in_place,
+    /* .moe_cache_prefill_stream = */ nullptr,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
