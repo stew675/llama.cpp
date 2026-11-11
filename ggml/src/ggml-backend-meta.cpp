@@ -340,19 +340,25 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .slab_set_ring_cap    = */ nullptr,
     /* .slab_enabled         = */ nullptr,
     /* .slab_ring_slots      = */ nullptr,
-    // the host-expert tier's device hooks (appended to `ggml_backend_device_i` after the slab ones): the meta
-    // device owns no host master and no heat prior of its own -- the host experts are placed on the simple
-    // devices' own buffer types, and the meta BACKEND forwards `moe_cache_band` itself
-    // (`ggml_backend_meta_moe_cache_band`).  Listed explicitly so the positional initializer above cannot be
-    // read as "this device forgot them"; whether the `-sm tensor` arms of `scripts/gate-host-pool.sh` need any
-    // of these forwarded is an open question (R13 finding), and a forwarded hook would have to pick a device.
-    /* .moe_host_master_buft            = */ nullptr,
-    /* .moe_cache_band                  = */ nullptr,
-    /* .moe_cache_forget                = */ nullptr,
-    /* .moe_cache_set_host_pool_budget  = */ nullptr,
-    /* .moe_heat_open                   = */ nullptr,
-    /* .moe_heat_score                  = */ nullptr,
-    /* .moe_cache_set_host_fill_mode    = */ nullptr,
+    // The optional hooks appended to `ggml_backend_device_i` after the slab ones: the meta device owns no host
+    // master, no heat prior and no GTT store of its own -- host experts are backed by the simple devices' own
+    // buffer types, the meta BACKEND forwards `moe_cache_band` itself
+    // (`ggml_backend_meta_moe_cache_band`), and the GTT store is an APU feature a device implements or not.
+    // Listed explicitly so the positional initializer above cannot be read as "this device forgot them"; if a
+    // hook ever must be forwarded, it has to pick one simple device, so that is a decision, not a default.
+    /* .moe_host_master_buft           = */ nullptr,
+    /* .moe_cache_band                 = */ nullptr,
+    /* .moe_cache_forget               = */ nullptr,
+    /* .moe_cache_set_host_pool_budget = */ nullptr,
+    /* .moe_heat_open                  = */ nullptr,
+    /* .moe_heat_score                 = */ nullptr,
+    /* .moe_cache_set_host_fill_mode   = */ nullptr,
+    /* .gtt_store_open                 = */ nullptr,
+    /* .gtt_store_report               = */ nullptr,
+    /* .gtt_store_lockable             = */ nullptr,
+    /* .gtt_store_arena                = */ nullptr,
+    /* .gtt_store_free_bytes           = */ nullptr,
+    /* .gtt_store_arena_min            = */ nullptr,
 };
 
 bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev) {
@@ -5163,6 +5169,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .moe_cache_register     = */ ggml_backend_meta_moe_cache_register,
     /* .moe_cache_stage_ready  = */ ggml_backend_meta_moe_cache_stage_ready,
     /* .moe_cache_in_place     = */ ggml_backend_meta_moe_cache_in_place,
+    /* .moe_cache_prefill_stream = */ nullptr,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
