@@ -93,6 +93,8 @@ public:
             seq_pos[s].clear();
             std::fill(seq_bits[s].begin(), seq_bits[s].end(), 0);
         }
+
+        n_multi = 0;
     }
 
     void reset_shift() {
@@ -182,6 +184,10 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
 
+            if (res.seq[j].count() > 1) {
+                res.n_multi++;
+            }
+
             assert(shift[idx] == 0);
         }
 
@@ -200,6 +206,10 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+
+            if (res.seq[j].count() > 1) {
+                res.n_multi++;
+            }
 
             assert(shift[idx] == 0);
         }
@@ -226,9 +236,17 @@ public:
                 seq_pos_rm(i + j);
             }
 
+            if (seq[idx].count() > 1) {
+                n_multi--;
+            }
+
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+
+            if (seq[idx].count() > 1) {
+                n_multi++;
+            }
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -257,9 +275,17 @@ public:
                 seq_pos_rm(idx);
             }
 
+            if (seq[idx].count() > 1) {
+                n_multi--;
+            }
+
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+
+            if (seq[idx].count() > 1) {
+                n_multi++;
+            }
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -275,6 +301,9 @@ public:
         assert(pos[i] != -1);
 
         seq_pos_rm(i);
+        if (seq[i].count() > 1) {
+            n_multi--;
+        }
         seq[i].reset();
 
         pos[i] = -1;
@@ -292,6 +321,9 @@ public:
         assert(pos[i] != -1);
         assert(seq_id >= 0);
 
+        if (seq[i].count() == 2) {
+            n_multi--;
+        }
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
 
@@ -335,6 +367,9 @@ public:
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
+            if (seq[i].count() > 1) {
+                n_multi--;
+            }
             seq[i].reset();
 
             seq[i].set(seq_id);
@@ -345,6 +380,9 @@ public:
 
         if (seq[i].any()) {
             seq_pos_rm(i);
+            if (seq[i].count() > 1) {
+                n_multi--;
+            }
             seq[i].reset();
 
             pos[i] = -1;
@@ -367,6 +405,11 @@ public:
         assert(pos[i] != -1);
 
         return seq[i].count();
+    }
+
+    // the number of cells that carry more than one sequence
+    uint32_t get_n_multi_seq() const {
+        return n_multi;
     }
 
     // the full set of sequences this cell is visible to
@@ -418,6 +461,10 @@ public:
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
+
+        if (seq[i].count() == 2) {
+            n_multi++;
+        }
     }
 
     // return the sequence id of this cell
@@ -580,6 +627,9 @@ public:
         has_shift = true;
 
         if (pos[i] < 0) {
+            if (seq[i].count() > 1) {
+                n_multi--;
+            }
             seq[i].reset();
             pos[i] = -1;
             shift[i] = 0;
@@ -643,6 +693,9 @@ private:
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
+
+    // the number of cells that carry more than one sequence (llama_memory_seq_cp); 0 lets kq_mask_derivable_seqs skip its scan
+    uint32_t n_multi = 0;
 
     // the set seq_pos[s] holds one (pos, cell) pair per cell that carries sequence s, ordered by position
     // this way seq_pos[s].begin() and seq_pos[s].rbegin() give us the min/max positions currently in the cache
