@@ -5495,6 +5495,17 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     return (enum ggml_prec) prec_i32;
 }
 
+// Frontend hint for the CUDA/HIP FA chooser (see ggml.h).  Process-wide; set once per context.
+static bool g_fa_tensor_parallel = false;
+
+void ggml_set_fa_tensor_parallel(bool enable) {
+    g_fa_tensor_parallel = enable;
+}
+
+bool ggml_get_fa_tensor_parallel(void) {
+    return g_fa_tensor_parallel;
+}
+
 void ggml_flash_attn_ext_set_n_kv_max(
         struct ggml_tensor * a,
         int32_t              n_kv_max) {
@@ -5502,6 +5513,36 @@ void ggml_flash_attn_ext_set_n_kv_max(
     GGML_ASSERT(n_kv_max >= 0);
 
     ggml_set_op_params_i32(a, 4, n_kv_max);
+}
+
+// V3: kq mask derived from compact per-cell/per-token state (see ggml.h)
+void ggml_flash_attn_ext_add_kq_derived(
+        struct ggml_tensor * a,
+        struct ggml_tensor * cell_pos,
+        struct ggml_tensor * tok_lo,
+        struct ggml_tensor * tok_hi) {
+    if (!cell_pos) {
+        a->src[6] = NULL;
+        a->src[7] = NULL;
+        a->src[8] = NULL;
+        return;
+    }
+
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    // src[5] is the kv_rows form (ggml_flash_attn_ext_rows); the derived form is src[6..8]
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(a->src[6] == NULL);
+    GGML_ASSERT(tok_lo != NULL && tok_hi != NULL);
+    GGML_ASSERT(cell_pos->type == GGML_TYPE_I32 && tok_lo->type == GGML_TYPE_I32 && tok_hi->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(cell_pos) && ggml_is_contiguous(tok_lo) && ggml_is_contiguous(tok_hi));
+    // cell_pos indexes the K rows (the cache cells), tok_lo/tok_hi the mask rows (the query tokens)
+    GGML_ASSERT(cell_pos->ne[0] == a->src[1]->ne[1]);
+    GGML_ASSERT(tok_lo->ne[0]   == a->src[0]->ne[1]);
+    GGML_ASSERT(tok_hi->ne[0]   == a->src[0]->ne[1]);
+
+    a->src[6] = cell_pos;
+    a->src[7] = tok_lo;
+    a->src[8] = tok_hi;
 }
 
 void ggml_flash_attn_ext_add_sinks(
