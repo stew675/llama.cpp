@@ -1165,6 +1165,81 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // LLAMA_SERVER_PREFILL_FAIR (on unless 0): give the slots that have prompt tokens a max-min fair share of
+    // the batch window instead of letting the lowest slot fill n_batch first.  Every active prompt is then
+    // admitted to every step, and a slot that needs less than its share returns the difference to the pool,
+    // which is redistributed among the slots that can still use it.  A kill-switch for bisection, not an
+    // opt-in: the share is measured to cost no throughput (a second sequence in the batch is free).
+    const bool prefill_fair = [] {
+        const char * e = getenv("LLAMA_SERVER_PREFILL_FAIR");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    // `-ib` / `--interactive-batch-size` (env form `LLAMA_ARG_INTERACTIVE_BATCH_SIZE`; the legacy
+    // `LLAMA_SERVER_PREFILL_CHUNK` env var is the option's deprecated alias, still read, with one WARN): the
+    // prompt tokens admitted per step WHILE a decoder is waiting (some slot owes a decode token).  This is the
+    // bound on a decoding slot's inter-token latency and on the worst-case wait for a request arriving behind a
+    // running prompt, because a batch is assembled once per step and cannot be joined mid-flight.  A step with
+    // NOTHING decoding takes the whole window (n_batch) instead: with no decoder waiting the cap bounds
+    // nothing, and below `n_ubatch` it is strictly dominated anyway (the step still issues one
+    // `llama_process()` and the same kernel launches, so it re-pays the step's fixed cost for no fewer
+    // launches).  That fixed cost is what decides the trade and it is shape-dependent -- ~2 ms on a dense
+    // model on one GPU, ~196 ms on a PLE-on-CPU + host-expert + attendance-pool shape (fitted from
+    // llama-benchy: 128 steps of 512 tok cost 45.1 s against 4 steps of 16384 at 21.6 s for the same 65536
+    // tokens), which is why an unconditioned cap cost the field shape half of its uncontended prefill (1454 vs
+    // 3036 t/s on the same 65536 tokens).  So this is an interactivity knob, not a throughput one: `-ub` at or
+    // above n_batch makes it a no-op, and a cheap decoder bound still requires lowering `-ub` as well, which is
+    // the honest coupling.  -1 = one `n_ubatch` (the default), 0 = no bound, N = explicit.  Resolved in
+    // resolve_prefill_admission(): the member initializers here run before load_model() copies the parsed
+    // params in, so this cannot read params_base.
+    int32_t prefill_chunk = -1;
+
+    // LLAMA_SERVER_PREFILL_SKEW (default 1 = off): weight the slot with the SHORTEST remaining prompt this
+    // many times against the others.  >1 is a tunable droop from the max-min fair share toward
+    // shortest-remaining-first: the shortest answers and finishes sooner, every other slot still advances on
+    // every step (and so still gives feedback), and the rest accelerate as slots retire.  Any value >= 1 keeps
+    // starvation impossible.  1 is the plain max-min share and allocates EXACTLY what it did before this knob
+    // existed, so the equal-share measurements stay valid.
+    const int32_t prefill_skew = [] {
+        const char * e = getenv("LLAMA_SERVER_PREFILL_SKEW");
+        if (e == nullptr) {
+            return 1;
+        }
+        const int v = atoi(e);
+        return v < 1 ? 1 : v > 64 ? 64 : v;
+    }();
+
+    // LLAMA_SERVER_PREFILL_DUTY (0/1 = off, K > 1 = one prefill step every K steps at most): the other steps,
+    // up to K-1 of them, admit NO prompt tokens, so they are decode-only.  A decoding slot's rate is
+    // 1/step_time, and a step that carries prompt tokens is the slow one, so a burst of decode-only steps
+    // followed by one prefill step gives the decoder K-1 tokens at the decode-only step time instead of one
+    // token per prefill step.  The cost is the prefill's own wall time, so the burst is BOUNDED: the deferral
+    // stops as soon as the idle time accumulated since the last prefill step reaches that step's own duration
+    // (measured, no model knowledge), which holds the stretch of a concurrent prefill under ~2x.  Without the
+    // bound the stretch is `1 + (K-1) * decode_step / prefill_step`, which measured 1.1x on the field shape
+    // (one 16k step, 15 ms decode steps) but 3.0x on a dense 4B at a 512-token chunk -- and 16x on a shape
+    // whose decode step is as slow as its prefill step.  Never defers into an EMPTY batch: a step with no
+    // decode work prefills immediately, so an idle server (or one prompt arriving with nothing decoding) is
+    // untouched and the tick does not advance.
+    const int32_t prefill_duty = [] {
+        const char * e = getenv("LLAMA_SERVER_PREFILL_DUTY");
+        if (e == nullptr) {
+            return 16; // default ON: the bound above is what makes it safe on every shape
+        }
+        const int v = atoi(e);
+        return v < 2 ? 0 : (v > 1024 ? 1024 : v);
+    }();
+
+    int32_t prefill_idle_steps = 0;     // decode-only steps since the last prefill step
+    int64_t prefill_idle_us    = 0;     // their accumulated wall time: the prefill's stretch
+    int64_t prefill_step_us    = 0;     // the last prefill step's wall time: the stretch budget
+    int64_t prefill_step_start = 0;     // start of the step being assembled
+    bool    prefill_step_prev  = false; // the step that just finished carried prompt tokens
+    bool    prefill_idle_prev  = false; // the previous step was a deferred (decode-only) step
+
+    // rotating start for the fair-share walk, so the tie-break is not always slot 0
+    int32_t slot_next = 0;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     // LLAMA_SERVER_LAZY_IDLE_SLOTS (on unless 0): with a unified KV cache, an idle slot keeps its context when a new task
@@ -1419,6 +1494,32 @@ private:
 
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
+    // Resolve the prompt-admission knobs once the parsed params are in hand.  The member initializers run at
+    // construction, BEFORE load_model() copies the caller's params into params_base, so anything that comes
+    // from a command-line option has to be resolved here.  Also the one place the legacy env aliases are read,
+    // so they can be reported once with the option that replaced them.
+    void resolve_prefill_admission() {
+        prefill_chunk = params_base.interactive_batch_size < -1 ? -1 : params_base.interactive_batch_size;
+
+        // the legacy env var is `-ib`'s deprecated alias: it only speaks when the option did not (it is named
+        // in shipped scripts and gate invocations, so it keeps working rather than breaking them)
+        const char * e = getenv("LLAMA_SERVER_PREFILL_CHUNK");
+        if (e != nullptr && e[0] != '\0') {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                if (params_base.interactive_batch_size_set) {
+                    SRV_WRN("%s\n", "LLAMA_SERVER_PREFILL_CHUNK is the deprecated alias of -ib/--interactive-batch-size and is IGNORED (the option was given)");
+                } else {
+                    SRV_WRN("%s\n", "LLAMA_SERVER_PREFILL_CHUNK is the deprecated alias of -ib/--interactive-batch-size; prefer -ib N");
+                }
+            }
+            if (!params_base.interactive_batch_size_set) {
+                prefill_chunk = std::max(0, atoi(e));
+            }
+        }
+    }
+
     bool load_model(common_params & params) {
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
@@ -1430,6 +1531,8 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+
+        resolve_prefill_admission();
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft() && params.speculative.uses_dft();
@@ -1703,6 +1806,15 @@ private:
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+
+        // the prompt admission policy, so a log always says which one ran (wip/session-scheduling)
+        // `chunk` is the cap on a step that carries decode work; a step with no decoder waiting takes the
+        // whole window (`no-decode = n_batch`), which is why the chunk is not a throughput setting.
+        SRV_INF("prefill admission: fair share = %s, chunk = %s, skew = %d, duty = %d, no-decode = n_batch\n",
+                prefill_fair ? "on" : "off",
+                prefill_chunk < 0 ? "n_ubatch" : prefill_chunk == 0 ? "off" : std::to_string(prefill_chunk).c_str(),
+                prefill_skew,
+                prefill_duty <= 1 ? 1 : prefill_duty);
 
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -2129,6 +2241,119 @@ private:
                 }
             }
         }
+    }
+
+    // Max-min fair (water-filling) split of the prompt window across the slots that still have prompt tokens
+    // to place.  Each pass gives every remaining slot budget/n_active tokens; a slot that needs less leaves
+    // the difference in the pool, and the pool is shared again among the slots that can still use it.  The
+    // result is that nobody fills n_batch first and every active prompt is admitted to every step.  Rotation
+    // makes the tie-break fair across steps.  WIP: wip/session-scheduling/ in the delivery repo.
+    void share_prompt_budget(std::vector<int32_t> & prompt_budget, int32_t budget) {
+        if (slots.empty()) {
+            return;
+        }
+
+        std::vector<size_t>  active;
+        std::vector<int64_t> remaining(slots.size(), 0);
+
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const size_t k = (slot_next + i) % slots.size();
+            const auto & s = slots[k];
+
+            if (!s.is_processing() || s.task == nullptr) {
+                continue;
+            }
+            if (s.state != SLOT_STATE_PROCESSING_PROMPT && s.state != SLOT_STATE_STARTED) {
+                continue;
+            }
+            if (s.state == SLOT_STATE_WAIT_OTHER) {
+                continue; // a child waits for its parent's shared prefix
+            }
+            if (s.task->type == SERVER_TASK_TYPE_TTS || s.task->type == SERVER_TASK_TYPE_REALTIME ||
+                s.task->type == SERVER_TASK_TYPE_TRANSCRIBE_RT) {
+                continue; // these bypass the shared batch
+            }
+
+            // a STARTED slot still has its whole prompt to place; the cache-reuse prefix is only known inside
+            // the fill loop, so this is an upper bound (a slot that finishes early simply uses less)
+            const int64_t r = s.state == SLOT_STATE_STARTED
+                ? (int64_t) s.task->n_tokens()
+                : (int64_t) s.task->n_tokens() - (int64_t) s.prompt.n_tokens();
+            if (r <= 0) {
+                continue;
+            }
+
+            active.push_back(k);
+            remaining[k] = r;
+        }
+
+        // No permanent starvation: even when the decode tokens have committed the whole window (only
+        // possible when n_parallel is at or above n_batch), every active prompt still gets one token.  The
+        // batch then exceeds n_batch by at most n_active tokens and the outer llama_process() loop splits it
+        // into a second pass, which is the price of never starving a prompt.  Without this, a config with
+        // n_parallel >= n_batch would let the decoding slots deny prompt admission forever.
+        budget = std::max(budget, (int32_t) active.size());
+
+        // One token each FIRST, whatever the weights are: that is what keeps a low-weight slot in every step,
+        // and it leaves the default allocation identical to the plain share (budget/n == 1 + (budget-n)/n).
+        {
+            std::vector<size_t> next;
+            for (const size_t k : active) {
+                prompt_budget[k] += 1;
+                remaining[k]     -= 1;
+                budget           -= 1;
+                if (remaining[k] > 0) {
+                    next.push_back(k);
+                }
+            }
+            active.swap(next);
+        }
+
+        // then share the remainder, weighting the shortest-remaining slot `prefill_skew` times
+        while (!active.empty() && budget > 0) {
+            size_t skew_i = active.size();
+            if (prefill_skew > 1 && active.size() > 1) {
+                int64_t best = -1;
+                for (size_t i = 0; i < active.size(); ++i) {
+                    if (best < 0 || remaining[active[i]] < best) {
+                        best   = remaining[active[i]];
+                        skew_i = i; // ties keep the first in the rotated order
+                    }
+                }
+            }
+
+            int64_t wsum = 0;
+            for (size_t i = 0; i < active.size(); ++i) {
+                wsum += (i == skew_i ? prefill_skew : 1);
+            }
+            if (wsum <= 0) {
+                break;
+            }
+
+            const int32_t budget_before = budget;
+            std::vector<size_t> next;
+            for (size_t i = 0; i < active.size(); ++i) {
+                const size_t  k = active[i];
+                const int64_t w = (i == skew_i ? prefill_skew : 1);
+                const int64_t share_i = (int64_t) budget * w / wsum;
+                const int64_t take    = std::min<int64_t>(remaining[k], share_i);
+
+                prompt_budget[k] += (int32_t) take;
+                remaining[k]     -= take;
+                budget           -= (int32_t) take;
+
+                if (remaining[k] > 0) {
+                    next.push_back(k);
+                }
+            }
+            active.swap(next);
+
+            if (budget == budget_before) {
+                break; // integer truncation gave nobody a token; the window is effectively committed
+            }
+        }
+
+        slot_next = (slot_next + 1) % (int32_t) slots.size();
     }
 
     // return true if at least one slot has been cleared
@@ -4287,6 +4512,101 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // max-min fair share of the prompt window: the decode tokens are already in the batch, so share what
+        // is left across every slot that still has prompt tokens.  See share_prompt_budget().
+        std::vector<int32_t> prompt_budget(slots.size(), 0);
+        // The cycle is up to K-1 DECODE steps followed by one prefill step, so the decode burst comes first
+        // and the prefill stall comes last.  Two stop conditions, and either one ends the burst:
+        //   * K-1 decode-only steps (LLAMA_SERVER_PREFILL_DUTY, the burst length), and
+        //   * the idle time accumulated since the last prefill step reaching that step's own duration.
+        // The second is what keeps the prefill's wall time bounded: without it the stretch is
+        // 1 + (K-1)*decode_step/prefill_step, i.e. unbounded in K and worst on a shape whose per-step fixed
+        // cost dominates (measured 3.0x on a dense 4B at a 512-token chunk, 1.7x on a streamed host-expert
+        // 35B-class shape, 1.1x on the field shape's one 16k step).  Both are measured here, not assumed:
+        // `prefill_step_us` is the wall time of the last step that carried prompt tokens.
+        // The deferral is only taken when this step already carries decode work: a step with no prompt tokens
+        // and no decode tokens is an empty batch, which decode() calls "no tokens to decode" and aborts on
+        // after four in a row.  So an idle server (or a prompt arriving with nothing decoding) is prefilled
+        // immediately and neither counter advances -- which is also what calibrates `prefill_step_us`.
+        const size_t n_batch_decode = batch.size(); // the decode tokens are already in; prompt tokens are not
+        const int64_t t_step_now = ggml_time_us();
+        const int64_t step_us    = prefill_step_start > 0 ? t_step_now - prefill_step_start : 0;
+        if (prefill_step_prev) {
+            prefill_step_us = step_us;
+        }
+        prefill_step_start = t_step_now;
+        bool prefill_now = true;
+        if (prefill_duty > 1 && batch.size() > 0) {
+            const bool steps_left = prefill_idle_steps < prefill_duty - 1;
+            const bool time_left  = prefill_step_us <= 0 || prefill_idle_us < prefill_step_us;
+            prefill_now = !(steps_left && time_left);
+        }
+        if (prefill_now) {
+            prefill_idle_steps = 0;
+            prefill_idle_us    = 0;
+        } else {
+            prefill_idle_steps += 1;
+            // the elapsed time of THIS burst so far: the first deferred step adds nothing (its own duration is
+            // not known yet), every later one adds the step that just finished
+            prefill_idle_us = prefill_idle_prev ? prefill_idle_us + step_us : 0;
+        }
+        prefill_idle_prev = !prefill_now;
+
+        // The per-step chunk is an INTERACTIVITY bound: it exists so a decoding slot's inter-token latency
+        // and a newly arrived request's wait are bounded by one chunk-sized step.  It is not a throughput
+        // setting, and below the ubatch it is strictly dominated (the step still issues one llama_process()
+        // and the same kernel launches, so it re-pays the step's fixed cost `b` for nothing).  So it applies
+        // only to a step that carries DECODE work: with nothing generating, the only work in flight is the
+        // prompts themselves and the whole logical window (n_batch, ubatch-split internally) is available.
+        //
+        // The test is "some slot owes a decode token", not `batch.size() == 0`: slots that cannot batch
+        // together still serialise (two LoRA classes, can_batch_with()), so a generating slot can be left
+        // OUT of this step's batch and `batch.size()` would read zero while a decoder is in fact waiting.
+        // An audio/TTS slot is not in the shared batch either.  Both cases stay chunked here, which is the
+        // safe direction -- a wide step handed to a waiting decoder is exactly the stall this bounds.
+        bool decode_active = false;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING) {
+                decode_active = true;
+                break;
+            }
+        }
+
+        if (!prefill_now) {
+            // a decode-only step: no prompt slot is admitted, and the zero budgets make the fill loop skip
+            // them (its guard is `n_tokens() > 0 && prompt_budget <= 0`)
+        } else {
+            // -1 = follow the ubatch (the default), 0 = no cap, >0 = explicit
+            const int32_t want   = prefill_chunk > 0 ? prefill_chunk
+                                 : prefill_chunk < 0 ? (int32_t) n_ubatch
+                                 : n_batch;
+            // no decoder is waiting: nothing to bound, so the step takes the whole window.  A wide step never
+            // carries a decode token by construction (the decode token is added above, before this), so a
+            // decoder's first contended step is already chunk-bounded -- it only waits out an in-flight
+            // uncontended step.  This is the shape r300's c4 measurement priced: 1454 t/s at chunk 512 against
+            // 3036 t/s at no cap on the field `runme` (b ~= 196 ms, 128 steps vs 4), and it is also the better
+            // TTFR there (40.6 s vs 19.5 s).  The number of concurrent PROMPTS is irrelevant: the window is
+            // shared max-min fairly either way, so several prompts prefilling with nothing decoding is still
+            // the uncontended case.
+            const int32_t cap    = decode_active ? std::min(n_batch, want) : n_batch;
+            const int32_t budget = std::max(0, cap - (int32_t) batch.size());
+
+            if (prefill_fair && !use_mixed_batch()) {
+                share_prompt_budget(prompt_budget, budget);
+            } else {
+                // kill-switch: keep today's slot-order fill.  The per-step cap is a separate mechanism and
+                // still applies -- every slot may add up to the whole remaining window, so the lowest slot
+                // that wants one wins, exactly as before.
+                //
+                // A mixed / non-causal batch (use_mixed_batch(): no memory, or no causal attention) is the
+                // same path: add_prompt_mixed() places a whole prompt at once, so a per-sequence share is not
+                // expressible there.  The policy is left off rather than half-applied.
+                for (auto & b : prompt_budget) {
+                    b = budget;
+                }
+            }
+        }
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
@@ -4297,6 +4617,13 @@ private:
                 }
 
                 if (!slot.is_processing() || slot.task->type == SERVER_TASK_TYPE_TTS || slot.task->type == SERVER_TASK_TYPE_REALTIME) {
+                    return;
+                }
+
+                // no share of the window this step: the prompt slots get a max-min fair share of
+                // n_batch - (decode tokens), so a slot with a zero share waits for the next step instead of
+                // filling the batch itself.  An empty prompt still goes through so it can be released.
+                if (slot.task->n_tokens() > 0 && prompt_budget[slot.id] <= 0) {
                     return;
                 }
 
@@ -4759,8 +5086,12 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
-                    // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // add prompt tokens for processing in the current batch, at most this slot's fair share
+                    const int32_t n_prompt_start  = (int32_t) slot.prompt.n_tokens();
+                    const int32_t n_prompt_budget = prompt_budget[slot.id];
+
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
+                           (int32_t) slot.prompt.n_tokens() - n_prompt_start < n_prompt_budget) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4836,6 +5167,9 @@ private:
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
 
+                    SLT_DBG(slot, "fair share: budget = %d, added = %d, batch = %d / %d\n",
+                            n_prompt_budget, (int32_t) n_tokens_cur, (int32_t) batch.size(), n_batch);
+
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
@@ -4900,6 +5234,10 @@ private:
                 }
             });
         }
+
+        // a step counts as a prefill step for the stretch budget only if it really carried prompt tokens: a
+        // prefill_now step with nothing left to place is a decode-only step and its duration is not a budget
+        prefill_step_prev = prefill_now && (size_t) batch.size() > n_batch_decode;
     }
 
     // see https://github.com/ggml-org/llama.cpp/pull/29969
