@@ -432,6 +432,13 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
     bool update_cache = false;
 
+    // the KV admission verdict comes FIRST, before any candidate is considered: it is a whole-request decision
+    // (see `admit`), so it cannot depend on which slot would have been picked, and asking it here means a request
+    // that cannot fit is deferred exactly like one that finds no slot -- the caller needs no second defer site
+    if (admit && !admit(task)) {
+        return { -1, false, server_slot_refusal::no_capacity };
+    }
+
     // if a specific slot is requested, use it (still goes through cache update logic below)
     if (task.id_slot != -1 && !slots.empty()) {
         // note: allow id_slot to be out of bounds (wrap around)
@@ -447,7 +454,7 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
         if (ret) {
             // a busy slot is returned untouched, the caller defers the task
             if (ret->is_processing) {
-                return { ret->id, false };
+                return { ret->id, false, server_slot_refusal::no_slot };
             }
 
             SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
@@ -526,11 +533,11 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
     }
 
     if (ret == nullptr) {
-        return {};
+        return { -1, false, server_slot_refusal::no_slot };
     }
 
     // cache prompts only for the tasks that reuse them
     update_cache = update_cache && !task.is_stateless();
 
-    return { ret->id, update_cache };
+    return { ret->id, update_cache, server_slot_refusal::none };
 }

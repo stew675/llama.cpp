@@ -762,6 +762,16 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
+    // `-ib` / `--interactive-batch-size`: the prompt tokens admitted per step WHILE a decoder is waiting (some
+    // slot owes a decode token) -- the interactive bound on a decoding slot's inter-token latency and on a
+    // newcomer's wait for admission.  A step with NOTHING decoding always takes the whole `-b` window, because
+    // with no decoder waiting there is nothing to bound (and a chunk below `n_ubatch` re-pays the step's fixed
+    // cost for nothing), so this is an interactivity knob, not a throughput one.  -1 = one `n_ubatch` (the
+    // default), 0 = no bound, N = explicit.  The legacy env var `LLAMA_SERVER_PREFILL_CHUNK` is the option's
+    // deprecated alias and is still read, with one WARN.
+    int32_t interactive_batch_size     = -1;
+    bool    interactive_batch_size_set = false; // set by -ib/--interactive-batch-size (flag or env form)
+
     // llama-connect params
     bool        server_connect      = false;
     std::string server_connect_code = "";

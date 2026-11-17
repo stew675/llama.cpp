@@ -112,6 +112,17 @@ void server_queue::pop_deferred_task(int id_slot) {
     condition_tasks.notify_one();
 }
 
+std::vector<server_task> server_queue::take_deferred_tasks() {
+    std::unique_lock<std::mutex> lock(mutex_tasks);
+    std::vector<server_task> res;
+    res.reserve(queue_tasks_deferred.size());
+    for (auto & task : queue_tasks_deferred) {
+        res.push_back(std::move(task));
+    }
+    queue_tasks_deferred.clear();
+    return res;
+}
+
 void server_queue::wait_until_no_sleep() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (sleeping) {

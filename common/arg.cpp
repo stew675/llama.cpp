@@ -2662,6 +2662,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"-ib", "--interactive-batch-size"}, "N",
+        string_format("the prompt tokens admitted per step WHILE a decoder is waiting -- the interactive bound on "
+                      "a decoding slot's inter-token latency and on a newcomer's wait for admission (default: "
+                      "%d = one n_ubatch, 0 = no bound).  A step with NOTHING decoding always takes the whole -b "
+                      "window: with no decoder waiting there is nothing to bound, and below n_ubatch a smaller "
+                      "step only re-pays the step's fixed cost.  So this bounds interactivity and never caps an "
+                      "uncontended prefill.  LLAMA_SERVER_PREFILL_CHUNK is this option's deprecated alias",
+                      params.interactive_batch_size),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("error: invalid value for interactive-batch-size (-1 = one n_ubatch, 0 = no bound, N > 0 = tokens per step)");
+            }
+            params.interactive_batch_size     = value;
+            params.interactive_batch_size_set = true;
+        }
+    ).set_env("LLAMA_ARG_INTERACTIVE_BATCH_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",

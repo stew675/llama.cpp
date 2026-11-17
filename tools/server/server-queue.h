@@ -66,6 +66,10 @@ public:
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
 
+    // Remove every deferred task and hand them back.  For a shutdown: a deferred task was never launched, so no
+    // slot, release or abort will ever answer it, and its HTTP worker waits on its result until something does.
+    std::vector<server_task> take_deferred_tasks();
+
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping
     // the server then stays awake until the caller calls release_inflight()

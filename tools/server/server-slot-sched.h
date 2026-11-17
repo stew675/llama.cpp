@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-task.h"
 
+#include <functional>
 #include <list>
 #include <memory>
 #include <vector>
@@ -128,17 +129,40 @@ struct server_slot_info {
     const server_prompt * prompt = nullptr;
 };
 
+// why the plan refused the task.  The caller defers the task either way (and the same release wake re-offers it),
+// so this is not a control path: it exists because "no slot is available" is the wrong thing to print when a slot
+// IS free and the request cannot be admitted into the KV cache, and because a gate needs a non-vacuous count.
+enum class server_slot_refusal {
+    none = 0,     // a slot was chosen (id_slot >= 0)
+    no_slot,      // every slot is busy, or the task's own pinned slot is
+    no_capacity,  // a free slot exists, but the task cannot be admitted into the KV cache right now
+};
+
 struct server_slot_plan {
     // -1 if no slot is available; a busy slot if the task asks for it by id, the caller defers the task
     int id_slot = -1;
 
     // save the slot state to the prompt cache, then load the best match for the task
     bool update_cache = false;
+
+    // id_slot == -1: why, so the caller logs the honest reason
+    server_slot_refusal why = server_slot_refusal::no_slot;
 };
 
 // decides only, the caller applies the plan
 struct server_slot_sched {
     float slot_prompt_similarity = 0.0f;
+
+    // The KV admission ORACLE: may this task be admitted into the KV cache at all right now?  Injected by the
+    // owner (the server context, which owns the context size and the slots' held cells), so the scheduler stays a
+    // decision object that knows nothing about cells, reserves or margins.  It is asked ONCE, before a candidate
+    // is chosen, and a refusal travels the caller's existing "no slot is available -> defer" path -- so there is
+    // no second defer site, the release wake and the deferred count cover it for free, and a prompt pinned to an
+    // idle `id_slot` is refused by the same path.  It therefore MUST stay slot-INDEPENDENT: a whole-request
+    // go/no-go, never "does it fit on this candidate" (that would have to be asked per candidate, inside the
+    // selection loops below, and a refinement such as "reuse this slot's resident prefix" would silently be
+    // wrong here).  Null = admit everything (the stock behaviour).
+    std::function<bool(const server_task &)> admit;
 
     // idle slots that lose the least by being reused: empty slots first, then the least recently used ones
     std::vector<int> get_free_slots(const std::vector<server_slot_info> & slots, size_t n_slots_needed, int exclude_id_slot) const;
