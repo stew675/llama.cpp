@@ -68,6 +68,32 @@ static __device__ __forceinline__ void dump_store(
 
 constexpr int n_unroll = 4; // Manually unroll this many loop iterations for better performance.
 
+// Writes the tile_spec entries of one expert (thread 0 of its block only).
+//
+// Upstream (#31047) assigns one MUL_MAT_ID tile per tile_spec entry and launches exactly
+//     ntj = ceil(n_tokens*n_expert_used / tile_width) + n_experts
+// blocks in the grid: the entries at < ntj - n_experts are the tile-aligned tiles indexed by their column
+// position, and the last n_experts entries ("between the seams") hold each expert's remaining columns.
+static __device__ __forceinline__ void mm_ids_write_tile_spec(
+        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int expert, const int nex_prev, const int n_dumped,
+        const uint3 tile_width, const int n_tokens, const int n_expert_used) {
+    int col_low  = nex_prev;
+    int col_high = nex_prev + min(int(tile_width.z), n_dumped);
+
+    // The while loop covers all tiles at the seams containing the column with % tile_width == 0.
+    while (col_high > fastdiv(col_low + tile_width.z - 1, tile_width) * tile_width.z) {
+        tile_spec[fastdiv(col_low + tile_width.z - 1, tile_width)]
+            = {expert, col_low, col_high, /*padding =*/ 0};
+
+        col_low  = col_high;
+        col_high = min(col_high + int(tile_width.z), nex_prev + n_dumped);
+    }
+
+    // Finally, at most one extra tile_spec between the seams per expert.
+    tile_spec[fastdiv(n_tokens*n_expert_used + tile_width.z - 1, tile_width) + expert]
+        = {expert, col_low, col_high, /*padding =*/ 0};
+}
+
 // Helper function for mul_mat_id, converts ids to a more convenient format.
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
 // ids_dst describes the same mapping but for the dst tensor.
@@ -219,21 +245,70 @@ static __global__ void mm_ids_helper(
         return;
     }
 
-    int col_low  = nex_prev;
-    int col_high = nex_prev + min(int(tile_width.z), n_dumped);
+    mm_ids_write_tile_spec(tile_spec, expert, nex_prev, n_dumped, tile_width, n_tokens, n_expert_used);
+}
 
-    // The while loop covers all tiles at the seams containing the column with % tile_width == 0.
-    while (col_high > fastdiv(col_low + tile_width.z - 1, tile_width) * tile_width.z) {
-        tile_spec[fastdiv(col_low + tile_width.z - 1, tile_width)]
-            = {expert, col_low, col_high, /*padding =*/ 0};
+// Replace the `n_experts` one-warp expert blocks of the helper with ONE 1024-thread block for the
+// 512-experts / 10-used shape (RDNA3_5 source of record + RDNA4): one bucket-sort pass over
+// n_tokens*n_expert_used slots with per-expert counters in shared memory, then the same tile_spec writer.
+// Measured gfx1201: prefill +4.5 % pp16384 / +5.2 % pp2048, decode unaffected (the helper feeds the mmq
+// prefill path only), same-seed text byte-identical.  Kill switch: GGML_CUDA_DISABLE_MMID_512.
+//
+// An expert id may repeat within a token's row: every occurrence is an independent destination column and
+// gets its own compact row, which is why the scatter is per (token, iex) slot and not per token.
+static __global__ void __launch_bounds__(1024) mm_ids_helper_512_10(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
+        ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, const int n_tokens, const int nchannels_y,
+        const uint3 tile_width, const int si1, const int sis1, const bool write_inverse) {
+    constexpr int n_experts    = 512;
+    constexpr int n_expert_used = 10;
 
-        col_low  = col_high;
-        col_high = min(col_high + int(tile_width.z), nex_prev + n_dumped);
+    __shared__ int counts[n_experts];
+    __shared__ int cursors[n_experts];
+
+    const int tid = threadIdx.x;
+    if (tid < n_experts) {
+        counts[tid]  = 0;
+        cursors[tid] = 0;
     }
+    __syncthreads();
 
-    // Finally, at most one extra tile_spec between the seams per expert.
-    tile_spec[fastdiv(n_tokens*n_expert_used + tile_width.z - 1, tile_width) + expert]
-        = {expert, col_low, col_high, /*padding =*/ 0};
+    const int n_slots = n_tokens * n_expert_used;
+    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
+        const int token = idx / n_expert_used;
+        const int iex   = idx - token * n_expert_used;
+        atomicAdd(&counts[ids[token * si1 + iex]], 1);
+    }
+    __syncthreads();
+
+    // The expert offsets are cumulative (thread 0 only: counts[] is read and rewritten in place).
+    if (tid == 0) {
+        int nex_prev = 0;
+        for (int e = 0; e < n_experts; ++e) {
+            const int c = counts[e];
+            counts[e] = nex_prev;
+            nex_prev += c;
+        }
+    }
+    __syncthreads();
+
+    for (int idx = tid; idx < n_slots; idx += blockDim.x) {
+        const int token  = idx / n_expert_used;
+        const int iex    = idx - token * n_expert_used;
+        const int expert = ids[token * si1 + iex];
+        const int dst    = counts[expert] + atomicAdd(&cursors[expert], 1);
+        ids_dst[dst] = idx;
+        if (write_inverse) {
+            ids_src1[idx] = dst;
+        } else {
+            ids_src1[dst] = token * sis1 + iex % nchannels_y;
+        }
+    }
+    __syncthreads();
+
+    if (tid < n_experts) {
+        mm_ids_write_tile_spec(tile_spec, tid, counts[tid], cursors[tid], tile_width, n_tokens, n_expert_used);
+    }
 }
 
 template <int n_expert_used_template>
@@ -267,6 +342,20 @@ void ggml_cuda_launch_mm_ids_helper(
         int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int tile_width,
         const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+    // The 512-expert / 10-used fast path (block 00): one 1024-thread block instead of 512 one-warp expert
+    // blocks.  RDNA3_5 (source of record) + RDNA4 only -- the shape is a qwen4exp host-expert model's.
+    {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        static const bool mmid_512_disabled = getenv("GGML_CUDA_DISABLE_MMID_512") != nullptr;
+        if (!mmid_512_disabled && (GGML_CUDA_CC_IS_RDNA3_5(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) &&
+                n_experts == 512 && n_expert_used == 10) {
+            mm_ids_helper_512_10<<<1, 1024, 0, stream>>>(
+                ids, ids_src1, ids_dst, tile_spec, n_tokens, nchannels_y, init_fastdiv_values(tile_width),
+                si1, sis1, write_inverse);
+            return;
+        }
+    }
+
     switch (n_expert_used) {
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, tile_spec,

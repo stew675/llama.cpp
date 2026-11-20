@@ -677,6 +677,69 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+// GGML_OP_GLU in place (r323): an FFN's gate, up and GLU output are not all live at once -- the GLU output takes
+// the GATE's memory when the gate has exactly one reader and no views, which is the whole of an FFN's saving
+// (Qwen3.8-27B at -ub 2048: 150 MiB of compute buffer).  Three properties matter and each has a way to be wrong:
+//   * the UP must never be taken (a backend whose gated GLU is a chain destroys it -- CANN's `aclnn Silu` into dst
+//     followed by `aclnnInplaceMul(dst, src1)` would square the up operand),
+//   * a second reader of the gate must decline,
+//   * the one-input (split) form halves ne[0], so it never has the same layout and never qualifies.
+// This is the only coverage of the rule: `test-backend-ops` cannot see a memory-layout decision, and a wrong
+// answer here is a silent one.  The GGML_GLU_INPLACE=0 arm is the shell gate's (scripts/gate-glu-inplace.sh).
+static void test_glu_inplace() {
+    {
+        // one reader each: the output takes the gate, not the up
+        dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+        auto [ctx, graph, ctx_ptr] = make_context();
+
+        ggml_tensor * x[3];
+        x[0] = make_input_1d(ctx, 8);
+        x[1] = make_input_1d(ctx, 8);
+        x[2] = ggml_glu_split(ctx, x[0], x[1], GGML_GLU_OP_SWIGLU);
+        assign_names(ctx);
+
+        ggml_gallocr_ptr galloc = allocate_graph(graph, x[2], &backend.buffer_type);
+        check_all_allocated(graph);
+        check_no_overlap(graph);
+        GGML_ASSERT(x[2]->data == x[0]->data);
+        GGML_ASSERT(x[2]->data != x[1]->data);
+        GGML_ASSERT(backend.context->allocated_total() <= 2*32);   // gate + up; the output lives in the gate
+    }
+    {
+        // a second reader of the gate: the output is allocated on its own
+        dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+        auto [ctx, graph, ctx_ptr] = make_context();
+
+        ggml_tensor * x[4];
+        x[0] = make_input_1d(ctx, 8);
+        x[1] = make_input_1d(ctx, 8);
+        x[2] = ggml_glu_split(ctx, x[0], x[1], GGML_GLU_OP_SWIGLU);
+        x[3] = ggml_add(ctx, x[0], x[2]);   // x0 now has two readers
+        assign_names(ctx);
+
+        ggml_gallocr_ptr galloc = allocate_graph(graph, x[3], &backend.buffer_type);
+        check_all_allocated(graph);
+        GGML_ASSERT(x[2]->data != x[0]->data);
+        GGML_ASSERT(x[2]->data != x[1]->data);
+        GGML_ASSERT(backend.context->allocated_total() > 2*32);     // the output is its own allocation
+    }
+    {
+        // the one-input form: ne[0] is halved, so the layouts differ and the gate is not reused
+        dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+        auto [ctx, graph, ctx_ptr] = make_context();
+
+        ggml_tensor * x[2];
+        x[0] = make_input_1d(ctx, 16);
+        x[1] = ggml_glu(ctx, x[0], GGML_GLU_OP_SWIGLU, false);
+        assign_names(ctx);
+        GGML_ASSERT(x[1]->ne[0] == 8);
+
+        ggml_gallocr_ptr galloc = allocate_graph(graph, x[1], &backend.buffer_type);
+        check_all_allocated(graph);
+        GGML_ASSERT(x[1]->data != x[0]->data);
+    }
+}
+
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
 // matches the actual size of the buffer allocated for the ctx tensors
 static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
@@ -1121,6 +1184,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_glu_inplace", test_glu_inplace);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
