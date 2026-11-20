@@ -58,9 +58,7 @@ typedef uint64_t ggml_cuda_thread_mask_t;
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
-#define CUresult hipError_t
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
-#define CUDA_ERROR_OUT_OF_MEMORY hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
