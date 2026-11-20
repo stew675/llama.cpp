@@ -72,6 +72,29 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 find_package(Threads REQUIRED)
 target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
 
+if (LLAMA_ALL_WARNINGS AND NOT MSVC)
+    # -Wshadow catches the dangerous "declaration shadows a local variable" class in src/ (the
+    # mask-chain bug of 2026-09-11 was one).  GCC's -Wshadow additionally reports the ubiquitous
+    # "declaration shadows a member" constructor idiom and "hides constructor", which the delivery
+    # does not police and which the container build (GCC host compiler) surfaced by the thousand;
+    # -Wshadow=local keeps the dangerous local-shadow class and drops that member/global output.
+    #
+    # clang has no =local form: plain -Wshadow there also reports every upstream "local or parameter
+    # named after the field it belongs to" (`mctx`, `params`, `n_embd`, `n_kv`, ... -- 100+ sites across
+    # src/ and src/models/) as well as the `ml` member/parameter idiom.  The delivery deliberately keeps
+    # upstream's identifiers (renaming them re-skins every re-base conflict for no correctness gain:
+    # TODO #101) and picks up upstream's own fixes on the weekly re-base, so it does not police that
+    # class on clang.  Keep -Wshadow on the files this delivery ADDS (where a new shadow is a defect,
+    # as it was in the 2026-09-11 finding) and leave it off elsewhere on clang; the container build
+    # (GCC) still has -Wshadow=local over the whole target.
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wshadow=local>)
+    else()
+        target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wno-shadow>)
+        set_source_files_properties(llama-lazy-reader.cpp PROPERTIES COMPILE_OPTIONS "-Wshadow")
+    endif()
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

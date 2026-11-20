@@ -132,7 +132,6 @@ typedef uint32_t ggml_cuda_thread_mask_t;
 
 // Additional mappings for MUSA graphs
 #define CUDA_SUCCESS MUSA_SUCCESS
-#define CUDA_ERROR_OUT_OF_MEMORY MUSA_ERROR_OUT_OF_MEMORY
 #define CUresult MUresult
 #define cuGetErrorString muGetErrorString
 #define cudaErrorGraphExecUpdateFailure musaErrorGraphExecUpdateFailure
