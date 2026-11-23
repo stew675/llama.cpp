@@ -369,6 +369,14 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_TQ1_0:
+            get_rows_cuda_kq<64, dst_t, dequantize_tq1_0<dst_t>>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        case GGML_TYPE_TQ2_0:
+            get_rows_cuda_kq<64, dst_t, dequantize_tq2_0<dst_t>>(src0_d, src1_d, dst_d,
+                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
         case GGML_TYPE_Q2_K:
             get_rows_cuda_kq<64, dst_t, dequantize_q2_K<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
@@ -473,6 +481,10 @@ void get_rows_cuda(
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    if (src0->type == GGML_TYPE_TQ1_0 || src0->type == GGML_TYPE_TQ2_0) {
+        ctx.tq_census[2]++;
+    }
 
     cudaStream_t stream = ctx.stream();
 

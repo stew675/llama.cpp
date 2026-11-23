@@ -68,6 +68,7 @@
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
 #include "ggml-cuda/mean.cuh"
+#include "ggml-cuda/tq.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
@@ -2226,6 +2227,84 @@ static const ggml_tensor * ggml_cuda_get_mul_mat_id_scale(const ggml_tensor * re
     return scale;
 }
 
+// TQ1_0 / TQ2_0 weights, one src1 column (tq.cu's vec kernel): gate + up + SWIGLU as one launch that writes the GLU,
+// a matmul and the ADD of its result (the residual) as one launch that writes the ADD, or two or three matmuls over the
+// same src1 (e.g. the K and V projections) as one launch.  Every row keeps its own
+// unchanged dot product, and the GLU is computed as the GLU kernel does, so the results are those of the separate ops.
+// Returns the index offset of the last fused node.  GGML_CUDA_TQ_FUSE=0: off.
+static int ggml_cuda_tq_try_fuse(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_TQ_FUSE"); return e == nullptr || atoi(e) != 0; }();
+    const ggml_tensor * node = cgraph->nodes[i];
+    if (!on || node->op != GGML_OP_MUL_MAT || !ggml_cuda_mul_mat_tq_vec_ok(node)) {
+        return 0;
+    }
+    const auto same = [&](const ggml_tensor * t) {
+        return t->op == GGML_OP_MUL_MAT && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && t->src[1] == node->src[1] &&
+               t->src[0]->type == node->src[0]->type && t->src[0]->ne[0] == node->src[0]->ne[0] &&
+               ggml_cuda_mul_mat_tq_vec_ok(t) && ggml_is_matrix(t->src[0]) && ggml_is_vector(t) && ggml_is_contiguous(t);
+    };
+    if (!same(node)) {
+        return 0;
+    }
+    if (i + 2 < cgraph->n_nodes) {
+        const ggml_tensor * mm1 = cgraph->nodes[i + 1];
+        ggml_tensor       * glu = cgraph->nodes[i + 2];
+        const ggml_op ops[3]    = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+        const int     out[1]    = { i + 2 };
+        if (glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && !ggml_get_op_params_i32(glu, 1) &&
+                glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) && same(mm1) &&
+                ((glu->src[0] == node && glu->src[1] == mm1) || (glu->src[0] == mm1 && glu->src[1] == node)) &&
+                ggml_are_same_shape(node->src[0], mm1->src[0]) && ggml_are_same_shape(glu, node) &&
+                ggml_can_fuse_subgraph(cgraph, i, 3, ops, out, 1) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out, 1)) {
+            const ggml_tensor * mm[2] = { glu->src[0], glu->src[1] }; // gate, up
+            ggml_cuda_mul_mat_tq_vec(*ctx, mm, 2, glu, nullptr);
+            return 2;
+        }
+    }
+
+    // matmul + ADD (the residual): the sum is written by the matmul's threads, element by element, so the ADD may write in
+    // place over its other operand, but not over the matmul's src1, which other thread blocks may still be reading
+    if (i + 1 < cgraph->n_nodes) {
+        ggml_tensor   * add    = cgraph->nodes[i + 1];
+        const ggml_op   ops[2] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+        const int       out[1] = { i + 1 };
+        const ggml_tensor * res = add->src[0] == node ? add->src[1] : add->src[0];
+        const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+            const uintptr_t a0 = (uintptr_t) a->data, a1 = a0 + ggml_nbytes(a), b0 = (uintptr_t) b->data, b1 = b0 + ggml_nbytes(b);
+            return a0 < b1 && b0 < a1;
+        };
+        if (add->op == GGML_OP_ADD && (add->src[0] == node || add->src[1] == node) && res != node &&
+                add->type == GGML_TYPE_F32 && res->type == GGML_TYPE_F32 && ggml_are_same_shape(add, node) &&
+                ggml_are_same_shape(res, add) && ggml_is_contiguous(add) && ggml_is_contiguous(res) &&
+                ggml_can_fuse_subgraph(cgraph, i, 2, ops, out, 1) && !overlap(add, node->src[1]) && !overlap(res, node->src[1]) &&
+                (!overlap(add, res) || add->data == res->data)) {
+            const ggml_tensor * mm[1] = { node };
+            ggml_cuda_mul_mat_tq_vec(*ctx, mm, 1, nullptr, add);
+            return 1;
+        }
+    }
+
+    const ggml_tensor * mm[3] = { node, nullptr, nullptr };
+    int n    = 1;
+    int last = i;
+    for (int j = i + 1; j < std::min(cgraph->n_nodes, i + 8) && n < 3; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (!same(t)) {
+            break;
+        }
+        mm[n++] = t;
+        last    = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    ggml_cuda_mul_mat_tq_vec(*ctx, mm, n, nullptr, nullptr);
+    return last - i;
+}
+
 int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -3017,6 +3096,11 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // TQ1_0 / TQ2_0 decode (tq.cu): gate + up + SWIGLU, or two or three matmuls over the same src1, in one launch
+    if (const int n_tq = ggml_cuda_tq_try_fuse(cuda_ctx, cgraph, i)) {
+        return n_tq;
     }
 
     // Dual-output mmvq fusion (owned by mmvq.cu).  The row concat runs first (the submitter's order, measured identical to

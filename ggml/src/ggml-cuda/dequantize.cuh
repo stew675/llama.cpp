@@ -448,6 +448,34 @@ static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const 
     }
 }
 
+// TQ1_0 / TQ2_0 (ternary): 64 threads per block, 4 values each; value = (trit - 1) * d as in ggml-quants.c
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_tq1_0(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_tq1_0 * x = (const block_tq1_0 *) vx + ib;
+
+    const float d = __half2float(x->d);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int e = tid + 64*k;
+        yy[e] = ggml_cuda_cast<dst_t>((float) (ggml_cuda_tq1_0_trit(x, e) - 1) * d);
+    }
+}
+
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_tq2_0(const void * vx, const int64_t ib, dst_t * yy, const int tid) {
+    const block_tq2_0 * x = (const block_tq2_0 *) vx + ib;
+
+    // value 128*h + 32*l + m is bits 2l..2l+1 of qs[32*h + m]; thread tid takes byte tid
+    const int     h = tid / 32;
+    const int     m = tid % 32;
+    const uint8_t q = x->qs[tid];
+    const float   d = __half2float(x->d);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        yy[128*h + 32*l + m] = ggml_cuda_cast<dst_t>((float) (((q >> (2*l)) & 3) - 1) * d);
+    }
+}
+
 template<typename dst_t>
 static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
 

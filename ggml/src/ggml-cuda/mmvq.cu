@@ -369,8 +369,8 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
-    if (!ggml_is_quantized(type)) {
-        return false;
+    if (!ggml_is_quantized(type) || type == GGML_TYPE_TQ1_0 || type == GGML_TYPE_TQ2_0) {
+        return false; // TQ1_0 / TQ2_0: tq.cu
     }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.

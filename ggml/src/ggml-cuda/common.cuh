@@ -1466,6 +1466,28 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ4_NL> {
     static constexpr int bs = sizeof(block_iq4_nl);
 };
 
+// TQ1_0 (ggml-quants.c dequantize_row_tq1_0): the trit 0..2 of value e (0..255) of a block, the stored value being trit - 1.
+// qs[0..31] hold values 0..159 (digit e/32 of byte e%32), qs[32..47] values 160..239 (digit (e-160)/16 of byte
+// 32 + (e-160)%16), qh[0..3] values 240..255 (digit (e-240)/4 of byte (e-240)%4); digit n of byte b is
+// ((uint8_t) (b*3^n) * 3) >> 8.
+static __device__ __forceinline__ int ggml_cuda_tq1_0_trit(const block_tq1_0 * x, const int e) {
+    int b;
+    int n;
+    if (e < 160) {
+        b = x->qs[e % 32];
+        n = e / 32;
+    } else if (e < 240) {
+        b = x->qs[32 + (e - 160) % 16];
+        n = (e - 160) / 16;
+    } else {
+        b = x->qh[(e - 240) % 4];
+        n = (e - 240) / 4;
+    }
+    const int     p = n == 0 ? 1 : n == 1 ? 3 : n == 2 ? 9 : n == 3 ? 27 : 81;
+    const uint8_t q = (uint8_t) (b * p);
+    return ((uint16_t) q * 3) >> 8;
+}
+
 template<>
 struct ggml_cuda_type_traits<GGML_TYPE_IQ4_XS> {
     static constexpr int qk = QK_K;
@@ -1954,6 +1976,11 @@ struct ggml_backend_cuda_context {
     // GGML_CUDA_FUSE_GDN_NORM_GATE_SILU=0 declined.  All three are counted AT THE GATE NODE, i.e. where the host walks
     // the graph, so a replayed graph adds nothing.
     uint64_t            gdn_norm_gate_census[3] = {};
+    // census (GGML_CUDA_TQ_CENSUS=1, logged when the context is freed): TQ1_0 / TQ2_0 weights, [0] MUL_MAT through the
+    // small-batch kernel, [1] MUL_MAT through the MMA kernel, [2] GET_ROWS, [3] decode launches of the vec kernel, [4] the
+    // nodes they took on top of the first matmul (fused matmuls and ADDs; GGML_CUDA_TQ_FUSE=0: none).  Host-side calls: a replayed graph
+    // adds nothing.
+    uint64_t            tq_census[5] = {};
     const ggml_tensor * glu_q8_1_mm   = nullptr;
     std::vector<q8_1_cache_entry> q8_1_cache;
     size_t q8_1_arena_pos = 0;
