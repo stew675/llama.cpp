@@ -7,6 +7,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -26,6 +29,63 @@
 //
 // llama_context
 //
+
+// a batch of several sequences the derived kq mask cannot serve (see llama_kv_cache::kq_mask_derivable_seqs); a batch of
+// at most KQ_DERIVED_MULTISEQ_MIN_TOKENS tokens has only ubatches that keep the packed mask, which the reserve covers
+static bool batch_needs_packed_multiseq(const llama_batch_ext & batch, const std::vector<llama_kv_cache *> & kvs) {
+    if (kvs.empty() || batch.tokens.size() <= llama_kv_cache::KQ_DERIVED_MULTISEQ_MIN_TOKENS) {
+        return false;
+    }
+
+    // fixed-size, no allocation: this runs on every decode() batch until a latch fires
+    llama_seq_id seqs[LLAMA_MAX_SEQ];
+    bool seen[LLAMA_MAX_SEQ] = {};
+    uint32_t n_seqs = 0;
+    llama_pos pos_max = 0;
+
+    for (const auto & tok : batch.tokens) {
+        if (tok.seq_ids.size() > 1) {
+            return true;
+        }
+        for (const llama_seq_id s : tok.seq_ids) {
+            if (s < 0 || s >= LLAMA_MAX_SEQ) {
+                return true;
+            }
+            if (!seen[s]) {
+                seen[s] = true;
+                seqs[n_seqs++] = s;
+            }
+        }
+        pos_max = std::max(pos_max, tok.pos[0]);
+    }
+
+    if (n_seqs <= 1) {
+        return false;
+    }
+    for (const auto * kv : kvs) {
+        if (!kv->kq_mask_derivable_seqs(seqs, n_seqs, pos_max)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// issue #238: does this batch carry a non-degenerate 2-D (M-RoPE) position?  Only an embedding entry (an
+// image/audio chunk, i.e. no token id) can: the batch allocator expands a text entry to [p, p, p, 0], so a
+// text token is degenerate by construction.  This mirrors what llama_ubatch::is_pos_2d() + the check in
+// llama_kv_cache::kq_mask_derivable() will decide for the resulting ubatch - an embedding whose sections
+// differ, or whose later sections were left at 0, needs the packed mask.
+static bool batch_has_pos_2d(const llama_batch_ext & batch) {
+    for (const auto & tok : batch.tokens) {
+        if (tok.id != LLAMA_TOKEN_NULL) {
+            continue;
+        }
+        if (tok.pos[0] != tok.pos[1] || tok.pos[0] != tok.pos[2]) {
+            return true;
+        }
+    }
+    return false;
+}
 
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
@@ -122,6 +182,28 @@ struct llm_fused_op_probe {
     llm_fused_op op;
     const char * name;
     uint32_t n_tokens_per_seq;
+
+    // number of sequences to reserve the probe graph with (0 = the context's n_seq_max)
+    uint32_t n_seqs = 0;
+
+    // the fused node has to land on a GPU device (used by features that only make sense on a GPU)
+    bool require_gpu = false;
+
+    // ... and specifically on a backend that implements the derived kq mask (CUDA/HIP)
+    bool require_kq_derived = false;
+
+    // the probe graph has to actually contain the fused op - otherwise nothing was verified
+    bool require_observed = false;
+
+    // ... and when the node is legitimately absent from the probe graph, ask the acting DEVICE
+    // whether it implements the op (ggml_backend_dev_supports_op) instead of reporting "enabled"
+    // from a graph that never built it.  That is r308's vacuity class (TODO #345): an op can be
+    // PREFILL-only (qwen4exp's DSV4 HC ops: its 1-token arm runs the fused HC_MIX/HC_COMBINE band),
+    // or belong to another arch entirely (TOP_K_MASK is built only by the DSA arches, while
+    // qwen4exp's indexer_top_k still arms this probe).  Only for ops whose backend predicate reads
+    // the SOURCE TYPES rather than the runtime geometry -- a shape-dependent predicate (the
+    // lightning indexer's) cannot be answered by any single probe shape, so that one stays inert.
+    bool query_supports_op = false;
 };
 
 static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
@@ -130,41 +212,284 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// V5 (r308): the kv_rows probe must OBSERVE the node, because its probe graph can be built on a shape that
+// never creates one.  The reserve/probe context carries `n_kv = kv->get_size()` (the whole PADDED cache
+// extent, llama-kv-cache.cpp), not the used depth, and a model's decode arm can depend on that extent:
+// qwen4exp (QSA) decodes dense only while `n_kv < qsa_dense_decode_until`, which is 32768 on gfx1151, so at
+// `-c 32768` (or any larger ctx) the probe graph takes the SPARSE arm and builds no rows node at all.
+// Without this flag that is a vacuous PASS and "enabled" is logged - and at the time (r308) NO kernel outside
+// NVIDIA turing-MMA read the rows form (fattn.cu's kv_rows branch returned NONE on every AMD arch, so the node
+// landed on the CPU backend), leaving every joint attention layer on the CPU at decode time.  Since r358 an AMD
+// MMA kernel (CDNA MFMA / RDNA WMMA, with the GQA-optimised layout) does read it, so "enabled" means the rows
+// form runs on the GPU - a CPU placement is still the defect this flag exists to catch, and
+// `scripts/gate-fused-probe-splits.sh` grades it by the device the node landed on and by `splits`, not by the
+// verdict alone (`INVARIANTS.md` r308 item 2, r358).
+//
+// Since r359 the form is OPT-IN and this probe runs only when `LLAMA_KV_ROWS_DISABLE=0` asks for it: the rows
+// form was measured slower than the dense one on gfx1201 at every reachable shape, including an 18x-compacted
+// row list (the seven-arm table is in `INVARIANTS.md` r359 and in the constructor's `auto_fkvr` block below),
+// because a rows graph cannot take the derived kq mask and must run the stream-k MMA kernel at decode width.
+//
+// Measured (Strix Halo, gfx1151, Qwen3.8 Flash-Next IQ4_NL, `--kv-unified`, ONE active slot, 15.5K depth):
+// plain decode `-c 32768` 11.0 t/s and 25 backend splits in the decode graph, against 32.5 t/s with
+// `LLAMA_KV_ROWS_DISABLE=1` and 32.5 t/s for `--no-kv-unified` (prefill unaffected); MTP `draft-mtp n3`
+// `-c 32768` 18.7 -> 62.4-65.0 t/s (3.3-3.5x), because the verify band takes the same dense arm, so every
+// verify step built the rows form too.  RDNA3_0 (gfx1100) and RDNA4 (gfx1201) cannot reach it (their
+// `qsa_dense_decode_until` is unbounded, so the probe always reaches the node and declines by placement), and
+// a non-QSA model never can; both were re-verified with the flag.
+//
+// DO NOT SHORTEN THIS INITIALIZER.  The list is POSITIONAL - the `/*.field =*/` designators below are
+// comments, not C++20 designated initializers - so a value inserted at the wrong position initializes the
+// wrong field.  Writing only `{op, name, 1, /*.require_observed =*/ true}` sets `n_seqs = 1` and leaves the
+// flag false, which measures exactly nothing (r308's first cut did that).
 static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
     /*.name             =*/ "Flash Attention over K/V rows",
     /*.n_tokens_per_seq =*/ 1,
+    /*.n_seqs           =*/ 0,
+    /*.require_gpu      =*/ false,
+    /*.require_kq_derived =*/ false,
+    /*.require_observed =*/ true,
 };
 
+// TODO #345 (a): this probe is INERT and stays inert (option (c) of the r308 follow-up).  Its backend
+// predicate is SHAPE-dependent -- ggml_cuda_lightning_indexer_generic_supported() rejects anything whose
+// q->ne[0] != 128 or whose head width is not 64/32/4 -- so no single probe shape answers the question
+// for a model whose indexer geometry differs (dsv4's is 64 heads, qwen4exp's is 4), and every backend has
+// a generic fallback for the op, so a device that cannot run the fused form is SLOW rather than wrong.
+// The models that read cparams.fused_lid gate on their own capability at their OWN geometry
+// (qwen4exp.cpp's lightning_indexer_op_supported() queries the real per-layer shape), which is the only
+// faithful instrument here.  `cparams.auto_flid` is therefore false, and the resolve block below never
+// runs -- keep the descriptor for that hook, not as a live probe.
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
     /*.name             =*/ "Lightning Indexer",
     /*.n_tokens_per_seq =*/ 1,
+    /*.n_seqs           =*/ 0,
+    /*.require_gpu      =*/ false,
+    /*.require_kq_derived =*/ false,
+    /*.require_observed =*/ false,
+    /*.query_supports_op =*/ false,
 };
 
+// The three DSV4 hyper-connection ops are built on EVERY shape by deepseek4/glm5-next/xing4-0, so the
+// placement verdict is available there -- but on qwen4exp they are PREFILL-only (build_hc_mix and
+// build_hc_combine collapse to HC_MIX/HC_COMBINE up to HC_FUSED_MAX_TOKENS/HC_BF16_MAX_TOKENS, i.e. at
+// the probe's 1 token), so the probe graph can never contain them for the model family this box actually
+// runs.  `query_supports_op` is the fallback for exactly that case: when the probe graph DID contain the
+// node the placement verdict below is the stronger answer and is used unchanged.
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
     /*.name             =*/ "fused DeepSeek V4 HC pre",
     /*.n_tokens_per_seq =*/ 1,
+    /*.n_seqs           =*/ 0,
+    /*.require_gpu      =*/ false,
+    /*.require_kq_derived =*/ false,
+    /*.require_observed =*/ false,
+    /*.query_supports_op =*/ true,
 };
 
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COMB,
     /*.name             =*/ "fused DeepSeek V4 HC comb",
     /*.n_tokens_per_seq =*/ 1,
+    /*.n_seqs           =*/ 0,
+    /*.require_gpu      =*/ false,
+    /*.require_kq_derived =*/ false,
+    /*.require_observed =*/ false,
+    /*.query_supports_op =*/ true,
 };
 
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
+    /*.n_seqs           =*/ 0,
+    /*.require_gpu      =*/ false,
+    /*.require_kq_derived =*/ false,
+    /*.require_observed =*/ false,
+    /*.query_supports_op =*/ true,
 };
 
+// TOP_K_MASK is built by the DSA arches (deepseek4/deepseek41/kimi-k31/glm5-next/dots3note/glm-dsa/
+// hy-v4/mistral-large4/deepseek32), never by qwen4exp -- whose GGUF still carries indexer_top_k (2048)
+// and therefore still ARMS this probe (cparams.auto_ftkm = hparams.indexer_top_k > 0).  On qwen4exp the
+// probe graph has no such node and there is no second gate, so before r311 this line reported "enabled"
+// having verified nothing.  Its backend predicate is a pure mask-type check (F16/F32), so the device
+// query is faithful.
 static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.op               =*/ LLM_FUSED_OP_TOP_K_MASK,
     /*.name             =*/ "fused top-k mask",
     /*.n_tokens_per_seq =*/ 1,
+    /*.n_seqs           =*/ 0,
+    /*.require_gpu      =*/ false,
+    /*.require_kq_derived =*/ false,
+    /*.require_observed =*/ false,
+    /*.query_supports_op =*/ true,
 };
+
+// V3: the derived kq mask only changes the flash attention prefill path (the packed mask stays for
+// decode and small batches), so the probe is a prefill-shaped single sequence
+static const llm_fused_op_probe llm_fused_op_kq_derived_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_DERIVED,
+    /*.name             =*/ "derived kq mask flash attention",
+    /*.n_tokens_per_seq =*/ 64,
+    /*.n_seqs           =*/ 1,
+    /*.require_gpu      =*/ true,
+    /*.require_kq_derived =*/ true,
+    /*.require_observed =*/ true,
+};
+
+// the derived kq mask is implemented by the CUDA/HIP backend only - any other backend that accepts
+// the flash attention op would silently ignore the derived sources.  An iGPU (APU) is still the
+// CUDA/HIP backend, so it implements the derived path too (the MMA kernel is the same one).
+static bool ggml_backend_dev_is_cuda(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    const auto type = ggml_backend_dev_type(dev);
+    if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return false;
+    }
+
+    const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+
+    return name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0);
+}
+
+// Only a tensor split distributes a single attention op across devices; tell the HIP FA chooser
+// so it can pick a per-GPU-bandwidth-friendly kernel config instead of the whole-card one.
+static void llama_context_set_fa_tensor_parallel_hint(const llama_model & model) {
+    int n_cuda_dev = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        if (ggml_backend_dev_is_cuda(ggml_backend_dev_get(i))) {
+            n_cuda_dev++;
+        }
+    }
+    ggml_set_fa_tensor_parallel(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1);
+}
+
+// true when this build exposes the CUDA/HIP backend at all
+static bool ggml_backend_cuda_family_available() {
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        const char * name = ggml_backend_reg_name(ggml_backend_reg_get(i));
+
+        if (name != nullptr && (strcmp(name, "CUDA") == 0 || strcmp(name, "ROCm") == 0)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// A minimal op tensor for `probe.query_supports_op`: the direct device query needs a tensor whose
+// SOURCE TYPES are the ones the graph will build, because that is all the backends' predicates for
+// these ops read (see ggml-cuda.cu's DSV4_HC_PRE/COMB/POST and TOP_K_MASK cases -- a type check, no
+// geometry).  Returns nullptr for an op with no faithful minimal form (a shape-dependent predicate),
+// which turns into "cannot verify" at the call site rather than a silent pass.
+static ggml_tensor * llm_fused_op_query_tensor(ggml_context * ctx, llm_fused_op op) {
+    switch (op) {
+        // the GATED form: qwen4exp -- the family whose probe graph never contains this op -- builds
+        // ggml_dsv4_hc_pre_gated(), and both forms share src types and the same op
+        case LLM_FUSED_OP_DSV4_HC_PRE: {
+            ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 4, 1);
+            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 4, 1);
+            return ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f/4.0f);
+        }
+        // hc_comb asserts hc == 4, so mixes is exactly (2 + hc)*hc = 24 wide
+        case LLM_FUSED_OP_DSV4_HC_COMB: {
+            ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 24, 1);
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+            ggml_tensor * base  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
+            return ggml_dsv4_hc_comb(ctx, mixes, scale, base, 0.0f, 1);
+        }
+        // the comb-present form (deepseek4); qwen4exp passes nullptr, and the predicate accepts both
+        case LLM_FUSED_OP_DSV4_HC_POST: {
+            ggml_tensor * x        = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 1);
+            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 4, 1);
+            ggml_tensor * post     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 1);
+            ggml_tensor * comb     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 4, 4, 1);
+            return ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        }
+        case LLM_FUSED_OP_TOP_K_MASK: {
+            ggml_tensor * mask  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 8, 1, 1, 1);
+            ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, 1, 1, 1);
+            return ggml_top_k_mask(ctx, mask, top_k, nullptr, nullptr, nullptr);
+        }
+        default:
+            return nullptr;
+    }
+}
+
+// Ask every acting DEVICE whether it implements the op -- the fallback for a probe whose node the probe
+// graph legitimately does not contain.  `model.dev_layer(il)` is the device that executes layer il; under
+// `-sm tensor` it is the Meta device, whose supports_op() requires EVERY tensor-parallel child to accept
+// the op, so this query is also the split-safety condition (the same reason qsa_op_supported() asks it).
+// Returns true when all of them accept it; on a refusal `*refused_dev`/`*refused_il` name the culprit.
+// Returns false with `*refused_dev == nullptr` when the op could not even be constructed (nothing verified).
+static bool llm_fused_op_query_devices(
+        const llama_model & model, llm_fused_op op,
+        ggml_backend_dev_t * refused_dev, uint32_t * refused_il) {
+    *refused_dev = nullptr;
+    *refused_il  = 0;
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 16*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * qop = llm_fused_op_query_tensor(ctx, op);
+    bool ok = qop != nullptr;
+
+    std::vector<ggml_backend_dev_t> seen;
+    for (uint32_t il = 0; ok && il < model.hparams.n_layer_all; ++il) {
+        ggml_backend_dev_t dev = model.dev_layer((int) il);
+        if (dev == nullptr) {
+            continue;
+        }
+        // one query per distinct device: a layer split repeats the same answer per layer
+        if (std::find(seen.begin(), seen.end(), dev) != seen.end()) {
+            continue;
+        }
+        seen.push_back(dev);
+
+        if (!ggml_backend_dev_supports_op(dev, qop)) {
+            *refused_dev = dev;
+            *refused_il  = il;
+            ok = false;
+        }
+    }
+
+    ggml_free(ctx);
+
+    return ok;
+}
+
+// the derived kq mask is only implemented by the CUDA/HIP backend.  A "meta" device (the
+// tensor-parallel wrapper used for multi-GPU tensor split) does not expose its sub-devices here, but
+// its supports_op forwards to all of them - which is exactly how the probed node ended up on it - so
+// accepting it is only safe while this build has the CUDA/HIP backend that the check above enforces.
+static bool ggml_backend_dev_implements_kq_derived(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+
+    switch (ggml_backend_dev_type(dev)) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+            return ggml_backend_dev_is_cuda(dev);
+        case GGML_BACKEND_DEVICE_TYPE_META:
+            return ggml_backend_cuda_family_available();
+        default:
+            return false;
+    }
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -183,6 +508,8 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
+
+    llama_context_set_fa_tensor_parallel_hint(model);
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -338,6 +665,52 @@ llama_context::llama_context(
         cparams.auto_fa    = false;
     }
 
+    cparams.kq_mask_derived = true;
+    cparams.auto_kq_mask_derived = true;
+    {
+        const char * LLAMA_KQ_MASK_DERIVED = getenv("LLAMA_KQ_MASK_DERIVED");
+        if (LLAMA_KQ_MASK_DERIVED) {
+            // only an explicit 0 forces the packed mask - the probe below stays in charge of whether
+            // the backend can actually run the derived form
+            cparams.kq_mask_derived = atoi(LLAMA_KQ_MASK_DERIVED) != 0;
+            cparams.auto_kq_mask_derived = cparams.kq_mask_derived;
+            LLAMA_LOG_INFO("%s: derived kq mask = %d (env)\n", __func__, cparams.kq_mask_derived);
+        }
+    }
+
+    // issue #238: the packed kq mask costs 2 bytes per KV cell per ubatch token (860 MiB of VRAM plus as
+    // much pinned host memory at -c 220160 -ub 2048) and only a batch the derived form cannot serve needs
+    // it.  For an M-RoPE model (Qwen3.x is IMROPE even for text) that is a batch carrying non-degenerate
+    // 2-D positions, i.e. an image/audio chunk from a multimodal projector.  Two signals decide it:
+    //   * `params.pos_2d` - the caller declares that 2-D positions can reach this context (`common` sets
+    //     it when --mmproj is given), so a multimodal run keeps the worst-case reserve at load time and
+    //     never has to grow later;
+    //   * `kq_mask_pos_2d_seen` - latched in decode() when a 2-D batch actually arrives from a caller that
+    //     did not declare it, which forces one re-reserve with the packed mask.
+    // Without either, the much smaller derived layout is reserved: a text-only M-RoPE context never pays.
+    // LLAMA_KQ_MASK_PACKED_RESERVE=1 forces the packed reserve for every M-RoPE context (the pre-r160
+    // behaviour); =0 forces the derived one and disables the latch (the growth path is the fallback).
+    cparams.kq_mask_pos_2d        = params.pos_2d;
+    cparams.kq_mask_packed_reserve = -1;
+    {
+        const char * e = getenv("LLAMA_KQ_MASK_PACKED_RESERVE");
+        if (e != nullptr) {
+            cparams.kq_mask_packed_reserve = atoi(e) != 0 ? 1 : 0;
+            LLAMA_LOG_INFO("%s: packed kq mask reserve = %d (env)\n", __func__, cparams.kq_mask_packed_reserve);
+        } else if (cparams.kq_mask_pos_2d && hparams.n_pos_per_embd() > 1) {
+            LLAMA_LOG_INFO("%s: packed kq mask reserve = 1 (2-D positions declared, e.g. a multimodal projector)\n",
+                    __func__);
+        }
+    }
+
+
+    // TODO #345 (c): the Lightning Indexer probe is inert ON PURPOSE.  Its backend predicate is
+    // shape-dependent (q->ne[0] == 128 and a 64/32/4 head width in
+    // ggml_cuda_lightning_indexer_generic_supported), so no single probe shape answers it for a model
+    // whose indexer geometry differs -- dsv4 is 64 heads, qwen4exp is 4 -- and every backend has a
+    // generic fallback for the op, so an unsupported device is SLOW rather than wrong.  The models that
+    // read fused_lid gate on their own capability at their OWN geometry (qwen4exp.cpp's
+    // lightning_indexer_op_supported(), which asks the real per-layer shape).
     cparams.fused_lid = true;
     cparams.auto_flid = false;
 
@@ -384,16 +757,48 @@ llama_context::llama_context(
     cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
 
     // resolved after flash attention, see resolve_fused_ops()
+    //
+    // Upstream's `ggml_flash_attn_ext_rows` ("kv_rows") form is OPT-IN on this delivery since r359: it is the
+    // one attention form that ONLY the MMA kernel reads, so on an RDNA box it always costs both the band/tile
+    // kernel family and the derived (materialised-mask-free) kq mask, and together those outweigh every
+    // compaction the row list can buy.  Measured on gfx1201 (GitHub issue #365), ONE R9700,
+    // `--kv-unified -np 2 -ctk/-ctv q8_0`; the same-seed greedy text is identical in every arm, so this is a
+    // pure form/placement decision and not a numerics one:
+    //
+    //   Qwen3.8-27B-UD-Q5_K_XL, -c 131072, a 94428-token prompt into slot 0 (row list == the whole extent):
+    //     rows on  pp 833.6 tg 14.74       rows off pp 847.1 tg 23.41     -> dense +59 %
+    //   ... then a 5246-token prompt into slot 1 while slot 0 stays resident (row list 18x shorter):
+    //     rows on  pp 1219.3 tg 25.96      rows off pp 1223.2 tg 27.23    -> dense  +5 %
+    //   Flash-Next GSQ-RCO-IQ3_XXS (host experts), the same two shapes:
+    //     rows on  pp 1998.9 tg 14.80      rows off pp 1994.9 tg 18.20    -> dense +23 %
+    //     rows on  pp 1654.4 tg 31.98      rows off pp 1664.2 tg 34.34    -> dense  +7 %
+    //   and on the dense model with the band disabled, i.e. inside the MMA family alone:
+    //     rows on  tg 14.74                 rows off tg 21.78             -> the row list itself costs ~32 %
+    //
+    // The compaction never paid, not even at 18x.  Two mechanisms, both visible in `-lv 4`: a rows graph builds
+    // no plain `ggml_flash_attn_ext` node, so the derived kq mask probe cannot observe its op and the mask is
+    // then MATERIALISED (n_kv_rows x n_tokens f16 per ubatch, host-filled) where the dense form derives it in
+    // the kernel and materialises nothing; and the rows kernel is stream-k MMA, which at decode width is
+    // slower than the band/tile family even at equal work.  The dense form is upstream's own pre-kv_rows path
+    // and reads the same text (prefill-logit KLD 0.000000 against the recorded base), so opting out gives
+    // nothing up.  The switch keeps its upstream meaning on both sides of the flip: `0` = "do not disable" =
+    // the opt-in, `1`/unset = off.  The probe below still runs on request and still grades the hardware
+    // capability (r358), which `scripts/gate-fused-probe-splits.sh` exercises with the opt-in set.
     {
         cparams.fused_kv_rows = false;
 
+        // value-gated, not presence-only: an EMPTY value (or an unset one) keeps the delivery default, so a
+        // script that exports `LLAMA_KV_ROWS_DISABLE=` (or a `set -u` slip) cannot turn the measured-loss form on
         const char * LLAMA_KV_ROWS_DISABLE = getenv("LLAMA_KV_ROWS_DISABLE");
-        if (!LLAMA_KV_ROWS_DISABLE) {
-            cparams.auto_fkvr = cparams.kv_unified;
-        } else {
-            LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
-            cparams.auto_fkvr = false;
-        }
+        const bool   kv_rows_opt_in = LLAMA_KV_ROWS_DISABLE != nullptr && LLAMA_KV_ROWS_DISABLE[0] != '\0' &&
+                                      atoi(LLAMA_KV_ROWS_DISABLE) == 0;
+
+        cparams.auto_fkvr = kv_rows_opt_in && cparams.kv_unified;
+
+        LLAMA_LOG_INFO("%s: K/V rows attention: %s\n", __func__,
+                cparams.auto_fkvr ?   "requested (LLAMA_KV_ROWS_DISABLE=0), probing the device" :
+                kv_rows_opt_in ?      "not used (the cache is not --kv-unified)" :
+                                      "dense form (opt-in: LLAMA_KV_ROWS_DISABLE=0; INVARIANTS.md r359)");
     }
 
     // initialized later
@@ -675,18 +1080,22 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             return;
         }
 
-        const uint32_t n_tokens_probe = probe.n_tokens_per_seq*n_seqs;
+        const uint32_t n_seqs_probe    = probe.n_seqs > 0 ? probe.n_seqs : n_seqs;
+        const uint32_t n_tokens_probe  = probe.n_tokens_per_seq*n_seqs_probe;
 
-        auto * gf = graph_reserve(n_tokens_probe, n_seqs, n_tokens_probe, mctx, true);
+        auto * gf = graph_reserve(n_tokens_probe, n_seqs_probe, n_tokens_probe, mctx, true);
         if (!gf) {
             throw std::runtime_error(std::string("failed to reserve graph for ") + probe.name + " check");
         }
 
         bool device_mismatch = false;
+        bool observed = false;
         for (const auto & node : get_gf_res_reserve()->get_fused_nodes()) {
             if (node.op != probe.op) {
                 continue;
             }
+
+            observed = true;
 
             GGML_ASSERT(node.il >= 0);
 
@@ -707,14 +1116,86 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                 device_mismatch = true;
                 break;
             }
+
+            const auto device_fused_type = ggml_backend_dev_type(device_fused);
+
+            if (probe.require_gpu && device_fused_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    device_fused_type != GGML_BACKEND_DEVICE_TYPE_IGPU &&
+                    device_fused_type != GGML_BACKEND_DEVICE_TYPE_META) {
+                LLAMA_LOG_WARN("%s: %s is not supported on a CPU device\n", func, probe.name);
+                device_mismatch = true;
+                break;
+            }
+
+            if (probe.require_kq_derived && !ggml_backend_dev_implements_kq_derived(device_fused)) {
+                LLAMA_LOG_WARN("%s: %s is assigned to %s, but it is only implemented by the CUDA/HIP backend\n",
+                        func, probe.name,
+                        device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                device_mismatch = true;
+                break;
+            }
+        }
+
+        if (!observed && probe.require_observed) {
+            LLAMA_LOG_WARN("%s: %s was not used in the probe graph, set to disabled\n", func, probe.name);
+            device_mismatch = true;
+        }
+
+        // The node can be legitimately absent (a PREFILL-only op, or a model that does not build it at
+        // all): a probe graph that never contained it has verified nothing, so ask the acting DEVICE
+        // instead of reporting "enabled" from the graph's shape (r308's class, TODO #345).
+        bool verified_by_query = false;
+        if (!observed && !probe.require_observed && probe.query_supports_op) {
+            ggml_backend_dev_t refused_dev = nullptr;
+            uint32_t           refused_il  = 0;
+
+            if (!llm_fused_op_query_devices(model, probe.op, &refused_dev, &refused_il)) {
+                if (refused_dev != nullptr) {
+                    LLAMA_LOG_WARN("%s: %s: layer %u is assigned to device %s, which does not implement the op "
+                            "(the probe graph built no such node, so this was asked of the device directly)\n",
+                            func, probe.name, refused_il, ggml_backend_dev_name(refused_dev));
+                } else {
+                    LLAMA_LOG_WARN("%s: %s: no minimal op tensor could be built for the device query\n",
+                            func, probe.name);
+                }
+                device_mismatch = true;
+            } else {
+                verified_by_query = true;
+            }
         }
 
         if (device_mismatch) {
             enabled = false;
             LLAMA_LOG_WARN("%s: %s not supported, set to disabled\n", func, probe.name);
+
+            // The derived kq mask is implemented by both kernels that can serve a prefill: the MMA
+            // and the tile flash attention kernel (the vec kernel is decode/verify-only, and the
+            // derived form only exists for prefill-shaped batches).  So a rejection here is no longer
+            // a head-cap or kernel-tuning issue - it means neither kernel served this graph.  The
+            // generic "missing support" text sends people looking at the device instead, hence the
+            // pointer at the kernel selection.
+            if (probe.require_kq_derived) {
+                LLAMA_LOG_WARN("%s: note: the derived kq mask is implemented by the MMA and the tile "
+                        "flash attention kernels; it is disabled here because neither served this "
+                        "graph (or the node did not reach the GPU)\n", func);
+            }
         } else {
             enabled = true;
-            LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
+            if (verified_by_query) {
+                // the marker is what the gate greps for: "enabled" is only claimed here after the
+                // acting device was asked about the op itself (ggml_backend_dev_supports_op), never
+                // from a probe graph that happened not to build the node
+                LLAMA_LOG_INFO("%s: %s enabled (the probe graph built no such node; the acting device accepts "
+                        "the op, verified by ggml_backend_dev_supports_op)\n", func, probe.name);
+            } else if (probe.query_supports_op) {
+                // the node WAS in the probe graph, so the placement check above is the verdict.  Say so
+                // explicitly: for these probes a bare "enabled" must never appear, or a regression to
+                // the vacuous form (r308) would be indistinguishable from a verified pass.
+                LLAMA_LOG_INFO("%s: %s enabled (the probe graph contained the node and its placement was "
+                        "checked)\n", func, probe.name);
+            } else {
+                LLAMA_LOG_INFO("%s: %s enabled\n", func, probe.name);
+            }
         }
     };
 
@@ -728,6 +1209,31 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_kv_rows = cparams.flash_attn;
         resolve(llm_fused_op_flash_attn_kv_rows_probe, cparams.fused_kv_rows);
         cparams.auto_fkvr = false;
+    }
+
+    // note: after the flash attention probe, so that cparams.flash_attn is already resolved
+    if (cparams.auto_kq_mask_derived) {
+        // The derived form needs a single KV stream: llama_kv_cache::kq_mask_derivable() rejects a
+        // multi-stream cache.  That is `n_seq_max > 1` without kv_unified for the plain cache, and
+        // always `n_seq_max > 1` for the dsv4 caches (deepseek4 and deepseek41), which keep
+        // per-sequence streams even in unified mode (llama_kv_cache_dsv4 pins
+        // unified_raw/unified_compressed to false).  Do not run the probe there - it forces a
+        // single-sequence graph, and on a multi-stream cache that is a shape the cache-layout-driven
+        // attention builders reject (dsv4's lightning indexer ties its query stream count to the
+        // cache K's ne[3] while its mask uses the plan's stream count, so mask->ne[1] != q->ne[2]
+        // and ggml_lightning_indexer asserts; V4.1's indexer asserts the same way, issue #300).
+        // Derived is dead in that configuration anyway, so skipping the probe loses nothing.
+        const bool multi_stream = n_seqs > 1 && (!cparams.kv_unified ||
+                model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41);
+
+        if (multi_stream) {
+            LLAMA_LOG_INFO("%s: derived kq mask disabled (multi-stream KV cache)\n", func);
+            cparams.kq_mask_derived = false;
+        } else {
+            LLAMA_LOG_INFO("%s: resolving derived kq mask support:\n", func);
+            resolve(llm_fused_op_kq_derived_probe, cparams.kq_mask_derived);
+        }
+        cparams.auto_kq_mask_derived = false;
     }
 
     if (cparams.auto_flid) {
@@ -799,6 +1305,61 @@ void llama_context::sched_new(const sched_params & params) {
     sched_params_cur = params;
 }
 
+// the attention KV caches that decide the derived kq mask: the cache itself, the attention part of a hybrid memory,
+// or both caches of an iSWA memory; empty for any other memory (which then keeps the packed reserve).  Resolved once:
+// `memory` is immutable for the lifetime of the context, and decode() asks this on every batch until a latch fires.
+const std::vector<llama_kv_cache *> & llama_context::kq_mask_kvs() const {
+    if (memory && !kq_mask_kvs_done) {
+        kq_mask_kvs_store.clear();
+
+        if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+            kq_mask_kvs_store = { kv };
+        } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+            kq_mask_kvs_store = { hybrid->get_mem_attn() };
+        } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+            kq_mask_kvs_store = { iswa->get_base(), iswa->get_swa() };
+        }
+
+        kq_mask_kvs_done = true;
+    }
+
+    return kq_mask_kvs_store;
+}
+
+bool llama_context::kq_mask_packed_reachable() const {
+    // issue #238: an explicit LLAMA_KQ_MASK_PACKED_RESERVE=1 restores the pre-r160 worst-case reserve for
+    // every model (an A/B arm and a safety valve, not a policy)
+    if (cparams.kq_mask_packed_reserve > 0) {
+        return true;
+    }
+
+    // several sequences in one batch: on a single-stream cache they derive their mask too (each in its own position
+    // range, llama_kv_cache::kq_mask_derivable_seqs); a batch they cannot serve latches `kq_mask_multiseq_seen` in
+    // decode() and re-reserves once.  Without the multi-sequence form (LLAMA_KQ_MASK_DERIVED_MULTISEQ=0, or a memory
+    // it does not cover) such batches take the packed mask.
+    const bool multiseq_packed = cparams.n_seq_max > 1 &&
+            (kq_mask_multiseq_seen || !cparams.kq_mask_derived || kq_mask_kvs().empty() ||
+             !llama_kv_cache::kq_mask_derived_multiseq_enabled());
+
+    if (model.hparams.n_pos_per_embd() > 1) {
+        // 2-D (M-RoPE) positions.  Only a caller that can submit them (a multimodal projector) needs the
+        // packed mask reserved up front; a 2-D batch that arrives on a context which did not declare it
+        // latches `kq_mask_pos_2d_seen` and re-reserves once (see decode()).  A text-only context keeps
+        // the derived layout, which every M-RoPE text batch satisfies (kq_mask_derivable() accepts
+        // degenerate positions, and qwen35/qwen3.8 are IMROPE even for text).
+        if (cparams.kq_mask_packed_reserve == 0) {
+            return false;
+        }
+        return cparams.kq_mask_pos_2d || kq_mask_pos_2d_seen || multiseq_packed;
+    }
+
+    if (multiseq_packed) {
+        return true;
+    }
+
+    return model.hparams.use_alibi;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -814,6 +1375,10 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+
+    // size the compute buffers for the packed kq mask when a batch the derived form cannot serve is
+    // reachable in this context - see kq_mask_packed_reachable()
+    const bool packed_kq_mask = kq_mask_packed_reachable();
 
     const size_t max_nodes = this->graph_max_nodes();
 
@@ -866,7 +1431,8 @@ void llama_context::sched_reserve() {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
+                model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr,
+                packed_kq_mask);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
@@ -876,7 +1442,7 @@ void llama_context::sched_reserve() {
                     /*.parallel   =*/ false,
                     /*.op_offload =*/ cparams.op_offload,
                 });
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only =*/ false, nullptr, packed_kq_mask);
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -897,7 +1463,7 @@ void llama_context::sched_reserve() {
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.no_alloc());
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.no_alloc(), nullptr, packed_kq_mask);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -919,10 +1485,10 @@ void llama_context::sched_reserve() {
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc());
+                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.no_alloc(), nullptr, packed_kq_mask);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc());
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.no_alloc(), nullptr, packed_kq_mask);
         };
 
         if (!gf) {
@@ -1093,7 +1659,7 @@ bool llama_context::memory_update(bool optimize) {
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get(), /*split_only =*/ false, nullptr, kq_mask_packed_reachable());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -2267,6 +2833,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    // issue #238: a 2-D (M-RoPE) position can only come from a multimodal chunk, and the compute reserve
+    // covers the packed kq mask for such a batch only when the caller declared it at context creation.
+    // When one arrives from a caller that did not, re-reserve ONCE here (before this batch is split into
+    // ubatches) instead of leaving the graph to grow a buffer mid-flight - the packed mask is 2 bytes per
+    // KV cell per ubatch token.  A text-only context never reaches this.  See kq_mask_packed_reachable().
+    if (!kq_mask_pos_2d_seen && !cparams.kq_mask_pos_2d && cparams.kq_mask_packed_reserve != 0 &&
+            model.hparams.n_pos_per_embd() > 1 && batch_has_pos_2d(batch_inp)) {
+        kq_mask_pos_2d_seen = true;
+        sched_need_reserve = true;
+        LLAMA_LOG_INFO("%s: 2-D (M-RoPE) positions in this batch - re-reserving with the packed kq mask\n", __func__);
+    }
+
+    // the same for a batch of several sequences the derived kq mask cannot serve together
+    if (!kq_mask_multiseq_seen && cparams.kq_mask_packed_reserve != 0 && cparams.n_seq_max > 1 && cparams.kq_mask_derived &&
+            llama_kv_cache::kq_mask_derived_multiseq_enabled() && batch_needs_packed_multiseq(batch_inp, kq_mask_kvs())) {
+        kq_mask_multiseq_seen = true;
+        sched_need_reserve = true;
+        LLAMA_LOG_INFO("%s: a batch of several sequences the derived kq mask cannot serve - re-reserving with the packed kq mask\n", __func__);
+    }
+
     sched_reserve();
 
     bool did_optimize = false;
@@ -3096,7 +3682,8 @@ static void ubatch_prepare_reserve(
 }
 
 ggml_cgraph * llama_context::graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs_l, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
+        bool packed_kq_mask) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs_l);
     GGML_ASSERT(n_outputs_l >= 1);
 
@@ -3126,7 +3713,22 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    // The derived kq mask is a *per-batch* optimization, so a batch it cannot serve allocates the
+    // packed mask, n_kv*n_tokens*2 bytes - and at a deep context that is hundreds of MiB, which a
+    // reserve measured with the derived form on does not contain.  The first such batch then has to
+    // *grow* the compute buffer mid-run, and on a --fit server whose target left less free memory than
+    // that the growth fails with cudaMalloc out of memory and the request dies
+    // (github.com/stew675/llama-cpp-rdna-boosts/issues/42).  Building the measure graph with the
+    // packed mask makes the reserve (and therefore --fit) account for it up front, so the growth
+    // cannot happen.  Callers pass kq_mask_packed_reachable(), which is true only when such a batch is
+    // actually reachable in this context - see its definition.  Only the *reserve* changes: every
+    // derivable batch still takes the derived path at runtime, and a non-derivable one takes the
+    // packed-mask kernel upstream ships for it anyway.
+    if (packed_kq_mask) {
+        gparams.cparams.kq_mask_derived = false;
+    }
 
     res->reset();
 
@@ -4531,6 +5133,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.pos_2d                      =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
